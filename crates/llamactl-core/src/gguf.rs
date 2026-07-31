@@ -27,8 +27,11 @@ pub enum Value {
     F64(f64),
     Bool(bool),
     Str(String),
-    /// Arrays are skipped, not stored — we record element type and length so
-    /// callers can see what was there (e.g. tokenizer vocab size).
+    /// Small scalar arrays are retained — per-layer attention metadata
+    /// (kv-head counts, SWA flags) lives in these on modern architectures.
+    Array(Vec<Value>),
+    /// Large or string arrays are skipped, recording element type and length
+    /// so callers can see what was there (e.g. tokenizer vocab size).
     ArraySkipped {
         elem_type: u32,
         len: u64,
@@ -46,6 +49,26 @@ impl Value {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+    /// Array of unsigned integers, if every element converts.
+    pub fn as_u64_array(&self) -> Option<Vec<u64>> {
+        match self {
+            Value::Array(items) => items.iter().map(|v| v.as_u64()).collect(),
+            _ => None,
+        }
+    }
+    /// Array of bools, if every element is one.
+    pub fn as_bool_array(&self) -> Option<Vec<bool>> {
+        match self {
+            Value::Array(items) => items.iter().map(|v| v.as_bool()).collect(),
             _ => None,
         }
     }
@@ -68,12 +91,23 @@ pub struct GgufHeader {
     pub context_length: Option<u64>,
     pub embedding_length: Option<u64>,
     pub head_count: Option<u64>,
+    /// Scalar KV-head count (uniform architectures).
     pub head_count_kv: Option<u64>,
+    /// Per-layer KV-head counts (e.g. Gemma-4 stores an i32[block_count]).
+    pub head_count_kv_per_layer: Option<Vec<u64>>,
+    /// Attention head dims: `attention.key_length` / `value_length`, with
+    /// `_swa` variants for sliding-window layers where present. These are the
+    /// authoritative head dims — NOT embedding/head_count.
+    pub key_length: Option<u64>,
+    pub value_length: Option<u64>,
+    pub key_length_swa: Option<u64>,
+    pub value_length_swa: Option<u64>,
     /// Per-layer sliding-window size, if the architecture uses SWA.
     pub sliding_window: Option<u64>,
-    /// SWA pattern: on e.g. Gemma-family models only 1 in N layers is
-    /// full-attention, which changes KV growth with context dramatically.
+    /// Scalar SWA pattern (older style): every Nth layer is full-attention.
     pub sliding_window_pattern: Option<u64>,
+    /// Per-layer SWA flags (newer style, bool[block_count]): true = sliding.
+    pub swa_layer_flags: Option<Vec<bool>>,
     pub expert_count: Option<u64>,
     pub expert_used_count: Option<u64>,
     /// All scalar metadata (arrays recorded as skipped).
@@ -113,6 +147,10 @@ pub fn read_header(path: &Path) -> Result<GgufHeader> {
         let a = arch.as_deref()?;
         metadata.get(&format!("{a}.{suffix}")).and_then(|v| v.as_u64())
     };
+    let arch_val = |suffix: &str| -> Option<&Value> {
+        let a = arch.as_deref()?;
+        metadata.get(&format!("{a}.{suffix}"))
+    };
 
     Ok(GgufHeader {
         path: path.to_path_buf(),
@@ -127,8 +165,16 @@ pub fn read_header(path: &Path) -> Result<GgufHeader> {
         embedding_length: arch_key("embedding_length"),
         head_count: arch_key("attention.head_count"),
         head_count_kv: arch_key("attention.head_count_kv"),
+        head_count_kv_per_layer: arch_val("attention.head_count_kv")
+            .and_then(|v| v.as_u64_array()),
+        key_length: arch_key("attention.key_length"),
+        value_length: arch_key("attention.value_length"),
+        key_length_swa: arch_key("attention.key_length_swa"),
+        value_length_swa: arch_key("attention.value_length_swa"),
         sliding_window: arch_key("attention.sliding_window"),
         sliding_window_pattern: arch_key("attention.sliding_window_pattern"),
+        swa_layer_flags: arch_val("attention.sliding_window_pattern")
+            .and_then(|v| v.as_bool_array()),
         expert_count: arch_key("expert_count"),
         expert_used_count: arch_key("expert_used_count"),
         architecture: arch,
@@ -201,13 +247,21 @@ fn read_value<R: Read + Seek>(r: &mut R, vtype: u32, path: &Path) -> Result<Valu
         7 => Value::Bool(read_byte(r, path)? != 0),
         8 => Value::Str(read_string(r, path)?),
         9 => {
-            // Array: elem type + count. Seek past fixed-width elements; walk
-            // string/nested arrays element-wise (tokenizer vocabs are string
-            // arrays — walking lengths is still only a few MB of I/O).
+            // Array: elem type + count. Small scalar arrays are retained
+            // (per-layer attention metadata). Large scalar arrays are seeked
+            // past; string arrays are walked element-wise (tokenizer vocabs
+            // are string arrays — walking lengths is still only MBs of I/O).
             let elem_type = read_u32(r, path)?;
             let len = read_u64(r, path)?;
             if len > MAX_SANE_LEN {
                 return Err(malformed(path, format!("implausible array length {len}")));
+            }
+            if scalar_width(elem_type).is_some() && len <= 4096 {
+                let mut items = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    items.push(read_value(r, elem_type, path)?);
+                }
+                return Ok(Value::Array(items));
             }
             if let Some(w) = scalar_width(elem_type) {
                 let bytes = w.checked_mul(len)
@@ -315,6 +369,22 @@ mod tests {
                         out.extend_from_slice(&f.to_le_bytes());
                     }
                 }
+                SynthVal::I32Array(items) => {
+                    out.extend_from_slice(&9u32.to_le_bytes());
+                    out.extend_from_slice(&5u32.to_le_bytes()); // elem type: i32
+                    out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                    for v in items {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                SynthVal::BoolArray(items) => {
+                    out.extend_from_slice(&9u32.to_le_bytes());
+                    out.extend_from_slice(&7u32.to_le_bytes()); // elem type: bool
+                    out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                    for v in items {
+                        out.push(if *v { 1 } else { 0 });
+                    }
+                }
             }
         }
         out
@@ -325,6 +395,8 @@ mod tests {
         Str(&'static str),
         StrArray(Vec<&'static str>),
         F32Array(Vec<f32>),
+        I32Array(Vec<i32>),
+        BoolArray(Vec<bool>),
     }
 
     fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -357,11 +429,40 @@ mod tests {
         assert_eq!(h.head_count_kv, Some(4));
         assert_eq!(h.sliding_window, Some(1024));
         assert_eq!(h.sliding_window_pattern, Some(6));
-        // Arrays skipped but recorded.
+        // String arrays skipped but recorded.
         assert_eq!(
             h.metadata.get("tokenizer.ggml.tokens"),
             Some(&Value::ArraySkipped { elem_type: 8, len: 3 })
         );
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The Gemma-4 style: per-layer kv-head counts (i32[]) and SWA flags
+    /// (bool[]), plus explicit key/value lengths with SWA variants.
+    #[test]
+    fn parses_per_layer_attention_arrays() {
+        let bytes = synth_gguf(&[
+            ("general.architecture", SynthVal::Str("gemma4")),
+            ("gemma4.block_count", SynthVal::U32(4)),
+            ("gemma4.attention.head_count", SynthVal::U32(16)),
+            ("gemma4.attention.head_count_kv", SynthVal::I32Array(vec![2, 2, 2, 4])),
+            ("gemma4.attention.key_length", SynthVal::U32(512)),
+            ("gemma4.attention.value_length", SynthVal::U32(512)),
+            ("gemma4.attention.key_length_swa", SynthVal::U32(256)),
+            ("gemma4.attention.value_length_swa", SynthVal::U32(256)),
+            ("gemma4.attention.sliding_window", SynthVal::U32(1024)),
+            (
+                "gemma4.attention.sliding_window_pattern",
+                SynthVal::BoolArray(vec![true, true, true, false]),
+            ),
+        ]);
+        let path = write_temp("perlayer", &bytes);
+        let h = read_header(&path).unwrap();
+        assert_eq!(h.head_count_kv_per_layer, Some(vec![2, 2, 2, 4]));
+        assert_eq!(h.head_count_kv, None, "array form is not a scalar");
+        assert_eq!(h.key_length, Some(512));
+        assert_eq!(h.value_length_swa, Some(256));
+        assert_eq!(h.swa_layer_flags, Some(vec![true, true, true, false]));
         std::fs::remove_file(path).ok();
     }
 
