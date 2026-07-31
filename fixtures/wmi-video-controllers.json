@@ -1,0 +1,29 @@
+﻿[
+    {
+        "name":  "AMD Radeon(TM) Graphics",
+        "pnp_device_id":  "PCI\\VEN_1002\u0026DEV_13C0\u0026SUBSYS_7D781462\u0026REV_CB\\4\u002627E89230\u00260\u00260041",
+        "driver_version":  "32.0.21045.1000",
+        "bus_number":  19,
+        "h_res":  1920,
+        "v_res":  1080,
+        "refresh_hz":  59
+    },
+    {
+        "name":  "AMD Radeon AI PRO R9700",
+        "pnp_device_id":  "PCI\\VEN_1002\u0026DEV_7551\u0026SUBSYS_54131849\u0026REV_C0\\6\u00263305601B\u00260\u002600000009",
+        "driver_version":  "32.0.31035.1003",
+        "bus_number":  3,
+        "h_res":  2560,
+        "v_res":  1440,
+        "refresh_hz":  144
+    },
+    {
+        "name":  "AMD Radeon AI PRO R9700",
+        "pnp_device_id":  "PCI\\VEN_1002\u0026DEV_7551\u0026SUBSYS_54131849\u0026REV_C0\\8\u00261A11ECB9\u00260\u0026000000000011",
+        "driver_version":  "32.0.31035.1003",
+        "bus_number":  8,
+        "h_res":  1920,
+        "v_res":  1080,
+        "refresh_hz":  59
+    }
+]

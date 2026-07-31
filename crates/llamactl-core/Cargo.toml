@@ -1,0 +1,21 @@
+[package]
+name = "llamactl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+wmi = "0.15"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Performance",
+] }

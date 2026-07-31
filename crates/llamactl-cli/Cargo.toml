@@ -1,0 +1,15 @@
+[package]
+name = "llamactl-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llamactl"
+path = "src/main.rs"
+
+[dependencies]
+llamactl-core = { path = "../llamactl-core" }
+clap = { version = "4", features = ["derive"] }
+anyhow.workspace = true
+serde_json.workspace = true
