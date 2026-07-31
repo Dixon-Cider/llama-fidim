@@ -3,6 +3,7 @@
 //!
 //! The UI layers (CLI now, Tauri later) are thin wrappers over this crate.
 
+pub mod bench;
 pub mod config;
 pub mod devices;
 pub mod discovery;

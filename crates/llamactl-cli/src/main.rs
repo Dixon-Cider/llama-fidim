@@ -69,6 +69,21 @@ enum Cmd {
         #[arg(long, default_value = "40")]
         tail: usize,
     },
+    /// Benchmark a running server and store the baseline on its profile.
+    Bench {
+        profile_id: String,
+        /// Concurrent streams (default: the profile's slot count).
+        #[arg(long)]
+        concurrency: Option<u32>,
+        /// Decode length per measured request.
+        #[arg(long, default_value = "256")]
+        tokens: u32,
+        #[arg(long, default_value = "2")]
+        warmups: u32,
+        /// Skip writing the baseline (measure and print only).
+        #[arg(long)]
+        no_save: bool,
+    },
     /// Write starter profiles translated from the existing batch files.
     Seed,
 }
@@ -91,6 +106,9 @@ fn main() -> anyhow::Result<()> {
             cmd_export(&cfg, &platform, &profile_id, &format, out)
         }
         Cmd::Logs { target, tail } => cmd_logs(&cfg, &target, tail),
+        Cmd::Bench { profile_id, concurrency, tokens, warmups, no_save } => {
+            cmd_bench(&cfg, &platform, &profile_id, concurrency, tokens, warmups, no_save)
+        }
         Cmd::Seed => cmd_seed(&cfg),
     }
 }
@@ -387,7 +405,21 @@ fn cmd_launch(
         prepared.context.resolved.iter().map(|r| r.device.stable_key.clone()).collect();
     let free_before: Vec<u64> =
         prepared.context.resolved.iter().map(|r| r.device.free_mib).collect();
-    let state = supervise::spawn(&prepared.plan, &profile, &cfg.runs_dir, device_keys, free_before)?;
+    let cold_start = supervise::is_cold_start(&Config::config_dir(), &profile.model.path);
+    if cold_start {
+        println!(
+            "note: first load of this model file since it changed — the first benchmark will be \
+             marked cold-cache (R-08)"
+        );
+    }
+    let state = supervise::spawn(
+        &prepared.plan,
+        &profile,
+        &cfg.runs_dir,
+        device_keys,
+        free_before,
+        cold_start,
+    )?;
     println!(
         "launched pid {} on port {} — waiting for /v1/models (log: {})",
         state.pid,
@@ -396,6 +428,7 @@ fn cmd_launch(
     );
     supervise::wait_ready(&state, Duration::from_secs(ready_timeout))?;
     println!("ready.");
+    supervise::record_model_loaded(&Config::config_dir(), &profile.model.path)?;
     verify_residency(platform, &state, &prepared);
     Ok(())
 }
@@ -564,6 +597,149 @@ fn cmd_logs(cfg: &Config, target: &str, tail: usize) -> anyhow::Result<()> {
     let lines: Vec<&str> = text.lines().collect();
     for line in lines.iter().rev().take(tail).rev() {
         println!("{line}");
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------ bench ----
+
+fn cmd_bench(
+    cfg: &Config,
+    platform: &dyn Platform,
+    profile_id: &str,
+    concurrency: Option<u32>,
+    tokens: u32,
+    warmups: u32,
+    no_save: bool,
+) -> anyhow::Result<()> {
+    let profile = load_profile(cfg, profile_id)?;
+    let run = find_run(cfg, profile_id)?;
+    if run.crashed {
+        bail!("run for {profile_id} has crashed — relaunch before benchmarking");
+    }
+    let n = concurrency.unwrap_or(profile.runtime.slots).max(1);
+    let opts = llamactl_core::bench::BenchOptions {
+        warmups,
+        max_tokens: tokens,
+        concurrency: n,
+        ..Default::default()
+    };
+    println!(
+        "sweeping {} on port {}: {} warmups, serial + {}x{} tokens{}",
+        profile_id,
+        run.state.port,
+        warmups,
+        n,
+        tokens,
+        if run.state.cold_start { "  [COLD-CACHE RUN]" } else { "" }
+    );
+    let sweep =
+        llamactl_core::bench::run_sweep(&run.state.host, run.state.port, &run.state.alias, &opts)?;
+
+    // Measured VRAM from the PDH counters, per profile device.
+    let mem = platform.gpu_process_memory(run.state.pid).unwrap_or_default();
+    let adapters = platform.video_adapters().unwrap_or_default();
+    let key_to_luid: Vec<(String, Option<u64>)> = run
+        .state
+        .device_keys
+        .iter()
+        .map(|key| {
+            let luid = adapters
+                .iter()
+                .find(|a| {
+                    llamactl_core::devices::stable_key(&a.pnp_device_id, a.bus_number) == *key
+                })
+                .and_then(|a| a.luid_low);
+            (key.clone(), luid)
+        })
+        .collect();
+    let per_device_vram_gb: Vec<f64> = key_to_luid
+        .iter()
+        .map(|(_, luid)| {
+            luid.and_then(|l| mem.iter().find(|m| m.luid_low == l))
+                .map(|m| m.dedicated_bytes.max(m.committed_bytes) as f64 / (1024.0 * 1024.0 * 1024.0))
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let vram_gb: f64 = per_device_vram_gb.iter().sum();
+
+    let serial_tok_s = sweep.serial.decode_tok_s.unwrap_or(sweep.serial.wall_tok_s);
+    println!("  serial: {serial_tok_s:.1} tok/s ({} tokens in {:.1}s wall)",
+        sweep.serial.tokens, sweep.serial.wall_seconds);
+    if let Some(c) = &sweep.concurrent {
+        println!(
+            "  concurrent n={}: wall aggregate {:.1} tok/s, decode aggregate {:.1} tok/s, per-stream {:.1} tok/s",
+            c.n, c.aggregate_tok_s, c.decode_aggregate_tok_s, c.per_stream_tok_s
+        );
+    }
+    println!("  resident VRAM: {vram_gb:.2} GiB ({})",
+        per_device_vram_gb.iter().map(|g| format!("{g:.2}")).collect::<Vec<_>>().join(" + "));
+
+    // Assemble the baseline record (§06 schema shape).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let driver = adapters
+        .iter()
+        .find(|a| {
+            key_to_luid.iter().any(|(k, l)| {
+                l.is_some()
+                    && *l == a.luid_low
+                    && run.state.device_keys.contains(k)
+            })
+        })
+        .map(|a| a.driver_version.clone());
+    let sdk = launch::sdk_version(cfg.rocm_bin.as_deref());
+    let split = profile.split_mode.map(|m| {
+        serde_json::json!({
+            "mode": m,
+            "fractions": profile.devices.iter().map(|d| d.split_fraction).collect::<Vec<_>>(),
+        })
+    });
+    let baseline = serde_json::json!({
+        "measured_at": llamactl_core::bench::iso8601_utc(now),
+        "measured_at_unix": now,
+        "build_version": profile.build.version,
+        "driver": driver,
+        "sdk": sdk,
+        "split": split,
+        "vram_gb": (vram_gb * 100.0).round() / 100.0,
+        "per_device_vram_gb": per_device_vram_gb.iter().map(|g| (g * 100.0).round() / 100.0).collect::<Vec<_>>(),
+        "serial_tok_s": (serial_tok_s * 10.0).round() / 10.0,
+        "concurrent": sweep.concurrent.as_ref().map(|c| serde_json::json!({
+            "n": c.n,
+            "aggregate_tok_s": (c.aggregate_tok_s * 10.0).round() / 10.0,
+            "decode_aggregate_tok_s": (c.decode_aggregate_tok_s * 10.0).round() / 10.0,
+            "per_stream_tok_s": (c.per_stream_tok_s * 10.0).round() / 10.0,
+        })),
+        "cold_cache": run.state.cold_start,
+        "profile_fingerprint": llamactl_core::bench::profile_fingerprint(&profile),
+        "bench": { "warmups": warmups, "tokens": tokens },
+    });
+
+    // History always gets the record; the profile baseline only warm runs.
+    let hist_dir = Config::config_dir().join("benchmarks");
+    std::fs::create_dir_all(&hist_dir)?;
+    let hist_path = hist_dir.join(format!("{profile_id}.jsonl"));
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&hist_path)?;
+    writeln!(f, "{}", serde_json::to_string(&baseline)?)?;
+    println!("  appended to history: {}", hist_path.display());
+
+    if no_save {
+        println!("  baseline NOT saved (--no-save)");
+    } else if run.state.cold_start {
+        println!(
+            "  baseline NOT saved: cold-cache run (R-08) — a fresh model file measured 2.4x slow \
+             once and nearly became a recorded number. Stop, relaunch, and bench again for a warm \
+             baseline."
+        );
+    } else {
+        let mut profile = profile;
+        profile.baseline = Some(baseline);
+        profile.save(&cfg.profile_dir.join(format!("{profile_id}.json")))?;
+        println!("  baseline saved to profile {profile_id}");
     }
     Ok(())
 }
