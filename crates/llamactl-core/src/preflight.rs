@@ -375,6 +375,7 @@ mod tests {
                 driver_version: "32.0.21045.1000".into(),
                 bus_number: Some(19),
                 display: None,
+                luid_low: Some(0x1DCEC),
             },
             OsAdapter {
                 name: "AMD Radeon AI PRO R9700".into(),
@@ -382,6 +383,7 @@ mod tests {
                 driver_version: "32.0.31035.1003".into(),
                 bus_number: Some(3),
                 display: Some(DisplayMode { width: 2560, height: 1440, refresh_hz: 144 }),
+                luid_low: Some(0x1621C),
             },
             OsAdapter {
                 name: "AMD Radeon AI PRO R9700".into(),
@@ -389,6 +391,7 @@ mod tests {
                 driver_version: "32.0.31035.1003".into(),
                 bus_number: Some(8),
                 display: None,
+                luid_low: Some(0x1B592),
             },
         ];
         correlate(

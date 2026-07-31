@@ -121,6 +121,11 @@ pub struct OsAdapter {
     pub bus_number: Option<u32>,
     /// Present when the adapter is currently driving a display (R-06).
     pub display: Option<DisplayMode>,
+    /// Low dword of the adapter LUID — links PDH "GPU Process Memory"
+    /// counter instances (`pid_N_luid_0x.._0x<low>_phys_0`) to this card.
+    /// Volatile across reboots/driver resets; never persisted in profiles.
+    #[serde(default)]
+    pub luid_low: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +151,8 @@ pub struct Device {
     pub bus_number: Option<u32>,
     pub driver_version: Option<String>,
     pub display: Option<DisplayMode>,
+    /// LUID low dword for PDH counter attribution (residency verification).
+    pub luid_low: Option<u64>,
     /// True when the OS-adapter correlation relied on the discrete-order
     /// assumption rather than a unique name match. Surfaced in the Devices
     /// view; runtime residency checks are the backstop.
@@ -224,6 +231,7 @@ pub fn correlate(
                 bus_number: adapter.and_then(|a| a.bus_number),
                 driver_version: adapter.map(|a| a.driver_version.clone()),
                 display: adapter.and_then(|a| a.display.clone()),
+                luid_low: adapter.and_then(|a| a.luid_low),
                 correlation_assumed: assumed && adapter.is_some(),
             });
         }
@@ -290,6 +298,7 @@ mod tests {
                 driver_version: "32.0.21045.1000".into(),
                 bus_number: Some(19),
                 display: Some(DisplayMode { width: 1920, height: 1080, refresh_hz: 59 }),
+                luid_low: Some(0x1DCEC),
             },
             OsAdapter {
                 name: "AMD Radeon AI PRO R9700".into(),
@@ -297,6 +306,7 @@ mod tests {
                 driver_version: "32.0.31035.1003".into(),
                 bus_number: Some(3),
                 display: Some(DisplayMode { width: 2560, height: 1440, refresh_hz: 144 }),
+                luid_low: Some(0x1621C),
             },
             OsAdapter {
                 name: "AMD Radeon AI PRO R9700".into(),
@@ -304,6 +314,7 @@ mod tests {
                 driver_version: "32.0.31035.1003".into(),
                 bus_number: Some(8),
                 display: Some(DisplayMode { width: 1920, height: 1080, refresh_hz: 59 }),
+                luid_low: Some(0x1B592),
             },
         ]
     }

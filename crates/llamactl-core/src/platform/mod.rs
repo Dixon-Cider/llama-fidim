@@ -28,17 +28,37 @@ impl SystemCommit {
     }
 }
 
+/// Dedicated GPU memory one process holds on one adapter, from the PDH
+/// "GPU Process Memory" counters. This is the residency ground truth on
+/// Windows: WDDM virtualizes VRAM, so `--list-devices` free-memory deltas
+/// do NOT see other processes' allocations (verified on the target machine).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct GpuProcessMem {
+    pub luid_low: u64,
+    /// Resident in dedicated VRAM. On a layer-split launch the non-main
+    /// card stays near zero until the first forward pass touches its layers
+    /// (WDDM residency is on-demand) — verified on the target machine.
+    pub dedicated_bytes: u64,
+    /// Committed against the adapter — proves placement immediately, before
+    /// first inference makes it resident.
+    pub committed_bytes: u64,
+}
+
 pub trait Platform {
-    /// Video adapters with PNP identity, bus number, and attached display.
+    /// Video adapters with PNP identity, bus number, LUID, and display.
     fn video_adapters(&self) -> Result<Vec<OsAdapter>>;
     /// Current commit limit and charge.
     fn system_commit(&self) -> Result<SystemCommit>;
+    /// Per-adapter dedicated GPU memory held by `pid`.
+    fn gpu_process_memory(&self, pid: u32) -> Result<Vec<GpuProcessMem>>;
 }
 
 /// Deterministic fake for tests: scripted responses, no OS access.
+#[derive(Default)]
 pub struct FakePlatform {
     pub adapters: Vec<OsAdapter>,
-    pub commit: SystemCommit,
+    pub commit: Option<SystemCommit>,
+    pub gpu_mem: Vec<GpuProcessMem>,
 }
 
 impl Platform for FakePlatform {
@@ -46,6 +66,12 @@ impl Platform for FakePlatform {
         Ok(self.adapters.clone())
     }
     fn system_commit(&self) -> Result<SystemCommit> {
-        Ok(self.commit)
+        Ok(self.commit.unwrap_or(SystemCommit {
+            limit_bytes: 100 * 1024 * 1024 * 1024,
+            charge_bytes: 10 * 1024 * 1024 * 1024,
+        }))
+    }
+    fn gpu_process_memory(&self, _pid: u32) -> Result<Vec<GpuProcessMem>> {
+        Ok(self.gpu_mem.clone())
     }
 }

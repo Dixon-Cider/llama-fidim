@@ -8,10 +8,13 @@ pub mod devices;
 pub mod discovery;
 pub mod error;
 pub mod estimate;
+pub mod export;
 pub mod gguf;
+pub mod launch;
 pub mod platform;
 pub mod preflight;
 pub mod profile;
+pub mod supervise;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
