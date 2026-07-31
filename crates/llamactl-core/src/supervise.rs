@@ -31,6 +31,11 @@ pub struct RunState {
     /// Free VRAM (MiB) per device just before launch — residency
     /// verification compares against a fresh enumeration after readiness.
     pub free_mib_before: Vec<u64>,
+    /// True when the model file had never been loaded since its last
+    /// modification (R-08): the first benchmark against this run is a
+    /// cold-cache measurement and must not become a saved baseline.
+    #[serde(default)]
+    pub cold_start: bool,
 }
 
 impl RunState {
@@ -45,6 +50,48 @@ impl RunState {
     }
 }
 
+// ------------------------------------------------- model load history ----
+
+/// `<config-dir>/model-history.json`: model path → unix time of the last
+/// successful load. Drives the cold-cache heuristic (R-08): a model counts
+/// cold until one recorded load postdates its mtime.
+fn model_history_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("model-history.json")
+}
+
+fn load_model_history(config_dir: &Path) -> std::collections::BTreeMap<String, u64> {
+    std::fs::read_to_string(model_history_path(config_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Whether a launch of `model_path` would be a cold-cache first load.
+pub fn is_cold_start(config_dir: &Path, model_path: &Path) -> bool {
+    let mtime = std::fs::metadata(model_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let history = load_model_history(config_dir);
+    match history.get(&model_path.to_string_lossy().to_lowercase()) {
+        Some(last_loaded) => *last_loaded < mtime,
+        None => true,
+    }
+}
+
+/// Record a successful load (call after readiness, not after spawn — a
+/// crashed load warms nothing).
+pub fn record_model_loaded(config_dir: &Path, model_path: &Path) -> Result<()> {
+    let mut history = load_model_history(config_dir);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    history.insert(model_path.to_string_lossy().to_lowercase(), now);
+    std::fs::create_dir_all(config_dir).map_err(|e| Error::io(config_dir, e))?;
+    let p = model_history_path(config_dir);
+    std::fs::write(&p, serde_json::to_string_pretty(&history)?).map_err(|e| Error::io(&p, e))
+}
+
 /// Spawn the plan detached: new process group, no console window, stdout and
 /// stderr appended to a log file. Closing llamactl later must not kill it.
 pub fn spawn(
@@ -53,6 +100,7 @@ pub fn spawn(
     runs_dir: &Path,
     device_keys: Vec<String>,
     free_mib_before: Vec<u64>,
+    cold_start: bool,
 ) -> Result<RunState> {
     std::fs::create_dir_all(runs_dir).map_err(|e| Error::io(runs_dir, e))?;
     let started_unix =
@@ -99,6 +147,7 @@ pub fn spawn(
         visibility_env: plan.visibility_env.clone(),
         device_keys,
         free_mib_before,
+        cold_start,
     };
     state.save(runs_dir)?;
     Ok(state)
@@ -334,6 +383,24 @@ mod tests {
     }
 
     #[test]
+    fn cold_start_until_a_load_postdates_mtime() {
+        let dir = std::env::temp_dir().join(format!("llamactl-hist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("model.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        // Never loaded → cold.
+        assert!(is_cold_start(&dir, &model));
+        // Recorded load (now > mtime) → warm.
+        record_model_loaded(&dir, &model).unwrap();
+        assert!(!is_cold_start(&dir, &model));
+        // Re-download (fresh mtime after the recorded load) → cold again.
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(&model, b"GGUF2").unwrap();
+        assert!(is_cold_start(&dir, &model));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn run_state_round_trips() {
         let dir = std::env::temp_dir().join(format!("llamactl-runs-{}", std::process::id()));
         let state = RunState {
@@ -348,6 +415,7 @@ mod tests {
             visibility_env: "2".into(),
             device_keys: vec!["pci:A:bus08".into()],
             free_mib_before: vec![32472],
+            cold_start: false,
         };
         state.save(&dir).unwrap();
         let attached = reattach(&dir);
