@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "llamactl-ui",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "C:\\Users\\me\\Documents\\Claude\\Projects\\llamactl\\ui", "dev"],
+      "port": 1420
+    }
+  ]
+}
