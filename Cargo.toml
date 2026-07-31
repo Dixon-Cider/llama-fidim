@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/llamactl-core", "crates/llamactl-cli"]
+members = ["crates/llamactl-core", "crates/llamactl-cli", "ui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

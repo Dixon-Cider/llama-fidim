@@ -122,6 +122,9 @@ pub fn compose(profile: &Profile, resolved: &[ResolvedDevice]) -> LaunchPlan {
 
     args.push("--jinja".into());
     args.push("--metrics".into());
+    // Enables the /slots endpoint the Running view reads (V-3). Local-only
+    // servers; the endpoint's prompt-exposure caveat does not apply here.
+    args.push("--slots".into());
     args.extend(["--alias".into(), profile.server.alias.clone()]);
     args.extend(["--host".into(), profile.server.host.clone()]);
     args.extend(["--port".into(), profile.server.port.to_string()]);
@@ -229,19 +232,52 @@ pub fn sdk_version(rocm_bin: Option<&Path>) -> Option<String> {
     bin.parent().and_then(|p| p.file_name()).map(|n| format!("ROCm {}", n.to_string_lossy()))
 }
 
+/// Pre-gathered slow inputs for `prepare_with_inputs`: the UI caches these
+/// (device enumeration ~2-4s, build probe ~1s) so the profile editor can
+/// re-run pre-flight live. Launches always gather fresh (R-03).
+pub struct PrepareInputs {
+    pub devices_now: Vec<Device>,
+    pub build_version_output: Option<String>,
+}
+
+impl PrepareInputs {
+    pub fn gather(cfg: &Config, profile: &Profile, platform: &dyn Platform) -> Result<Self> {
+        let server_exe = profile.build.path.join("bin").join("llama-server.exe");
+        let build_version_output =
+            run_capture(&server_exe, &["--version"], cfg.rocm_bin.as_deref())
+                .ok()
+                .filter(|t| discovery::parse_version_output(t).is_some());
+        let devices_now = if build_version_output.is_some() {
+            enumerate_devices(cfg, &server_exe, platform)?
+        } else {
+            Vec::new()
+        };
+        Ok(PrepareInputs { devices_now, build_version_output })
+    }
+}
+
 /// Build the full pre-flight context for a profile: resolve devices, compute
 /// fractions, estimate VRAM, read commit, probe the build, check the port.
+/// Gathers fresh inputs — the correct choice for a real launch.
 pub fn prepare(
     cfg: &Config,
     profile: &Profile,
     platform: &dyn Platform,
     running_aliases: Vec<String>,
 ) -> Result<PreparedLaunch> {
-    // Build probe.
-    let server_exe = profile.build.path.join("bin").join("llama-server.exe");
-    let build_version_output = run_capture(&server_exe, &["--version"], cfg.rocm_bin.as_deref())
-        .ok()
-        .filter(|t| discovery::parse_version_output(t).is_some());
+    let inputs = PrepareInputs::gather(cfg, profile, platform)?;
+    prepare_with_inputs(cfg, profile, platform, running_aliases, inputs)
+}
+
+/// `prepare` with the slow inputs supplied by the caller (UI live checks).
+pub fn prepare_with_inputs(
+    cfg: &Config,
+    profile: &Profile,
+    platform: &dyn Platform,
+    running_aliases: Vec<String>,
+    inputs: PrepareInputs,
+) -> Result<PreparedLaunch> {
+    let PrepareInputs { devices_now, build_version_output } = inputs;
 
     // File existence (check 2).
     let mut missing = Vec::new();
@@ -260,12 +296,7 @@ pub fn prepare(
         }
     }
 
-    // Device resolution (check 3) against a fresh enumeration.
-    let devices_now = if build_version_output.is_some() {
-        enumerate_devices(cfg, &server_exe, platform)?
-    } else {
-        Vec::new()
-    };
+    // Device resolution (check 3).
     let mut resolved: Vec<ResolvedDevice> = Vec::new();
     let mut unresolved: Vec<(String, String)> = Vec::new();
     let mut taken: Vec<String> = Vec::new();
