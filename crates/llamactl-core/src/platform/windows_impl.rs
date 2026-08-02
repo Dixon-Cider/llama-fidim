@@ -83,9 +83,14 @@ impl Platform for WindowsPlatform {
                 .map_err(|e| Error::Platform(format!("GetPerformanceInfo: {e}")))?;
         }
         let page = info.PageSize as u64;
+        let (pagefile_allocated_bytes, pagefile_can_grow) = pagefile_state();
         Ok(SystemCommit {
             limit_bytes: info.CommitLimit as u64 * page,
             charge_bytes: info.CommitTotal as u64 * page,
+            physical_total_bytes: info.PhysicalTotal as u64 * page,
+            physical_available_bytes: info.PhysicalAvailable as u64 * page,
+            pagefile_allocated_bytes,
+            pagefile_can_grow,
         })
     }
 
@@ -166,6 +171,54 @@ fn device_property_u64(instance_id: &str, key: &DEVPROPKEY) -> Option<u64> {
         4.. => Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64),
         _ => None,
     }
+}
+
+/// Allocated pagefile size and whether any pagefile may grow.
+///
+/// `Win32_PageFileUsage.AllocatedBaseSize` is the CURRENT allocation, which
+/// Windows extends on demand — the extension is the stall we guard against.
+/// `Win32_PageFileSetting` with InitialSize = MaximumSize = 0 means
+/// "system managed size" for that drive, i.e. it can grow.
+fn pagefile_state() -> (u64, bool) {
+    #[derive(Deserialize, Debug)]
+    struct PageFileUsage {
+        #[serde(rename = "AllocatedBaseSize")]
+        allocated_mb: Option<u32>,
+    }
+    #[derive(Deserialize, Debug)]
+    struct PageFileSetting {
+        #[serde(rename = "InitialSize")]
+        initial_mb: Option<u32>,
+        #[serde(rename = "MaximumSize")]
+        maximum_mb: Option<u32>,
+    }
+
+    let Ok(com) = wmi::COMLibrary::new() else { return (0, true) };
+    let Ok(con) = wmi::WMIConnection::new(com) else { return (0, true) };
+
+    let allocated: u64 = con
+        .raw_query::<PageFileUsage>("SELECT AllocatedBaseSize FROM Win32_PageFileUsage")
+        .map(|rows| {
+            rows.iter().filter_map(|r| r.allocated_mb).map(|mb| mb as u64 * 1024 * 1024).sum()
+        })
+        .unwrap_or(0);
+
+    // Assume growable when the setting cannot be read: the guard then warns
+    // about a growth stall rather than claiming a hard failure.
+    let can_grow = con
+        .raw_query::<PageFileSetting>("SELECT InitialSize, MaximumSize FROM Win32_PageFileSetting")
+        .map(|rows| {
+            rows.is_empty()
+                || rows.iter().any(|r| {
+                    let init = r.initial_mb.unwrap_or(0);
+                    let max = r.maximum_mb.unwrap_or(0);
+                    // 0/0 = system managed; max > init = room to expand.
+                    (init == 0 && max == 0) || max > init
+                })
+        })
+        .unwrap_or(true);
+
+    (allocated, can_grow)
 }
 
 /// PDH query for `\GPU Process Memory(pid_N*)\Dedicated Usage` — the

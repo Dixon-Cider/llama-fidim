@@ -363,6 +363,7 @@ pub fn prepare_with_inputs(
     });
 
     let commit = platform.system_commit()?;
+    let inflight_reserved_bytes = crate::supervise::inflight_reserved_bytes(&cfg.runs_dir);
     let port_free = port_is_free(&profile.server.host, profile.server.port);
 
     // Driver/SDK now vs baseline (check 11).
@@ -386,6 +387,7 @@ pub fn prepare_with_inputs(
         unresolved,
         estimate,
         commit,
+        inflight_reserved_bytes,
         visibility_env: plan.visibility_env.clone(),
         running_aliases,
         port_free,
@@ -399,6 +401,47 @@ pub fn prepare_with_inputs(
 
 pub fn port_is_free(host: &str, port: u16) -> bool {
     TcpListener::bind((host, port)).is_ok()
+}
+
+/// Final commit gate, run immediately before spawn.
+///
+/// Pre-flight can be minutes stale by the time a launch actually fires (a
+/// model finished loading elsewhere, another launch started, the user opened
+/// something large). Re-reading commit here closes that window. Deliberately
+/// commit-only: physical RAM is not a gate anywhere in this pipeline, per the
+/// 2026-08-01 measurement in `platform::SystemCommit`.
+pub fn final_commit_gate(
+    cfg: &Config,
+    platform: &dyn Platform,
+    estimate: Option<&VramEstimate>,
+    overridden: bool,
+) -> Result<()> {
+    if overridden {
+        return Ok(());
+    }
+    let commit = platform.system_commit()?;
+    let inflight = crate::supervise::inflight_reserved_bytes(&cfg.runs_dir);
+    let add = estimate.map(|e| e.total_bytes).unwrap_or(0) + inflight;
+    if add == 0 || commit.limit_bytes == 0 {
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let projected = commit.charge_bytes + add;
+    if projected as f64 > commit.limit_bytes as f64 * 0.90 {
+        let inflight_note = if inflight > 0 {
+            format!(" ({:.1} GiB of it reserved by a server still loading)", gib(inflight))
+        } else {
+            String::new()
+        };
+        return Err(Error::Platform(format!(
+            "aborted at the final commit gate: conditions changed since pre-flight — projected commit \
+             {:.1} GiB of {:.1} GiB limit exceeds 90%{inflight_note}. Stop another server or wait for one \
+             to finish loading, then retry; --override-blocks proceeds anyway",
+            gib(projected),
+            gib(commit.limit_bytes)
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
