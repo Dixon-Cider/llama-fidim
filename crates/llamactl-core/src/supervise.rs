@@ -36,6 +36,26 @@ pub struct RunState {
     /// cold-cache measurement and must not become a saved baseline.
     #[serde(default)]
     pub cold_start: bool,
+    /// Total bytes this run is expected to occupy (VRAM estimate). Concurrent
+    /// launches read this to account for memory a still-loading server has
+    /// reserved but not yet charged.
+    #[serde(default)]
+    pub estimated_bytes: u64,
+    /// Set once `/v1/models` answers. Until then the run is "in flight" and
+    /// its full `estimated_bytes` counts against a subsequent launch.
+    #[serde(default)]
+    pub ready: bool,
+}
+
+/// Bytes reserved by runs that are alive but not yet finished loading.
+/// A loading server has claimed its memory without having charged it, so a
+/// concurrent pre-flight that ignores it sees phantom headroom.
+pub fn inflight_reserved_bytes(runs_dir: &Path) -> u64 {
+    reattach(runs_dir)
+        .iter()
+        .filter(|r| r.alive && !r.state.ready)
+        .map(|r| r.state.estimated_bytes)
+        .sum()
 }
 
 impl RunState {
@@ -101,6 +121,7 @@ pub fn spawn(
     device_keys: Vec<String>,
     free_mib_before: Vec<u64>,
     cold_start: bool,
+    estimated_bytes: u64,
 ) -> Result<RunState> {
     std::fs::create_dir_all(runs_dir).map_err(|e| Error::io(runs_dir, e))?;
     let started_unix =
@@ -148,6 +169,8 @@ pub fn spawn(
         device_keys,
         free_mib_before,
         cold_start,
+        estimated_bytes,
+        ready: false,
     };
     state.save(runs_dir)?;
     Ok(state)
@@ -229,6 +252,16 @@ pub fn http_post_json(
 /// Wait for `/v1/models` to answer 200 (R-07: readiness by HTTP, never by
 /// log-scraping). Large models take minutes to load.
 pub fn wait_ready(state: &RunState, deadline: Duration) -> Result<()> {
+    wait_ready_in(state, deadline, None)
+}
+
+/// `wait_ready`, additionally clearing the run's in-flight reservation once
+/// it answers (pass the runs dir so the state file is rewritten).
+pub fn wait_ready_in(
+    state: &RunState,
+    deadline: Duration,
+    runs_dir: Option<&Path>,
+) -> Result<()> {
     let start = Instant::now();
     loop {
         if !process_alive(state.pid) {
@@ -240,6 +273,11 @@ pub fn wait_ready(state: &RunState, deadline: Duration) -> Result<()> {
         }
         if let Ok((200, _)) = http_get(&state.host, state.port, "/v1/models", Duration::from_secs(2))
         {
+            if let Some(dir) = runs_dir {
+                let mut ready_state = state.clone();
+                ready_state.ready = true;
+                ready_state.save(dir)?;
+            }
             return Ok(());
         }
         if start.elapsed() > deadline {
@@ -416,6 +454,8 @@ mod tests {
             device_keys: vec!["pci:A:bus08".into()],
             free_mib_before: vec![32472],
             cold_start: false,
+            estimated_bytes: 20 * 1024 * 1024 * 1024,
+            ready: true,
         };
         state.save(&dir).unwrap();
         let attached = reattach(&dir);

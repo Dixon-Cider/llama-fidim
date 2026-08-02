@@ -412,6 +412,13 @@ fn cmd_launch(
              marked cold-cache (R-08)"
         );
     }
+    // Final gate: pre-flight may be minutes stale by now.
+    launch::final_commit_gate(
+        cfg,
+        platform,
+        prepared.context.estimate.as_ref(),
+        override_blocks,
+    )?;
     let state = supervise::spawn(
         &prepared.plan,
         &profile,
@@ -419,6 +426,7 @@ fn cmd_launch(
         device_keys,
         free_before,
         cold_start,
+        prepared.context.estimate.as_ref().map(|e| e.total_bytes).unwrap_or(0),
     )?;
     println!(
         "launched pid {} on port {} — waiting for /v1/models (log: {})",
@@ -426,7 +434,7 @@ fn cmd_launch(
         state.port,
         state.log_path.display()
     );
-    supervise::wait_ready(&state, Duration::from_secs(ready_timeout))?;
+    supervise::wait_ready_in(&state, Duration::from_secs(ready_timeout), Some(&cfg.runs_dir))?;
     println!("ready.");
     supervise::record_model_loaded(&Config::config_dir(), &profile.model.path)?;
     verify_residency(platform, &state, &prepared);

@@ -249,6 +249,13 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
     let free_before: Vec<u64> =
         prepared.context.resolved.iter().map(|r| r.device.free_mib).collect();
     let cold = supervise::is_cold_start(&Config::config_dir(), &profile.model.path);
+    launch::final_commit_gate(
+        &cfg,
+        &platform,
+        prepared.context.estimate.as_ref(),
+        override_blocks,
+    )
+    .map_err(|e| e.to_string())?;
     let state = supervise::spawn(
         &prepared.plan,
         &profile,
@@ -256,9 +263,11 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         device_keys,
         free_before,
         cold,
+        prepared.context.estimate.as_ref().map(|e| e.total_bytes).unwrap_or(0),
     )
     .map_err(|e| e.to_string())?;
-    supervise::wait_ready(&state, Duration::from_secs(420)).map_err(|e| e.to_string())?;
+    supervise::wait_ready_in(&state, Duration::from_secs(420), Some(&cfg.runs_dir))
+        .map_err(|e| e.to_string())?;
     supervise::record_model_loaded(&Config::config_dir(), &profile.model.path)
         .map_err(|e| e.to_string())?;
 

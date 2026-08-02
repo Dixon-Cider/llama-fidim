@@ -63,6 +63,12 @@ pub struct LaunchContext {
     pub unresolved: Vec<(String, String)>,
     pub estimate: Option<VramEstimate>,
     pub commit: SystemCommit,
+    /// Bytes already promised by servers that are still loading: their VRAM
+    /// is reserved but not yet fully charged to commit or resident in RAM.
+    /// Without this, launching two large servers back-to-back sees the
+    /// second one's headroom as if the first had allocated nothing — the
+    /// exact hole that thrashed the machine on 2026-08-01.
+    pub inflight_reserved_bytes: u64,
     /// The exact `HIP_VISIBLE_DEVICES` value the launcher will set.
     pub visibility_env: String,
     /// Aliases of currently-running servers.
@@ -248,21 +254,97 @@ fn check_vram(ctx: &LaunchContext) -> CheckResult {
     }
 }
 
+const GIB_F: f64 = 1024.0 * 1024.0 * 1024.0;
+
+fn gib(b: u64) -> f64 {
+    b as f64 / GIB_F
+}
+
+/// Everything this launch will add: its own estimate plus anything already
+/// promised by servers still loading.
+fn projected_add(ctx: &LaunchContext) -> u64 {
+    ctx.estimate.as_ref().map(|e| e.total_bytes).unwrap_or(0) + ctx.inflight_reserved_bytes
+}
+
+/// Commit headroom, and the pagefile growth that may happen near the ceiling.
+///
+/// Commit is the ceiling that binds. A loaded server charges substantial
+/// commit for its GPU allocation (measured 2026-08-01: llama-server holding
+/// 19.8 GiB of VRAM reported 17.7 GiB of private bytes). The exact VRAM ->
+/// commit ratio is NOT established — two runs on a machine in active use
+/// disagreed (+8.4 and +24 GiB system-wide) — so this check gates on the
+/// system total rather than on any assumed per-byte ratio.
+///
+/// What IS established is that the charge is a reservation, not a transfer:
+/// the same server's resident working set was 11.6 GiB against 19.8 GiB of
+/// VRAM, and the machine stayed fully responsive at 0.6 GiB of free RAM
+/// while commit sat at ~52% of the limit. Hence there is deliberately NO
+/// physical-RAM gate anywhere in this pipeline: a RAM gate would have
+/// blocked that healthy state, and models much larger than RAM load fine
+/// when VRAM holds them and commit can promise them.
+///
+/// Two hazards as projected commit rises:
+///   1. Above the *allocated pagefile*, Windows must extend it. Extension is
+///      synchronous and disk-heavy and can stall the machine. HYPOTHESIS for
+///      the 2026-08-01 freeze — the limit did move 88.9 -> 114.9 GiB during
+///      that session, but the growth was never tied to the launch by
+///      timestamp. Treated as a risk to warn about, not a proven mechanism.
+///   2. Above ~90% of the limit, allocations fail or WDDM evicts VRAM — the
+///      documented 88.9 -> 1.8 tok/s collapse. This one is observed.
 fn check_commit(ctx: &LaunchContext) -> CheckResult {
-    let projected = ctx.commit.charge_bytes
-        + ctx.estimate.as_ref().map(|e| e.total_bytes).unwrap_or(0);
+    let add = projected_add(ctx);
+    let projected = ctx.commit.charge_bytes + add;
     let limit = ctx.commit.limit_bytes.max(1);
     let frac = projected as f64 / limit as f64;
-    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let inflight_note = if ctx.inflight_reserved_bytes > 0 {
+        format!(
+            " (includes {:.1} GiB reserved by a server still loading)",
+            gib(ctx.inflight_reserved_bytes)
+        )
+    } else {
+        String::new()
+    };
+    let head = format!(
+        "projected commit {:.1} GiB of {:.1} GiB limit ({:.0}%){inflight_note}",
+        gib(projected),
+        gib(limit),
+        frac * 100.0
+    );
+
+    // Growth threshold: how close to the ceiling before Windows extends.
+    // Windows starts extending well before the limit is reached, so treat
+    // the top ~12% of a growable pagefile as the danger band.
+    let pagefile = ctx.commit.pagefile_allocated_bytes;
+    let growth_risk = pagefile > 0
+        && ctx.commit.pagefile_can_grow
+        && frac > 0.88
+        && frac <= 0.90;
+
     let outcome = if frac > 0.90 {
-        Outcome::Block(format!(
-            "projected commit {:.1} GiB of {:.1} GiB limit ({:.0}%) — past ~90% Windows evicts GPU \
-             allocations to the pagefile: the server stays up but decode collapses (~50x observed) with \
-             nothing in any log. Remedy: enlarge the pagefile (Settings > System > About > Advanced \
-             system settings > Performance > Virtual memory) — needs no reboot to grow",
-            gib(projected),
-            gib(limit),
-            frac * 100.0
+        if ctx.commit.pagefile_can_grow {
+            Outcome::Block(format!(
+                "{head} — past ~90% Windows evicts GPU allocations, which collapses decode roughly 50x with \
+                 nothing in any log (observed). Covering this may also require extending the {:.0} GiB \
+                 pagefile, and extension is synchronous and disk-heavy — a suspected cause of a multi-minute \
+                 machine stall on 2026-08-01, though not proven. Remedies: stop another server, or set an \
+                 explicit fixed pagefile size so Windows never extends mid-launch (System Properties > \
+                 Performance > Virtual memory; needs elevation — this tool will not change it for you)",
+                gib(pagefile)
+            ))
+        } else {
+            Outcome::Block(format!(
+                "{head} — the pagefile is a fixed {:.0} GiB and cannot grow, so this allocation fails \
+                 outright rather than slowing down. Remedies: stop another server, use a smaller \
+                 quantisation, or raise the pagefile size (needs elevation)",
+                gib(pagefile)
+            ))
+        }
+    } else if growth_risk {
+        Outcome::Warn(format!(
+            "{head} — close enough to the ceiling that Windows may need to extend the {:.0} GiB pagefile \
+             during load. Extension is synchronous and can stall the machine while it writes; a fixed \
+             pagefile size avoids the risk entirely",
+            gib(pagefile)
         ))
     } else {
         Outcome::Pass
@@ -434,7 +516,12 @@ mod tests {
             commit: SystemCommit {
                 limit_bytes: 100 * 1024 * 1024 * 1024,
                 charge_bytes: 30 * 1024 * 1024 * 1024,
+                physical_total_bytes: 64 * 1024 * 1024 * 1024,
+                physical_available_bytes: 48 * 1024 * 1024 * 1024,
+                pagefile_allocated_bytes: 36 * 1024 * 1024 * 1024,
+                pagefile_can_grow: true,
             },
+            inflight_reserved_bytes: 0,
             visibility_env: "2".into(),
             running_aliases: vec![],
             port_free: true,
@@ -450,6 +537,111 @@ mod tests {
         let results = run_all(&healthy_ctx());
         assert_eq!(results.len(), 11);
         assert!(!any_block(&results), "{results:?}");
+    }
+
+    fn estimate_of(bytes: u64) -> crate::estimate::VramEstimate {
+        crate::estimate::VramEstimate {
+            per_device: vec![],
+            total_bytes: bytes,
+            assumptions: vec![],
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The machine as measured 2026-08-01 while idle.
+    fn measured_idle_commit() -> SystemCommit {
+        SystemCommit {
+            limit_bytes: 114 * GIB + GIB / 2,   // 114.9 GiB
+            charge_bytes: 31 * GIB + GIB / 5,   // 31.2 GiB
+            physical_total_bytes: 30 * GIB + GIB * 9 / 10, // 30.9 GiB
+            physical_available_bytes: 11 * GIB, // 11.0 GiB
+            pagefile_allocated_bytes: 84 * GIB,
+            pagefile_can_grow: true,
+        }
+    }
+
+    /// A model far larger than physical RAM must launch. Measured: a 20 GB
+    /// model charges +19.6 GiB commit but costs only ~8 GiB of RAM, and
+    /// other loaders do this routinely on this box. An earlier revision
+    /// gated on RAM 1:1 and would have blocked this — it was wrong.
+    #[test]
+    fn model_larger_than_physical_ram_is_allowed() {
+        let mut ctx = healthy_ctx();
+        ctx.commit = measured_idle_commit(); // 30.9 GiB RAM, 11.0 GiB free
+        ctx.estimate = Some(estimate_of(34 * GIB)); // bigger than ALL of RAM
+        let results = run_all(&ctx);
+        assert!(
+            !any_block(&results),
+            "a model larger than RAM must still launch — VRAM holds it and commit promises it: {results:?}"
+        );
+    }
+
+    /// Commit near the ceiling is the real hazard, and the message must name
+    /// the pagefile-extension stall rather than the old eviction-only story.
+    #[test]
+    fn commit_over_limit_blocks_and_names_pagefile_growth() {
+        let mut ctx = healthy_ctx();
+        ctx.commit = SystemCommit { charge_bytes: 95 * GIB, ..measured_idle_commit() };
+        ctx.estimate = Some(estimate_of(15 * GIB)); // 110 of 114.9 = 96%
+        let results = run_all(&ctx);
+        let commit = results.iter().find(|r| r.id == "commit-headroom").unwrap();
+        assert!(commit.blocks(), "{commit:?}");
+        if let Outcome::Block(msg) = &commit.outcome {
+            assert!(msg.contains("extend"), "must explain the growth stall: {msg}");
+            assert!(msg.contains("fixed pagefile size"), "must offer the remedy: {msg}");
+        }
+    }
+
+    /// A fixed-size pagefile cannot stall on growth, so the explanation and
+    /// remedy differ — it fails outright instead.
+    #[test]
+    fn fixed_pagefile_reports_hard_failure_not_a_stall() {
+        let mut ctx = healthy_ctx();
+        ctx.commit = SystemCommit {
+            charge_bytes: 95 * GIB,
+            pagefile_can_grow: false,
+            ..measured_idle_commit()
+        };
+        ctx.estimate = Some(estimate_of(15 * GIB));
+        let commit = run_all(&ctx).into_iter().find(|r| r.id == "commit-headroom").unwrap();
+        assert!(commit.blocks());
+        if let Outcome::Block(msg) = &commit.outcome {
+            assert!(msg.contains("cannot grow"), "{msg}");
+            assert!(msg.contains("fails outright"), "{msg}");
+        }
+    }
+
+    /// The back-to-back launch hole: a spawned-but-not-ready server has
+    /// claimed commit it has not finished charging, so a second launch
+    /// evaluated in that window sees phantom headroom.
+    #[test]
+    fn inflight_reservation_counts_against_a_concurrent_launch() {
+        let mut ctx = healthy_ctx();
+        // Charge reflects only what the loading server has committed so far.
+        ctx.commit = SystemCommit { charge_bytes: 80 * GIB, ..measured_idle_commit() };
+        ctx.estimate = Some(estimate_of(13 * GIB)); // 93 of 114.9 = 81%, fine
+
+        let commit = run_all(&ctx).into_iter().find(|r| r.id == "commit-headroom").unwrap();
+        assert!(!commit.blocks(), "81% is genuinely fine: {commit:?}");
+
+        // But a server still loading has 20 GiB more to charge: 113 of 114.9.
+        ctx.inflight_reserved_bytes = 20 * GIB;
+        let commit = run_all(&ctx).into_iter().find(|r| r.id == "commit-headroom").unwrap();
+        assert!(commit.blocks(), "must count the loading server: {commit:?}");
+        if let Outcome::Block(msg) = &commit.outcome {
+            assert!(msg.contains("still loading"), "must name the in-flight server: {msg}");
+        }
+    }
+
+    /// The everyday single-server launch on the real machine must not regress.
+    #[test]
+    fn measured_everyday_launch_passes() {
+        let mut ctx = healthy_ctx();
+        ctx.commit = measured_idle_commit();
+        ctx.estimate = Some(estimate_of(20 * GIB)); // the worker pool
+        let results = run_all(&ctx);
+        assert!(!any_block(&results), "the everyday launch must not regress: {results:?}");
     }
 
     #[test]
@@ -485,6 +677,7 @@ mod tests {
         ctx.commit = SystemCommit {
             limit_bytes: 100 * 1024 * 1024 * 1024,
             charge_bytes: 65 * 1024 * 1024 * 1024,
+            ..measured_idle_commit()
         };
         ctx.estimate = Some(crate::estimate::VramEstimate {
             per_device: vec![],
