@@ -36,6 +36,9 @@ pub enum Error {
     #[error("config error: {0}")]
     Config(String),
 
+    #[error("update: {0}")]
+    Update(String),
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }

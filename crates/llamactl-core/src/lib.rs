@@ -16,6 +16,7 @@ pub mod platform;
 pub mod preflight;
 pub mod profile;
 pub mod supervise;
+pub mod update;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;

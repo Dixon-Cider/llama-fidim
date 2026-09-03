@@ -151,6 +151,7 @@ pub fn spawn(
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        stop_inheriting_std_handles();
     }
     let child = cmd
         .spawn()
@@ -247,6 +248,31 @@ pub fn http_post_json(
         .ok_or_else(|| Error::Platform(format!("no HTTP status from {addr}")))?;
     let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
     Ok((status, body))
+}
+
+/// Clear the inherit flag on this process's own stdin/stdout/stderr before
+/// spawning the detached server. Rust's `Command` passes
+/// `bInheritHandles = TRUE` whenever stdio is configured, and every
+/// inheritable handle in the parent comes along — including the pipe a
+/// shell created to capture OUR output. The server then holds that pipe's
+/// write end for its whole lifetime and the shell's reader never sees EOF:
+/// `llamactl launch … | Out-String` (2026-09-02, 2.5 h hang) and
+/// `llamactl launch … | tail` both deadlocked this way. The server's own
+/// stdio is set explicitly to the log file, so it loses nothing.
+#[cfg(windows)]
+fn stop_inheriting_std_handles() {
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+    use windows::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // Best effort: a missing console handle (GUI process) is not an error.
+        if let Ok(h) = unsafe { GetStdHandle(which) } {
+            if !h.is_invalid() {
+                let _ = unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) };
+            }
+        }
+    }
 }
 
 /// Wait for `/v1/models` to answer 200 (R-07: readiness by HTTP, never by

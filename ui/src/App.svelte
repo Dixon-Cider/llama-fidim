@@ -5,6 +5,7 @@
   import Running from "./views/Running.svelte";
   import Benchmarks from "./views/Benchmarks.svelte";
   import Logs from "./views/Logs.svelte";
+  import Updates from "./views/Updates.svelte";
 
   const views = [
     { id: "devices", label: "Devices", component: Devices },
@@ -12,6 +13,7 @@
     { id: "running", label: "Running", component: Running },
     { id: "benchmarks", label: "Benchmarks", component: Benchmarks },
     { id: "logs", label: "Logs", component: Logs },
+    { id: "updates", label: "Updates", component: Updates },
   ];
   let active = $state("devices");
   const ActiveComponent = $derived(views.find((v) => v.id === active).component);

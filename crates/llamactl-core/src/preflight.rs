@@ -105,7 +105,19 @@ pub fn any_block(results: &[CheckResult]) -> bool {
 
 fn check_build(ctx: &LaunchContext) -> CheckResult {
     let outcome = match &ctx.build_version_output {
-        Some(_) => Outcome::Pass,
+        // The binary runs. Also catch a build directory that was rebuilt or
+        // replaced underneath the profile: the stored version is what the
+        // baseline was measured against, so drift makes those numbers moot.
+        Some(text) => {
+            let actual = crate::discovery::parse_version_output(text).map(|(v, _)| v);
+            match (&ctx.profile.build.version, actual) {
+                (Some(want), Some(have)) if want != &have => Outcome::Note(format!(
+                    "profile records build {want} but the binary reports {have} — the build \
+                     directory changed underneath the profile; re-bench before trusting its baseline"
+                )),
+                _ => Outcome::Pass,
+            }
+        }
         None => Outcome::Block(format!(
             "build binary {} did not run — reinstall or rescan builds",
             ctx.profile.build.path.display()

@@ -87,10 +87,16 @@ fn run_version(exe: &Path, rocm_bin: Option<&Path>) -> Result<String> {
     Ok(text)
 }
 
-/// Parse `version: 9817 (5397c3619)` into (`b9817`, commit).
+/// Parse the two upstream `--version` formats into (`b<n>`, commit):
+/// - pre-b10000: `version: 9817 (5397c3619)`
+/// - semver era: `version: 0.3.0-dev (build 10770, commit 9cc33944f)`
 pub fn parse_version_output(text: &str) -> Option<(String, String)> {
-    let re = regex::Regex::new(r"version:\s*(\d+)\s*\(([0-9a-fA-F]+)\)").unwrap();
-    let caps = re.captures(text)?;
+    let old = regex::Regex::new(r"version:\s*(\d+)\s*\(([0-9a-fA-F]+)\)").unwrap();
+    if let Some(caps) = old.captures(text) {
+        return Some((format!("b{}", &caps[1]), caps[2].to_string()));
+    }
+    let new = regex::Regex::new(r"build\s+(\d+),\s*commit\s+([0-9a-fA-F]+)").unwrap();
+    let caps = new.captures(text)?;
     Some((format!("b{}", &caps[1]), caps[2].to_string()))
 }
 
@@ -201,6 +207,12 @@ fn load_model(path: PathBuf, mmproj: &[PathBuf], drafts: &[PathBuf]) -> Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_parse_handles_semver_era_output() {
+        let text = "version: 0.3.0-dev (build 10770, commit 9cc33944f)\nbuilt with Clang 20.1.8 for Windows x86_64\n";
+        assert_eq!(parse_version_output(text), Some(("b10770".into(), "9cc33944f".into())));
+    }
 
     #[test]
     fn version_parse_matches_real_output() {
