@@ -41,9 +41,25 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Stable-key -> adapter LUID low dword, for attributing PDH counters to a
-# physical card. Volatile across driver resets; re-derive with
-# `llamactl devices --json` if placement checks start failing.
-$LuidByBus = @{ 'bus03' = 0x1621C; 'bus08' = 0x1B592 }
+# physical card. LUIDs are volatile across driver updates (the 2026-08-25
+# driver change moved bus03 0x1621C -> 0x16CEF and bus08 0x1B592 -> 0x1BAAD
+# and silently failed every residency check), so derive them at start from
+# PnP: DEVPKEY_Device_BusNumber -> DEVPKEY_Gpu_Luid, same as the tool does.
+function Get-LuidByBus {
+  $map = @{}
+  foreach ($d in (Get-PnpDevice -Class Display -ErrorAction SilentlyContinue)) {
+    $bus  = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_BusNumber' -ErrorAction SilentlyContinue).Data
+    $luid = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName '{60B193CB-5276-4D0F-96FC-F173ABAD3EC6} 2' -ErrorAction SilentlyContinue).Data
+    if ($null -eq $bus -or $null -eq $luid) { continue }
+    $map[('bus{0:D2}' -f [int]$bus)] = [int64]$luid
+  }
+  foreach ($k in 'bus03', 'bus08') {
+    if (-not $map.ContainsKey($k)) { throw "could not resolve adapter LUID for $k from PnP" }
+  }
+  return $map
+}
+$LuidByBus = Get-LuidByBus
+Write-Host ("adapter LUIDs: bus03=0x{0:X} bus08=0x{1:X}" -f $LuidByBus['bus03'], $LuidByBus['bus08']) -ForegroundColor DarkGray
 
 $script:Results = [System.Collections.ArrayList]::new()
 $script:Started = [System.Collections.ArrayList]::new()
@@ -120,11 +136,39 @@ function Get-RunState($profileId) {
   return Get-Content $f.FullName -Raw | ConvertFrom-Json
 }
 
+# `& $Cli launch ... | Out-String` deadlocks: the detached llama-server
+# inherits PowerShell's stdout pipe handle (Rust std does not restrict the
+# inheritable-handle list), so the pipeline never sees EOF until the server
+# exits. Start-Process -Wait is no better: in Windows PowerShell 5.1 it
+# waits for the whole descendant tree, i.e. the server again. So we take
+# the Process object and call WaitForExit(), which waits on the CLI's own
+# process handle only; the redirect targets are plain files read back after.
+function Invoke-CliToFile([string[]]$CliArgs) {
+  $stdout = [System.IO.Path]::GetTempFileName()
+  $stderr = [System.IO.Path]::GetTempFileName()
+  try {
+    $proc = Start-Process -FilePath $Cli -ArgumentList $CliArgs -PassThru `
+      -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    # Touch the handle before the process exits, otherwise PS 5.1 leaves
+    # ExitCode null afterwards.
+    $null = $proc.Handle
+    $proc.WaitForExit()
+    $text = (Get-Content $stdout -Raw -ErrorAction SilentlyContinue) + "`n" +
+            (Get-Content $stderr -Raw -ErrorAction SilentlyContinue)
+    $code = $proc.ExitCode
+    if ($null -eq $code) { $code = 0 }   # unknown: fall back to the ready match
+    return @{ ExitCode = $code; Output = $text }
+  } finally {
+    Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Start-Server($profileId) {
   Assert-Headroom "before $profileId" | Out-Null
   Write-Host "  launching $profileId ..." -ForegroundColor Cyan
-  $out = & $Cli launch $profileId --ready-timeout 600 2>&1 | Out-String
-  if ($out -notmatch 'ready\.') {
+  $r = Invoke-CliToFile @('launch', $profileId, '--ready-timeout', '600')
+  $out = $r.Output
+  if ($r.ExitCode -ne 0 -or $out -notmatch 'ready\.') {
     throw "launch of $profileId did not reach ready:`n$out"
   }
   [void]$script:Started.Add($profileId)
@@ -186,9 +230,13 @@ function Invoke-Phase1 {
   }
 
   # Re-attach: a fresh CLI process rebuilds live state from disk alone.
+  # Judge only the two servers this phase launched: the listing may also carry
+  # older crashed-run state that the tool keeps on purpose for diagnosis.
   $status = & $Cli status 2>&1 | Out-String
-  if ($status -match [regex]::Escape($a) -and $status -match [regex]::Escape($b) -and $status -notmatch 'CRASHED') {
-    Record 'Closing and reopening the tool re-attaches to running servers' 'PASS' 'a new llamactl process listed both servers as healthy from run state alone'
+  $lineA = ($status -split "`r?`n" | Where-Object { $_ -match ('^\s*' + [regex]::Escape($a) + '\s') } | Select-Object -First 1)
+  $lineB = ($status -split "`r?`n" | Where-Object { $_ -match ('^\s*' + [regex]::Escape($b) + '\s') } | Select-Object -First 1)
+  if ($lineA -match '\bhealthy\b' -and $lineB -match '\bhealthy\b') {
+    Record 'Closing and reopening the tool re-attaches to running servers' 'PASS' ("a new llamactl process listed both servers as healthy from run state alone:`n" + $lineA.Trim() + "`n" + $lineB.Trim())
   } else {
     Record 'Closing and reopening the tool re-attaches to running servers' 'FAIL' $status.Trim()
   }
