@@ -15,6 +15,13 @@ export async function api(cmd, args = {}) {
   return mock(cmd, args);
 }
 
+/// Subscribe to a Tauri event; returns an unlisten function. No-op outside Tauri.
+export async function onEvent(name, cb) {
+  if (!inTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen(name, (e) => cb(e.payload));
+}
+
 // ------------------------------------------------------------------ mocks ----
 
 const MOCK_DEVICES = [

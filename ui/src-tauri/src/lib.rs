@@ -13,7 +13,9 @@ use llamactl_core::launch::{self, PrepareInputs};
 use llamactl_core::platform::{Platform, WindowsPlatform};
 use llamactl_core::profile::{self, Profile};
 use llamactl_core::supervise;
+use llamactl_core::update::{self, PromoteScope};
 use llamactl_core::{bench, discovery, export, preflight};
+use tauri::Emitter;
 
 /// Cached slow inputs for live pre-flight (device enumeration ~2-4s, build
 /// probe ~1s). Real launches never read this cache — they enumerate fresh
@@ -526,6 +528,89 @@ fn export_blocking(id: &str, format: &str) -> Result<serde_json::Value, String> 
     Ok(serde_json::json!({ "path": out, "text": text }))
 }
 
+// ---------------------------------------------------------------- updates ----
+
+/// Latest upstream release vs newest installed build. Network + a build
+/// probe, so it runs on the blocking pool.
+#[tauri::command]
+async fn update_check() -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let c = update::check(&cfg).map_err(|e| e.to_string())?;
+        serde_json::to_value(c).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Install `tag` (latest when None) as prebuilt or from source. Progress
+/// lines stream to the window as `update-progress` events. Never launches.
+#[tauri::command]
+async fn update_install(
+    app: tauri::AppHandle,
+    tag: Option<String>,
+    source: bool,
+) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let release = match &tag {
+            Some(t) => update::release_by_tag(t),
+            None => update::latest_release(),
+        }
+        .map_err(|e| e.to_string())?;
+        let mut progress = |line: String| {
+            let _ = app.emit("update-progress", line);
+        };
+        let r = if source {
+            update::build_from_source(&cfg, &release.tag, &mut progress)
+        } else {
+            update::install_prebuilt(&cfg, &release, &mut progress)
+        }
+        .map_err(|e| e.to_string())?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Re-point profiles onto an installed build directory. `from_path` limits
+/// the scope to profiles on that build; `all` moves every unpinned profile.
+#[tauri::command]
+async fn update_promote(
+    to_path: String,
+    to_version: Option<String>,
+    from_path: Option<String>,
+    all: bool,
+) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let scope = if all {
+            PromoteScope::All
+        } else if let Some(f) = from_path {
+            PromoteScope::FromBuild(PathBuf::from(f))
+        } else {
+            PromoteScope::All
+        };
+        let r = update::promote(&cfg, &PathBuf::from(to_path), to_version, scope).map_err(|e| e.to_string())?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn update_rollback() -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let r = update::rollback(&cfg).map_err(|e| e.to_string())?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+fn update_history() -> Result<serde_json::Value, String> {
+    let h = update::load_history().map_err(|e| e.to_string())?;
+    serde_json::to_value(h).map_err(|e| e.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
@@ -547,6 +632,11 @@ pub fn run() {
             bench_profile,
             bench_history,
             export_profile,
+            update_check,
+            update_install,
+            update_promote,
+            update_rollback,
+            update_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running llamactl UI");

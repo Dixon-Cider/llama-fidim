@@ -86,6 +86,28 @@ enum Cmd {
     },
     /// Write starter profiles translated from the existing batch files.
     Seed,
+    /// Check upstream llama.cpp releases; optionally install, promote, roll back.
+    /// Never launches a server or loads a model.
+    Update {
+        /// Download + verify the prebuilt Windows ROCm build (latest, or --tag).
+        #[arg(long)]
+        install: bool,
+        /// Build from source with config.source_build_script instead of prebuilt.
+        #[arg(long)]
+        source: bool,
+        /// Re-point profiles onto the installed build (default scope: profiles
+        /// on the previous newest build; --all for every unpinned profile).
+        #[arg(long)]
+        promote: bool,
+        #[arg(long)]
+        all: bool,
+        /// Undo the most recent promotion.
+        #[arg(long)]
+        rollback: bool,
+        /// Specific release tag (default: latest).
+        #[arg(long)]
+        tag: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -110,7 +132,154 @@ fn main() -> anyhow::Result<()> {
             cmd_bench(&cfg, &platform, &profile_id, concurrency, tokens, warmups, no_save)
         }
         Cmd::Seed => cmd_seed(&cfg),
+        Cmd::Update { install, source, promote, all, rollback, tag } => {
+            cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag)
+        }
     }
+}
+
+// ---------------------------------------------------------------- update ----
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_update(
+    cfg: &Config,
+    json: bool,
+    install: bool,
+    source: bool,
+    promote: bool,
+    all: bool,
+    rollback: bool,
+    tag: Option<String>,
+) -> anyhow::Result<()> {
+    use llamactl_core::update::{self, PromoteScope};
+
+    if rollback {
+        let r = update::rollback(cfg)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        } else {
+            println!("rolled back promotion from {}", r.batch_at_unix);
+            for e in &r.restored {
+                println!("  {:<20} -> {} ({})", e.profile_id, e.from.path.display(), e.from.version.as_deref().unwrap_or("?"));
+            }
+            for (id, why) in &r.skipped {
+                println!("  {id:<20} skipped: {why}");
+            }
+        }
+        return Ok(());
+    }
+
+    let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+    let release = match &tag {
+        Some(t) => update::release_by_tag(t)?,
+        None => update::latest_release()?,
+    };
+    let check = update::check_against(cfg, &builds, release.clone())?;
+    let previous = check.newest_installed.clone();
+    if !json {
+        println!("upstream latest : {} ({})", check.latest.tag, check.latest.published_at);
+        match &previous {
+            Some(n) => println!(
+                "newest installed: {} at {}{}",
+                n.version,
+                n.path.display(),
+                check.behind.map(|b| format!("  [{b} releases behind]")).unwrap_or_default()
+            ),
+            None => println!("newest installed: none"),
+        }
+        println!("install dir     : {}{}", check.install_dir.display(), if check.already_installed { "  [present]" } else { "" });
+        if let Some(e) = &check.asset_error {
+            println!("prebuilt        : unavailable — {e}");
+        }
+    }
+    if !install && !promote {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&check)?);
+        } else if !check.update_available {
+            println!("up to date.");
+        } else {
+            println!("run with --install to fetch it (add --source to compile instead).");
+        }
+        return Ok(());
+    }
+
+    let mut progress = |line: String| {
+        if !json {
+            println!("  {line}");
+        }
+    };
+    let report = if install {
+        let r = if source {
+            update::build_from_source(cfg, &release.tag, &mut progress)?
+        } else {
+            update::install_prebuilt(cfg, &release, &mut progress)?
+        };
+        if !json {
+            let v = &r.verify;
+            println!(
+                "installed {} ({}) at {} — binary reports {}; HIP {}",
+                r.tag,
+                r.source,
+                r.dir.display(),
+                v.version.as_deref().unwrap_or("?"),
+                if v.hip_ok { "OK" } else { "NOT LOADED" }
+            );
+            for d in &v.devices {
+                println!("    {}{}  {}  {} MiB", d.backend, d.index, d.name, d.total_mib);
+            }
+            if !v.detail.is_empty() {
+                println!("    {}", v.detail.trim().replace('\n', "\n    "));
+            }
+        }
+        Some(r)
+    } else {
+        None
+    };
+
+    if promote {
+        let (to_dir, to_version) = match &report {
+            Some(r) => (r.dir.clone(), r.verify.version.clone()),
+            None => {
+                // --promote without --install: promote onto the newest
+                // installed build (already verified by the scan).
+                let n = update::newest_installed(&builds).context("no installed build to promote onto")?;
+                (n.path.clone(), Some(n.version.clone()))
+            }
+        };
+        if let Some(r) = &report {
+            if !r.verify.hip_ok {
+                bail!("refusing to promote onto {}: the HIP backend did not load (see detail above)", r.dir.display());
+            }
+        }
+        let scope = if all {
+            PromoteScope::All
+        } else {
+            match &previous {
+                Some(p) if !llamactl_core::update::version_number(&p.version).is_none() => {
+                    PromoteScope::FromBuild(p.path.clone())
+                }
+                _ => PromoteScope::All,
+            }
+        };
+        let r = update::promote(cfg, &to_dir, to_version, scope)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        } else {
+            println!("promoted {} profile(s) onto {}:", r.batch.entries.len(), to_dir.display());
+            for e in &r.batch.entries {
+                println!("  {:<20} {} -> {}", e.profile_id, e.from.version.as_deref().unwrap_or("?"), e.to.version.as_deref().unwrap_or("?"));
+            }
+            for (id, why) in &r.skipped {
+                println!("  {id:<20} skipped: {why}");
+            }
+            println!("nothing was launched — bench a profile when the GPUs are free; `llamactl update --rollback` undoes this.");
+        }
+    } else if json {
+        if let Some(r) = &report {
+            println!("{}", serde_json::to_string_pretty(r)?);
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ scan ----

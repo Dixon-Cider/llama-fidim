@@ -26,6 +26,18 @@ pub struct Config {
     pub profile_dir: PathBuf,
     /// Where run state + captured logs live.
     pub runs_dir: PathBuf,
+    /// Where `llamactl update` installs new builds (`<root>/<tag>-<flavor>`).
+    /// Defaults to the first build root so the scan finds them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_root: Option<PathBuf>,
+    /// llama.cpp git checkout used for source builds (defaults to the first
+    /// build root, which on this machine IS the checkout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama_cpp_source: Option<PathBuf>,
+    /// Script invoked as `<script> <checkout> <tag> <output dir>` to build a
+    /// tag from source with the local HIP toolchain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_build_script: Option<PathBuf>,
     /// Preserved unknown fields from newer schema versions.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -63,6 +75,11 @@ impl Config {
             integrated_name_patterns: default_igpu_patterns(),
             profile_dir: dir.join("profiles"),
             runs_dir: dir.join("runs"),
+            install_root: None,
+            llama_cpp_source: None,
+            source_build_script: Some(PathBuf::from(
+                r"C:\Users\me\Documents\Claude\Projects\llamactl\scripts\build-from-tag.bat",
+            )),
             extra: serde_json::Map::new(),
         }
     }
