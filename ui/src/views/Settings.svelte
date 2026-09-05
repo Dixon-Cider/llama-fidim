@@ -166,7 +166,7 @@
         <span class="k">iGPU name patterns (one per line)</span>
         <textarea rows="2" bind:value={igpuText}></textarea>
       </label>
-      <label class="field" style="grid-column: span 3;" title="Default for new launches: a 1-token request every N seconds keeps the GPU busy so Windows never powers the adapter down and evicts the model to RAM when the displays switch off. 0 = off. Profiles can override.">
+      <label class="field" style="grid-column: span 3;" title="Off by default. The eviction root cause is the PCIe Link State Power Management power setting (pre-flight check 12 warns if it is not Off). Only if that cannot be Off: a 1-token request every N seconds keeps the GPU busy so Windows never powers the adapter down. Profiles can override.">
         <span class="k">keep-alive interval (seconds, 0 = off)</span>
         <input type="number" min="0" max="60" bind:value={cfg.keep_alive_seconds} />
       </label>

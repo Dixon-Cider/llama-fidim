@@ -714,7 +714,7 @@ fn cmd_launch(
     let ka = profile.keep_alive_seconds.unwrap_or(cfg.keep_alive_seconds);
     match supervise::spawn_keepalive(&mut state, &cfg.runs_dir, ka) {
         Ok(Some(kp)) => println!("  keep-alive every {ka} s (pid {kp}) - VRAM stays resident when the displays power off"),
-        Ok(None) => println!("  keep-alive off - the model WILL be evicted from VRAM when the displays power off"),
+        Ok(None) => {}
         Err(e) => println!("  keep-alive NOT started: {e}"),
     }
     verify_residency(platform, &state, &prepared);

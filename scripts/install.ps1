@@ -51,9 +51,35 @@ New-Item -ItemType Directory -Force $dest | Out-Null
 # The installed GUI may be running too.
 Get-Process llamactl-ui -ErrorAction SilentlyContinue |
   Where-Object { $_.Path -like "$dest*" } | Stop-Process -Force
-Start-Sleep -Milliseconds 300
+# Keep-alive helpers hold llamactl.exe open; stop them, remember which runs
+# had one, and restart them from the new binary afterwards. (Stop-Process,
+# never Git-Bash taskkill: MSYS mangles /PID into a path.)
+$helpers = Get-CimInstance Win32_Process -Filter "Name='llamactl.exe'" |
+  Where-Object { $_.CommandLine -like '*keepalive*' }
+$restart = @()
+foreach ($h in $helpers) {
+  if ($h.CommandLine -match '--port (\d+).*--interval (\d+).*--server-pid (\d+)') {
+    $restart += @{ port = $Matches[1]; interval = $Matches[2]; serverPid = $Matches[3] }
+  }
+  Stop-Process -Id $h.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Start-Sleep -Milliseconds 500
 foreach ($exe in 'llamactl.exe', 'llamactl-ui.exe') {
   Copy-Item (Join-Path $release $exe) (Join-Path $dest $exe) -Force
+}
+foreach ($r in $restart) {
+  $p = Start-Process -FilePath (Join-Path $dest 'llamactl.exe') -WindowStyle Hidden -PassThru `
+    -ArgumentList @('keepalive', '--host', '127.0.0.1', '--port', $r.port, '--interval', $r.interval, '--server-pid', $r.serverPid)
+  # Point the run state at the new helper pid so `stop` still kills it.
+  Get-ChildItem "$env:USERPROFILE\.llamactl\runs\*-$($r.port).json" -ErrorAction SilentlyContinue | ForEach-Object {
+    $j = Get-Content $_.FullName -Raw | ConvertFrom-Json
+    if ("$($j.pid)" -eq $r.serverPid) {
+      $j | Add-Member -NotePropertyName keepalive_pid -NotePropertyValue $p.Id -Force
+      # No BOM: llamactl reads these with serde_json.
+      [IO.File]::WriteAllText($_.FullName, ($j | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+    }
+  }
+  Write-Host ("== restarted keep-alive for port {0} (pid {1})" -f $r.port, $p.Id)
 }
 
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'

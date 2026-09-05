@@ -461,8 +461,28 @@ pub fn prepare_with_inputs(
         driver_baseline,
         sdk_now,
         sdk_baseline,
+        pcie_aspm: pcie_aspm_ac(),
     };
     Ok(PreparedLaunch { context, plan, devices_now })
+}
+
+/// AC index of "PCI Express > Link State Power Management" on the active
+/// power plan (0 = Off, 1 = Moderate, 2 = Maximum). Read via powercfg; None
+/// when it cannot be read. See preflight check 12 for why it matters.
+pub fn pcie_aspm_ac() -> Option<u32> {
+    let mut cmd = std::process::Command::new("powercfg");
+    cmd.args(["/q", "SCHEME_CURRENT", "SUB_PCIEXPRESS", "ASPM"]);
+    hide_console(&mut cmd);
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_powercfg_ac_index(&text)
+}
+
+/// `Current AC Power Setting Index: 0x00000001` -> 1.
+pub fn parse_powercfg_ac_index(text: &str) -> Option<u32> {
+    let line = text.lines().find(|l| l.contains("Current AC Power Setting Index"))?;
+    let hex = line.split(':').nth(1)?.trim().trim_start_matches("0x");
+    u32::from_str_radix(hex, 16).ok()
 }
 
 pub fn port_is_free(host: &str, port: u16) -> bool {
@@ -652,5 +672,20 @@ mod tests {
         assert!(!port_is_free("127.0.0.1", port));
         drop(listener);
         assert!(port_is_free("127.0.0.1", port));
+    }
+}
+
+#[cfg(test)]
+mod aspm_tests {
+    #[test]
+    fn parses_powercfg_ac_index() {
+        let text = concat!(
+            "  Current AC Power Setting Index: 0x00000001", "
+",
+            "  Current DC Power Setting Index: 0x00000002", "
+"
+        );
+        assert_eq!(super::parse_powercfg_ac_index(text), Some(1));
+        assert_eq!(super::parse_powercfg_ac_index("nothing here"), None);
     }
 }
