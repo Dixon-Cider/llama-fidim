@@ -748,6 +748,91 @@ fn update_history() -> Result<serde_json::Value, String> {
     serde_json::to_value(h).map_err(|e| e.to_string())
 }
 
+// ----------------------------------------------------------------- router ----
+
+#[tauri::command]
+fn router_get() -> Result<serde_json::Value, String> {
+    let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
+    serde_json::to_value(rc).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn router_save(rc: llamactl_core::router::RouterConfig) -> Result<(), String> {
+    llamactl_core::router::save_config(&rc).map_err(|e| e.to_string())
+}
+
+/// Render the preset file for a (possibly unsaved) router config.
+#[tauri::command]
+async fn router_ini(state: tauri::State<'_, AppState>, rc: llamactl_core::router::RouterConfig) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
+    blocking(move || {
+        let cfg = cfg()?;
+        let profiles = Profile::load_all(&cfg.profile_dir).map_err(|e| e.to_string())?;
+        let devices = cached_devices(&cache, &cfg, false)?;
+        let r = llamactl_core::router::render_ini(&rc, &profiles, &devices).map_err(|e| e.to_string())?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn router_launch() -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
+        let profiles = Profile::load_all(&cfg.profile_dir).map_err(|e| e.to_string())?;
+        let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+        let build_dir = match &rc.build {
+            Some(b) => b.clone(),
+            None => update::newest_installed(&builds).ok_or("no installed build")?.path,
+        };
+        let devices = launch::enumerate_devices(&cfg, &build_dir.join("bin").join("llama-server.exe"), &WindowsPlatform)
+            .map_err(|e| e.to_string())?;
+        let r = llamactl_core::router::launch(&cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(180))
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+fn router_status() -> Result<serde_json::Value, String> {
+    let cfg = cfg()?;
+    let run = supervise::reattach(&cfg.runs_dir).into_iter().find(|r| r.state.profile_id == llamactl_core::router::ROUTER_ID);
+    Ok(match run {
+        Some(r) => serde_json::json!({ "alive": r.alive, "state": r.state }),
+        None => serde_json::json!({ "alive": false }),
+    })
+}
+
+#[tauri::command]
+async fn router_models() -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
+        let ms = llamactl_core::router::models(&rc.host, rc.port).map_err(|e| e.to_string())?;
+        serde_json::to_value(ms).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn router_load(id: String) -> Result<(), String> {
+    blocking(move || {
+        let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
+        llamactl_core::router::load_model(&rc.host, rc.port, &id).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn router_unload(id: String) -> Result<(), String> {
+    blocking(move || {
+        let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
+        llamactl_core::router::unload_model(&rc.host, rc.port, &id).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
@@ -779,6 +864,14 @@ pub fn run() {
             get_config,
             save_config,
             ui_log,
+            router_get,
+            router_save,
+            router_ini,
+            router_launch,
+            router_status,
+            router_models,
+            router_load,
+            router_unload,
         ])
         .run(tauri::generate_context!())
         .expect("error while running llamactl UI");

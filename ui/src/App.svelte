@@ -7,11 +7,13 @@
   import Logs from "./views/Logs.svelte";
   import Updates from "./views/Updates.svelte";
   import Settings from "./views/Settings.svelte";
+  import Router from "./views/Router.svelte";
   import { api, log } from "./api.js";
 
   const views = [
     { id: "devices", label: "Devices", component: Devices },
     { id: "profiles", label: "Profiles", component: Profiles },
+    { id: "router", label: "Router", component: Router },
     { id: "running", label: "Running", component: Running },
     { id: "benchmarks", label: "Benchmarks", component: Benchmarks },
     { id: "logs", label: "Logs", component: Logs },

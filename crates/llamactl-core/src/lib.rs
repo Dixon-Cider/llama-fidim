@@ -16,6 +16,7 @@ pub mod launch;
 pub mod platform;
 pub mod preflight;
 pub mod profile;
+pub mod router;
 pub mod runtime;
 pub mod supervise;
 pub mod update;
