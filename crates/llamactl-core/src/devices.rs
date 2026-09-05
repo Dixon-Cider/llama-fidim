@@ -136,7 +136,7 @@ pub struct DisplayMode {
 }
 
 /// The fully-correlated device the rest of the tool operates on.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Device {
     /// Stable identity persisted in profiles: `pci:<VEN&DEV&SUBSYS>:busNN`.
     pub stable_key: String,

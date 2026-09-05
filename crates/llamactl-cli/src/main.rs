@@ -23,6 +23,45 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum RouterCmd {
+    /// Show the router config and rendered preset file.
+    Show,
+    /// Add a profile as a member (its alias becomes the model id).
+    Add {
+        profile_id: String,
+        #[arg(long)]
+        load_on_startup: bool,
+    },
+    /// Remove a member.
+    Remove { profile_id: String },
+    /// Change router settings.
+    Set {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        models_max: Option<u32>,
+        #[arg(long)]
+        autoload: Option<bool>,
+        /// Build directory, or `newest`.
+        #[arg(long)]
+        build: Option<String>,
+    },
+    /// Write the preset file, take the port over, launch, wait for readiness.
+    Launch {
+        #[arg(long, default_value = "120")]
+        ready_timeout: u64,
+    },
+    /// Stop the router (and its model instances).
+    Stop,
+    /// Models the running router knows, with load state.
+    Status,
+    /// Load a model on the running router.
+    Load { model_id: String },
+    /// Unload a model from the running router.
+    Unload { model_id: String },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Scan configured roots for builds and models.
     Scan,
@@ -39,6 +78,11 @@ enum Cmd {
     CreatorDefaults { model_path: PathBuf },
     /// Parse one GGUF header and report what the scanner would see (and how long it took).
     Gguf { path: PathBuf },
+    /// One OpenAI-compatible port serving every member profile (llama-server router mode).
+    Router {
+        #[command(subcommand)]
+        cmd: RouterCmd,
+    },
     /// (internal) keep a server's VRAM resident: 1-token request every --interval s until --server-pid exits.
     #[command(hide = true)]
     Keepalive {
@@ -141,6 +185,7 @@ fn main() -> anyhow::Result<()> {
             supervise::run_keepalive(&host, port, interval, server_pid);
             Ok(())
         }
+        Cmd::Router { cmd } => cmd_router(&cfg, cli.json, cmd),
         Cmd::Gguf { path } => {
             let t = std::time::Instant::now();
             let h = gguf::read_header(&path)?;
@@ -1109,5 +1154,92 @@ fn cmd_seed(cfg: &Config) -> anyhow::Result<()> {
         println!("wrote {}", path.display());
     }
     println!("\nNOTE: verify the draft-model paths — seed guesses the MTP filenames; `llamactl scan` shows the real ones.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------- router ----
+
+fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
+    use llamactl_core::router::{self, RouterMember};
+    let mut rc = router::load_config()?;
+    match cmd {
+        RouterCmd::Show => {
+            let profiles = Profile::load_all(&cfg.profile_dir)?;
+            let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+            let platform = WindowsPlatform;
+            let exe = pick_build(&builds, None)?.server_exe.clone();
+            let devices = launch::enumerate_devices(cfg, &exe, &platform)?;
+            let ini = router::render_ini(&rc, &profiles, &devices);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "config": rc, "ini": ini.as_ref().map(|r| r.text.clone()).ok() }))?);
+            } else {
+                println!("router: http://{}:{}  models-max {}  autoload {}  build {}", rc.host, rc.port, rc.models_max, rc.autoload,
+                    rc.build.as_ref().map(|b| b.display().to_string()).unwrap_or_else(|| "newest".into()));
+                for m in &rc.members {
+                    println!("  member {:<20} load-on-startup {}", m.profile_id, m.load_on_startup);
+                }
+                match ini {
+                    Ok(r) => { println!("\n--- {} ---\n{}", router::ini_path().display(), r.text); if !r.env_conflicts.is_empty() { println!("env conflicts (first wins): {:?}", r.env_conflicts); } }
+                    Err(e) => println!("\n(preset not renderable: {e})"),
+                }
+            }
+        }
+        RouterCmd::Add { profile_id, load_on_startup } => {
+            Profile::load(&cfg.profile_dir.join(format!("{profile_id}.json"))).context("no such profile")?;
+            rc.members.retain(|m| m.profile_id != profile_id);
+            rc.members.push(RouterMember { profile_id: profile_id.clone(), load_on_startup });
+            router::save_config(&rc)?;
+            println!("added {profile_id} ({} members)", rc.members.len());
+        }
+        RouterCmd::Remove { profile_id } => {
+            rc.members.retain(|m| m.profile_id != profile_id);
+            router::save_config(&rc)?;
+            println!("removed {profile_id} ({} members)", rc.members.len());
+        }
+        RouterCmd::Set { port, models_max, autoload, build } => {
+            if let Some(p) = port { rc.port = p; }
+            if let Some(m) = models_max { rc.models_max = m; }
+            if let Some(a) = autoload { rc.autoload = a; }
+            if let Some(b) = build { rc.build = if b == "newest" { None } else { Some(PathBuf::from(b)) }; }
+            router::save_config(&rc)?;
+            println!("saved: port {} models-max {} autoload {}", rc.port, rc.models_max, rc.autoload);
+        }
+        RouterCmd::Launch { ready_timeout } => {
+            let profiles = Profile::load_all(&cfg.profile_dir)?;
+            let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+            let build_dir = match &rc.build {
+                Some(b) => b.clone(),
+                None => llamactl_core::update::newest_installed(&builds).context("no installed build")?.path,
+            };
+            let platform = WindowsPlatform;
+            let devices = launch::enumerate_devices(cfg, &build_dir.join("bin").join("llama-server.exe"), &platform)?;
+            let r = router::launch(cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(ready_timeout))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                if !r.replaced.is_empty() { println!("stopped {} to take over port {}", r.replaced.join(", "), rc.port); }
+                println!("router ready: http://{}:{}/v1  pid {}  models: {}", rc.host, rc.port, r.state.pid, r.sections.join(", "));
+                println!("preset: {}", r.ini_path.display());
+                if !r.env_conflicts.is_empty() { println!("env conflicts (first wins): {:?}", r.env_conflicts); }
+            }
+        }
+        RouterCmd::Stop => {
+            let runs = supervise::reattach(&cfg.runs_dir);
+            match runs.into_iter().find(|r| r.state.profile_id == router::ROUTER_ID) {
+                Some(r) => { supervise::stop(&r.state, &cfg.runs_dir)?; println!("stopped router (pid {})", r.state.pid); }
+                None => println!("router is not running"),
+            }
+        }
+        RouterCmd::Status => {
+            let ms = router::models(&rc.host, rc.port)?;
+            if json { println!("{}", serde_json::to_string_pretty(&ms)?); } else {
+                for m in &ms {
+                    println!("  {:<40} {}{}", m.id, m.status, if m.failed { format!(" FAILED exit {:?}", m.exit_code) } else { String::new() });
+                }
+            }
+        }
+        RouterCmd::Load { model_id } => { router::load_model(&rc.host, rc.port, &model_id)?; println!("loading {model_id}"); }
+        RouterCmd::Unload { model_id } => { router::unload_model(&rc.host, rc.port, &model_id)?; println!("unloaded {model_id}"); }
+    }
     Ok(())
 }
