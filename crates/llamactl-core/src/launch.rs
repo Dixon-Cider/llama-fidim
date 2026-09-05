@@ -62,8 +62,8 @@ pub fn compose(profile: &Profile, resolved: &[ResolvedDevice]) -> LaunchPlan {
     }
     if let Some(draft) = &m.draft {
         if draft.enabled {
-            // Speculative-decoding specifics (--spec-type etc.) are
-            // build-dependent; they belong in runtime.extra_flags.
+            // The file only; the mode and draft-token knobs come from
+            // profile.speculative (emitted after sampling, below).
             args.push("-md".into());
             args.push(draft.path.to_string_lossy().into_owned());
         }
@@ -118,6 +118,32 @@ pub fn compose(profile: &Profile, resolved: &[ResolvedDevice]) -> LaunchPlan {
     }
     if let Some(d) = s.dry_multiplier {
         args.extend(["--dry-multiplier".into(), format_num(d)]);
+    }
+    if let Some(p) = s.repeat_penalty {
+        args.extend(["--repeat-penalty".into(), format_num(p)]);
+    }
+    if let Some(p) = s.presence_penalty {
+        args.extend(["--presence-penalty".into(), format_num(p)]);
+    }
+    if let Some(t) = r.threads {
+        args.extend(["-t".into(), t.to_string()]);
+    }
+
+    // Speculative decoding (same flag family on every build since b9553).
+    // `-md <draft>` for external heads/drafts is emitted with the model
+    // block above whenever model.draft is enabled.
+    let spec = profile.speculative_effective();
+    if let Some(t) = spec.spec_type() {
+        args.extend(["--spec-type".into(), t.into()]);
+        if let Some(n) = spec.n_max {
+            args.extend(["--spec-draft-n-max".into(), n.to_string()]);
+        }
+        if let Some(n) = spec.n_min {
+            args.extend(["--spec-draft-n-min".into(), n.to_string()]);
+        }
+        if let Some(p) = spec.p_min {
+            args.extend(["--spec-draft-p-min".into(), format_num(p)]);
+        }
     }
 
     args.push("--jinja".into());
@@ -210,9 +236,28 @@ pub fn enumerate_devices_with(
     Ok(devices::correlate(&listed, &adapters, &hipinfo, &cfg.integrated_name_patterns))
 }
 
+/// Keep a probe/helper process from opening a console window. From a GUI
+/// process every `Command` child gets its own console by default, so a
+/// profile selection (build probe + --list-devices + hipInfo) flashed a
+/// burst of windows and stole keyboard focus. Output is captured through
+/// pipes either way, so nothing is lost.
+pub fn hide_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 pub fn run_capture(exe: &Path, args: &[&str], rocm_bin: Option<&Path>) -> Result<String> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
+    hide_console(&mut cmd);
     if let Some(rocm) = rocm_bin {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut joined = rocm.as_os_str().to_owned();

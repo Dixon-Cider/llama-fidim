@@ -11,8 +11,20 @@ if (inTauri) {
 }
 
 export async function api(cmd, args = {}) {
-  if (invoke) return invoke(cmd, args);
-  return mock(cmd, args);
+  if (!invoke) return mock(cmd, args);
+  try {
+    return await invoke(cmd, args);
+  } catch (e) {
+    // Surface every failed command in ~/.llamactl/ui.log so problems inside
+    // the web view can be diagnosed from outside it.
+    if (cmd !== "ui_log") log(`command ${cmd} failed: ${String(e)}`);
+    throw e;
+  }
+}
+
+export function log(line) {
+  if (!invoke) { console.log(line); return; }
+  invoke("ui_log", { line }).catch(() => {});
 }
 
 /// Subscribe to a Tauri event; returns an unlisten function. No-op outside Tauri.

@@ -78,6 +78,7 @@ fn run_version(exe: &Path, rocm_bin: Option<&Path>) -> Result<String> {
         joined.push(path);
         cmd.env("PATH", joined);
     }
+    crate::launch::hide_console(&mut cmd);
     let out = cmd.output().map_err(|e| Error::BuildBinary {
         path: exe.to_path_buf(),
         detail: e.to_string(),

@@ -34,6 +34,9 @@ pub struct Profile {
     pub runtime: Runtime,
     #[serde(default)]
     pub sampling: Sampling,
+    /// Speculative decoding. None = off (or legacy `model.draft.enabled`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<Speculative>,
     #[serde(default)]
     pub chat: Chat,
     /// Arbitrary env passthrough — hardware workarounds change without
@@ -130,6 +133,9 @@ pub struct Runtime {
     pub kv_unified: bool,
     #[serde(default)]
     pub cache_reuse: Option<u32>,
+    /// `-t`: CPU threads for the non-offloaded work. None = llama.cpp default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u32>,
     /// Unknown llama-server flags pass through without a tool update (§07).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_flags: Vec<String>,
@@ -155,8 +161,82 @@ pub struct Sampling {
     pub min_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dry_multiplier: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Speculative decoding configuration, mapped onto llama-server's
+/// `--spec-type` family (same flags on every build from b9553 to b10771).
+///
+/// - `mtp`: the model's built-in Multi-Token Prediction head
+///   (`nextn_predict_layers` in the GGUF, e.g. Qwen 3.8), or an external MTP
+///   head file in `model.draft` (Gemma 4's `MTP/` sidecars).
+/// - `draft`: a separate small draft model in `model.draft`.
+/// - `dflash`: a DFlash draft file in `model.draft`.
+/// - `ngram`: model-free n-gram drafting (`ngram-mod`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Speculative {
+    /// `off`, `mtp`, `draft`, `dflash`, `ngram`.
+    #[serde(default = "default_spec_mode")]
+    pub mode: String,
+    /// `--spec-draft-n-max` (engine default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_max: Option<u32>,
+    /// `--spec-draft-n-min` (engine default 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_min: Option<u32>,
+    /// `--spec-draft-p-min` (engine default 0.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p_min: Option<f64>,
+}
+
+fn default_spec_mode() -> String {
+    "off".into()
+}
+
+impl Default for Speculative {
+    fn default() -> Self {
+        Speculative { mode: default_spec_mode(), n_max: None, n_min: None, p_min: None }
+    }
+}
+
+impl Speculative {
+    /// llama-server's `--spec-type` value for this mode, None when off.
+    pub fn spec_type(&self) -> Option<&'static str> {
+        match self.mode.as_str() {
+            "mtp" => Some("draft-mtp"),
+            "draft" => Some("draft-simple"),
+            "dflash" => Some("draft-dflash"),
+            "ngram" => Some("ngram-mod"),
+            _ => None,
+        }
+    }
+    /// Whether this mode needs a file in `model.draft`.
+    pub fn needs_draft_file(&self) -> bool {
+        matches!(self.mode.as_str(), "draft" | "dflash")
+    }
+}
+
+impl Profile {
+    /// The effective speculative config: the explicit section, else the
+    /// legacy `model.draft.enabled` translated (MTP sidecar -> `mtp`,
+    /// anything else -> `draft`), else off.
+    pub fn speculative_effective(&self) -> Speculative {
+        if let Some(s) = &self.speculative {
+            return s.clone();
+        }
+        if let Some(d) = &self.model.draft {
+            if d.enabled {
+                let mode = if d.path.to_string_lossy().to_lowercase().contains("mtp") { "mtp" } else { "draft" };
+                return Speculative { mode: mode.into(), n_max: None, n_min: None, p_min: None };
+            }
+        }
+        Speculative::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -231,6 +311,27 @@ fn finding(severity: Severity, code: &'static str, message: String) -> Finding {
 /// no filesystem or device access — so the profile editor can run it live.
 pub fn validate(p: &Profile) -> Vec<Finding> {
     let mut out = Vec::new();
+
+    let spec = p.speculative_effective();
+    if !matches!(spec.mode.as_str(), "off" | "mtp" | "draft" | "dflash" | "ngram") {
+        out.push(finding(
+            Severity::Error,
+            "spec-mode",
+            format!("speculative.mode `{}` is not one of off/mtp/draft/dflash/ngram", spec.mode),
+        ));
+    }
+    if spec.needs_draft_file() && p.model.draft.as_ref().map_or(true, |d| d.path.as_os_str().is_empty()) {
+        out.push(finding(
+            Severity::Error,
+            "spec-draft-file",
+            format!("speculative mode `{}` needs a draft file in model.draft", spec.mode),
+        ));
+    }
+    if let (Some(lo), Some(hi)) = (spec.n_min, spec.n_max) {
+        if lo > hi {
+            out.push(finding(Severity::Error, "spec-range", format!("speculative n_min {lo} exceeds n_max {hi}")));
+        }
+    }
     let err = Severity::Error;
     let warn = Severity::Warning;
 

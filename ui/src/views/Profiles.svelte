@@ -1,45 +1,182 @@
 <script>
   import { api } from "../api.js";
+  import Range from "../components/Range.svelte";
 
   let profiles = $state([]);
   let devices = $state([]);
   let runtimes = $state([]);
+  let builds = $state([]);
+  let models = $state([]);
   let selectedId = $state(null);
   let draft = $state(null); // deep-copied profile being edited
   let check = $state(null); // live_check result
   let checking = $state(false);
   let busy = $state("");
   let toast = $state(null);
+  let creator = $state(null); // creator_defaults result or { error }
+  let creatorBusy = $state(false);
   let checkTimer = null;
 
   const GIB = 1024 * 1024 * 1024;
+  const fmtInt = (v) => Number(v).toLocaleString();
+  const fmtGib = (b) => (b / GIB).toFixed(1) + " GiB";
+
+  let loadErrors = $state([]); // [name, message] for anything that failed to load
+  let loading = $state(true);
 
   async function load() {
-    const [p, d, r] = await Promise.all([
-      api("list_profiles"),
-      api("devices", { refresh: false }),
-      api("list_runtimes").catch(() => []),
+    loading = true;
+    const errs = [];
+    const grab = async (name, fn, fallback) => {
+      try { return await fn(); } catch (e) { errs.push([name, String(e)]); return fallback; }
+    };
+    // Independent calls, each with its own failure — one broken scan must
+    // not blank the whole editor.
+    const [p, d, r, s] = await Promise.all([
+      grab("profiles", () => api("list_profiles"), []),
+      grab("devices", () => api("devices", { refresh: false }), []),
+      grab("runtimes", () => api("list_runtimes"), []),
+      grab("scan", () => api("scan"), { builds: [], models: [] }),
     ]);
     profiles = p;
     devices = d.map((r) => r.device);
     runtimes = r;
+    builds = s.builds ?? [];
+    models = (s.models ?? []).slice().sort((a, b) => a.path.localeCompare(b.path));
+    loadErrors = errs;
+    loading = false;
     if (!selectedId && profiles.length) select(profiles[0].profile.id);
   }
   load();
 
+  async function rescan() {
+    busy = "scan";
+    try {
+      const s = await api("scan", { refresh: true });
+      builds = s.builds ?? [];
+      models = (s.models ?? []).slice().sort((a, b) => a.path.localeCompare(b.path));
+      toastMsg(`Found ${builds.length} builds, ${models.length} models`);
+    } catch (e) { toastMsg(String(e), true); }
+    busy = "";
+  }
+
+  // ---- model-derived limits ------------------------------------------------
+  const selectedModel = $derived(models.find((m) => samePath(m.path, draft?.model?.path)));
+  const header = $derived(selectedModel?.header ?? null);
+  const ctxMax = $derived(header?.context_length ?? 262144);
+  const layerMax = $derived(header?.block_count ?? 99);
+  const selectedBuild = $derived(builds.find((b) => samePath(b.path, draft?.build?.path)));
+
+  function samePath(a, b) {
+    if (!a || !b) return false;
+    return String(a).replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase() ===
+           String(b).replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+  }
+  function base(p) { return String(p ?? "").split(/[\\/]/).pop(); }
+  function modelLabel(m) {
+    const h = m.header;
+    const bits = [base(m.path)];
+    if (h?.architecture) bits.push(h.architecture);
+    if (h?.file_type != null) bits.push(quantName(h.file_type));
+    bits.push(fmtGib(m.file_size));
+    return bits.join(" · ");
+  }
+  function quantName(ft) {
+    const names = { 0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K", 19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S", 22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M", 28: "IQ2_S", 29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16" };
+    return names[ft] ?? `ft${ft}`;
+  }
+
+  function onModelPick(path) {
+    draft.model.path = path;
+    const m = models.find((x) => samePath(x.path, path));
+    // Auto-pair what discovery found beside the file; keep explicit choices otherwise.
+    draft.model.mmproj = m?.mmproj_candidates?.[0] ?? null;
+    draft.model.draft = null;
+    const h = m?.header;
+    if (h?.context_length && draft.runtime.ctx_total > h.context_length) draft.runtime.ctx_total = h.context_length;
+    if (h?.block_count && draft.runtime.n_gpu_layers > h.block_count) draft.runtime.n_gpu_layers = h.block_count;
+    creator = null;
+    scheduleCheck();
+  }
+  function onBuildPick(path) {
+    draft.build.path = path;
+    draft.build.version = builds.find((b) => samePath(b.path, path))?.version ?? null;
+    scheduleCheck();
+  }
+  function onDraftPick(path) {
+    draft.model.draft = path ? { path, enabled: false } : null;
+    if (!path && draft.speculative && (draft.speculative.mode === "draft" || draft.speculative.mode === "dflash" || (draft.speculative.mode === "mtp" && !mtpBuiltIn)))
+      draft.speculative.mode = "off";
+    scheduleCheck();
+  }
+
+  // ---- selection / new / duplicate ---------------------------------------
   function select(id) {
     selectedId = id;
     const row = profiles.find((r) => r.profile.id === id);
-    draft = row ? JSON.parse(JSON.stringify(row.profile)) : null;
+    draft = row ? withDefaults(JSON.parse(JSON.stringify(row.profile))) : null;
     check = null;
+    creator = null;
+    scheduleCheck();
+  }
+
+  function withDefaults(p) {
+    p.sampling ??= {};
+    p.chat ??= {};
+    p.env ??= {};
+    p.runtime.extra_flags ??= [];
+    p.runtime.threads ??= null;
+    p.runtime.cache_reuse ??= null;
+    p.rocm_runtime ??= null;
+    for (const k of ["temperature", "top_p", "top_k", "min_p", "dry_multiplier", "repeat_penalty", "presence_penalty"])
+      p.sampling[k] ??= null;
+    p.chat.enable_thinking ??= null;
+    // Legacy profiles: an enabled draft file means speculative was on.
+    if (!p.speculative) {
+      const d = p.model.draft;
+      p.speculative = {
+        mode: d?.enabled ? (String(d.path).toLowerCase().includes("mtp") ? "mtp" : "draft") : "off",
+        n_max: null, n_min: null, p_min: null,
+      };
+    }
+    p.speculative.n_max ??= null; p.speculative.n_min ??= null; p.speculative.p_min ??= null;
+    return p;
+  }
+
+  // ---- speculative decoding -------------------------------------------------
+  const mtpBuiltIn = $derived((header?.nextn_predict_layers ?? 0) > 0);
+  const draftName = $derived(base(draft?.model?.draft?.path ?? ""));
+  const specModes = $derived.by(() => {
+    const m = [{ v: "off", l: "off" }];
+    if (mtpBuiltIn) m.push({ v: "mtp", l: `MTP — built into this model (${header.nextn_predict_layers} predict layer${header.nextn_predict_layers === 1 ? "" : "s"})` });
+    else if (draft?.model?.draft?.path && draftName.toLowerCase().includes("mtp")) m.push({ v: "mtp", l: `MTP — external head ${draftName}` });
+    if (draft?.model?.draft?.path) {
+      m.push({ v: "draft", l: `draft model — ${draftName}` });
+      if (draftName.toLowerCase().includes("dflash")) m.push({ v: "dflash", l: `DFlash — ${draftName}` });
+    }
+    m.push({ v: "ngram", l: "n-gram (model-free, prompt-lookup)" });
+    return m;
+  });
+  const SPEC_ENGINE_DEFAULTS = { n_max: 3, n_min: 0, p_min: 0 };
+  function onSpecMode(mode) {
+    draft.speculative.mode = mode;
+    // Keep the legacy flag in step so `-md` is emitted exactly when a file is in use.
+    if (draft.model.draft) draft.model.draft.enabled = mode !== "off" && mode !== "ngram" && !(mode === "mtp" && mtpBuiltIn);
+    scheduleCheck();
+  }
+  function applySpecDefaults() {
+    draft.speculative.n_max = SPEC_ENGINE_DEFAULTS.n_max;
+    draft.speculative.n_min = SPEC_ENGINE_DEFAULTS.n_min;
+    draft.speculative.p_min = SPEC_ENGINE_DEFAULTS.p_min;
     scheduleCheck();
   }
 
   function newProfile() {
     const first = devices.find((d) => !d.integrated);
-    draft = {
+    const newest = builds.filter((b) => b.version).sort((a, b) => (b.version > a.version ? 1 : -1))[0];
+    draft = withDefaults({
       schema: 1, id: "new-profile", name: "New profile",
-      build: { path: "", version: null },
+      build: { path: newest?.path ?? "", version: newest?.version ?? null },
       model: { path: "", mmproj: null, draft: null },
       devices: first ? [{ key: first.stable_key, split_fraction: null, resolved_index_last_launch: null }] : [],
       split_mode: null, main_device: 0, rocm_runtime: null,
@@ -47,12 +184,13 @@
       runtime: {
         n_gpu_layers: 99, ctx_total: 32768, slots: 1, kv_type_k: "f16", kv_type_v: "f16",
         flash_attn: "on", batch_logical: 2048, batch_physical: 512, cont_batching: true,
-        kv_unified: false, cache_reuse: null, extra_flags: [],
+        kv_unified: false, cache_reuse: null, threads: null, extra_flags: [],
       },
       sampling: {}, chat: {}, env: {}, baseline: null, notes: "",
-    };
+    });
     selectedId = null;
     check = null;
+    creator = null;
     scheduleCheck();
   }
 
@@ -82,18 +220,37 @@
     checking = false;
   }
 
+  const numOrNull = (v) => (v === "" || v === null || v === undefined ? null : Number(v));
+
   function normalized(p) {
     const copy = JSON.parse(JSON.stringify(p));
     copy.server.port = Number(copy.server.port) || 0;
     const r = copy.runtime;
     for (const k of ["n_gpu_layers", "ctx_total", "slots", "batch_logical", "batch_physical"])
       r[k] = Number(r[k]) || 0;
-    if (r.cache_reuse === "" || r.cache_reuse === null) r.cache_reuse = null;
-    else r.cache_reuse = Number(r.cache_reuse);
+    r.cache_reuse = numOrNull(r.cache_reuse);
+    r.threads = numOrNull(r.threads);
+    if (copy.speculative) {
+      const sp = copy.speculative;
+      sp.n_max = numOrNull(sp.n_max); sp.n_min = numOrNull(sp.n_min); sp.p_min = numOrNull(sp.p_min);
+      if (sp.n_max !== null) sp.n_max = Math.round(sp.n_max);
+      if (sp.n_min !== null) sp.n_min = Math.round(sp.n_min);
+      for (const k of ["n_max", "n_min", "p_min"]) if (sp[k] === null) delete sp[k];
+    }
+    if (typeof r.extra_flags === "string")
+      r.extra_flags = r.extra_flags.split(/\s+/).filter(Boolean);
     copy.main_device = Number(copy.main_device) || 0;
     for (const d of copy.devices)
       d.split_fraction = d.split_fraction === null || d.split_fraction === "" ? null : Number(d.split_fraction);
     if (copy.devices.length < 2) copy.split_mode = null;
+    const s = copy.sampling ?? {};
+    for (const k of Object.keys(s)) s[k] = numOrNull(s[k]);
+    if (s.top_k !== null && s.top_k !== undefined) s.top_k = Math.round(s.top_k);
+    for (const k of Object.keys(s)) if (s[k] === null) delete s[k];
+    copy.sampling = s;
+    if (copy.chat.enable_thinking === null) delete copy.chat.enable_thinking;
+    if (!copy.model.mmproj) copy.model.mmproj = null;
+    if (copy.model.draft && !copy.model.draft.path) copy.model.draft = null;
     return copy;
   }
 
@@ -106,15 +263,23 @@
     scheduleCheck();
   }
 
+  // Outcome comes from Rust as `{ outcome: "pass" | "note" | "warn" | "block", message? }`.
+  // Never default to "pass": an unrecognised shape must look wrong, not green.
   function outcomeKind(o) {
     if (o === "pass") return "pass";
-    if (o.warn !== undefined) return "warn";
-    if (o.block !== undefined) return "block";
-    if (o.note !== undefined) return "note";
-    return "pass";
+    if (o && typeof o === "object") {
+      if (typeof o.outcome === "string") return o.outcome;
+      for (const k of ["block", "warn", "note", "pass"]) if (o[k] !== undefined) return k;
+    }
+    return "block";
   }
   function outcomeMsg(o) {
-    return o === "pass" ? "" : (o.warn ?? o.block ?? o.note ?? "");
+    if (o === "pass") return "";
+    if (o && typeof o === "object") {
+      if (typeof o.outcome === "string") return o.message ?? "";
+      return o.warn ?? o.block ?? o.note ?? "";
+    }
+    return `unrecognised pre-flight outcome: ${JSON.stringify(o)}`;
   }
 
   const anyBlock = $derived(check?.results?.some((r) => outcomeKind(r.outcome) === "block") ?? false);
@@ -138,6 +303,47 @@
     });
   });
 
+  // ---- creator defaults ----------------------------------------------------
+  // The GGUF header often embeds them (general.sampling.*); Hugging Face's
+  // generation_config.json is the fallback behind the button.
+  const embedded = $derived.by(() => {
+    if (!header) return null;
+    const has = header.sampling_temp != null || header.sampling_top_k != null || header.sampling_top_p != null;
+    return has ? {
+      repo: header.source_repo ?? "GGUF header",
+      temperature: header.sampling_temp ?? null,
+      top_p: header.sampling_top_p ?? null,
+      top_k: header.sampling_top_k ?? null,
+      min_p: header.sampling_min_p ?? null,
+      repetition_penalty: header.sampling_repeat_penalty ?? null,
+      embedded: true,
+    } : null;
+  });
+  const creatorShown = $derived(creator && !creator.error ? creator : embedded);
+
+  async function fetchCreator() {
+    if (!draft?.model?.path) return;
+    creatorBusy = true;
+    try {
+      creator = await api("creator_defaults", { modelPath: draft.model.path });
+    } catch (e) {
+      creator = { error: String(e) };
+    }
+    creatorBusy = false;
+  }
+  function applyCreator() {
+    const c = creatorShown;
+    if (!c) return;
+    const s = draft.sampling;
+    if (c.temperature != null) s.temperature = c.temperature;
+    if (c.top_p != null) s.top_p = c.top_p;
+    if (c.top_k != null) s.top_k = c.top_k;
+    if (c.min_p != null) s.min_p = c.min_p;
+    if (c.repetition_penalty != null) s.repeat_penalty = c.repetition_penalty;
+    scheduleCheck();
+  }
+
+  // ---- actions --------------------------------------------------------------
   async function save() {
     busy = "save";
     try {
@@ -206,6 +412,22 @@
 </script>
 
 <h1>Profiles <span class="sub">saved launch configurations — the editor runs the same pre-flight as launch</span></h1>
+{#if loadErrors.length}
+  <div class="card">
+    {#each loadErrors as [name, msg]}
+      <div><span class="chip block">{name} failed</span> <span class="mono" style="font-size: 11.5px;">{msg}</span></div>
+    {/each}
+    <div class="faint" style="font-size: 11px; margin-top: 4px;">Check the roots on the Settings tab, then Rescan.</div>
+  </div>
+{:else if !loading && (!models.length || !builds.length || !devices.length)}
+  <div class="card">
+    <span class="chip warn">nothing to pick from</span>
+    <span style="font-size: 12px;">
+      {models.length} models · {builds.length} builds · {devices.length} GPUs —
+      set the model and build roots on the <b>Settings</b> tab (scanning {models.length ? "" : "found no GGUF files"}{!builds.length ? (models.length ? "" : "; ") + "found no bin\\llama-server.exe" : ""}).
+    </span>
+  </div>
+{/if}
 
 <div style="display: flex; gap: 16px; align-items: flex-start;">
   <!-- list -->
@@ -213,6 +435,7 @@
     <div class="toolbar">
       <button class="btn" onclick={newProfile}>New</button>
       <button class="btn" onclick={duplicate} disabled={!draft}>Duplicate</button>
+      <button class="btn" onclick={rescan} disabled={busy === "scan"} title="rescan build and model roots">{busy === "scan" ? "…" : "Rescan"}</button>
     </div>
     <div class="card" style="padding: 6px;">
       {#each profiles as row}
@@ -225,8 +448,11 @@
             <span>{row.profile.id}</span>
             <span class="mono faint" style="font-size: 10px;">:{row.profile.server.port}</span>
           </div>
+          <div class="faint" style="font-size: 10.5px; font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+            {base(row.profile.model.path)}
+          </div>
           <div class="faint" style="font-size: 10.5px; font-weight: 400;">
-            {row.profile.devices.length} device{row.profile.devices.length === 1 ? "" : "s"}{row.profile.split_mode ? ` · ${row.profile.split_mode} split` : ""}
+            {row.profile.build.version ?? "?"} · {row.profile.devices.length} device{row.profile.devices.length === 1 ? "" : "s"}{row.profile.split_mode ? ` · ${row.profile.split_mode} split` : ""}
             {#if row.profile.baseline}
               · {row.profile.baseline.serial_tok_s} tok/s
             {/if}
@@ -244,18 +470,70 @@
   <!-- editor -->
   {#if draft}
     <div style="flex: 1; min-width: 0;">
+      <!-- identity + model + build -->
       <div class="card">
         <div class="formgrid">
-          <label class="field"><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
-          <label class="field" style="grid-column: span 2;"><span class="k">name</span><input bind:value={draft.name} /></label>
-          <label class="field"><span class="k">port</span><input type="number" bind:value={draft.server.port} oninput={scheduleCheck} /></label>
-          <label class="field"><span class="k">alias</span><input bind:value={draft.server.alias} oninput={scheduleCheck} /></label>
+          <label class="field" title="Profile identifier: the file name under the profile directory and what the CLI uses (llamactl launch <id>). Letters, digits, dashes."><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
+          <label class="field" style="grid-column: span 2;" title="Free-text display name."><span class="k">name</span><input bind:value={draft.name} /></label>
+          <label class="field" title="TCP port the server listens on. Each running profile needs its own; pre-flight checks it is free."><span class="k">port</span><input type="number" bind:value={draft.server.port} oninput={scheduleCheck} /></label>
+          <label class="field" title="Model name the server reports on /v1/models and what clients pass as 'model'. Unique across running servers."><span class="k">alias</span><input bind:value={draft.server.alias} oninput={scheduleCheck} /></label>
         </div>
-        <div class="formgrid" style="margin-top: 10px;">
-          <label class="field" style="grid-column: span 3;"><span class="k">build path</span><input bind:value={draft.build.path} oninput={scheduleCheck} /></label>
-          <label class="field" style="grid-column: span 3;"><span class="k">model path</span><input bind:value={draft.model.path} oninput={scheduleCheck} /></label>
+
+        <div class="formgrid" style="margin-top: 12px;">
+          <label class="field" style="grid-column: 1 / -1;">
+            <span class="k">model <span class="faint" style="text-transform: none; letter-spacing: 0;">— {models.length} GGUF files under the model roots</span></span>
+            <select value={models.find((m) => samePath(m.path, draft.model.path))?.path ?? ""} onchange={(e) => onModelPick(e.target.value)}>
+              <option value="" disabled>choose a model…</option>
+              {#each models as m}
+                <option value={m.path}>{modelLabel(m)}</option>
+              {/each}
+            </select>
+          </label>
+          {#if header}
+            <div class="mono faint" style="grid-column: 1 / -1; font-size: 10.5px;">
+              {header.model_name ?? base(draft.model.path)} · {header.architecture} · {header.size_label ?? ""} · {header.block_count} layers · trained context {fmtInt(header.context_length ?? 0)}
+              {#if header.source_repo} · <span title="from GGUF general.base_model">{header.source_repo}</span>{/if}
+              <br /><span style="opacity: .7; word-break: break-all;">{draft.model.path}</span>
+            </div>
+          {:else if draft.model.path}
+            <div class="mono faint" style="grid-column: 1 / -1; font-size: 10.5px; word-break: break-all;">{draft.model.path} <span class="chip warn">not in scan</span></div>
+          {/if}
+          <label class="field" style="grid-column: span 2;">
+            <span class="k">vision projector (mmproj)</span>
+            <select bind:value={draft.model.mmproj} onchange={scheduleCheck}>
+              <option value={null}>none</option>
+              {#each selectedModel?.mmproj_candidates ?? [] as c}<option value={c}>{base(c)}</option>{/each}
+              {#if draft.model.mmproj && !(selectedModel?.mmproj_candidates ?? []).includes(draft.model.mmproj)}
+                <option value={draft.model.mmproj}>{base(draft.model.mmproj)}</option>
+              {/if}
+            </select>
+          </label>
+          <label class="field" style="grid-column: span 2;">
+            <span class="k">speculative draft model</span>
+            <select value={draft.model.draft?.path ?? ""} onchange={(e) => onDraftPick(e.target.value)}>
+              <option value="">none</option>
+              {#each selectedModel?.draft_candidates ?? [] as c}<option value={c}>{base(c)}</option>{/each}
+              {#if draft.model.draft?.path && !(selectedModel?.draft_candidates ?? []).includes(draft.model.draft.path)}
+                <option value={draft.model.draft.path}>{base(draft.model.draft.path)}</option>
+              {/if}
+            </select>
+          </label>
+          {#if draft.model.draft}
+            <div class="faint" style="font-size: 11px; align-self: end;">used by the Speculative decoding section below</div>
+          {/if}
         </div>
-        <div class="formgrid" style="margin-top: 10px;">
+
+        <div class="formgrid" style="margin-top: 12px;">
+          <label class="field" style="grid-column: span 3;">
+            <span class="k">llama.cpp build</span>
+            <select value={selectedBuild?.path ?? ""} onchange={(e) => onBuildPick(e.target.value)}>
+              <option value="" disabled>choose a build…</option>
+              {#each builds as b}
+                <option value={b.path} disabled={!!b.version_error}>{b.tag} · {b.version ?? "broken"}{b.version_error ? " (does not run)" : ""}</option>
+              {/each}
+              {#if draft.build.path && !selectedBuild}<option value={draft.build.path}>{draft.build.path} (not in scan)</option>{/if}
+            </select>
+          </label>
           <label class="field" style="grid-column: span 3;">
             <span class="k">ROCm runtime</span>
             <select bind:value={draft.rocm_runtime} onchange={scheduleCheck}>
@@ -265,24 +543,21 @@
               {/each}
             </select>
           </label>
-          <div class="faint" style="grid-column: span 3; font-size: 11px; align-self: end;">
-            DLL search path the server launches with. Benched 2026-09-02: 7.1 vs 7.14 identical for llama.cpp; leave on default unless a build needs otherwise.
-          </div>
         </div>
       </div>
 
-      <!-- device picker (v1.1: multi-select + fractions) -->
+      <!-- devices -->
       <div class="card">
         <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">
-          Devices
-          <span class="faint" style="font-weight: 400;">— multi-select spans one model across cards (layer split)</span>
+          GPU
+          <span class="faint" style="font-weight: 400;">— one card loads the whole model there; two cards span it (layer split)</span>
         </div>
         {#each devices.filter((d) => !d.integrated) as dev}
           {@const entry = draft.devices.find((x) => x.key === dev.stable_key)}
           <div style="display: flex; gap: 10px; align-items: center; padding: 5px 0;">
             <input type="checkbox" style="width: auto;" checked={!!entry} onchange={() => toggleDevice(dev)} />
-            <span class="mono" style="flex: 1;">{dev.stable_key}</span>
-            <span class="faint mono" style="font-size: 10.5px;">{dev.backend}{dev.hip_index} · {(dev.free_mib / 1024).toFixed(1)} GiB free</span>
+            <span style="flex: 1;">{dev.name} <span class="mono faint" style="font-size: 10.5px;">{dev.stable_key.split(":").pop()}</span></span>
+            <span class="faint mono" style="font-size: 10.5px;">{dev.backend}{dev.hip_index} · {(dev.free_mib / 1024).toFixed(1)} / {(dev.total_mib / 1024).toFixed(1)} GiB free{dev.display ? " · display attached" : ""}</span>
             {#if entry && draft.devices.length > 1}
               <label class="field" style="width: 90px;">
                 <span class="k">fraction</span>
@@ -294,19 +569,17 @@
         {/each}
         {#if draft.devices.length > 1}
           <div class="formgrid" style="margin-top: 6px;">
-            <label class="field"><span class="k">split mode</span>
+            <label class="field" title="layer: whole layers per card (supported, no cross-GPU collectives). row: split each tensor across cards (experimental on this stack)."><span class="k">split mode</span>
               <select bind:value={draft.split_mode} onchange={scheduleCheck}>
                 <option value="layer">layer (supported)</option>
                 <option value="row">row (experimental)</option>
               </select>
             </label>
-            <label class="field"><span class="k">main device (list index)</span>
+            <label class="field" title="Which selected card holds the KV cache and small tensors — index into the checked cards above, in order."><span class="k">main device (list index)</span>
               <input type="number" min="0" bind:value={draft.main_device} oninput={scheduleCheck} />
             </label>
           </div>
         {/if}
-
-        <!-- per-device budget bars -->
         {#if budgets.length}
           <div class="budget">
             {#each budgets as b}
@@ -325,37 +598,148 @@
         {/if}
       </div>
 
-      <!-- runtime -->
+      <!-- context & offload -->
       <div class="card">
-        <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Runtime</div>
+        <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Context and offload</div>
         <div class="formgrid">
-          <label class="field"><span class="k">ctx total</span><input type="number" bind:value={draft.runtime.ctx_total} oninput={scheduleCheck} /></label>
-          <label class="field"><span class="k">slots (-np)</span><input type="number" bind:value={draft.runtime.slots} oninput={scheduleCheck} /></label>
-          <label class="field"><span class="k">gpu layers</span><input type="number" bind:value={draft.runtime.n_gpu_layers} oninput={scheduleCheck} /></label>
-          <label class="field"><span class="k">kv type K</span>
-            <select bind:value={draft.runtime.kv_type_k} onchange={scheduleCheck}>
-              {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
-            </select>
+          <Range bind:value={draft.runtime.ctx_total} label="context length" title="Total tokens of context the server allocates (split across slots). VRAM is nearly flat with context on Gemma 4's sliding-window layers; on dense models it grows linearly." min={512} max={ctxMax} step={256}
+            hint={header ? `model supports up to ${fmtInt(ctxMax)} tokens` : "no model header — default cap"} format={fmtInt} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.n_gpu_layers} label="GPU offload (layers)" title="How many transformer layers live on the GPU. Anything at or above the model's layer count = everything on GPU (fastest). Lower it only when the model does not fit." min={0} max={layerMax} step={1}
+            hint={header ? `${layerMax} layers; ≥ ${layerMax} = all` : "99 = all"} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.slots} label="max concurrent requests (slots)" title="-np: parallel request slots. Context divides evenly across them. Measured knee on the 26B-A4B: 6 slots." min={1} max={16} step={1}
+            hint={`per-slot context = ${fmtInt(Math.floor(draft.runtime.ctx_total / Math.max(1, draft.runtime.slots)))}`} onchange={scheduleCheck} span={3} />
+          <label class="field" style="grid-column: span 3; justify-content: end;">
+            <span class="k">unified KV cache</span>
+            <span><input type="checkbox" style="width: auto;" bind:checked={draft.runtime.kv_unified} onchange={scheduleCheck} /> one shared KV pool across slots (experimental)</span>
           </label>
-          <label class="field"><span class="k">kv type V</span>
-            <select bind:value={draft.runtime.kv_type_v} onchange={scheduleCheck}>
-              {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
-            </select>
-          </label>
-          <label class="field"><span class="k">flash attn</span>
+        </div>
+      </div>
+
+      <!-- advanced -->
+      <div class="card">
+        <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Advanced</div>
+        <div class="formgrid">
+          <Range bind:value={draft.runtime.threads} label="CPU thread pool size" title="-t: CPU threads for layers not offloaded and for tokenisation. Irrelevant when everything is on the GPU." min={1} max={32} step={1} nullable placeholder={8}
+            hint="only matters for layers left on CPU" onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse (min chunk)" title="--cache-reuse: reuse KV cache for a prompt that shares a prefix with a previous one, in chunks of at least this many tokens. 0 = off." min={0} max={2048} step={32} nullable placeholder={256}
+            hint="--cache-reuse" onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.batch_logical} label="evaluation batch size (-b)" title="-b: logical batch, the per-iteration token budget shared by prefill and decode." min={64} max={8192} step={64}
+            hint="shared per-iteration budget" format={fmtInt} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.batch_physical} label="physical batch size (-ub)" title="-ub: micro-batch actually pushed through the GPU; sizes the compute buffer. 256 measured best on the R9700 at long context." min={32} max={2048} step={32}
+            hint="sizes the compute buffer; 256 = R9700 sweet spot" format={fmtInt} onchange={scheduleCheck} span={3} />
+          <label class="field" title="Fused attention kernel: less VRAM, faster prefill. Must be on for V-cache quantisation. 'auto' lets llama.cpp decide."><span class="k">flash attention</span>
             <select bind:value={draft.runtime.flash_attn} onchange={scheduleCheck}>
               <option value="on">on</option><option value="off">off</option><option value="auto">auto</option>
             </select>
           </label>
-          <label class="field"><span class="k">batch logical (-b)</span><input type="number" bind:value={draft.runtime.batch_logical} oninput={scheduleCheck} /></label>
-          <label class="field"><span class="k">batch physical (-ub)</span><input type="number" bind:value={draft.runtime.batch_physical} oninput={scheduleCheck} /></label>
+          <label class="field" title="Storage type of the attention key cache. q8_0 is visually lossless and halves KV VRAM; q4_0 quarters it with some quality cost."><span class="k">K cache quant</span>
+            <select bind:value={draft.runtime.kv_type_k} onchange={scheduleCheck}>
+              {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
+            </select>
+          </label>
+          <label class="field" title="Storage type of the attention value cache. Needs flash attention on for anything but f16."><span class="k">V cache quant</span>
+            <select bind:value={draft.runtime.kv_type_v} onchange={scheduleCheck}>
+              {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
+            </select>
+          </label>
+          <label class="field" title="Serve concurrent requests inside one forward pass instead of queueing them. Leave on."><span class="k">continuous batching</span>
+            <span><input type="checkbox" style="width: auto;" bind:checked={draft.runtime.cont_batching} onchange={scheduleCheck} /> -cb</span>
+          </label>
+          <label class="field" style="grid-column: 1 / -1;" title="Anything this editor does not model, e.g. --spec-type mtp --draft-max 3 or --no-mmap. Passed to llama-server unchanged."><span class="k">extra llama-server flags (space-separated, passed through verbatim)</span>
+            <input value={Array.isArray(draft.runtime.extra_flags) ? draft.runtime.extra_flags.join(" ") : draft.runtime.extra_flags}
+              oninput={(e) => { draft.runtime.extra_flags = e.target.value; scheduleCheck(); }} placeholder="--spec-type mtp --draft-max 3" />
+          </label>
         </div>
-        {#if draft.runtime.slots > 0}
-          <div class="faint mono" style="font-size: 10.5px; margin-top: 6px;">
-            per-slot context = {Math.floor(draft.runtime.ctx_total / Math.max(1, draft.runtime.slots)).toLocaleString()} tokens
-            (context divides across slots — R-10)
+        <div class="faint" style="font-size: 11px; margin-top: 6px;">
+          KV quantisation is where the VRAM is on this architecture (q8_0 ≈ f16 quality); flash attention must be on for V-cache quant.
+        </div>
+      </div>
+
+      <!-- speculative decoding -->
+      <div class="card">
+        <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
+          <span style="font-weight: 700; font-size: 12.5px;">Speculative decoding</span>
+          {#if mtpBuiltIn}<span class="chip pass">model supports MTP</span>{/if}
+          <span class="faint" style="font-size: 11px;">drafts several tokens per step and verifies them in one pass — free speed when the draft is right</span>
+          <div style="flex: 1;"></div>
+          <button class="btn" onclick={applySpecDefaults} disabled={draft.speculative.mode === "off"} title="engine defaults: 3 max, 0 min, 0.0 probability">Apply creator defaults</button>
+        </div>
+        <div class="formgrid">
+          <label class="field" style="grid-column: span 3;" title="How drafts are produced. MTP uses the model's own multi-token head (built in for Qwen 3.5+/3.8, a sidecar file for Gemma 4). draft = a separate small model. DFlash = a DFlash draft file. n-gram = prompt lookup, no model.">
+            <span class="k">mode</span>
+            <select value={draft.speculative.mode} onchange={(e) => onSpecMode(e.target.value)}>
+              {#each specModes as m}<option value={m.v}>{m.l}</option>{/each}
+            </select>
+          </label>
+          {#if draft.speculative.mode !== "off"}
+            <Range bind:value={draft.speculative.n_max} label="max draft tokens" min={1} max={16} step={1} nullable placeholder={3}
+              hint="engine default 3" onchange={scheduleCheck} span={3}
+              title="--spec-draft-n-max: how many tokens the draft proposes per step. Higher = more speed when accepted, more waste when rejected." />
+            <Range bind:value={draft.speculative.n_min} label="min draft tokens" min={0} max={16} step={1} nullable placeholder={0}
+              hint="engine default 0" onchange={scheduleCheck} span={3}
+              title="--spec-draft-n-min: skip speculation entirely when fewer than this many draft tokens are available." />
+            <Range bind:value={draft.speculative.p_min} label="draft probability" min={0} max={1} step={0.01} nullable placeholder={0}
+              hint="engine default 0.00" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3}
+              title="--spec-draft-p-min: only keep draft tokens the draft itself is at least this confident in (greedy). 0 = keep all." />
+          {/if}
+        </div>
+        {#if draft.speculative.mode === "mtp" && !mtpBuiltIn && !draft.model.draft?.path}
+          <div class="chip block" style="margin-top: 6px;">MTP needs either a model with a built-in head or an MTP sidecar chosen above</div>
+        {/if}
+      </div>
+
+      <!-- inference -->
+      <div class="card">
+        <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
+          <span style="font-weight: 700; font-size: 12.5px;">Inference</span>
+          <span class="faint" style="font-size: 11px;">unchecked = the engine's own default</span>
+          <div class="grow" style="flex: 1;"></div>
+          <button class="btn" onclick={fetchCreator} disabled={creatorBusy || !draft.model.path} title="look up generation_config.json on Hugging Face">
+            {creatorBusy ? "Fetching…" : embedded ? "Re-check on Hugging Face" : "Creator defaults"}
+          </button>
+          {#if creatorShown}
+            <button class="btn primary" onclick={applyCreator}>Apply creator defaults</button>
+          {/if}
+        </div>
+        {#if creatorShown || creator?.error}
+          <div class="mono" style="font-size: 11px; margin-bottom: 10px; padding: 8px 10px; background: var(--ground-inset); border-radius: 4px;">
+            {#if creator?.error}
+              <span class="chip block">hugging face</span> {creator.error}<br />
+            {/if}
+            {#if creatorShown}
+              <span class="chip accent">{creatorShown.repo}</span>
+              temperature {creatorShown.temperature ?? "—"} · top_p {creatorShown.top_p ?? "—"} · top_k {creatorShown.top_k ?? "—"} · min_p {creatorShown.min_p ?? "—"} · repetition_penalty {creatorShown.repetition_penalty ?? "—"}
+              <span class="faint">({creatorShown.embedded ? "embedded in the GGUF header by the converter" : (creatorShown.from_cache ? "cached" : "fetched") + " from generation_config.json"})</span>
+            {/if}
           </div>
         {/if}
+        <div class="formgrid">
+          <label class="field" style="grid-column: span 3;" title="Sets enable_thinking in the chat template. Off is what fixed the agentic loops on Gemma; on gives reasoning traces."><span class="k">thinking</span>
+            <select bind:value={draft.chat.enable_thinking} onchange={scheduleCheck}>
+              <option value={null}>model default</option>
+              <option value={true}>on</option>
+              <option value={false}>off (recommended for agentic use)</option>
+            </select>
+          </label>
+          <div style="grid-column: span 3;"></div>
+          <Range bind:value={draft.sampling.temperature} label="temperature" title="Randomness of sampling. 0 = greedy, 1 = the model's raw distribution. Creator default shown as the hint when known." min={0} max={2} step={0.05} nullable placeholder={creatorShown?.temperature ?? 0.8}
+            hint={creatorShown?.temperature != null ? `creator: ${creator.temperature}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.sampling.top_k} label="top K sampling" title="Keep only the K most likely tokens before sampling. 0 = disabled." min={0} max={200} step={1} nullable placeholder={creatorShown?.top_k ?? 40}
+            hint={creatorShown?.top_k != null ? `creator: ${creator.top_k}` : "0 = off"} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.sampling.top_p} label="top P sampling" title="Nucleus sampling: keep the smallest set of tokens whose probabilities sum to P." min={0} max={1} step={0.01} nullable placeholder={creatorShown?.top_p ?? 0.95}
+            hint={creatorShown?.top_p != null ? `creator: ${creator.top_p}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.sampling.min_p} label="min P sampling" title="Drop tokens whose probability is below P × the top token's probability. Stronger and more stable than top-p at high temperature." min={0} max={1} step={0.01} nullable placeholder={creatorShown?.min_p ?? 0.05}
+            hint={creatorShown?.min_p != null ? `creator: ${creator.min_p}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.sampling.repeat_penalty} label="repeat penalty" title="Multiplicative penalty on tokens already seen in the context. 1.0 = off; 1.1 is a common mild setting." min={1} max={2} step={0.01} nullable placeholder={creatorShown?.repetition_penalty ?? 1.0}
+            hint={creatorShown?.repetition_penalty != null ? `creator: ${creator.repetition_penalty}` : "1.0 = off"} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.sampling.presence_penalty} label="presence penalty" title="Flat penalty on any token that has appeared at all. 0 = off." min={0} max={2} step={0.05} nullable placeholder={0}
+            hint="0 = off" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.sampling.dry_multiplier} label="DRY multiplier" title="DRY (Don't Repeat Yourself) sampler strength: penalises repeating whole sequences, not single tokens. 0 = off." min={0} max={2} step={0.05} nullable placeholder={0}
+            hint="0 = off; repetition suppression" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+        </div>
+        <label class="field" style="margin-top: 10px;" title="Why this profile exists, what was measured, what to remember. Free text, kept with the profile."><span class="k">notes</span>
+          <textarea rows="2" bind:value={draft.notes}></textarea>
+        </label>
       </div>
 
       {#if check?.findings?.length}
@@ -405,11 +789,11 @@
       <div class="toolbar">
         <button class="btn primary" onclick={save} disabled={!!busy}>Save</button>
         <button class="btn" onclick={() => launch(false)} disabled={!!busy || anyBlock}>
-          {busy === "launch" ? "Launching…" : "Launch"}
+          {busy === "launch" ? "Loading…" : "Save & load"}
         </button>
         {#if anyBlock}
           <button class="btn danger" onclick={() => launch(true)} disabled={!!busy}>
-            Override blocks &amp; launch
+            Override blocks &amp; load
           </button>
         {/if}
         <button class="btn" onclick={() => exportScript("bat")} disabled={!!busy}>Export .bat</button>

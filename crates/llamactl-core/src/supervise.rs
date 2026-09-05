@@ -355,9 +355,10 @@ pub fn probe_health(state: &RunState, deep: bool) -> Health {
 
 pub fn process_alive(pid: u32) -> bool {
     // tasklist filters by PID; output contains the PID only when it exists.
-    let out = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output();
+    let mut cmd = std::process::Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    crate::launch::hide_console(&mut cmd);
+    let out = cmd.output();
     match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")),
         Err(_) => false,
@@ -367,10 +368,10 @@ pub fn process_alive(pid: u32) -> bool {
 /// Stop a server. llama-server has no shutdown endpoint; on Windows a
 /// process-tree terminate is the clean stop (§04 clean-stop requirement).
 pub fn stop(state: &RunState, runs_dir: &Path) -> Result<()> {
-    let out = std::process::Command::new("taskkill")
-        .args(["/PID", &state.pid.to_string(), "/T", "/F"])
-        .output()
-        .map_err(|e| Error::Platform(format!("taskkill: {e}")))?;
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/PID", &state.pid.to_string(), "/T", "/F"]);
+    crate::launch::hide_console(&mut cmd);
+    let out = cmd.output().map_err(|e| Error::Platform(format!("taskkill: {e}")))?;
     if !out.status.success() {
         let text = String::from_utf8_lossy(&out.stderr).into_owned();
         // Already gone counts as stopped.
