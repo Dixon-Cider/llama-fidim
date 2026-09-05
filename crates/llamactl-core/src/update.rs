@@ -565,15 +565,17 @@ pub fn build_from_source(
         return Ok(InstallReport { tag: tag.into(), dir, source: "source".into(), skipped_existing: true, verify });
     }
     progress(format!("running {} {} {} {}", script.display(), src.display(), tag, dir.display()));
-    let mut child = Command::new("cmd")
-        .arg("/c")
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/c")
         .arg(&script)
         .arg(&src)
         .arg(tag)
         .arg(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::launch::hide_console(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| upd(format!("spawn {}: {e}", script.display())))?;
     let stderr = child.stderr.take();

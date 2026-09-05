@@ -19,7 +19,7 @@ const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 /// make us allocate absurd buffers.
 const MAX_SANE_LEN: u64 = 256 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Value {
     U64(u64),
@@ -58,6 +58,15 @@ impl Value {
             _ => None,
         }
     }
+    /// Any numeric scalar as f64 (the converter writes sampling defaults as f32).
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::F64(v) => Some(*v),
+            Value::U64(v) => Some(*v as f64),
+            Value::I64(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
     /// Array of unsigned integers, if every element converts.
     pub fn as_u64_array(&self) -> Option<Vec<u64>> {
         match self {
@@ -76,7 +85,7 @@ impl Value {
 
 /// Everything llamactl needs from a model file, plus the raw scalar metadata
 /// for display and future estimator refinements.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GgufHeader {
     pub path: PathBuf,
     pub file_size: u64,
@@ -87,6 +96,24 @@ pub struct GgufHeader {
     pub size_label: Option<String>,
     /// `general.file_type` — llama.cpp's quantisation enum (e.g. 15 = Q4_K_M).
     pub file_type: Option<u64>,
+    /// Hugging Face repo of the ORIGINAL model (`general.base_model.0.*`),
+    /// where the creator's generation_config.json lives; falls back to the
+    /// quant repo (`general.source.*` / `general.repo_url`).
+    pub source_repo: Option<String>,
+    /// The repo this GGUF itself came from (`general.source.*`), when it
+    /// differs from the base model — the quantizer's repo.
+    pub quant_repo: Option<String>,
+    /// Creator sampling defaults embedded by the converter (`general.sampling.*`
+    /// from the source repo's generation_config.json). None = not present.
+    pub sampling_temp: Option<f64>,
+    pub sampling_top_k: Option<u32>,
+    pub sampling_top_p: Option<f64>,
+    pub sampling_min_p: Option<f64>,
+    pub sampling_repeat_penalty: Option<f64>,
+    /// `<arch>.nextn_predict_layers`: the model ships a built-in Multi-Token
+    /// Prediction head (Qwen 3.5+, DeepSeek V3). > 0 = `--spec-type draft-mtp`
+    /// works without a separate draft file.
+    pub nextn_predict_layers: Option<u64>,
     pub block_count: Option<u64>,
     pub context_length: Option<u64>,
     pub embedding_length: Option<u64>,
@@ -160,6 +187,22 @@ pub fn read_header(path: &Path) -> Result<GgufHeader> {
         model_name: metadata.get("general.name").and_then(|v| v.as_str().map(String::from)),
         size_label: metadata.get("general.size_label").and_then(|v| v.as_str().map(String::from)),
         file_type: metadata.get("general.file_type").and_then(|v| v.as_u64()),
+        source_repo: source_repo_from(&metadata),
+        quant_repo: quant_repo_from(&metadata),
+        // Stored as f32 by the converter; round away the f32->f64 noise
+        // (0.949999988 -> 0.95) so the UI shows what the creator wrote.
+        sampling_temp: metadata.get("general.sampling.temp").and_then(|v| v.as_f64()).map(round4),
+        sampling_top_k: metadata.get("general.sampling.top_k").and_then(|v| v.as_f64()).map(|k| k.round() as u32),
+        sampling_top_p: metadata.get("general.sampling.top_p").and_then(|v| v.as_f64()).map(round4),
+        sampling_min_p: metadata.get("general.sampling.min_p").and_then(|v| v.as_f64()).map(round4),
+        sampling_repeat_penalty: metadata
+            .get("general.sampling.repeat_penalty")
+            .or_else(|| metadata.get("general.sampling.repetition_penalty"))
+            .and_then(|v| v.as_f64())
+            .map(round4),
+        nextn_predict_layers: arch_key("nextn_predict_layers").or_else(|| {
+            metadata.iter().find(|(k, _)| k.ends_with(".nextn_predict_layers")).and_then(|(_, v)| v.as_u64())
+        }),
         block_count: arch_key("block_count"),
         context_length: arch_key("context_length"),
         embedding_length: arch_key("embedding_length"),
@@ -223,6 +266,24 @@ fn scalar_width(vtype: u32) -> Option<u64> {
     }
 }
 
+/// Skip `n` bytes. Short runs are consumed through the reader's buffer
+/// (no syscall); only genuinely large runs pay for a seek.
+fn skip_bytes<R: Read + Seek>(r: &mut R, n: u64, path: &Path) -> Result<()> {
+    const THROUGH_BUFFER: u64 = 64 * 1024;
+    if n <= THROUGH_BUFFER {
+        let mut left = n;
+        let mut scratch = [0u8; 4096];
+        while left > 0 {
+            let take = left.min(scratch.len() as u64) as usize;
+            read_exact(r, &mut scratch[..take], path)?;
+            left -= take as u64;
+        }
+        Ok(())
+    } else {
+        r.seek(SeekFrom::Current(n as i64)).map(|_| ()).map_err(|e| Error::io(path, e))
+    }
+}
+
 fn read_value<R: Read + Seek>(r: &mut R, vtype: u32, path: &Path) -> Result<Value> {
     Ok(match vtype {
         0 => Value::U64(read_byte(r, path)? as u64),
@@ -268,12 +329,16 @@ fn read_value<R: Read + Seek>(r: &mut R, vtype: u32, path: &Path) -> Result<Valu
                     .ok_or_else(|| malformed(path, "array size overflow".into()))?;
                 r.seek(SeekFrom::Current(bytes as i64)).map_err(|e| Error::io(path, e))?;
             } else if elem_type == 8 {
+                // Tokenizer vocab + merges: ~262K short strings each. A
+                // `seek` per string discards the BufReader buffer and costs a
+                // syscall + refill every time (measured 15-25 s per model);
+                // consuming the bytes through the buffer instead is ~ms.
                 for _ in 0..len {
                     let slen = read_u64(r, path)?;
                     if slen > MAX_SANE_LEN {
                         return Err(malformed(path, format!("implausible string length {slen}")));
                     }
-                    r.seek(SeekFrom::Current(slen as i64)).map_err(|e| Error::io(path, e))?;
+                    skip_bytes(r, slen, path)?;
                 }
             } else if elem_type == 9 {
                 // Nested arrays are legal in the format but unseen in real
@@ -299,6 +364,51 @@ fn read_byte<R: Read>(r: &mut R, path: &Path) -> Result<u8> {
     let mut b = [0u8; 1];
     read_exact(r, &mut b, path)?;
     Ok(b[0])
+}
+
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+
+/// `owner/name` of the model's Hugging Face repo from the GGUF `general.*`
+/// provenance keys, preferring the base (creator) model over the quant repo.
+/// Accepts either `repo_url` (`https://huggingface.co/owner/name`) or the
+/// `organization` + `name` pair the converter writes.
+pub fn source_repo_from(metadata: &BTreeMap<String, Value>) -> Option<String> {
+    repo_from_keys(metadata, "general.base_model.0.repo_url", "general.base_model.0.organization", "general.base_model.0.name")
+        .or_else(|| quant_repo_from(metadata))
+}
+
+/// The quantizer's own repo (`general.source.*`, or the top-level
+/// `general.repo_url` / `general.organization` + `general.name` pair).
+pub fn quant_repo_from(metadata: &BTreeMap<String, Value>) -> Option<String> {
+    repo_from_keys(metadata, "general.source.repo_url", "general.source.organization", "general.source.name")
+        .or_else(|| repo_from_keys(metadata, "general.source.url", "", ""))
+        .or_else(|| repo_from_keys(metadata, "general.repo_url", "general.organization", "general.name"))
+}
+
+fn repo_from_keys(
+    metadata: &BTreeMap<String, Value>,
+    url_key: &str,
+    org_key: &str,
+    name_key: &str,
+) -> Option<String> {
+    let s = |k: &str| {
+        metadata.get(k).and_then(|v| v.as_str()).map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
+    };
+    if let Some(u) = s(url_key) {
+        if let Some(rest) = u.split("huggingface.co/").nth(1) {
+            let parts: Vec<&str> = rest.trim_matches('/').split('/').collect();
+            if parts.len() >= 2 {
+                return Some(format!("{}/{}", parts[0], parts[1]));
+            }
+        }
+    }
+    if org_key.is_empty() {
+        return None;
+    }
+    let (o, n) = (s(org_key)?, s(name_key)?);
+    Some(format!("{}/{}", o.replace(' ', "-"), n.replace(' ', "-")))
 }
 
 /// Human name for llama.cpp's `general.file_type` enum (the common ones).

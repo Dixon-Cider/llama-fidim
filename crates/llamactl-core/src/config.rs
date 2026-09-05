@@ -46,6 +46,10 @@ pub struct Config {
     /// tag from source with the local HIP toolchain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_build_script: Option<PathBuf>,
+    /// Hugging Face token for gated repos when fetching creator defaults
+    /// (`HF_TOKEN` in the environment takes precedence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_token: Option<String>,
     /// Preserved unknown fields from newer schema versions.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -90,6 +94,7 @@ impl Config {
             source_build_script: Some(PathBuf::from(
                 r"C:\Users\Paul\Documents\Claude\Projects\llamactl\scripts\build-from-tag.bat",
             )),
+            hf_token: None,
             extra: serde_json::Map::new(),
         }
     }

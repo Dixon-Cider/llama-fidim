@@ -11,6 +11,7 @@ pub mod error;
 pub mod estimate;
 pub mod export;
 pub mod gguf;
+pub mod hf;
 pub mod launch;
 pub mod platform;
 pub mod preflight;

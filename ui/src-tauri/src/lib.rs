@@ -23,7 +23,11 @@ use tauri::Emitter;
 struct UiCache {
     devices: Option<(Instant, Vec<Device>)>,
     build_probes: HashMap<PathBuf, Option<String>>,
+    /// Build + model scan; probing every build costs ~0.3 s each.
+    scan: Option<(Instant, serde_json::Value)>,
 }
+
+const SCAN_TTL: Duration = Duration::from_secs(60);
 
 struct AppState {
     /// Arc so command bodies can move a handle onto the blocking pool.
@@ -62,10 +66,11 @@ fn cached_devices(
         }
     }
     let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+    // Newest by release NUMBER — a string compare ranks b9817 above b10771.
     let build = builds
         .iter()
         .filter(|b| b.version.is_some())
-        .max_by(|a, b| a.version.cmp(&b.version))
+        .max_by_key(|b| b.version.as_deref().and_then(llamactl_core::update::version_number).unwrap_or(0))
         .or(builds.first())
         .ok_or("no builds found under configured build_roots")?;
     let devices = launch::enumerate_devices(cfg, &build.server_exe, &WindowsPlatform)
@@ -106,11 +111,37 @@ fn running_aliases(cfg: &Config) -> Vec<String> {
 // ---------------------------------------------------------------- commands ----
 
 #[tauri::command]
-fn scan() -> Result<serde_json::Value, String> {
-    let cfg = cfg()?;
-    let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
-    let models = discovery::scan_models(&cfg.model_roots);
-    Ok(serde_json::json!({ "builds": builds, "models": models }))
+async fn scan(state: tauri::State<'_, AppState>, refresh: Option<bool>) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
+    let refresh = refresh.unwrap_or(false);
+    blocking(move || {
+        if !refresh {
+            let c = cache.lock().unwrap();
+            if let Some((at, v)) = &c.scan {
+                if at.elapsed() < SCAN_TTL {
+                    return Ok(v.clone());
+                }
+            }
+        }
+        let cfg = cfg()?;
+        let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+        let models = discovery::scan_models(&cfg.model_roots);
+        let v = serde_json::json!({ "builds": builds, "models": models });
+        cache.lock().unwrap().scan = Some((Instant::now(), v.clone()));
+        Ok(v)
+    })
+    .await
+}
+
+/// The model author's published sampling defaults (generation_config.json).
+#[tauri::command]
+async fn creator_defaults(model_path: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let d = llamactl_core::hf::creator_defaults(&cfg, &PathBuf::from(model_path)).map_err(|e| e.to_string())?;
+        serde_json::to_value(d).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -196,6 +227,41 @@ fn live_check_blocking(
         launch::prepare_with_inputs(&cfg, &p, &WindowsPlatform, running_aliases(&cfg), inputs)
             .map_err(|e| e.to_string())?;
     let results = preflight::run_all(&prepared.context);
+    // Trace what the editor's check saw, so a PASS here that a real launch
+    // contradicts can be diagnosed from ~/.llamactl/ui.log.
+    {
+        let dev: Vec<String> = prepared
+            .context
+            .resolved
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}[free {} MiB, display {}]",
+                    r.device.stable_key.rsplit(':').next().unwrap_or("?"),
+                    r.device.free_mib,
+                    r.device.display.is_some()
+                )
+            })
+            .collect();
+        let est = prepared
+            .context
+            .estimate
+            .as_ref()
+            .map(|e| format!("{:.2} GiB", e.total_bytes as f64 / (1u64 << 30) as f64))
+            .unwrap_or_else(|| "none".into());
+        let blocks: Vec<String> = results
+            .iter()
+            .filter(|r| matches!(r.outcome, preflight::Outcome::Block(_)))
+            .map(|r| r.spec_number.to_string())
+            .collect();
+        let _ = ui_log(format!(
+            "live_check {}: devices={} estimate={} blocks=[{}]",
+            p.id,
+            dev.join(","),
+            est,
+            blocks.join(",")
+        ));
+    }
     Ok(serde_json::json!({
         "findings": findings,
         "results": results,
@@ -605,6 +671,47 @@ async fn update_rollback() -> Result<serde_json::Value, String> {
     .await
 }
 
+// --------------------------------------------------------------- settings ----
+
+/// The tool's own configuration (roots, runtime, install paths) plus where
+/// it lives, for the Settings view.
+#[tauri::command]
+fn get_config() -> Result<serde_json::Value, String> {
+    let cfg = cfg()?;
+    Ok(serde_json::json!({
+        "path": Config::config_path(),
+        "config": cfg,
+    }))
+}
+
+/// Save the configuration and invalidate every cache that depends on it.
+#[tauri::command]
+fn save_config(state: tauri::State<'_, AppState>, config: Config) -> Result<(), String> {
+    config.save(&Config::config_path()).map_err(|e| e.to_string())?;
+    let mut c = state.cache.lock().unwrap();
+    c.devices = None;
+    c.build_probes.clear();
+    c.scan = None;
+    Ok(())
+}
+
+/// Append a line from the web view to `~/.llamactl/ui.log` — the only way
+/// a failure inside the GUI becomes visible outside it.
+#[tauri::command]
+fn ui_log(line: String) -> Result<(), String> {
+    use std::io::Write;
+    let p = Config::config_dir().join("ui.log");
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| e.to_string())?;
+    writeln!(f, "{ts} {line}").map_err(|e| e.to_string())
+}
+
 /// ROCm runtimes a profile can name. Filesystem probing only.
 #[tauri::command]
 fn list_runtimes() -> Result<serde_json::Value, String> {
@@ -621,7 +728,7 @@ fn update_history() -> Result<serde_json::Value, String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
-            cache: Arc::new(Mutex::new(UiCache { devices: None, build_probes: HashMap::new() })),
+            cache: Arc::new(Mutex::new(UiCache { devices: None, build_probes: HashMap::new(), scan: None })),
         })
         .invoke_handler(tauri::generate_handler![
             scan,
@@ -645,6 +752,10 @@ pub fn run() {
             update_rollback,
             update_history,
             list_runtimes,
+            creator_defaults,
+            get_config,
+            save_config,
+            ui_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running llamactl UI");

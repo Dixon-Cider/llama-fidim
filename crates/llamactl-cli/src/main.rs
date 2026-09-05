@@ -35,6 +35,10 @@ enum Cmd {
     Profiles,
     /// List ROCm runtimes (HIP SDK, ComfyUI, LM Studio, manual) a profile can name.
     Runtimes,
+    /// The model author's published sampling defaults (Hugging Face generation_config.json).
+    CreatorDefaults { model_path: PathBuf },
+    /// Parse one GGUF header and report what the scanner would see (and how long it took).
+    Gguf { path: PathBuf },
     /// Run the pre-flight sequence for a profile without launching.
     Check { profile_id: String },
     /// Pre-flight then launch a profile; waits for readiness.
@@ -121,6 +125,43 @@ fn main() -> anyhow::Result<()> {
         Cmd::Devices { build } => cmd_devices(&cfg, build.as_deref(), cli.json),
         Cmd::Profiles => cmd_profiles(&cfg, cli.json),
         Cmd::Runtimes => cmd_runtimes(&cfg, cli.json),
+        Cmd::Gguf { path } => {
+            let t = std::time::Instant::now();
+            let h = gguf::read_header(&path)?;
+            let ms = t.elapsed().as_millis();
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&h)?);
+            } else {
+                println!(
+                    "{} ms  {}  arch={} layers={} ctx={} ft={} keys={} sampling(temp={:?} top_k={:?} top_p={:?}) repo={:?}",
+                    ms,
+                    path.display(),
+                    h.architecture.as_deref().unwrap_or("?"),
+                    h.block_count.unwrap_or(0),
+                    h.context_length.unwrap_or(0),
+                    h.file_type.unwrap_or(0),
+                    h.metadata.len(),
+                    h.sampling_temp,
+                    h.sampling_top_k,
+                    h.sampling_top_p,
+                    h.source_repo
+                );
+            }
+            Ok(())
+        }
+        Cmd::CreatorDefaults { model_path } => {
+            let d = llamactl_core::hf::creator_defaults(&cfg, &model_path)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                println!("{}  ({}{})", d.repo, if d.from_cache { "cached, " } else { "" }, d.url);
+                let f = |v: Option<f64>| v.map(|x| x.to_string()).unwrap_or_else(|| "-".into());
+                println!("  temperature {}  top_p {}  top_k {}  min_p {}  repetition_penalty {}",
+                    f(d.temperature), f(d.top_p), d.top_k.map(|k| k.to_string()).unwrap_or_else(|| "-".into()),
+                    f(d.min_p), f(d.repetition_penalty));
+            }
+            Ok(())
+        }
         Cmd::Check { profile_id } => cmd_check(&cfg, &platform, &profile_id, cli.json),
         Cmd::Launch { profile_id, override_blocks, ready_timeout } => {
             cmd_launch(&cfg, &platform, &profile_id, override_blocks, ready_timeout)
