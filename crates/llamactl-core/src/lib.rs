@@ -13,6 +13,7 @@ pub mod export;
 pub mod gguf;
 pub mod hf;
 pub mod launch;
+pub mod live;
 pub mod platform;
 pub mod preflight;
 pub mod profile;

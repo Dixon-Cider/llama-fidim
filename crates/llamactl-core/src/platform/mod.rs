@@ -66,6 +66,13 @@ impl SystemCommit {
 /// Windows: WDDM virtualizes VRAM, so `--list-devices` free-memory deltas
 /// do NOT see other processes' allocations (verified on the target machine).
 #[derive(Debug, Clone, Copy, Serialize)]
+pub struct GpuEngineUtil {
+    pub pid: u32,
+    pub luid_low: u64,
+    pub percent: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct GpuProcessMem {
     pub luid_low: u64,
     /// Resident in dedicated VRAM. On a layer-split launch the non-main
@@ -84,6 +91,12 @@ pub trait Platform {
     fn system_commit(&self) -> Result<SystemCommit>;
     /// Per-adapter dedicated GPU memory held by `pid`.
     fn gpu_process_memory(&self, pid: u32) -> Result<Vec<GpuProcessMem>>;
+    /// GPU engine busy percentage per (pid, adapter), sampled over a short
+    /// window. Sum over a pid's instances on one adapter; Windows reports
+    /// compute work under several engine types.
+    fn gpu_utilization(&self) -> Result<Vec<GpuEngineUtil>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Deterministic fake for tests: scripted responses, no OS access.

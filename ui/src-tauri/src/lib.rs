@@ -833,6 +833,65 @@ async fn router_unload(id: String) -> Result<(), String> {
     .await
 }
 
+// ------------------------------------------------------------------- live ----
+
+/// One poll of everything running: per run, slot phases + metrics (per
+/// model behind a router), resident VRAM, and per-card GPU busy.
+#[tauri::command]
+async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
+    blocking(move || {
+        let cfg = cfg()?;
+        let platform = WindowsPlatform;
+        let devices = cached_devices(&cache, &cfg, false).unwrap_or_default();
+        let card_of = |luid: u64| devices.iter().find(|d| d.luid_low == Some(luid)).map(|d| d.stable_key.clone());
+        let util = platform.gpu_utilization().unwrap_or_default();
+        // Per-card busy: sum over every process on that adapter.
+        let mut cards: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        for u in &util {
+            if let Some(k) = card_of(u.luid_low) {
+                *cards.entry(k).or_insert(0.0) += u.percent;
+            }
+        }
+        let runs: Vec<serde_json::Value> = supervise::reattach(&cfg.runs_dir)
+            .into_iter()
+            .map(|r| {
+                let mut samples = Vec::new();
+                if r.alive {
+                    if r.state.profile_id == llamactl_core::router::ROUTER_ID {
+                        if let Ok(ms) = llamactl_core::router::models(&r.state.host, r.state.port) {
+                            for m in ms.iter().filter(|m| m.status == "loaded") {
+                                samples.push(llamactl_core::live::sample(&r.state.host, r.state.port, Some(&m.id)));
+                            }
+                        }
+                    } else {
+                        samples.push(llamactl_core::live::sample(&r.state.host, r.state.port, None));
+                    }
+                }
+                let mem = platform.gpu_process_memory(r.state.pid).unwrap_or_default();
+                let resident: Vec<serde_json::Value> = mem
+                    .iter()
+                    .map(|m| serde_json::json!({ "card": card_of(m.luid_low), "dedicated_bytes": m.dedicated_bytes, "committed_bytes": m.committed_bytes }))
+                    .collect();
+                let busy: f64 = util.iter().filter(|u| u.pid == r.state.pid).map(|u| u.percent).sum();
+                serde_json::json!({
+                    "run": r,
+                    "samples": samples,
+                    "resident": resident,
+                    "gpu_busy_percent": busy.clamp(0.0, 100.0),
+                })
+            })
+            .collect();
+        let cards_json: Vec<serde_json::Value> = devices
+            .iter()
+            .filter(|d| !d.integrated)
+            .map(|d| serde_json::json!({ "key": d.stable_key, "name": d.name, "busy_percent": cards.get(&d.stable_key).copied().unwrap_or(0.0).clamp(0.0, 100.0), "total_mib": d.total_mib }))
+            .collect();
+        Ok(serde_json::json!({ "runs": runs, "cards": cards_json }))
+    })
+    .await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
@@ -872,6 +931,7 @@ pub fn run() {
             router_models,
             router_load,
             router_unload,
+            live,
         ])
         .run(tauri::generate_context!())
         .expect("error while running llamactl UI");
