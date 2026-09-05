@@ -397,7 +397,8 @@
           .map((p) => `${(Math.max(p.dedicated_bytes ?? 0, p.committed_bytes ?? 0) / GIB).toFixed(1)} GiB on ${p.key.split(":").pop()}`)
           .join(", ");
         const ka = r.keepalive?.pid ? ` · keep-alive ${r.keepalive.interval_s}s` : r.keepalive?.error ? ` · keep-alive FAILED: ${r.keepalive.error}` : " · keep-alive off";
-        toastMsg(`Launched pid ${r.state.pid} on port ${r.state.port}${r.cold_start ? " (cold cache)" : ""} — ${place}${ka}`);
+        const rep = r.replaced ? ` · replaced ${r.replaced} on this port` : "";
+        toastMsg(`Launched pid ${r.state.pid} on port ${r.state.port}${r.cold_start ? " (cold cache)" : ""} — ${place}${ka}${rep}`);
       }
     } catch (e) {
       toastMsg(String(e), true);

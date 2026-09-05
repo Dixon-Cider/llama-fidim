@@ -16,7 +16,7 @@ use crate::discovery;
 use crate::estimate::{self, EstimateInput, VramEstimate};
 use crate::gguf;
 use crate::platform::Platform;
-use crate::preflight::{LaunchContext, ResolvedDevice};
+use crate::preflight::{LaunchContext, PortHolder, ResolvedDevice};
 use crate::profile::{Profile, SplitMode};
 use crate::{Error, Result};
 
@@ -425,7 +425,7 @@ pub fn prepare_with_inputs(
 
     let commit = platform.system_commit()?;
     let inflight_reserved_bytes = crate::supervise::inflight_reserved_bytes(&cfg.runs_dir);
-    let port_free = port_is_free(&profile.server.host, profile.server.port);
+    let port_holder = port_holder(&profile.server.host, profile.server.port, &cfg.runs_dir);
 
     // Driver/SDK now vs baseline (check 11).
     let driver_now = resolved.iter().find_map(|r| r.device.driver_version.clone());
@@ -456,7 +456,7 @@ pub fn prepare_with_inputs(
         inflight_reserved_bytes,
         visibility_env: plan.visibility_env.clone(),
         running_aliases,
-        port_free,
+        port_holder,
         driver_now,
         driver_baseline,
         sdk_now,
@@ -483,6 +483,64 @@ pub fn parse_powercfg_ac_index(text: &str) -> Option<u32> {
     let line = text.lines().find(|l| l.contains("Current AC Power Setting Index"))?;
     let hex = line.split(':').nth(1)?.trim().trim_start_matches("0x");
     u32::from_str_radix(hex, 16).ok()
+}
+
+/// Who holds `port`, if anyone: a live llamactl run (by its state file),
+/// else whatever netstat says is listening there.
+pub fn port_holder(host: &str, port: u16, runs_dir: &Path) -> Option<PortHolder> {
+    if port_is_free(host, port) {
+        return None;
+    }
+    let ours = crate::supervise::reattach(runs_dir)
+        .into_iter()
+        .find(|r| r.alive && r.state.port == port);
+    let pid = ours.as_ref().map(|r| r.state.pid).or_else(|| listening_pid(port));
+    let process_name = pid.and_then(process_name);
+    Some(PortHolder { pid, process_name, profile_id: ours.map(|r| r.state.profile_id) })
+}
+
+/// PID of the process LISTENING on a TCP port (netstat -ano).
+pub fn listening_pid(port: u16) -> Option<u32> {
+    let mut cmd = std::process::Command::new("netstat");
+    cmd.args(["-ano", "-p", "tcp"]);
+    hide_console(&mut cmd);
+    let out = cmd.output().ok()?;
+    parse_netstat_listener(&String::from_utf8_lossy(&out.stdout), port)
+}
+
+/// `  TCP    127.0.0.1:1234    0.0.0.0:0    LISTENING    3776` -> 3776.
+pub fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
+    let suffix = format!(":{port}");
+    text.lines().find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 5 && f[0].eq_ignore_ascii_case("TCP") && f[1].ends_with(&suffix) && f[3] == "LISTENING" {
+            f[4].parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn process_name(pid: u32) -> Option<String> {
+    let mut cmd = std::process::Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    hide_console(&mut cmd);
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.starts_with('"'))?;
+    line.split(',').next().map(|s| s.trim_matches('"').to_string())
+}
+
+/// Poll until `port` is free or `timeout` elapses (used after a takeover stop).
+pub fn wait_port_free(host: &str, port: u16, timeout: std::time::Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    while !port_is_free(host, port) {
+        if start.elapsed() > timeout {
+            return Err(Error::Platform(format!("port {port} still in use {timeout:?} after stopping its server")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Ok(())
 }
 
 pub fn port_is_free(host: &str, port: u16) -> bool {
@@ -687,5 +745,15 @@ mod aspm_tests {
         );
         assert_eq!(super::parse_powercfg_ac_index(text), Some(1));
         assert_eq!(super::parse_powercfg_ac_index("nothing here"), None);
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    #[test]
+    fn parses_netstat_listener() {
+        let text = "  TCP    0.0.0.0:135    0.0.0.0:0    LISTENING    1234\n  TCP    127.0.0.1:9701    0.0.0.0:0    LISTENING    3776\n  TCP    127.0.0.1:9701    127.0.0.1:5000    ESTABLISHED    3776\n";
+        assert_eq!(super::parse_netstat_listener(text, 9701), Some(3776));
+        assert_eq!(super::parse_netstat_listener(text, 9702), None);
     }
 }
