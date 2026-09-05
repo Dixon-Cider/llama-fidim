@@ -33,6 +33,8 @@ enum Cmd {
     },
     /// List saved profiles with validation findings.
     Profiles,
+    /// List ROCm runtimes (HIP SDK, ComfyUI, LM Studio, manual) a profile can name.
+    Runtimes,
     /// Run the pre-flight sequence for a profile without launching.
     Check { profile_id: String },
     /// Pre-flight then launch a profile; waits for readiness.
@@ -118,6 +120,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Scan => cmd_scan(&cfg, cli.json),
         Cmd::Devices { build } => cmd_devices(&cfg, build.as_deref(), cli.json),
         Cmd::Profiles => cmd_profiles(&cfg, cli.json),
+        Cmd::Runtimes => cmd_runtimes(&cfg, cli.json),
         Cmd::Check { profile_id } => cmd_check(&cfg, &platform, &profile_id, cli.json),
         Cmd::Launch { profile_id, override_blocks, ready_timeout } => {
             cmd_launch(&cfg, &platform, &profile_id, override_blocks, ready_timeout)
@@ -136,6 +139,30 @@ fn main() -> anyhow::Result<()> {
             cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag)
         }
     }
+}
+
+// -------------------------------------------------------------- runtimes ----
+
+fn cmd_runtimes(cfg: &Config, json: bool) -> anyhow::Result<()> {
+    let all = llamactl_core::runtime::discover(cfg);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&all)?);
+        return Ok(());
+    }
+    println!("{:<34} {:<9} {:<9} {:<5} {}", "NAME", "SOURCE", "VERSION", "OK", "DIRS");
+    for r in &all {
+        println!(
+            "{:<34} {:<9} {:<9} {:<5} {}{}",
+            r.name,
+            r.source,
+            r.version.as_deref().unwrap_or("-"),
+            if r.available { "yes" } else { "NO" },
+            r.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(" ; "),
+            if r.is_default { "   <- default" } else { "" }
+        );
+    }
+    println!("\nselect per profile with \"rocm_runtime\": \"<name>\"; change the default with config.default_runtime.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------- update ----

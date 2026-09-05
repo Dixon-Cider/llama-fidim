@@ -2,8 +2,10 @@
   import { api } from "../api.js";
 
   let rows = $state([]);
+  let runtimes = $state([]);
   let loading = $state(false);
   let error = $state("");
+  api("list_runtimes").then((r) => (runtimes = r)).catch(() => {});
 
   async function load(refresh) {
     loading = true;
@@ -75,3 +77,23 @@
   ~ identical-name correlation by bus order — verified at launch by per-process residency ·
   display attached = compositing can consume VRAM and preempt compute (R-06)
 </p>
+
+<h2 style="margin-top: 18px;">ROCm runtimes <span class="sub">DLL search paths a profile can launch against; discovered from the HIP SDK, ComfyUI, LM Studio, and config</span></h2>
+<div class="card" style="padding: 0; overflow-x: auto;">
+  <table class="grid">
+    <thead><tr><th>Name</th><th>Source</th><th>Version</th><th>Available</th><th>Directories</th></tr></thead>
+    <tbody>
+      {#each runtimes as r}
+        <tr>
+          <td class="mono">{r.name}{#if r.is_default} <span class="chip accent">default</span>{/if}</td>
+          <td>{r.source}</td>
+          <td class="mono">{r.version ?? "—"}</td>
+          <td>{#if r.available}<span class="chip pass">yes</span>{:else}<span class="chip block">missing</span>{/if}</td>
+          <td class="mono faint" style="font-size: 10.5px;">{r.dirs.join(" ; ")}</td>
+        </tr>
+      {:else}
+        <tr><td colspan="5"><div class="empty">No runtimes discovered</div></td></tr>
+      {/each}
+    </tbody>
+  </table>
+</div>

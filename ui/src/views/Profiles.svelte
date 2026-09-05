@@ -3,6 +3,7 @@
 
   let profiles = $state([]);
   let devices = $state([]);
+  let runtimes = $state([]);
   let selectedId = $state(null);
   let draft = $state(null); // deep-copied profile being edited
   let check = $state(null); // live_check result
@@ -14,9 +15,14 @@
   const GIB = 1024 * 1024 * 1024;
 
   async function load() {
-    const [p, d] = await Promise.all([api("list_profiles"), api("devices", { refresh: false })]);
+    const [p, d, r] = await Promise.all([
+      api("list_profiles"),
+      api("devices", { refresh: false }),
+      api("list_runtimes").catch(() => []),
+    ]);
     profiles = p;
     devices = d.map((r) => r.device);
+    runtimes = r;
     if (!selectedId && profiles.length) select(profiles[0].profile.id);
   }
   load();
@@ -36,7 +42,7 @@
       build: { path: "", version: null },
       model: { path: "", mmproj: null, draft: null },
       devices: first ? [{ key: first.stable_key, split_fraction: null, resolved_index_last_launch: null }] : [],
-      split_mode: null, main_device: 0,
+      split_mode: null, main_device: 0, rocm_runtime: null,
       server: { port: 9710, alias: "new-profile", host: "127.0.0.1" },
       runtime: {
         n_gpu_layers: 99, ctx_total: 32768, slots: 1, kv_type_k: "f16", kv_type_v: "f16",
@@ -248,6 +254,20 @@
         <div class="formgrid" style="margin-top: 10px;">
           <label class="field" style="grid-column: span 3;"><span class="k">build path</span><input bind:value={draft.build.path} oninput={scheduleCheck} /></label>
           <label class="field" style="grid-column: span 3;"><span class="k">model path</span><input bind:value={draft.model.path} oninput={scheduleCheck} /></label>
+        </div>
+        <div class="formgrid" style="margin-top: 10px;">
+          <label class="field" style="grid-column: span 3;">
+            <span class="k">ROCm runtime</span>
+            <select bind:value={draft.rocm_runtime} onchange={scheduleCheck}>
+              <option value={null}>config default ({runtimes.find((r) => r.is_default)?.name ?? "default"}{runtimes.find((r) => r.is_default)?.version ? ` · ${runtimes.find((r) => r.is_default).version}` : ""})</option>
+              {#each runtimes.filter((r) => !r.is_default) as r}
+                <option value={r.name} disabled={!r.available}>{r.name}{r.version ? ` · ${r.version}` : ""}{r.available ? "" : " (missing)"}</option>
+              {/each}
+            </select>
+          </label>
+          <div class="faint" style="grid-column: span 3; font-size: 11px; align-self: end;">
+            DLL search path the server launches with. Benched 2026-09-02: 7.1 vs 7.14 identical for llama.cpp; leave on default unless a build needs otherwise.
+          </div>
         </div>
       </div>
 
