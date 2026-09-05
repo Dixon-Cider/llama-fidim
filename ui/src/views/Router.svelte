@@ -149,7 +149,7 @@
             <td class="mono">{p.server.alias || p.id}</td>
             <td class="faint" style="font-size: 11.5px;">{base(p.model.path)}</td>
             <td class="mono faint" style="font-size: 10.5px;">{p.devices.map((d) => d.key.split(":").pop()).join(", ")}</td>
-            <td>{#if isMember(p.id)}<input type="checkbox" style="width: auto;" bind:checked={member(p.id).load_on_startup} onchange={preview} />{/if}</td>
+            <td>{#if isMember(p.id)}<input type="checkbox" style="width: auto;" checked={member(p.id)?.load_on_startup ?? false} onchange={(e) => { member(p.id).load_on_startup = e.target.checked; preview(); }} />{/if}</td>
           </tr>
         {/each}
       </tbody>
