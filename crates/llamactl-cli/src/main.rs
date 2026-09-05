@@ -1266,7 +1266,7 @@ fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
             vec![live::sample(&r.state.host, r.state.port, None)]
         };
         let busy: f64 = util.iter().filter(|u| u.pid == r.state.pid).map(|u| u.percent).sum();
-        rows.push((r, samples, busy.clamp(0.0, 100.0)));
+        rows.push((r, samples, if busy <= 0.0 { 0.0 } else { busy.min(100.0) }));
     }
     if json {
         let v: Vec<serde_json::Value> = rows.iter().map(|(r, s, b)| serde_json::json!({ "run": r, "samples": s, "gpu_busy_percent": b })).collect();
