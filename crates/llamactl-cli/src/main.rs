@@ -579,6 +579,26 @@ fn cmd_check(
     println!("pre-flight for {profile_id}:");
     print_results(&results);
     if let Some(est) = &prepared.context.estimate {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        println!("\n  VRAM estimate: {:.2} GiB total", est.total_bytes as f64 / GIB);
+        for d in &est.per_device {
+            let free = prepared
+                .context
+                .resolved
+                .iter()
+                .find(|r| r.device.stable_key == d.key)
+                .map(|r| r.device.free_mib as f64 / 1024.0);
+            println!(
+                "    {}: {:.2} GiB = weights {:.2} + kv {:.2} + compute {:.2} + overhead {:.2}{}",
+                d.key.rsplit(':').next().unwrap_or(&d.key),
+                d.total_bytes as f64 / GIB,
+                d.weights_bytes as f64 / GIB,
+                d.kv_bytes as f64 / GIB,
+                d.compute_bytes as f64 / GIB,
+                d.overhead_bytes as f64 / GIB,
+                free.map(|f| format!("  (free {f:.2} GiB, {:.0}%)", 100.0 * d.total_bytes as f64 / GIB / f)).unwrap_or_default()
+            );
+        }
         println!("\n  estimate assumptions:");
         for a in &est.assumptions {
             println!("    - {a}");

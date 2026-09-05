@@ -114,6 +114,15 @@ pub struct GgufHeader {
     /// Prediction head (Qwen 3.5+, DeepSeek V3). > 0 = `--spec-type draft-mtp`
     /// works without a separate draft file.
     pub nextn_predict_layers: Option<u64>,
+    /// Hybrid linear/full attention (`<arch>.full_attention_interval`, e.g.
+    /// Qwen 3.5+/3.8 = 4): only every Nth layer keeps a KV cache; the others
+    /// are Gated-DeltaNet/SSM layers with a small fixed recurrent state.
+    pub full_attention_interval: Option<u64>,
+    /// Recurrent-state geometry for those layers (`<arch>.ssm.*`).
+    pub ssm_inner_size: Option<u64>,
+    pub ssm_state_size: Option<u64>,
+    pub ssm_conv_kernel: Option<u64>,
+    pub ssm_group_count: Option<u64>,
     pub block_count: Option<u64>,
     pub context_length: Option<u64>,
     pub embedding_length: Option<u64>,
@@ -203,6 +212,11 @@ pub fn read_header(path: &Path) -> Result<GgufHeader> {
         nextn_predict_layers: arch_key("nextn_predict_layers").or_else(|| {
             metadata.iter().find(|(k, _)| k.ends_with(".nextn_predict_layers")).and_then(|(_, v)| v.as_u64())
         }),
+        full_attention_interval: arch_key("full_attention_interval"),
+        ssm_inner_size: arch_key("ssm.inner_size"),
+        ssm_state_size: arch_key("ssm.state_size"),
+        ssm_conv_kernel: arch_key("ssm.conv_kernel"),
+        ssm_group_count: arch_key("ssm.group_count"),
         block_count: arch_key("block_count"),
         context_length: arch_key("context_length"),
         embedding_length: arch_key("embedding_length"),
