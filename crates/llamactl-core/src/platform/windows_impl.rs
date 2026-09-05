@@ -94,6 +94,10 @@ impl Platform for WindowsPlatform {
         })
     }
 
+    fn gpu_utilization(&self) -> Result<Vec<super::GpuEngineUtil>> {
+        pdh_gpu_utilization()
+    }
+
     fn gpu_process_memory(&self, pid: u32) -> Result<Vec<GpuProcessMem>> {
         pdh_gpu_process_memory(pid)
     }
@@ -303,6 +307,78 @@ fn pdh_counter_by_luid(pid: u32, counter_name: &str) -> Result<Vec<(u64, u64)>> 
         close(query);
         Ok(out)
     }
+}
+
+/// `\GPU Engine(pid_*)\Utilization Percentage` for every process, summed
+/// per (pid, adapter). A rate counter: two collections ~300 ms apart.
+fn pdh_gpu_utilization() -> Result<Vec<super::GpuEngineUtil>> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Performance::{
+        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+        PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
+    };
+    let counter_path = "\\GPU Engine(pid_*)\\Utilization Percentage";
+    let wide: Vec<u16> = counter_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut acc: std::collections::BTreeMap<(u32, u64), f64> = std::collections::BTreeMap::new();
+    unsafe {
+        let mut query = 0isize;
+        if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != 0 {
+            return Err(Error::Platform("PdhOpenQuery failed".into()));
+        }
+        let close = |q: isize| {
+            let _ = PdhCloseQuery(q);
+        };
+        let mut counter = 0isize;
+        if PdhAddEnglishCounterW(query, PCWSTR(wide.as_ptr()), 0, &mut counter) != 0 {
+            close(query);
+            return Ok(Vec::new());
+        }
+        if PdhCollectQueryData(query) != 0 {
+            close(query);
+            return Ok(Vec::new());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if PdhCollectQueryData(query) != 0 {
+            close(query);
+            return Ok(Vec::new());
+        }
+        let mut buf_size = 0u32;
+        let mut item_count = 0u32;
+        let _ = PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut buf_size, &mut item_count, None);
+        if buf_size == 0 {
+            close(query);
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; buf_size as usize];
+        let status = PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut buf_size,
+            &mut item_count,
+            Some(buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W),
+        );
+        if status == 0 {
+            let items = std::slice::from_raw_parts(
+                buf.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W,
+                item_count as usize,
+            );
+            for item in items {
+                let name = item.szName.to_string().unwrap_or_default();
+                let pid = name.strip_prefix("pid_").and_then(|r| r.split('_').next()).and_then(|p| p.parse::<u32>().ok());
+                if let (Some(pid), Some(luid)) = (pid, parse_luid_low(&name)) {
+                    let v = item.FmtValue.Anonymous.doubleValue;
+                    if v.is_finite() && v > 0.0 {
+                        *acc.entry((pid, luid)).or_insert(0.0) += v;
+                    }
+                }
+            }
+        }
+        close(query);
+    }
+    Ok(acc
+        .into_iter()
+        .map(|((pid, luid_low), percent)| super::GpuEngineUtil { pid, luid_low, percent: percent.clamp(0.0, 100.0) })
+        .collect())
 }
 
 /// `pid_3864_luid_0x00000000_0x0001B592_phys_0` → 0x1B592.

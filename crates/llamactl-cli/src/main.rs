@@ -78,6 +78,8 @@ enum Cmd {
     CreatorDefaults { model_path: PathBuf },
     /// Parse one GGUF header and report what the scanner would see (and how long it took).
     Gguf { path: PathBuf },
+    /// One-shot live view: phase, progress and throughput of every running server.
+    Live,
     /// One OpenAI-compatible port serving every member profile (llama-server router mode).
     Router {
         #[command(subcommand)]
@@ -185,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             supervise::run_keepalive(&host, port, interval, server_pid);
             Ok(())
         }
+        Cmd::Live => cmd_live(&cfg, cli.json),
         Cmd::Router { cmd } => cmd_router(&cfg, cli.json, cmd),
         Cmd::Gguf { path } => {
             let t = std::time::Instant::now();
@@ -1241,5 +1244,64 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
         RouterCmd::Load { model_id } => { router::load_model(&rc.host, rc.port, &model_id)?; println!("loading {model_id}"); }
         RouterCmd::Unload { model_id } => { router::unload_model(&rc.host, rc.port, &model_id)?; println!("unloaded {model_id}"); }
     }
+    Ok(())
+}
+
+// ------------------------------------------------------------------ live ----
+
+fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
+    use llamactl_core::live;
+    let platform = WindowsPlatform;
+    let util = platform.gpu_utilization().unwrap_or_default();
+    let mut rows = Vec::new();
+    for r in supervise::reattach(&cfg.runs_dir).into_iter().filter(|r| r.alive) {
+        let samples: Vec<live::LiveSample> = if r.state.profile_id == llamactl_core::router::ROUTER_ID {
+            llamactl_core::router::models(&r.state.host, r.state.port)
+                .unwrap_or_default()
+                .iter()
+                .filter(|m| m.status == "loaded")
+                .map(|m| live::sample(&r.state.host, r.state.port, Some(&m.id)))
+                .collect()
+        } else {
+            vec![live::sample(&r.state.host, r.state.port, None)]
+        };
+        let busy: f64 = util.iter().filter(|u| u.pid == r.state.pid).map(|u| u.percent).sum();
+        rows.push((r, samples, busy.clamp(0.0, 100.0)));
+    }
+    if json {
+        let v: Vec<serde_json::Value> = rows.iter().map(|(r, s, b)| serde_json::json!({ "run": r, "samples": s, "gpu_busy_percent": b })).collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    for (r, samples, busy) in &rows {
+        println!("{:<16} :{:<5} pid {:<6} gpu busy {:>5.1}%", r.state.profile_id, r.state.port, r.state.pid, busy);
+        for s in samples {
+            let m = &s.metrics;
+            let g = |k: &str| m.get(k).copied().unwrap_or(0.0);
+            let busy_slots = s.slots.iter().filter(|x| x.is_processing).count();
+            println!(
+                "  {:<24} {:<8} slots {}/{}  in-flight {}  queued {}  last decode {:.1} tok/s  last prompt {:.0} tok/s{}",
+                s.model.as_deref().unwrap_or("(standalone)"),
+                s.phase,
+                busy_slots,
+                s.slots.len(),
+                g("requests_processing"),
+                g("requests_deferred"),
+                g("predicted_tokens_seconds"),
+                g("prompt_tokens_seconds"),
+                if g("spec_decode_num_draft_tokens_total") > 0.0 {
+                    format!("  draft acceptance {:.0}%", 100.0 * g("spec_decode_num_accepted_tokens_total") / g("spec_decode_num_draft_tokens_total"))
+                } else { String::new() }
+            );
+            for x in s.slots.iter().filter(|x| x.is_processing) {
+                match x.phase.as_str() {
+                    "prefill" => println!("    slot {} prefill {}/{} tokens ({:.0}%)", x.id, x.n_prompt_tokens_processed, x.n_prompt_tokens, 100.0 * x.prefill_fraction),
+                    _ => println!("    slot {} decode {} generated, {} remain, ctx {:.0}%", x.id, x.n_decoded, x.n_remain, 100.0 * x.ctx_fraction),
+                }
+            }
+            if let Some(e) = &s.error { println!("    ({e})"); }
+        }
+    }
+    if rows.is_empty() { println!("nothing running"); }
     Ok(())
 }
