@@ -17,7 +17,15 @@ pub struct Config {
     /// Directories scanned recursively for `*.gguf`.
     pub model_roots: Vec<PathBuf>,
     /// Prepended to PATH when invoking llama-server (HIP runtime DLLs).
+    /// Listed as the `default` runtime; profiles that name no runtime use it.
     pub rocm_bin: Option<PathBuf>,
+    /// Name of the runtime used when a profile names none (see
+    /// `runtime::discover`). None = `default` = `rocm_bin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_runtime: Option<String>,
+    /// Extra runtimes declared by hand, on top of the auto-discovered ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtimes: Vec<crate::runtime::ManualRuntime>,
     /// Device names matching any of these substrings are classified as
     /// integrated graphics. APU marketing names carry no model suffix.
     #[serde(default = "default_igpu_patterns")]
@@ -72,6 +80,8 @@ impl Config {
             )],
             model_roots: vec![PathBuf::from(r"E:\models")],
             rocm_bin: Some(PathBuf::from(r"C:\Program Files\AMD\ROCm\7.1\bin")),
+            default_runtime: None,
+            runtimes: Vec::new(),
             integrated_name_patterns: default_igpu_patterns(),
             profile_dir: dir.join("profiles"),
             runs_dir: dir.join("runs"),

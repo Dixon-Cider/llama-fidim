@@ -184,7 +184,19 @@ pub fn enumerate_devices(
     server_exe: &Path,
     platform: &dyn Platform,
 ) -> Result<Vec<Device>> {
-    let listed_text = run_capture(server_exe, &["--list-devices"], cfg.rocm_bin.as_deref())?;
+    enumerate_devices_with(cfg, server_exe, platform, cfg.rocm_bin.as_deref())
+}
+
+/// `enumerate_devices` against a specific runtime search path (a profile's
+/// chosen ROCm runtime). hipInfo correlation still comes from the system
+/// SDK, which is the only runtime that ships it.
+pub fn enumerate_devices_with(
+    cfg: &Config,
+    server_exe: &Path,
+    platform: &dyn Platform,
+    runtime_path: Option<&Path>,
+) -> Result<Vec<Device>> {
+    let listed_text = run_capture(server_exe, &["--list-devices"], runtime_path)?;
     let listed = devices::parse_list_devices(&listed_text)?;
     let adapters = platform.video_adapters()?;
     let hipinfo = cfg
@@ -243,12 +255,16 @@ pub struct PrepareInputs {
 impl PrepareInputs {
     pub fn gather(cfg: &Config, profile: &Profile, platform: &dyn Platform) -> Result<Self> {
         let server_exe = profile.build.path.join("bin").join("llama-server.exe");
+        // Probe and enumerate with the runtime this profile will launch
+        // under, so a backend that only loads against one runtime is judged
+        // against that one.
+        let runtime_path = crate::runtime::path_prepend(cfg, profile.rocm_runtime.as_deref())?;
         let build_version_output =
-            run_capture(&server_exe, &["--version"], cfg.rocm_bin.as_deref())
+            run_capture(&server_exe, &["--version"], runtime_path.as_deref())
                 .ok()
                 .filter(|t| discovery::parse_version_output(t).is_some());
         let devices_now = if build_version_output.is_some() {
-            enumerate_devices(cfg, &server_exe, platform)?
+            enumerate_devices_with(cfg, &server_exe, platform, runtime_path.as_deref())?
         } else {
             Vec::new()
         };
@@ -368,16 +384,21 @@ pub fn prepare_with_inputs(
 
     // Driver/SDK now vs baseline (check 11).
     let driver_now = resolved.iter().find_map(|r| r.device.driver_version.clone());
-    let sdk_now = sdk_version(cfg.rocm_bin.as_deref());
+    let runtime = crate::runtime::resolve(cfg, profile.rocm_runtime.as_deref())?;
+    // SDK identity for the baseline fingerprint: hipconfig where the runtime
+    // has one (the HIP SDK), else the runtime's name + version.
+    let sdk_now = sdk_version(runtime.dirs.first().map(|p| p.as_path())).or_else(|| {
+        Some(format!("{}{}", runtime.name, runtime.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default()))
+    });
     let baseline = profile.baseline.as_ref();
     let driver_baseline =
         baseline.and_then(|b| b.get("driver")).and_then(|v| v.as_str()).map(String::from);
     let sdk_baseline =
         baseline.and_then(|b| b.get("sdk")).and_then(|v| v.as_str()).map(String::from);
 
-    let plan = compose(profile, &resolved);
-    let mut plan = plan;
-    plan.path_prepend = cfg.rocm_bin.clone();
+    let mut plan = compose(profile, &resolved);
+    // One or more dirs joined with `;` — everything downstream just prepends it.
+    plan.path_prepend = runtime.path_prepend();
 
     let context = LaunchContext {
         profile: profile.clone(),

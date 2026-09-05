@@ -605,6 +605,13 @@ async fn update_rollback() -> Result<serde_json::Value, String> {
     .await
 }
 
+/// ROCm runtimes a profile can name. Filesystem probing only.
+#[tauri::command]
+fn list_runtimes() -> Result<serde_json::Value, String> {
+    let cfg = cfg()?;
+    serde_json::to_value(llamactl_core::runtime::discover(&cfg)).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn update_history() -> Result<serde_json::Value, String> {
     let h = update::load_history().map_err(|e| e.to_string())?;
@@ -637,6 +644,7 @@ pub fn run() {
             update_promote,
             update_rollback,
             update_history,
+            list_runtimes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running llamactl UI");

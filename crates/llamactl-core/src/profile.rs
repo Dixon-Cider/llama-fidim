@@ -27,6 +27,9 @@ pub struct Profile {
     /// Index into `devices[]`, in remapped visibility-pinned order (R-13).
     #[serde(default)]
     pub main_device: u32,
+    /// Named ROCm runtime (see `runtime::discover`); None = config default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rocm_runtime: Option<String>,
     pub server: ServerCfg,
     pub runtime: Runtime,
     #[serde(default)]
