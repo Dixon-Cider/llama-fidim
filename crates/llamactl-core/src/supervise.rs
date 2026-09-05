@@ -204,15 +204,7 @@ pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<
         .map_err(|e| Error::Platform(format!("send {addr}: {e}")))?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).ok(); // best-effort: server may cut the stream
-    let text = String::from_utf8_lossy(&buf);
-    let status = text
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| Error::Platform(format!("no HTTP status from {addr}")))?;
-    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
-    Ok((status, body))
+    parse_response(&buf, &addr)
 }
 
 /// POST with a JSON body — used by the generation probe and the benchmark
@@ -244,15 +236,59 @@ pub fn http_post_json(
         .map_err(|e| Error::Platform(format!("send {addr}: {e}")))?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).ok();
-    let text = String::from_utf8_lossy(&buf);
-    let status = text
+    parse_response(&buf, &addr)
+}
+
+/// Split a raw HTTP/1.1 response into (status, body). Decodes
+/// `Transfer-Encoding: chunked` — llama-server (and the router proxy)
+/// chunk anything beyond a few KB, and a `/slots` body for 8 slots crosses
+/// a chunk boundary, which left a hex chunk-size line in the middle of the
+/// JSON ("expected ident at column 3940" on the Running tab, 2026-09-05).
+fn parse_response(buf: &[u8], addr: &str) -> Result<(u16, String)> {
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let (head, body) = match split {
+        Some(i) => (&buf[..i], &buf[i + 4..]),
+        None => (buf, &buf[buf.len()..]),
+    };
+    let head = String::from_utf8_lossy(head);
+    let status = head
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| Error::Platform(format!("no HTTP status from {addr}")))?;
-    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
-    Ok((status, body))
+    let chunked = head.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.trim_start().starts_with("transfer-encoding:") && l.contains("chunked")
+    });
+    let body = if chunked { dechunk(body) } else { body.to_vec() };
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// Concatenate the data of a chunked body. Tolerant: a truncated or
+/// malformed stream yields whatever was decoded so far.
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    loop {
+        let Some(nl) = b.windows(2).position(|w| w == b"\r\n") else { break };
+        let line = String::from_utf8_lossy(&b[..nl]);
+        let size_hex = line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else { break };
+        b = &b[nl + 2..];
+        if size == 0 {
+            break;
+        }
+        if b.len() < size {
+            out.extend_from_slice(b);
+            break;
+        }
+        out.extend_from_slice(&b[..size]);
+        b = &b[size..];
+        if b.starts_with(b"\r\n") {
+            b = &b[2..];
+        }
+    }
+    out
 }
 
 /// Clear the inherit flag on this process's own stdin/stdout/stderr before
@@ -449,6 +485,20 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("ok"));
         t.join().unwrap();
+    }
+
+    #[test]
+    fn chunked_bodies_are_reassembled() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n7\r\n[{\"id\":\r\n3;ext=1\r\n0}]\r\n0\r\n\r\n";
+        let (status, body) = parse_response(raw, "x").unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "[{\"id\":0}]");
+        // Content-Length bodies pass through untouched.
+        let (_, body) = parse_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}", "x").unwrap();
+        assert_eq!(body, "{}");
+        // Truncated chunk: keep what arrived rather than failing the poll.
+        let (_, body) = parse_response(b"HTTP/1.1 200 OK\r\ntransfer-encoding: Chunked\r\n\r\n10\r\n[{\"id\"", "x").unwrap();
+        assert_eq!(body, "[{\"id\"");
     }
 
     #[test]
