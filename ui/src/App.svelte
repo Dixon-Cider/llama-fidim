@@ -19,6 +19,10 @@
     { id: "settings", label: "Settings", component: Settings },
   ];
   let active = $state("devices");
+  // Any uncaught error in the web view goes to ~/.llamactl/ui.log; a thrown
+  // template expression otherwise just leaves the view half-updated.
+  window.addEventListener("error", (e) => log(`uncaught: ${e.message} @ ${e.filename}:${e.lineno} ${e.error?.stack ?? ""}`));
+  window.addEventListener("unhandledrejection", (e) => log(`unhandled rejection: ${e.reason?.stack ?? String(e.reason)}`));
 
   // Boot diagnostics: one line in ~/.llamactl/ui.log saying what the GUI can
   // see, so an empty picker can be diagnosed without a debugger.
