@@ -878,7 +878,7 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                     "run": r,
                     "samples": samples,
                     "resident": resident,
-                    "gpu_busy_percent": busy.clamp(0.0, 100.0),
+                    "gpu_busy_percent": if busy <= 0.0 { 0.0 } else { busy.min(100.0) },
                 })
             })
             .collect();
