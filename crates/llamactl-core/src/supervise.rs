@@ -45,6 +45,10 @@ pub struct RunState {
     /// its full `estimated_bytes` counts against a subsequent launch.
     #[serde(default)]
     pub ready: bool,
+    /// PID of the keep-alive helper (`llamactl keepalive`) started for this
+    /// run, if any. Killed by `stop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_pid: Option<u32>,
 }
 
 /// Bytes reserved by runs that are alive but not yet finished loading.
@@ -172,6 +176,7 @@ pub fn spawn(
         cold_start,
         estimated_bytes,
         ready: false,
+        keepalive_pid: None,
     };
     state.save(runs_dir)?;
     Ok(state)
@@ -368,6 +373,12 @@ pub fn process_alive(pid: u32) -> bool {
 /// Stop a server. llama-server has no shutdown endpoint; on Windows a
 /// process-tree terminate is the clean stop (§04 clean-stop requirement).
 pub fn stop(state: &RunState, runs_dir: &Path) -> Result<()> {
+    if let Some(kp) = state.keepalive_pid {
+        let mut k = std::process::Command::new("taskkill");
+        k.args(["/PID", &kp.to_string(), "/F"]);
+        crate::launch::hide_console(&mut k);
+        let _ = k.output();
+    }
     let mut cmd = std::process::Command::new("taskkill");
     cmd.args(["/PID", &state.pid.to_string(), "/T", "/F"]);
     crate::launch::hide_console(&mut cmd);
@@ -483,6 +494,7 @@ mod tests {
             cold_start: false,
             estimated_bytes: 20 * 1024 * 1024 * 1024,
             ready: true,
+            keepalive_pid: None,
         };
         state.save(&dir).unwrap();
         let attached = reattach(&dir);
@@ -490,5 +502,94 @@ mod tests {
         assert_eq!(attached[0].state.alias, "worker");
         assert!(attached[0].crashed, "pid 1234 should not be our live process");
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+
+// ---------------------------------------------------------------- keep-alive ----
+
+/// The CLI binary that hosts the `keepalive` loop: `llamactl.exe` beside the
+/// running executable (the GUI ships next to it), or the executable itself.
+pub fn keepalive_exe() -> Option<std::path::PathBuf> {
+    let me = std::env::current_exe().ok()?;
+    if me.file_name().is_some_and(|n| n.eq_ignore_ascii_case("llamactl.exe")) {
+        return Some(me);
+    }
+    let sibling = me.parent()?.join("llamactl.exe");
+    sibling.is_file().then_some(sibling)
+}
+
+/// Arguments for the helper process (kept separate so they are testable).
+pub fn keepalive_args(host: &str, port: u16, interval_s: u32, server_pid: u32) -> Vec<String> {
+    vec![
+        "keepalive".into(),
+        "--host".into(),
+        host.into(),
+        "--port".into(),
+        port.to_string(),
+        "--interval".into(),
+        interval_s.to_string(),
+        "--server-pid".into(),
+        server_pid.to_string(),
+    ]
+}
+
+/// Start the detached keep-alive helper for a ready run and record its PID
+/// in the run state. Why: with no lit display an idle adapter is powered
+/// down and WDDM evicts every allocation first (measured 2026-09-05: 25.6 GB
+/// gone within 20 s of the monitors switching off; a 1-token request every
+/// 5 s held it for the full test). `interval_s == 0` = disabled.
+pub fn spawn_keepalive(state: &mut RunState, runs_dir: &Path, interval_s: u32) -> Result<Option<u32>> {
+    if interval_s == 0 {
+        return Ok(None);
+    }
+    let exe = keepalive_exe().ok_or_else(|| {
+        Error::Platform("keep-alive helper llamactl.exe not found beside the running executable".into())
+    })?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(keepalive_args(&state.host, state.port, interval_s, state.pid))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        stop_inheriting_std_handles();
+    }
+    let child = cmd.spawn().map_err(|e| Error::Platform(format!("spawn keep-alive: {e}")))?;
+    state.keepalive_pid = Some(child.id());
+    state.save(runs_dir)?;
+    Ok(Some(child.id()))
+}
+
+/// The keep-alive loop itself (runs inside `llamactl keepalive`). Exits when
+/// the server process is gone. Request failures are ignored: a busy or
+/// restarting server is not a reason to stop trying.
+pub fn run_keepalive(host: &str, port: u16, interval_s: u32, server_pid: u32) {
+    let body = serde_json::json!({ "prompt": "hi", "n_predict": 1, "cache_prompt": false });
+    let interval = Duration::from_secs(interval_s.max(1) as u64);
+    loop {
+        std::thread::sleep(interval);
+        if !process_alive(server_pid) {
+            return;
+        }
+        let _ = http_post_json(host, port, "/completion", &body.to_string(), Duration::from_secs(120));
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_args_round_trip() {
+        let a = keepalive_args("127.0.0.1", 1234, 5, 42);
+        assert_eq!(
+            a,
+            ["keepalive", "--host", "127.0.0.1", "--port", "1234", "--interval", "5", "--server-pid", "42"]
+        );
     }
 }

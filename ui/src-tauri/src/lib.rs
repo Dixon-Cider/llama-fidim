@@ -324,7 +324,7 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         override_blocks,
     )
     .map_err(|e| e.to_string())?;
-    let state = supervise::spawn(
+    let mut state = supervise::spawn(
         &prepared.plan,
         &profile,
         &cfg.runs_dir,
@@ -338,6 +338,12 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         .map_err(|e| e.to_string())?;
     supervise::record_model_loaded(&Config::config_dir(), &profile.model.path)
         .map_err(|e| e.to_string())?;
+    let ka = profile.keep_alive_seconds.unwrap_or(cfg.keep_alive_seconds);
+    let keepalive = match supervise::spawn_keepalive(&mut state, &cfg.runs_dir, ka) {
+        Ok(Some(kp)) => serde_json::json!({ "interval_s": ka, "pid": kp }),
+        Ok(None) => serde_json::json!({ "interval_s": 0 }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    };
 
     // Placement verification (committed proves placement; dedicated fills on
     // first inference).
@@ -370,6 +376,7 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         "state": state,
         "cold_start": cold,
         "placement": placement,
+        "keepalive": keepalive,
     }))
 }
 

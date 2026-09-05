@@ -50,6 +50,11 @@ pub struct Config {
     /// (`HF_TOKEN` in the environment takes precedence).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_token: Option<String>,
+    /// Default keep-alive interval for launched servers (seconds; 0 = off).
+    /// A 1-token request this often stops WDDM from evicting the model when
+    /// the displays power off. 5 s measured sufficient; eviction starts <15 s.
+    #[serde(default = "default_keep_alive")]
+    pub keep_alive_seconds: u32,
     /// Preserved unknown fields from newer schema versions.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -57,6 +62,10 @@ pub struct Config {
 
 fn default_igpu_patterns() -> Vec<String> {
     vec!["Radeon(TM) Graphics".into()]
+}
+
+fn default_keep_alive() -> u32 {
+    5
 }
 
 impl Config {
@@ -95,6 +104,7 @@ impl Config {
                 r"C:\Users\me\Documents\Claude\Projects\llamactl\scripts\build-from-tag.bat",
             )),
             hf_token: None,
+            keep_alive_seconds: default_keep_alive(),
             extra: serde_json::Map::new(),
         }
     }

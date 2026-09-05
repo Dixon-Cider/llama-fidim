@@ -39,6 +39,18 @@ enum Cmd {
     CreatorDefaults { model_path: PathBuf },
     /// Parse one GGUF header and report what the scanner would see (and how long it took).
     Gguf { path: PathBuf },
+    /// (internal) keep a server's VRAM resident: 1-token request every --interval s until --server-pid exits.
+    #[command(hide = true)]
+    Keepalive {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "5")]
+        interval: u32,
+        #[arg(long)]
+        server_pid: u32,
+    },
     /// Run the pre-flight sequence for a profile without launching.
     Check { profile_id: String },
     /// Pre-flight then launch a profile; waits for readiness.
@@ -125,6 +137,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::Devices { build } => cmd_devices(&cfg, build.as_deref(), cli.json),
         Cmd::Profiles => cmd_profiles(&cfg, cli.json),
         Cmd::Runtimes => cmd_runtimes(&cfg, cli.json),
+        Cmd::Keepalive { host, port, interval, server_pid } => {
+            supervise::run_keepalive(&host, port, interval, server_pid);
+            Ok(())
+        }
         Cmd::Gguf { path } => {
             let t = std::time::Instant::now();
             let h = gguf::read_header(&path)?;
@@ -694,6 +710,13 @@ fn cmd_launch(
     supervise::wait_ready_in(&state, Duration::from_secs(ready_timeout), Some(&cfg.runs_dir))?;
     println!("ready.");
     supervise::record_model_loaded(&Config::config_dir(), &profile.model.path)?;
+    let mut state = state;
+    let ka = profile.keep_alive_seconds.unwrap_or(cfg.keep_alive_seconds);
+    match supervise::spawn_keepalive(&mut state, &cfg.runs_dir, ka) {
+        Ok(Some(kp)) => println!("  keep-alive every {ka} s (pid {kp}) - VRAM stays resident when the displays power off"),
+        Ok(None) => println!("  keep-alive off - the model WILL be evicted from VRAM when the displays power off"),
+        Err(e) => println!("  keep-alive NOT started: {e}"),
+    }
     verify_residency(platform, &state, &prepared);
     Ok(())
 }
@@ -814,7 +837,11 @@ fn cmd_status(cfg: &Config, deep: bool, json: bool) -> anyhow::Result<()> {
     for r in &runs {
         let health = match (&r.crashed, &r.health) {
             (true, _) => "CRASHED (state file kept; see log)".into(),
-            (false, Health::Healthy) => "healthy".to_string(),
+            (false, Health::Healthy) => match r.state.keepalive_pid {
+                Some(kp) if supervise::process_alive(kp) => "healthy + keep-alive".to_string(),
+                Some(_) => "healthy, keep-alive DIED".to_string(),
+                None => "healthy".to_string(),
+            },
             (false, Health::RespondingNotGenerating) => "responding but NOT generating".into(),
             (false, Health::Dead) => "dead (process alive, HTTP down)".into(),
         };

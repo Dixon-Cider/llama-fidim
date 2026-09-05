@@ -30,6 +30,12 @@ pub struct Profile {
     /// Named ROCm runtime (see `runtime::discover`); None = config default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rocm_runtime: Option<String>,
+    /// Keep-alive interval in seconds: a 1-token request this often keeps
+    /// the adapter busy so WDDM never evicts the model when the displays
+    /// power off (measured 2026-09-05: evicted within 20 s without it).
+    /// None = config default; 0 = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_seconds: Option<u32>,
     pub server: ServerCfg,
     pub runtime: Runtime,
     #[serde(default)]

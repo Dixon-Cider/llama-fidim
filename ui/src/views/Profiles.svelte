@@ -23,6 +23,8 @@
 
   let loadErrors = $state([]); // [name, message] for anything that failed to load
   let loading = $state(true);
+  let keepAliveDefault = $state(5);
+  api("get_config").then((c) => (keepAliveDefault = c.config?.keep_alive_seconds ?? 5)).catch(() => {});
 
   async function load() {
     loading = true;
@@ -128,6 +130,7 @@
     p.runtime.threads ??= null;
     p.runtime.cache_reuse ??= null;
     p.rocm_runtime ??= null;
+    p.keep_alive_seconds ??= null;
     for (const k of ["temperature", "top_p", "top_k", "min_p", "dry_multiplier", "repeat_penalty", "presence_penalty"])
       p.sampling[k] ??= null;
     p.chat.enable_thinking ??= null;
@@ -230,6 +233,9 @@
       r[k] = Number(r[k]) || 0;
     r.cache_reuse = numOrNull(r.cache_reuse);
     r.threads = numOrNull(r.threads);
+    copy.keep_alive_seconds = numOrNull(copy.keep_alive_seconds);
+    if (copy.keep_alive_seconds === null) delete copy.keep_alive_seconds;
+    else copy.keep_alive_seconds = Math.round(copy.keep_alive_seconds);
     if (copy.speculative) {
       const sp = copy.speculative;
       sp.n_max = numOrNull(sp.n_max); sp.n_min = numOrNull(sp.n_min); sp.p_min = numOrNull(sp.p_min);
@@ -384,7 +390,8 @@
         const place = (r.placement ?? [])
           .map((p) => `${(Math.max(p.dedicated_bytes ?? 0, p.committed_bytes ?? 0) / GIB).toFixed(1)} GiB on ${p.key.split(":").pop()}`)
           .join(", ");
-        toastMsg(`Launched pid ${r.state.pid} on port ${r.state.port}${r.cold_start ? " (cold cache)" : ""} — ${place}`);
+        const ka = r.keepalive?.pid ? ` · keep-alive ${r.keepalive.interval_s}s` : r.keepalive?.error ? ` · keep-alive FAILED: ${r.keepalive.error}` : " · keep-alive off";
+        toastMsg(`Launched pid ${r.state.pid} on port ${r.state.port}${r.cold_start ? " (cold cache)" : ""} — ${place}${ka}`);
       }
     } catch (e) {
       toastMsg(String(e), true);
@@ -619,6 +626,9 @@
       <div class="card">
         <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Advanced</div>
         <div class="formgrid">
+          <Range bind:value={draft.keep_alive_seconds} label="keep model resident (keep-alive, seconds)" min={0} max={30} step={1} nullable placeholder={keepAliveDefault}
+            hint={`config default ${keepAliveDefault} s · 0 = off`} onchange={scheduleCheck} span={3}
+            title="A 1-token request this often keeps the GPU busy so Windows never powers the adapter down and evicts the model to system RAM when the displays switch off. Measured 2026-09-05: evicted within 20 s without it, held for the whole test with 5 s. Costs ~70 ms of GPU time per ping." />
           <Range bind:value={draft.runtime.threads} label="CPU thread pool size" title="-t: CPU threads for layers not offloaded and for tokenisation. Irrelevant when everything is on the GPU." min={1} max={32} step={1} nullable placeholder={8}
             hint="only matters for layers left on CPU" onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse (min chunk)" title="--cache-reuse: reuse KV cache for a prompt that shares a prefix with a previous one, in chunks of at least this many tokens. 0 = off." min={0} max={2048} step={32} nullable placeholder={256}
