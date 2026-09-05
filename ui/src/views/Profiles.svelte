@@ -1,5 +1,5 @@
 <script>
-  import { api } from "../api.js";
+  import { api, log } from "../api.js";
   import Range from "../components/Range.svelte";
 
   let profiles = $state([]);
@@ -114,12 +114,18 @@
 
   // ---- selection / new / duplicate ---------------------------------------
   function select(id) {
-    selectedId = id;
-    const row = profiles.find((r) => r.profile.id === id);
-    draft = row ? withDefaults(JSON.parse(JSON.stringify(row.profile))) : null;
-    check = null;
-    creator = null;
-    scheduleCheck();
+    try {
+      selectedId = id;
+      const row = profiles.find((r) => r.profile.id === id);
+      draft = row ? withDefaults(JSON.parse(JSON.stringify(row.profile))) : null;
+      check = null;
+      creator = null;
+      log(`select ${id}: model=${base(draft?.model?.path)} build=${draft?.build?.version} ctx=${draft?.runtime?.ctx_total} slots=${draft?.runtime?.slots} kv=${draft?.runtime?.kv_type_k} spec=${draft?.speculative?.mode} port=${draft?.server?.port}`);
+      scheduleCheck();
+    } catch (e) {
+      log(`select ${id} FAILED: ${e?.stack ?? String(e)}`);
+      toastMsg(`could not load profile ${id}: ${String(e)}`, true);
+    }
   }
 
   function withDefaults(p) {
@@ -733,15 +739,15 @@
           </label>
           <div style="grid-column: span 3;"></div>
           <Range bind:value={draft.sampling.temperature} label="temperature" title="Randomness of sampling. 0 = greedy, 1 = the model's raw distribution. Creator default shown as the hint when known." min={0} max={2} step={0.05} nullable placeholder={creatorShown?.temperature ?? 0.8}
-            hint={creatorShown?.temperature != null ? `creator: ${creator.temperature}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+            hint={creatorShown?.temperature != null ? `creator: ${creatorShown.temperature}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.sampling.top_k} label="top K sampling" title="Keep only the K most likely tokens before sampling. 0 = disabled." min={0} max={200} step={1} nullable placeholder={creatorShown?.top_k ?? 40}
-            hint={creatorShown?.top_k != null ? `creator: ${creator.top_k}` : "0 = off"} onchange={scheduleCheck} span={3} />
+            hint={creatorShown?.top_k != null ? `creator: ${creatorShown.top_k}` : "0 = off"} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.sampling.top_p} label="top P sampling" title="Nucleus sampling: keep the smallest set of tokens whose probabilities sum to P." min={0} max={1} step={0.01} nullable placeholder={creatorShown?.top_p ?? 0.95}
-            hint={creatorShown?.top_p != null ? `creator: ${creator.top_p}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+            hint={creatorShown?.top_p != null ? `creator: ${creatorShown.top_p}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.sampling.min_p} label="min P sampling" title="Drop tokens whose probability is below P × the top token's probability. Stronger and more stable than top-p at high temperature." min={0} max={1} step={0.01} nullable placeholder={creatorShown?.min_p ?? 0.05}
-            hint={creatorShown?.min_p != null ? `creator: ${creator.min_p}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+            hint={creatorShown?.min_p != null ? `creator: ${creatorShown.min_p}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.sampling.repeat_penalty} label="repeat penalty" title="Multiplicative penalty on tokens already seen in the context. 1.0 = off; 1.1 is a common mild setting." min={1} max={2} step={0.01} nullable placeholder={creatorShown?.repetition_penalty ?? 1.0}
-            hint={creatorShown?.repetition_penalty != null ? `creator: ${creator.repetition_penalty}` : "1.0 = off"} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+            hint={creatorShown?.repetition_penalty != null ? `creator: ${creatorShown.repetition_penalty}` : "1.0 = off"} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.sampling.presence_penalty} label="presence penalty" title="Flat penalty on any token that has appeared at all. 0 = off." min={0} max={2} step={0.05} nullable placeholder={0}
             hint="0 = off" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.sampling.dry_multiplier} label="DRY multiplier" title="DRY (Don't Repeat Yourself) sampler strength: penalises repeating whole sequences, not single tokens. 0 = off." min={0} max={2} step={0.05} nullable placeholder={0}
