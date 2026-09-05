@@ -150,12 +150,41 @@ pub fn estimate(input: &EstimateInput) -> VramEstimate {
     let kv_estimable = block_count > 0
         && (0..block_count as usize).all(|i| kv_heads_for(i).is_some())
         && (k_dim + v_dim) > 0;
+    // Hybrid architectures (Qwen 3.5+/3.8, Qwen3-Next): only every Nth layer
+    // is full attention with a KV cache; the rest are linear-attention
+    // layers whose state is fixed per slot regardless of context —
+    // llama.cpp's n_embd_r + n_embd_s, in f32:
+    //   r = (conv_kernel - 1) x (inner + 2 x groups x state)
+    //   s = state x inner
+    let full_interval = h.full_attention_interval.unwrap_or(0);
+    let is_recurrent = |layer: usize| full_interval > 1 && (layer as u64 + 1) % full_interval != 0;
+    let recurrent_bytes_per_slot: f64 = if full_interval > 1 {
+        let inner = h.ssm_inner_size.unwrap_or(0) as f64;
+        let state = h.ssm_state_size.unwrap_or(0) as f64;
+        let conv = h.ssm_conv_kernel.unwrap_or(1) as f64;
+        let groups = h.ssm_group_count.unwrap_or(1) as f64;
+        ((conv - 1.0).max(0.0) * (inner + 2.0 * groups * state) + state * inner) * 4.0
+    } else {
+        0.0
+    };
+    if full_interval > 1 {
+        assumptions.push(format!(
+            "hybrid attention: KV cache on every {full_interval}th layer only; the other layers hold a fixed \
+             {:.1} MiB recurrent state per slot",
+            recurrent_bytes_per_slot / (1024.0 * 1024.0)
+        ));
+    }
+
     let kv_total = if !kv_estimable {
         assumptions.push("attention metadata incomplete; KV cache not estimable — treating as 0, DO NOT trust for tight fits".into());
         0u64
     } else {
         let mut total = 0.0f64;
         for layer in 0..block_count as usize {
+            if is_recurrent(layer) {
+                total += recurrent_bytes_per_slot * slots as f64;
+                continue;
+            }
             let heads = kv_heads_for(layer).unwrap_or(0) as f64;
             let (dims, tokens) = if sliding_for(layer) && window > 0 {
                 ((k_dim_swa + v_dim_swa) as f64, swa_tokens as f64)
