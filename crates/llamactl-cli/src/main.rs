@@ -678,6 +678,20 @@ fn cmd_launch(
         prepared.context.resolved.iter().map(|r| r.device.stable_key.clone()).collect();
     let free_before: Vec<u64> =
         prepared.context.resolved.iter().map(|r| r.device.free_mib).collect();
+    // Port takeover (check 8 warned): a llamactl server on this port is
+    // stopped first so the new model answers on the same well-known port.
+    if let Some(h) = &prepared.context.port_holder {
+        if h.profile_id.is_some() {
+            if let Some(run) = supervise::reattach(&cfg.runs_dir)
+                .into_iter()
+                .find(|r| r.alive && r.state.port == profile.server.port)
+            {
+                supervise::stop(&run.state, &cfg.runs_dir)?;
+                println!("stopped {} (pid {}) to take over port {}", run.state.profile_id, run.state.pid, profile.server.port);
+                launch::wait_port_free(&profile.server.host, profile.server.port, Duration::from_secs(20))?;
+            }
+        }
+    }
     let cold_start = supervise::is_cold_start(&Config::config_dir(), &profile.model.path);
     if cold_start {
         println!(

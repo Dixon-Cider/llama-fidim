@@ -39,6 +39,15 @@ impl CheckResult {
     }
 }
 
+/// The process listening on a profile's port, when it is not free.
+#[derive(Debug, Clone, Serialize)]
+pub struct PortHolder {
+    pub pid: Option<u32>,
+    pub process_name: Option<String>,
+    /// Set when the holder is a live llamactl run (from its state file).
+    pub profile_id: Option<String>,
+}
+
 /// A device the launch path resolved from a profile key.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedDevice {
@@ -73,7 +82,10 @@ pub struct LaunchContext {
     pub visibility_env: String,
     /// Aliases of currently-running servers.
     pub running_aliases: Vec<String>,
-    pub port_free: bool,
+    /// Who holds the requested port. None = free. A holder with a
+    /// `profile_id` is one of llamactl's own servers (launch takes the port
+    /// over by stopping it first); anything else is foreign and blocks.
+    pub port_holder: Option<PortHolder>,
     /// Driver/SDK now vs the profile baseline's recorded versions.
     pub driver_now: Option<String>,
     pub driver_baseline: Option<String>,
@@ -373,13 +385,27 @@ fn check_commit(ctx: &LaunchContext) -> CheckResult {
     }
 }
 
+/// Check 8. Serving every model on one well-known port is the normal way
+/// to use this box (clients point at :1234 regardless of which model is
+/// up), so a llamactl server already on the port is a Warn and launch
+/// replaces it. Only a process llamactl does not know blocks.
 fn check_port(ctx: &LaunchContext) -> CheckResult {
-    let outcome = if ctx.port_free {
-        Outcome::Pass
-    } else {
-        Outcome::Block(format!("port {} is already in use", ctx.profile.server.port))
+    let port = ctx.profile.server.port;
+    let pid = |h: &PortHolder| h.pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+    let outcome = match &ctx.port_holder {
+        None => Outcome::Pass,
+        Some(h) if h.profile_id.is_some() => Outcome::Warn(format!(
+            "port {port} is serving llamactl profile `{}`{} — launching stops that server first and takes the port over",
+            h.profile_id.as_deref().unwrap_or("?"),
+            pid(h)
+        )),
+        Some(h) => Outcome::Block(format!(
+            "port {port} is in use by {}{} — not a llamactl server; stop it or pick another port",
+            h.process_name.as_deref().unwrap_or("an unknown process"),
+            pid(h)
+        )),
     };
-    CheckResult { id: "port-free", spec_number: 8, title: "Requested port is free", outcome }
+    CheckResult { id: "port-free", spec_number: 8, title: "Requested port is free or held by a llamactl server", outcome }
 }
 
 fn check_alias(ctx: &LaunchContext) -> CheckResult {
@@ -563,13 +589,28 @@ mod tests {
             inflight_reserved_bytes: 0,
             visibility_env: "2".into(),
             running_aliases: vec![],
-            port_free: true,
+            port_holder: None,
             driver_now: Some("32.0.31035.1003".into()),
             driver_baseline: None,
             sdk_now: None,
             sdk_baseline: None,
             pcie_aspm: Some(0),
         }
+    }
+
+    #[test]
+    fn port_held_by_our_server_warns_and_foreign_blocks() {
+        let mut ctx = healthy_ctx();
+        ctx.port_holder = Some(PortHolder { pid: Some(7), process_name: Some("llama-server.exe".into()), profile_id: Some("daily-driver".into()) });
+        let r = run_all(&ctx);
+        let port = r.iter().find(|c| c.id == "port-free").unwrap();
+        assert!(matches!(port.outcome, Outcome::Warn(_)), "{port:?}");
+        assert!(!any_block(&r));
+        ctx.port_holder = Some(PortHolder { pid: Some(8), process_name: Some("LM Studio.exe".into()), profile_id: None });
+        let r = run_all(&ctx);
+        let port = r.iter().find(|c| c.id == "port-free").unwrap();
+        assert!(matches!(port.outcome, Outcome::Block(_)), "{port:?}");
+        assert!(any_block(&r));
     }
 
     #[test]

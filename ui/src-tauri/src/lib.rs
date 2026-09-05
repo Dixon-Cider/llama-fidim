@@ -316,6 +316,21 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         prepared.context.resolved.iter().map(|r| r.device.stable_key.clone()).collect();
     let free_before: Vec<u64> =
         prepared.context.resolved.iter().map(|r| r.device.free_mib).collect();
+    // Port takeover (check 8 warned): stop the llamactl server on this port first.
+    let mut replaced: Option<String> = None;
+    if let Some(h) = &prepared.context.port_holder {
+        if h.profile_id.is_some() {
+            if let Some(run) = supervise::reattach(&cfg.runs_dir)
+                .into_iter()
+                .find(|r| r.alive && r.state.port == profile.server.port)
+            {
+                supervise::stop(&run.state, &cfg.runs_dir).map_err(|e| e.to_string())?;
+                launch::wait_port_free(&profile.server.host, profile.server.port, Duration::from_secs(20))
+                    .map_err(|e| e.to_string())?;
+                replaced = Some(run.state.profile_id.clone());
+            }
+        }
+    }
     let cold = supervise::is_cold_start(&Config::config_dir(), &profile.model.path);
     launch::final_commit_gate(
         &cfg,
@@ -377,6 +392,7 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         "cold_start": cold,
         "placement": placement,
         "keepalive": keepalive,
+        "replaced": replaced,
     }))
 }
 
