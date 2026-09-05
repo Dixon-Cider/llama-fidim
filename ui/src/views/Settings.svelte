@@ -56,6 +56,7 @@
     out.integrated_name_patterns = unlines(igpuText);
     for (const k of ["rocm_bin", "install_root", "llama_cpp_source", "source_build_script", "hf_token", "default_runtime"])
       if (out[k] === "" || out[k] === undefined) out[k] = null;
+    out.keep_alive_seconds = Math.max(0, Math.round(Number(out.keep_alive_seconds) || 0));
     if (out.default_runtime === "default") out.default_runtime = null;
     let manual = [];
     if (manualRuntimesText.trim()) manual = JSON.parse(manualRuntimesText);
@@ -164,6 +165,10 @@
       <label class="field" style="grid-column: span 3;" title={HINTS.integrated_name_patterns}>
         <span class="k">iGPU name patterns (one per line)</span>
         <textarea rows="2" bind:value={igpuText}></textarea>
+      </label>
+      <label class="field" style="grid-column: span 3;" title="Default for new launches: a 1-token request every N seconds keeps the GPU busy so Windows never powers the adapter down and evicts the model to RAM when the displays switch off. 0 = off. Profiles can override.">
+        <span class="k">keep-alive interval (seconds, 0 = off)</span>
+        <input type="number" min="0" max="60" bind:value={cfg.keep_alive_seconds} />
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.hf_token}>
         <span class="k">hugging face token (gated repos only)</span>
