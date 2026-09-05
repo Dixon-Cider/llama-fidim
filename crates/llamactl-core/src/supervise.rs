@@ -420,7 +420,7 @@ pub fn reattach(runs_dir: &Path) -> Vec<AttachedRun> {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&p) else { continue };
-        let Ok(state) = serde_json::from_str::<RunState>(&text) else { continue };
+        let Ok(state) = serde_json::from_str::<RunState>(text.trim_start_matches('\u{feff}')) else { continue };
         let alive = process_alive(state.pid);
         let health = if alive { probe_health(&state, false) } else { Health::Dead };
         out.push(AttachedRun { crashed: !alive, alive, health, state });
@@ -571,10 +571,20 @@ pub fn spawn_keepalive(state: &mut RunState, runs_dir: &Path, interval_s: u32) -
 pub fn run_keepalive(host: &str, port: u16, interval_s: u32, server_pid: u32) {
     let body = serde_json::json!({ "prompt": "hi", "n_predict": 1, "cache_prompt": false });
     let interval = Duration::from_secs(interval_s.max(1) as u64);
+    // `process_alive` shells out to tasklist; one hiccup there must not
+    // take the helper down with it. Only three consecutive "gone" verdicts
+    // end the loop.
+    let mut gone_streak = 0u32;
     loop {
         std::thread::sleep(interval);
-        if !process_alive(server_pid) {
-            return;
+        if process_alive(server_pid) {
+            gone_streak = 0;
+        } else {
+            gone_streak += 1;
+            if gone_streak >= 3 {
+                return;
+            }
+            continue;
         }
         let _ = http_post_json(host, port, "/completion", &body.to_string(), Duration::from_secs(120));
     }

@@ -79,6 +79,9 @@ pub struct LaunchContext {
     pub driver_baseline: Option<String>,
     pub sdk_now: Option<String>,
     pub sdk_baseline: Option<String>,
+    /// PCI Express Link State Power Management, AC index of the active power
+    /// plan: 0 = Off, 1 = Moderate, 2 = Maximum. None = could not read.
+    pub pcie_aspm: Option<u32>,
 }
 
 pub fn run_all(ctx: &LaunchContext) -> Vec<CheckResult> {
@@ -94,6 +97,7 @@ pub fn run_all(ctx: &LaunchContext) -> Vec<CheckResult> {
         check_alias(ctx),
         check_display(ctx),
         check_versions(ctx),
+        check_pcie_aspm(ctx),
     ]
 }
 
@@ -411,7 +415,7 @@ fn check_display(ctx: &LaunchContext) -> CheckResult {
     } else {
         Outcome::Warn(format!(
             "target device(s) driving a display: {} — desktop compositing has consumed 2.68 GB and \
-             preempted compute in the past; move the cable to the iGPU outputs for clean numbers",
+             preempted compute in the past; one display per compute card is deliberate on this box, so this is the accepted cost",
             driving.join(", ")
         ))
     };
@@ -419,6 +423,29 @@ fn check_display(ctx: &LaunchContext) -> CheckResult {
         id: "no-display",
         spec_number: 10,
         title: "No target device is driving a display",
+        outcome,
+    }
+}
+
+/// Check 12: PCI Express Link State Power Management must be Off. Measured
+/// 2026-09-05 on this box: with it at Moderate, an idle card whose display
+/// powers off has its whole allocation evicted to system RAM within 20 s
+/// (25.6 GB, 4-6 s to re-page); at Off the model stays resident with no
+/// traffic at all. The keep-alive helper masks this, so it is a Warn, but
+/// the setting is the actual fix.
+fn check_pcie_aspm(ctx: &LaunchContext) -> CheckResult {
+    let outcome = match ctx.pcie_aspm {
+        Some(0) => Outcome::Pass,
+        Some(n) => Outcome::Warn(format!(
+            "PCI Express Link State Power Management is {} — an idle card with its display off will be              evicted from VRAM into system RAM; set it to Off in the power plan (measured 2026-09-05).              or enable the keep-alive interval on this profile as a workaround.",
+            match n { 1 => "Moderate".to_string(), 2 => "Maximum power savings".to_string(), o => format!("index {o}") }
+        )),
+        None => Outcome::Note("PCI Express Link State Power Management could not be read (powercfg)".into()),
+    };
+    CheckResult {
+        id: "pcie-aspm-off",
+        spec_number: 12,
+        title: "PCIe link-state power management is Off",
         outcome,
     }
 }
@@ -541,13 +568,14 @@ mod tests {
             driver_baseline: None,
             sdk_now: None,
             sdk_baseline: None,
+            pcie_aspm: Some(0),
         }
     }
 
     #[test]
     fn healthy_context_passes_everything() {
         let results = run_all(&healthy_ctx());
-        assert_eq!(results.len(), 11);
+        assert_eq!(results.len(), 12);
         assert!(!any_block(&results), "{results:?}");
     }
 

@@ -628,7 +628,7 @@
         <div class="formgrid">
           <Range bind:value={draft.keep_alive_seconds} label="keep model resident (keep-alive, seconds)" min={0} max={30} step={1} nullable placeholder={keepAliveDefault}
             hint={`config default ${keepAliveDefault} s · 0 = off`} onchange={scheduleCheck} span={3}
-            title="A 1-token request this often keeps the GPU busy so Windows never powers the adapter down and evicts the model to system RAM when the displays switch off. Measured 2026-09-05: evicted within 20 s without it, held for the whole test with 5 s. Costs ~70 ms of GPU time per ping." />
+            title="Workaround, off by default: the eviction root cause is the PCIe Link State Power Management power setting (pre-flight check 12). Only if that cannot be Off: a 1-token request this often keeps the GPU busy so Windows never powers the adapter down. 5 s measured sufficient; ~70 ms of GPU time per ping." />
           <Range bind:value={draft.runtime.threads} label="CPU thread pool size" title="-t: CPU threads for layers not offloaded and for tokenisation. Irrelevant when everything is on the GPU." min={1} max={32} step={1} nullable placeholder={8}
             hint="only matters for layers left on CPU" onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse (min chunk)" title="--cache-reuse: reuse KV cache for a prompt that shares a prefix with a previous one, in chunks of at least this many tokens. 0 = off." min={0} max={2048} step={32} nullable placeholder={256}

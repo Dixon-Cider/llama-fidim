@@ -52,7 +52,9 @@ pub struct Config {
     pub hf_token: Option<String>,
     /// Default keep-alive interval for launched servers (seconds; 0 = off).
     /// A 1-token request this often stops WDDM from evicting the model when
-    /// the displays power off. 5 s measured sufficient; eviction starts <15 s.
+    /// the displays power off. OFF by default: the root cause is the PCIe
+    /// Link State Power Management setting (pre-flight check 12); turn this
+    /// on (5 s measured sufficient) only if that setting cannot be Off.
     #[serde(default = "default_keep_alive")]
     pub keep_alive_seconds: u32,
     /// Preserved unknown fields from newer schema versions.
@@ -65,7 +67,7 @@ fn default_igpu_patterns() -> Vec<String> {
 }
 
 fn default_keep_alive() -> u32 {
-    5
+    0
 }
 
 impl Config {
