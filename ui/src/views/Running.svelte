@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from "svelte";
-  import { fly, slide, fade, scale } from "svelte/transition";
+  import { fly, slide, fade } from "svelte/transition";
   import { flip } from "svelte/animate";
   import { api } from "../api.js";
   import { arrive, leave, flipParams, stagger, LAYOUT } from "../motion.js";
@@ -263,9 +263,7 @@
             {#if pts.length > 1}
               <path d={sparkArea(pts)} class="area" />
               <polyline points={sparkLine(pts)} class="line" />
-              {#key pts.length + ":" + pts[pts.length - 1][1].toFixed(0)}
-                <circle cx={pts[pts.length - 1][0]} cy={pts[pts.length - 1][1]} r="2.5" class="end" in:scale={{ duration: LAYOUT, start: 2.2 }} />
-              {/key}
+              <circle cx={pts[pts.length - 1][0]} cy={pts[pts.length - 1][1]} r="2.5" class="end" />
             {/if}
           </svg>
           <span class="l">decode tok/s · last 60 s{#if pts.length > 1} · peak {fmt1(Math.max(...spark[k]))}{/if}</span>
