@@ -29,7 +29,7 @@
     rocm_family: "GPU family for AMD's nightly ROCm index. Empty = guessed from your cards. RDNA4 (Radeon AI PRO R9700, RX 9000) is gfx120X-all; RDNA3 (RX 7000) is gfx110X-all; RDNA2 (RX 6000) is gfx103X-all; Strix Halo is gfx1151.",
     runtimes: "Runtimes added by hand, JSON list: [{\"name\":\"x\",\"dirs\":[\"C:\\\\a\\\\bin\"],\"version\":\"9.9\"}]",
     integrated_name_patterns: "Device names containing any of these count as integrated graphics.",
-    allow_integrated: "Let profiles bind integrated graphics. Off, pre-flight blocks it, because next to a discrete card an iGPU is a trap: it runs at a fraction of the speed and never errors. On an APU-only machine, or a Strix Halo with 96 GB of shared memory, turn this on.",
+    allow_integrated: "Let profiles bind integrated graphics. Off, pre-flight blocks it, because next to a discrete card an iGPU is a trap: it runs at a fraction of the speed and never errors. On an APU-only machine, or a Strix Halo with up to 96 GB of shared memory, turn this on.",
     keep_alive: "Off by default. VRAM eviction on idle comes from the PCIe Link State Power Management power setting; pre-flight check 12 warns when it is not Off. If it cannot be Off, a 1-token request every N seconds keeps the GPU awake. Profiles can override.",
     hf_token: "Hugging Face token, used only to read generation_config.json from gated repos. HF_TOKEN in the environment wins.",
   };

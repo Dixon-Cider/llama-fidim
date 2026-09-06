@@ -31,8 +31,8 @@ wrote the launcher we wanted.
   idle). Anything that would fail is blocked with a reason.
 - **One port for every model.** Router mode puts every profile behind one
   OpenAI-compatible endpoint. Clients keep one base URL and pick a model by
-  name; instances load on demand and the least recently used one is evicted
-  when the limit is reached.
+  name; with autoload on, instances start on the first request that names
+  them, and past the instance limit the least recently used one is unloaded.
 - **Live view.** Each running server, sampled once a second: per-slot phase
   and progress, decode and prefill tokens per second, requests in flight,
   speculative-decoding acceptance, GPU busy and VRAM held per card. Turn on
@@ -45,12 +45,16 @@ wrote the launcher we wanted.
   build in one click, roll back in one click.
 - **Benchmarks.** Serial and concurrent decode sweeps against a running
   server, stored per profile as its baseline.
-- **Everything the GUI does, the `fidim` CLI does too.**
+- **Nearly everything the GUI does, the `fidim` CLI does too.** The live
+  slot text and the profile editor are GUI only; profiles are plain JSON.
 
 ## Requirements
 
-- Windows 11 with a recent AMD Radeon card. Tested on RDNA4 (Radeon AI PRO
-  R9700); RDNA3 and RDNA2 cards are supported by the same ROCm builds.
+- Windows 11 with an AMD Radeon card that upstream's Windows ROCm build
+  targets: RDNA4 (RX 9000, Radeon AI PRO R9700), RDNA3 (RX 7000, W7000),
+  the RDNA3.5 APUs (Strix Point, Strix Halo) and RDNA2 (RX 6600 and up).
+  Tested here on two Radeon AI PRO R9700s. The 780M-class APUs are not in
+  that build. Windows 10 is untested.
 - An AMD driver. The HIP SDK is optional: the app can install ROCm
   runtimes from AMD itself.
 - To build from source: a Rust toolchain (stable, MSVC), Node 20 or newer
@@ -75,8 +79,9 @@ after pulling changes.
 
 1. Open **Settings** and add your model folder. If LM Studio is installed,
    its download folder is already there.
-2. Open **Updates** and install the latest llama.cpp build. If you have no
-   ROCm runtime, install one from the ROCm section on the same tab.
+2. Open **Updates**. If no ROCm runtime is listed, install one from the ROCm
+   section and press **Make default**. Then install the latest llama.cpp
+   build; its verification needs a runtime to load the HIP backend.
 3. Open **Profiles**, create one, pick a model and a card, and press
    **Save & load**. The Running tab shows it come up.
 
@@ -109,15 +114,17 @@ These came from real failures on real hardware and are deliberate:
 - **Devices bind by hardware key, not index.** ROCm's index order changes
   with driver updates and with which card has a monitor. A profile that
   said "device 1" would silently land on a different card.
-- **Every launch pins `HIP_VISIBLE_DEVICES`.** A server that sees every card
-  can spill onto one you did not choose.
+- **Every standalone launch pins `HIP_VISIBLE_DEVICES`.** A server that sees
+  every card can spill onto one you did not choose. The router cannot be
+  pinned that way, since one process serves models on different cards, so
+  each of its models gets an explicit `device` in the preset instead.
 - **VRAM residency is read per process from Windows, not from
   `--list-devices`.** WDDM virtualises VRAM, so free-memory deltas cannot
   see other processes.
 - **A display on a compute card is a warning.** Desktop compositing takes
-  VRAM and pre-empts compute. And the PCIe Link State Power Management
-  setting, when not Off, lets Windows evict a whole model from VRAM while a
-  card idles. Pre-flight checks both.
+  VRAM and pre-empts compute. And on the hardware we tested, the PCIe Link
+  State Power Management power setting, when not Off, let Windows evict a
+  whole model from VRAM while a card idled. Pre-flight checks both.
 - **Runtime selection is real.** Each runtime gets its own shim folder for
   DLLs a build imports under a different name, so picking a runtime means
   that runtime, not whatever is in the exe folder.

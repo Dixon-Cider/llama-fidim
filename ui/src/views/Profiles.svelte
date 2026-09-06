@@ -759,7 +759,7 @@
         <div class="formgrid">
           <Range bind:value={draft.runtime.batch_logical} label="evaluation batch size (-b)" title="-b: logical batch, the per-iteration token budget shared by prefill and decode." min={64} max={8192} step={64}
             hint="shared per-iteration budget" format={fmtInt} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.batch_physical} label="physical batch size (-ub)" title="-ub: micro-batch pushed through the GPU; sizes the compute buffer. Smaller is usually better at long context." min={32} max={2048} step={32}
+          <Range bind:value={draft.runtime.batch_physical} label="physical batch size (-ub)" title="-ub: micro-batch pushed through the GPU; sizes the compute buffer. 256 measured best on an R9700 at long context; larger buys prefill speed at short context." min={32} max={2048} step={32}
             hint="sizes the compute buffer" format={fmtInt} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse (min chunk)" title="--cache-reuse: reuse KV cache for a prompt that shares a prefix with a previous one, in chunks of at least this many tokens. 0 = off." min={0} max={2048} step={32} nullable placeholder={256}
             hint="--cache-reuse" onchange={scheduleCheck} span={3} />
@@ -774,7 +774,7 @@
               <option value="on">on</option><option value="off">off</option><option value="auto">auto</option>
             </select>
           </label>
-          <label class="field" title="Storage type of the attention key cache. q8_0 halves KV VRAM at no visible cost; q4_0 quarters it with some quality cost."><span class="k">K cache quant</span>
+          <label class="field" title="Storage type of the attention key cache. q8_0 halves KV VRAM with little visible cost; q4_0 quarters it with some quality cost."><span class="k">K cache quant</span>
             <select bind:value={draft.runtime.kv_type_k} onchange={scheduleCheck}>
               {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
             </select>
