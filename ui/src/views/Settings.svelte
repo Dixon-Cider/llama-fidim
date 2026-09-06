@@ -2,6 +2,8 @@
   import { api, log } from "../api.js";
   import PathList from "../components/PathList.svelte";
   import Range from "../components/Range.svelte";
+  import { scale, fade } from "svelte/transition";
+  import { LAYOUT } from "../motion.js";
 
   let cfg = $state(null);       // editable copy of config.json
   let path = $state("");
@@ -77,6 +79,7 @@
       saved = "Saved. Models, builds and devices will rescan.";
       log("settings saved");
       await load();
+      setTimeout(() => (saved = ""), 2500);
     } catch (e) { error = String(e); }
     saving = false;
   }
@@ -109,9 +112,9 @@
 {#if cfg}
   <div class="savebar">
     <span class="path">{path}</span>
-    {#if dirty}<span class="chip warn">unsaved changes</span>{/if}
-    {#if saved}<span class="chip pass">{saved}</span>{/if}
-    {#if error}<span class="chip block">{error}</span>{/if}
+    {#if saved}<span class="chip pass" in:scale={{ duration: LAYOUT, start: 0.7 }} out:fade={{ duration: LAYOUT }}>{saved}</span>
+    {:else if dirty}<span class="chip warn" in:scale={{ duration: LAYOUT, start: 0.7 }}>unsaved changes</span>{/if}
+    {#if error}<span class="chip block shake">{error}</span>{/if}
     <span style="margin-left: auto; display: flex; gap: 8px;">
       <button class="btn" onclick={load} disabled={saving}>Reload</button>
       <button class="btn primary" onclick={save} disabled={saving}>{saving ? "Saving…" : "Save settings"}</button>

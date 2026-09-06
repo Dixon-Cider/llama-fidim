@@ -1,6 +1,9 @@
 <script>
   import { api, log } from "../api.js";
   import Range from "../components/Range.svelte";
+  import { fly, fade, slide, scale } from "svelte/transition";
+  import { flip } from "svelte/animate";
+  import { arrive, leave, flipParams, toastFly, stagger, LAYOUT } from "../motion.js";
 
   let profiles = $state([]);
   let devices = $state([]);
@@ -16,6 +19,17 @@
   let creator = $state(null); // creator_defaults result or { error }
   let creatorBusy = $state(false);
   let checkTimer = null;
+  // Rows whose pre-flight outcome changed on the last check pulse once.
+  let changed = $state(new Set());
+  let prevKinds = new Map();
+  let changedTimer = null;
+  let savedFlash = $state(false);
+  let savedTimer = null;
+  function flashSaved() {
+    savedFlash = true;
+    if (savedTimer) clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => (savedFlash = false), 2200);
+  }
 
   const GIB = 1024 * 1024 * 1024;
   const fmtInt = (v) => Number(v).toLocaleString();
@@ -223,6 +237,15 @@
     checking = true;
     try {
       check = await api("live_check", { p: normalized(draft) });
+      const now = new Map((check?.results ?? []).map((r) => [r.id, outcomeKind(r.outcome)]));
+      const diff = new Set();
+      for (const [id, kind] of now) if (prevKinds.has(id) && prevKinds.get(id) !== kind) diff.add(id);
+      prevKinds = now;
+      if (diff.size) {
+        changed = diff;
+        if (changedTimer) clearTimeout(changedTimer);
+        changedTimer = setTimeout(() => (changed = new Set()), 900);
+      }
     } catch (e) {
       check = { error: String(e) };
     }
@@ -360,7 +383,7 @@
     busy = "save";
     try {
       await api("save_profile", { p: normalized(draft) });
-      toastMsg(`Saved ${draft.id}`);
+      flashSaved();
       await load();
       selectedId = draft.id;
     } catch (e) {
@@ -455,9 +478,9 @@
       <button class="btn small" onclick={rescan} disabled={busy === "scan"} title="rescan build and model roots">{busy === "scan" ? "…" : "Rescan"}</button>
     </div>
     <div class="rows">
-      {#each profiles as row}
+      {#each profiles as row, i (row.profile.id)}
         {@const p = row.profile}
-        <button class="row" class:active={selectedId === p.id} onclick={() => select(p.id)}>
+        <button class="row" class:active={selectedId === p.id} onclick={() => select(p.id)} in:fly={arrive(stagger(i, 30))} out:slide={leave} animate:flip={flipParams}>
           <div class="r1"><span class="id">{p.id}</span><span class="mono faint">:{p.server.port}</span></div>
           <div class="r2">{base(p.model.path) || "no model"}</div>
           <div class="r3">
@@ -483,7 +506,7 @@
       <div class="editbar">
         <div class="who">
           <span class="name">{draft.name || draft.id}</span>
-          <span class="meta"><span class="mono muted">{draft.id} · :{draft.server.port} · {draft.server.alias}</span>{#if !selectedId}<span class="chip accent">unsaved</span>{/if}
+          <span class="meta"><span class="mono muted">{draft.id} · :{draft.server.port} · {draft.server.alias}</span>{#if savedFlash}<span class="chip pass" in:scale={{ duration: LAYOUT, start: 0.7 }} out:fade={{ duration: LAYOUT }}>saved</span>{:else if !selectedId}<span class="chip accent" in:scale={{ duration: LAYOUT, start: 0.7 }}>unsaved</span>{/if}
           <span class="pfsum" title="pre-flight, re-run on every edit">
           {#if checking}<span class="chip plain live">checking</span>
           {:else if check?.error}<span class="chip block">check failed</span>
@@ -496,7 +519,7 @@
         </div>
         <div class="actions">
           <button class="btn primary" onclick={save} disabled={!!busy}>Save</button>
-          <button class="btn" onclick={() => launch(false)} disabled={!!busy || anyBlock}>{busy === "launch" ? "Loading…" : "Save & load"}</button>
+          <button class="btn" onclick={() => launch(false)} disabled={!!busy || anyBlock}>{#if busy === "launch"}<span class="spinner"></span> Loading…{:else}Save & load{/if}</button>
           {#if anyBlock}
             <button class="btn danger" onclick={() => launch(true)} disabled={!!busy}>Override blocks &amp; load</button>
           {/if}
@@ -807,7 +830,7 @@
       </section>
 
       {#if check?.findings?.length}
-        <section class="card">
+        <section class="card" transition:slide={leave}>
           <div class="sec">Findings <span class="faint">problems with the profile itself</span></div>
           {#each check.findings as f}
             <div class="notice" style="padding: 4px 0;">
@@ -828,10 +851,10 @@
         </div>
         {#if check?.results}
           <div class="preflight">
-            {#each check.results as r}
+            {#each check.results as r (r.id)}
               {@const kind = outcomeKind(r.outcome)}
               {@const msg = outcomeMsg(r.outcome)}
-              <div class="row">
+              <div class="row" class:pulse-once={changed.has(r.id)}>
                 <span class="n">{r.spec_number}</span>
                 <span class="t">{r.title}</span>
                 <span class="chip {kind}">{kind}</span>
@@ -872,7 +895,7 @@
 </div>
 
 {#if toast}
-  <div class="toast" class:error={toast.isError}>{toast.text}</div>
+  <div class="toast" class:error={toast.isError} transition:fly={toastFly}>{toast.text}</div>
 {/if}
 
 <style>

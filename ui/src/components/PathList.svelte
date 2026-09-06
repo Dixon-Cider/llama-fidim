@@ -1,4 +1,6 @@
 <script>
+  import { slide } from "svelte/transition";
+  import { leave } from "../motion.js";
   // A list of folders or patterns, one row each. Rows are plain inputs so
   // paths can be pasted; empty rows are dropped on save by the caller.
   let { value = $bindable([]), placeholder = "", addLabel = "Add folder", mono = true, onchange = () => {} } = $props();
@@ -9,7 +11,7 @@
 
 <div class="plist">
   {#each value as v, i}
-    <div class="prow">
+    <div class="prow" transition:slide={leave}>
       <input class:mono value={v} {placeholder} oninput={(e) => set(i, e.target.value)} spellcheck="false" />
       <button type="button" class="btn small" onclick={() => remove(i)} title="remove">×</button>
     </div>

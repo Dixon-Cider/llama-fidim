@@ -1,6 +1,8 @@
 <script>
   import { onDestroy } from "svelte";
   import { api, onEvent } from "../api.js";
+  import { fly, fade, slide } from "svelte/transition";
+  import { arrive, leave, stagger, LAYOUT } from "../motion.js";
 
   let check = $state(null);      // update_check result
   let checking = $state(false);
@@ -118,6 +120,17 @@
     } catch (e) { rocmError = String(e); }
   }
 
+  // Download progress out of the log lines the installers emit
+  // ("name: 123 / 745 MB"); the bar fills between files.
+  const progress = $derived.by(() => {
+    for (let i = log.length - 1; i >= 0; i--) {
+      const m = /: (\d+) \/ (\d+) MB/.exec(log[i]);
+      if (m) return Math.round((100 * Number(m[1])) / Math.max(1, Number(m[2])));
+      if (/MB complete|unpacking|extracted/.test(log[i])) return 100;
+    }
+    return null;
+  });
+
   function when(unix) {
     return unix ? new Date(unix * 1000).toLocaleString() : "—";
   }
@@ -150,7 +163,7 @@
       Build from source
     </button>
   {/if}
-  {#if error}<span class="chip block">{error}</span>{/if}
+  {#if error}<span class="chip block shake">{error}</span>{/if}
 </div>
 
 {#if check}
@@ -188,8 +201,8 @@
         <span class="faint">{check.changes.length} releases since {check.newest_installed?.version ?? "the start"}{check.changes_complete ? "" : ", newest 100 only"}</span>
       </div>
       <div class="changes">
-        {#each check.changes as c}
-          <div class="change">
+        {#each check.changes as c, i (c.tag)}
+          <div class="change" in:fly={arrive(stagger(i, 20))}>
             <span class="mono tag">{c.tag}</span>
             <span class="faint mono">{day(c.published_at)}</span>
             <span class="title">{c.title}</span>
@@ -201,7 +214,10 @@
 {/if}
 
 {#if installing || rocmBusy || log.length}
-  <div class="card">
+  <div class="card" transition:slide={leave}>
+    {#if (installing || rocmBusy) && progress != null}
+      <div class="meter" style="margin-bottom: 10px;"><div class="fill" style="width: {progress}%;"></div></div>
+    {/if}
     <div class="logbox" style="max-height: 220px; overflow: auto;">
       {#each log as line}<div class="mono">{line}</div>{/each}
       {#if (installing || rocmBusy) && !log.length}<div class="faint">starting…</div>{/if}
@@ -296,7 +312,7 @@
   <div class="sec">
     Installed
     <span class="faint">{runtimes.filter((r) => r.available).length} usable</span>
-    {#if rocmError}<span class="chip block">{rocmError}</span>{/if}
+    {#if rocmError}<span class="chip block shake">{rocmError}</span>{/if}
   </div>
   <table class="grid">
     <thead><tr><th>Runtime</th><th>Version</th><th>Source</th><th>State</th><th>Folder</th><th></th></tr></thead>
@@ -338,8 +354,8 @@
     <table class="grid">
       <thead><tr><th>Version</th><th>Channel</th><th>Family</th><th></th></tr></thead>
       <tbody>
-        {#each avail.runtimes as a, i}
-          <tr>
+        {#each avail.runtimes as a, i (a.channel + a.version)}
+          <tr in:fade={{ duration: LAYOUT, delay: stagger(i, 20) }}>
             <td class="mono">{a.version}{#if i === 0} <span class="chip pass">latest</span>{/if}</td>
             <td><span class="chip {a.channel === 'release' ? 'accent' : 'plain'}">{a.channel}</span></td>
             <td class="mono faint">{a.family ?? "all"}</td>
