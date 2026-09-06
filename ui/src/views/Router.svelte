@@ -1,6 +1,9 @@
 <script>
   import { onDestroy } from "svelte";
+  import { fade, fly, slide } from "svelte/transition";
+  import { flip } from "svelte/animate";
   import { api } from "../api.js";
+  import { leave, flipParams, toastFly, LAYOUT } from "../motion.js";
 
   let rc = $state(null);          // router config (editable)
   let profiles = $state([]);
@@ -97,7 +100,7 @@
   <span class="mono">models-max</span> loaded instances, the least recently used is evicted.
 </p>
 
-{#if error}<div class="card"><span class="chip block">error</span> <span class="mono">{error}</span></div>{/if}
+{#if error}<div class="card" transition:slide={leave}><span class="chip block shake">error</span> <span class="mono">{error}</span></div>{/if}
 
 {#if rc}
   <div class="card">
@@ -174,8 +177,8 @@
       <table class="grid">
         <thead><tr><th>Model id</th><th>Status</th><th></th></tr></thead>
         <tbody>
-          {#each models as m}
-            <tr>
+          {#each models as m (m.id)}
+            <tr in:fade={{ duration: LAYOUT }} animate:flip={flipParams}>
               <td class="mono">{m.id}</td>
               <td>
                 {#if m.status === "loaded"}<span class="chip pass">loaded</span>
@@ -205,4 +208,4 @@
   </div>
 {/if}
 
-{#if toast}<div class="toast" class:error={toast.isError}>{toast.text}</div>{/if}
+{#if toast}<div class="toast" class:error={toast.isError} transition:fly={toastFly}>{toast.text}</div>{/if}

@@ -1,5 +1,8 @@
 <script>
   import { api } from "../api.js";
+  import { fly } from "svelte/transition";
+  import { arrive, stagger } from "../motion.js";
+  import Skeleton from "../components/Skeleton.svelte";
 
   let rows = $state([]);
   let runtimes = $state([]);
@@ -34,14 +37,17 @@
 
 <div class="toolbar">
   <button class="btn" onclick={() => load(true)} disabled={loading}>{loading ? "Enumerating…" : "Re-enumerate"}</button>
-  {#if error}<span class="chip block">{error}</span>{/if}
+  {#if error}<span class="chip block shake">{error}</span>{/if}
 </div>
 
 <div class="tiles">
-  {#each rows as row}
+  {#if loading && !rows.length}
+    <Skeleton height="190px" /><Skeleton height="190px" /><Skeleton height="190px" />
+  {/if}
+  {#each rows as row, i (row.device.stable_key)}
     {@const d = row.device}
     {@const used = d.total_mib - d.free_mib}
-    <div class="tile" class:dim={d.integrated}>
+    <div class="tile" class:dim={d.integrated} in:fly={arrive(stagger(i, 60))}>
       <div class="head">
         <span class="mono chip {d.integrated ? 'plain' : 'accent'}">{d.backend}{d.hip_index}{d.correlation_assumed ? " ~" : ""}</span>
         <span class="name">{d.name}</span>

@@ -105,7 +105,8 @@
   .scale .end:first-child { left: 0; }
   .scale .end:nth-child(2) { right: 0; }
   .scale .end.hide { opacity: 0; }
-  .scale .cur { position: absolute; top: 0; transform: translateX(-50%); color: var(--ink); font-weight: 600; white-space: nowrap; }
+  .scale .cur { position: absolute; top: 0; transform: translateX(-50%); color: var(--ink); font-weight: 600; white-space: nowrap; transition: transform var(--t-fast), color var(--t-fast); }
+  input[type="range"]:active + .scale .cur { transform: translate(-50%, -3px) scale(1.1); color: var(--accent); }
   .scale .cur.off { left: 0 !important; transform: none; color: var(--ink-faint); font-weight: 400; }
   @media (prefers-reduced-motion: reduce) { input[type="range"]::-webkit-slider-thumb, .scale .end { transition: none; } }
 </style>

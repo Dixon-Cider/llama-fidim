@@ -1,9 +1,27 @@
 <script>
   import { onDestroy } from "svelte";
+  import { fly, slide, fade, scale } from "svelte/transition";
+  import { flip } from "svelte/animate";
   import { api } from "../api.js";
+  import { arrive, leave, flipParams, stagger, LAYOUT } from "../motion.js";
+  import CountUp from "../components/CountUp.svelte";
+  import Skeleton from "../components/Skeleton.svelte";
 
   let data = $state({ runs: [], cards: [] });
+  let loaded = $state(false);   // first poll landed: skeletons give way to content
   let error = $state("");
+  // Dismiss with a 3-second undo: the row leaves at once, the state file
+  // only goes when the chip times out.
+  let pending = $state(null);   // { id, timer }
+  function dismiss(id) {
+    if (pending) { clearTimeout(pending.timer); stop(pending.id); }
+    pending = { id, timer: setTimeout(async () => { const p = pending; pending = null; if (p) await stop(p.id); }, 3000) };
+  }
+  function undo() {
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pending = null;
+  }
   let paused = $state(false);
   let now = $state(Math.floor(Date.now() / 1000));
   // Per (run, model) history of counter samples for rates and sparklines.
@@ -56,9 +74,11 @@
         }
       }
       data = d;
+      loaded = true;
       error = "";
     } catch (e) {
       error = String(e);
+      loaded = true;
     }
   }
   poll();
@@ -138,21 +158,24 @@
 </h1>
 
 <div class="strip">
-  {#each data.cards as c}
+  {#if !loaded}
+    <Skeleton height="118px" /><Skeleton height="118px" />
+  {/if}
+  {#each data.cards as c, i (c.key)}
     {@const held = heldOn(c.key)}
     {@const total = c.total_mib * 1024 * 1024}
-    <div class="tile card-tile" class:hot={c.busy_percent > 50}>
+    <div class="tile card-tile" class:hot={c.busy_percent > 50} in:fly={arrive(stagger(i, 60))}>
       <div class="head">
         <span class="name">{c.name.replace(/^AMD /, "")}</span>
         <span class="mono faint">{short(c.key)}</span>
       </div>
       <div class="two">
         <div class="stat">
-          <span class="v">{Math.round(c.busy_percent)}<small>% busy</small></span>
+          <span class="v"><CountUp value={Math.round(c.busy_percent)} /><small>% busy</small></span>
           <span class="l">GPU engine, all processes</span>
         </div>
         <div class="stat">
-          <span class="v">{(held / GIB).toFixed(1)}<small>/ {(total / GIB).toFixed(0)} GiB</small></span>
+          <span class="v"><CountUp value={held / GIB} format={(v) => v.toFixed(1)} /><small>/ {(total / GIB).toFixed(0)} GiB</small></span>
           <span class="l">VRAM held by servers</span>
         </div>
       </div>
@@ -162,16 +185,23 @@
   <div class="strip-tools">
     <button class="btn" onclick={() => (paused = !paused)}>{paused ? "Resume" : "Pause"}</button>
     <span class="chip {paused ? 'plain' : 'pass live'}">{paused ? "paused" : "live · 1 Hz"}</span>
-    {#if error}<span class="chip block">{error}</span>{/if}
+    {#if error}<span class="chip block shake">{error}</span>{/if}
+    {#if pending}
+      <span class="chip warn" transition:fade={{ duration: LAYOUT }}>dismissed {pending.id} · <button class="link" onclick={undo}>undo</button></span>
+    {/if}
   </div>
 </div>
 
-{#each data.runs as row}
+{#if !loaded}
+  <Skeleton height="220px" />
+{/if}
+
+{#each data.runs.filter((x) => x.run.state.profile_id !== pending?.id) as row, ri (row.run.state.profile_id + ":" + row.run.state.port)}
   {@const r = row.run}
   {@const h = health(r)}
   {@const vram = row.resident.reduce((a, m) => a + Math.max(m.dedicated_bytes, m.committed_bytes), 0)}
   {@const phase = phaseOf(row.samples)}
-  <section class="server" class:crashed={r.crashed}>
+  <section class="server" class:crashed={r.crashed} in:fly={arrive(stagger(ri, 60))} out:slide={leave} animate:flip={flipParams}>
     <header class="server-head">
       <div class="who">
         <span class="title">{r.state.profile_id}</span>
@@ -187,17 +217,17 @@
         <span class="mono">pid {r.state.pid} · :{r.state.port} · {r.state.alias}</span>
       </div>
       {#if r.alive}<button class="btn danger" onclick={() => stop(r.state.profile_id)}>Stop</button>
-      {:else}<button class="btn" onclick={() => stop(r.state.profile_id)} title="forget this run; the log file stays">Dismiss</button>{/if}
+      {:else}<button class="btn" onclick={() => dismiss(r.state.profile_id)} title="forget this run; the log file stays">Dismiss</button>{/if}
     </header>
 
-    {#each row.samples as s}
+    {#each row.samples as s, si (key(r, s))}
       {@const k = key(r, s)}
       {@const rt = rates[k]}
       {@const m = s.metrics ?? {}}
       {@const pts = sparkPts(spark[k])}
       {@const busySlots = s.slots.filter((x) => x.is_processing).length}
       {@const hasDraft = (m.spec_decode_num_draft_tokens_total ?? 0) > 0}
-      <div class="model" class:active={s.phase !== "idle"}>
+      <div class="model" class:active={s.phase !== "idle"} in:fly={arrive(stagger(si, 40))} out:slide={leave} animate:flip={flipParams}>
         <div class="ident">
           <div class="model-name">{s.model ?? r.state.alias}</div>
           <span class="chip {phaseChip(s.phase)}">{s.phase}</span>
@@ -233,7 +263,9 @@
             {#if pts.length > 1}
               <path d={sparkArea(pts)} class="area" />
               <polyline points={sparkLine(pts)} class="line" />
-              <circle cx={pts[pts.length - 1][0]} cy={pts[pts.length - 1][1]} r="2.5" class="end" />
+              {#key pts.length + ":" + pts[pts.length - 1][1].toFixed(0)}
+                <circle cx={pts[pts.length - 1][0]} cy={pts[pts.length - 1][1]} r="2.5" class="end" in:scale={{ duration: LAYOUT, start: 2.2 }} />
+              {/key}
             {/if}
           </svg>
           <span class="l">decode tok/s · last 60 s{#if pts.length > 1} · peak {fmt1(Math.max(...spark[k]))}{/if}</span>
@@ -262,7 +294,7 @@
         </div>
 
         {#each s.slots.filter((x) => open[slotKey(k, x.id)]) as x (x.id)}
-          <div class="drawer" class:loop={!!x.loop_hint}>
+          <div class="drawer" class:loop={!!x.loop_hint} transition:slide={leave}>
             <div class="dhead">
               <span class="mono" style="font-weight: 700;">slot {x.id}</span>
               <span class="chip {phaseChip(x.phase)}">{x.phase}</span>
@@ -297,7 +329,7 @@
     </footer>
   </section>
 {:else}
-  <div class="card"><div class="empty">Nothing is running. Launch a profile, or start the router.</div></div>
+  {#if loaded}<div class="card" in:fade={{ duration: LAYOUT }}><div class="empty">Nothing is running. Launch a profile, or start the router.</div></div>{/if}
 {/each}
 
 {#if data.runs.some((x) => x.samples.length)}
@@ -372,7 +404,9 @@
   }
   .drawer.loop .pane:last-child pre { border-color: rgba(232, 125, 110, 0.5); color: var(--ink); }
   @media (max-width: 1100px) { .panes { grid-template-columns: 1fr; } }
-  .slot .fill { position: absolute; inset: 0 auto 0 0; transition: width .3s ease; }
+  .slot { transition: border-color var(--t-layout), background-color var(--t-layout), box-shadow var(--t-fast); }
+  .slot .fill { position: absolute; inset: 0 auto 0 0; transition: width .3s ease, background-color var(--t-layout); }
+  .slot .what { transition: color var(--t-layout); }
   .slot.prefill .fill { background: var(--warn-bg); box-shadow: inset -1px 0 0 var(--warn); }
   .slot.decode .fill { background: var(--accent-soft); box-shadow: inset -1px 0 0 var(--accent); }
   .slot.prefill { border-color: rgba(220, 176, 74, 0.55); }

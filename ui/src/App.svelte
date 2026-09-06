@@ -10,6 +10,8 @@
   import Settings from "./views/Settings.svelte";
   import Router from "./views/Router.svelte";
   import { api, log } from "./api.js";
+  import { fly } from "svelte/transition";
+  import { arrive } from "./motion.js";
 
   // Grouped by what the person is doing: operating servers, inspecting the
   // box, maintaining the tool.
@@ -33,6 +35,13 @@
   let active = $state("running");
   let alive = $state(0);
   let setup = $state(null); // { models, builds } from the boot scan; drives the first-run banner
+  // The active pill slides between nav items instead of appearing.
+  let btns = $state({});
+  let pill = $state(null);
+  $effect(() => {
+    const b = btns[active];
+    if (b) pill = { top: b.offsetTop, height: b.offsetHeight };
+  });
   // Any uncaught error in the web view goes to ~/.fidim/ui.log; a thrown
   // template expression otherwise just leaves the view half-updated.
   window.addEventListener("error", (e) => log(`uncaught: ${e.message} @ ${e.filename}:${e.lineno} ${e.error?.stack ?? ""}`));
@@ -79,12 +88,13 @@
 <div class="shell">
   <nav class="nav">
     <div class="brand">Llama <em>FIDIM</em><span class="dot" class:off={!inTauri} title={inTauri ? "connected to the Rust core" : "browser preview: mock data"}></span></div>
+    {#if pill}<div class="pill" style="top: {pill.top}px; height: {pill.height}px;"></div>{/if}
     {#each groups as g}
       <div class="group">{g.label}</div>
       {#each g.views as v}
-        <button class:active={active === v.id} onclick={() => (active = v.id)}>
+        <button class:active={active === v.id} onclick={() => (active = v.id)} bind:this={btns[v.id]}>
           {v.label}
-          {#if v.id === "running" && alive > 0}<span class="count">{alive}</span>{/if}
+          {#if v.id === "running" && alive > 0}{#key alive}<span class="count pop">{alive}</span>{/key}{/if}
         </button>
       {/each}
     {/each}
@@ -107,7 +117,9 @@
       </div>
     {/if}
     {#key active}
-      <ActiveComponent />
+      <div in:fly={arrive()}>
+        <ActiveComponent />
+      </div>
     {/key}
   </main>
 </div>
