@@ -585,10 +585,11 @@ fn pick_build<'b>(builds: &'b [Build], tag: Option<&str>) -> anyhow::Result<&'b 
             .iter()
             .find(|b| b.tag == t)
             .with_context(|| format!("no build tagged {t}")),
+        // Newest by release number: a string compare ranks b9817 above b10771.
         None => Ok(builds
             .iter()
             .filter(|b| b.version.is_some())
-            .max_by(|a, b| a.version.cmp(&b.version))
+            .max_by_key(|b| b.version.as_deref().and_then(fidim_core::update::version_number).unwrap_or(0))
             .unwrap_or(&builds[0])),
     }
 }

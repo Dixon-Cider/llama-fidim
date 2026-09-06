@@ -210,7 +210,15 @@ pub fn enumerate_devices(
     server_exe: &Path,
     platform: &dyn Platform,
 ) -> Result<Vec<Device>> {
-    enumerate_devices_with(cfg, server_exe, platform, cfg.rocm_bin.as_deref())
+    // Probe with the default runtime (and its shims) so the HIP backend
+    // loads the same way a launch would; the bare fallback folder is the
+    // last resort.
+    // An in-folder shim from an older install shadows whatever runtime is
+    // on PATH (the exe folder wins DLL resolution) and mixes two ROCm
+    // versions in one process; retire it before every probe.
+    crate::update::retire_build_shims(server_exe);
+    let prepend = crate::runtime::default_prepend(cfg, server_exe).or_else(|| cfg.rocm_bin.clone());
+    enumerate_devices_with(cfg, server_exe, platform, prepend.as_deref())
 }
 
 /// `enumerate_devices` against a specific runtime search path (a profile's

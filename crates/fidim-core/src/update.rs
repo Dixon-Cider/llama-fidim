@@ -349,6 +349,7 @@ pub struct Verify {
 /// runtime and backend DLLs, exactly like every pre-flight does; allocates
 /// nothing on the GPU.
 pub fn verify_build(exe: &Path, rocm_bin: Option<&Path>) -> Verify {
+    retire_build_shims(exe);
     let mut v = Verify { version: None, commit: None, devices: vec![], hip_ok: false, detail: String::new() };
     match run_capture(exe, &["--version"], rocm_bin) {
         Ok(text) => match discovery::parse_version_output(&text) {

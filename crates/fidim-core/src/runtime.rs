@@ -234,10 +234,31 @@ pub fn discover(cfg: &Config) -> Vec<Runtime> {
 /// runtime therefore gets its own shim folder under `~/.fidim/shims/`,
 /// prepended ahead of its dirs, so the pick is honoured.
 pub fn shim_dir(rt: &Runtime, exe: &Path) -> Option<PathBuf> {
-    let bytes = std::fs::read(exe).ok()?;
     let dir = Config::config_dir().join("shims").join(&rt.name);
+    // Already built for this runtime: skip the import scan (it reads every
+    // DLL in the build folder, and ggml-hip.dll is large).
+    if std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
+        return Some(dir);
+    }
+    // The importer of a renamed library is the backend (ggml-hip.dll wants
+    // hipblas.dll), not the exe, so scan every binary beside the exe.
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(exe.parent()?).ok()?.flatten() {
+        let p = entry.path();
+        let is_bin = p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll") || x.eq_ignore_ascii_case("exe"));
+        if !is_bin {
+            continue;
+        }
+        if let Ok(b) = std::fs::read(&p) {
+            for n in crate::update::imported_dll_names(&b) {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+    }
     let mut any = false;
-    for name in crate::update::imported_dll_names(&bytes) {
+    for name in names {
         if rt.dirs.iter().any(|d| d.join(&name).is_file()) {
             continue;
         }
@@ -279,10 +300,20 @@ pub fn resolve(cfg: &Config, name: Option<&str>) -> Result<Runtime> {
         .map(str::to_string)
         .or_else(|| cfg.default_runtime.clone())
         .unwrap_or_else(|| DEFAULT_NAME.to_string());
-    let r = all
-        .into_iter()
-        .find(|r| r.name == wanted)
-        .ok_or_else(|| Error::Config(format!("ROCm runtime `{wanted}` is not known — see `fidim runtimes`")))?;
+    let r = match all.iter().find(|r| r.name == wanted) {
+        Some(r) => r.clone(),
+        // Runtimes discovered inside ComfyUI installs were dropped on
+        // 2026-09-06; a profile still naming one gets the default instead
+        // of a dead launch.
+        None if wanted.starts_with("comfyui-") => {
+            let d = cfg.default_runtime.clone().unwrap_or_else(|| DEFAULT_NAME.to_string());
+            all.iter()
+                .find(|r| r.name == d)
+                .cloned()
+                .ok_or_else(|| Error::Config(format!("ROCm runtime `{wanted}` is gone and the default `{d}` is not known — see `fidim runtimes`")))?
+        }
+        None => return Err(Error::Config(format!("ROCm runtime `{wanted}` is not known — see `fidim runtimes`"))),
+    };
     if !r.available {
         return Err(Error::Config(format!(
             "ROCm runtime `{}` is not available: missing {}",
