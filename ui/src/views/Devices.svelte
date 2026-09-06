@@ -57,7 +57,7 @@
         <dt>display</dt>
         <dd>{#if d.display}<span class="chip warn">{d.display.width}×{d.display.height} @ {d.display.refresh_hz} Hz</span>{:else}<span class="faint">none attached</span>{/if}</dd>
         <dt>occupied by</dt>
-        <dd>{#if row.occupied_by.length}{#each row.occupied_by as p}<span class="chip accent">{p}</span> {/each}{:else}<span class="faint">no llamactl server</span>{/if}</dd>
+        <dd>{#if row.occupied_by.length}{#each row.occupied_by as p}<span class="chip accent">{p}</span> {/each}{:else}<span class="faint">no Llama FIDIM server</span>{/if}</dd>
         <dt>driver</dt>
         <dd class="mono">{d.driver_version ?? "—"}</dd>
         <dt>stable key</dt>

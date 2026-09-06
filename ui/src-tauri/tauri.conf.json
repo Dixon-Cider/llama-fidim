@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "llamactl",
+  "productName": "Llama FIDIM",
   "version": "0.1.0",
-  "identifier": "rocks.fca.llamactl",
+  "identifier": "rocks.fca.fidim",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "llamactl",
+        "title": "Llama FIDIM",
         "width": 1440,
         "height": 920,
         "minWidth": 1024,

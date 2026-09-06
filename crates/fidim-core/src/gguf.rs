@@ -83,7 +83,7 @@ impl Value {
     }
 }
 
-/// Everything llamactl needs from a model file, plus the raw scalar metadata
+/// Everything Llama FIDIM needs from a model file, plus the raw scalar metadata
 /// for display and future estimator refinements.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GgufHeader {
@@ -524,7 +524,7 @@ mod tests {
     }
 
     fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("llamactl-gguf-tests");
+        let dir = std::env::temp_dir().join("fidim-gguf-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{name}-{}.gguf", std::process::id()));
         let mut f = File::create(&path).unwrap();
@@ -601,8 +601,8 @@ mod tests {
     /// strongest fixture is the actual inventory.
     #[test]
     fn parses_real_models_when_present() {
-        // Point LLAMACTL_TEST_MODELS at a folder of GGUF files to run this.
-        let Some(root_s) = std::env::var_os("LLAMACTL_TEST_MODELS") else { return };
+        // Point FIDIM_TEST_MODELS at a folder of GGUF files to run this.
+        let Some(root_s) = std::env::var_os("FIDIM_TEST_MODELS") else { return };
         let root = std::path::Path::new(&root_s);
         if !root.exists() {
             return;

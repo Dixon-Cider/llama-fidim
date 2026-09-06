@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn newer_schema_is_refused() {
-        let dir = std::env::temp_dir().join(format!("llamactl-prof-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fidim-prof-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("future.json");
         std::fs::write(

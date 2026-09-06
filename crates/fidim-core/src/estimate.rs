@@ -347,7 +347,7 @@ mod tests {
             v.extend_from_slice(&0u64.to_le_bytes());
             v
         };
-        let dir = std::env::temp_dir().join("llamactl-est-tests");
+        let dir = std::env::temp_dir().join("fidim-est-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("empty-{}.gguf", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();

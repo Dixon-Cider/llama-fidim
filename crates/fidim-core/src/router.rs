@@ -2,7 +2,7 @@
 //! member profile behind the OpenAI-compatible API, selected by the `model`
 //! field. Backed by llama-server's native router (`--models-preset`, b10819+):
 //! the router process loads per-model child instances on demand and forwards
-//! requests; llamactl generates the preset INI from its profiles.
+//! requests; Llama FIDIM generates the preset INI from its profiles.
 //!
 //! Instances inherit the router's arguments and environment, so per-model GPU
 //! placement is expressed with `device = ROCm0[,ROCm2]` (llama.cpp's own
@@ -23,7 +23,7 @@ use crate::profile::Profile;
 use crate::supervise::{self, http_get, http_post_json, RunState};
 use crate::{Error, Result};
 
-/// The run id the router is supervised under (`llamactl stop router`).
+/// The run id the router is supervised under (`fidim stop router`).
 pub const ROUTER_ID: &str = "router";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -261,7 +261,7 @@ pub struct RouterLaunch {
     pub sections: Vec<String>,
 }
 
-/// Write the INI, take the port over from any llamactl server on it, spawn
+/// Write the INI, take the port over from any Llama FIDIM server on it, spawn
 /// the router, wait for it to answer. Foreign port holders are an error.
 pub fn launch(cfg: &Config, rc: &RouterConfig, profiles: &[Profile], devices: &[Device], build_dir: &Path, ready_timeout: Duration) -> Result<RouterLaunch> {
     let exe = build_dir.join("bin").join("llama-server.exe");
@@ -279,7 +279,7 @@ pub fn launch(cfg: &Config, rc: &RouterConfig, profiles: &[Profile], devices: &[
     if let Some(h) = launch::port_holder(&rc.host, rc.port, &cfg.runs_dir) {
         if h.profile_id.is_none() {
             return Err(Error::Platform(format!(
-                "port {} is in use by {}{} — not a llamactl server",
+                "port {} is in use by {}{} — not a Llama FIDIM server",
                 rc.port,
                 h.process_name.as_deref().unwrap_or("an unknown process"),
                 h.pid.map(|p| format!(" (pid {p})")).unwrap_or_default()

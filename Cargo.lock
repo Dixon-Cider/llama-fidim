@@ -850,6 +850,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "fidim-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fidim-core",
+ "serde_json",
+]
+
+[[package]]
+name = "fidim-core"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "ureq",
+ "windows 0.58.0",
+ "wmi",
+ "zip",
+]
+
+[[package]]
 name = "field-offset"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1793,34 +1817,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
-name = "llamactl-cli"
+name = "llama-fidim"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "clap",
- "llamactl-core",
- "serde_json",
-]
-
-[[package]]
-name = "llamactl-core"
-version = "0.1.0"
-dependencies = [
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "ureq",
- "windows 0.58.0",
- "wmi",
- "zip",
-]
-
-[[package]]
-name = "llamactl-ui"
-version = "0.1.0"
-dependencies = [
- "llamactl-core",
+ "fidim-core",
  "serde",
  "serde_json",
  "tauri",

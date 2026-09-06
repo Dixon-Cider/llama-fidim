@@ -44,7 +44,7 @@ impl CheckResult {
 pub struct PortHolder {
     pub pid: Option<u32>,
     pub process_name: Option<String>,
-    /// Set when the holder is a live llamactl run (from its state file).
+    /// Set when the holder is a live Llama FIDIM run (from its state file).
     pub profile_id: Option<String>,
 }
 
@@ -62,6 +62,8 @@ pub struct ResolvedDevice {
 #[derive(Debug, Clone, Serialize)]
 pub struct LaunchContext {
     pub profile: Profile,
+    /// config.allow_integrated: binding an iGPU is a warning, not a block.
+    pub allow_integrated: bool,
     /// `--version` output of the build binary; None = it failed to run.
     pub build_version_output: Option<String>,
     /// Model + auxiliary files that must exist, with existence pre-checked
@@ -83,7 +85,7 @@ pub struct LaunchContext {
     /// Aliases of currently-running servers.
     pub running_aliases: Vec<String>,
     /// Who holds the requested port. None = free. A holder with a
-    /// `profile_id` is one of llamactl's own servers (launch takes the port
+    /// `profile_id` is one of Llama FIDIM's own servers (launch takes the port
     /// over by stopping it first); anything else is foreign and blocks.
     pub port_holder: Option<PortHolder>,
     /// Driver/SDK now vs the profile baseline's recorded versions.
@@ -196,10 +198,15 @@ fn check_discrete(ctx: &LaunchContext) -> CheckResult {
         .collect();
     let outcome = if igpus.is_empty() {
         Outcome::Pass
+    } else if ctx.allow_integrated {
+        Outcome::Warn(format!(
+            "target resolves to integrated graphics: {} — allowed by Settings; expect a fraction of a discrete card's throughput",
+            igpus.join(", ")
+        ))
     } else {
         Outcome::Block(format!(
-            "target resolves to integrated graphics: {} — on this machine the iGPU sits at index 1 \
-             between the two discrete cards; binding it runs inference at ~1/20th throughput with no error",
+            "target resolves to integrated graphics: {} — an iGPU runs inference at a fraction of a discrete card's speed with no error. \
+             Turn on 'allow integrated graphics' in Settings if that is what you want",
             igpus.join(", ")
         ))
     };
@@ -387,25 +394,25 @@ fn check_commit(ctx: &LaunchContext) -> CheckResult {
 
 /// Check 8. Serving every model on one well-known port is the normal way
 /// to use this box (clients point at :1234 regardless of which model is
-/// up), so a llamactl server already on the port is a Warn and launch
-/// replaces it. Only a process llamactl does not know blocks.
+/// up), so a Llama FIDIM server already on the port is a Warn and launch
+/// replaces it. Only a process Llama FIDIM does not know blocks.
 fn check_port(ctx: &LaunchContext) -> CheckResult {
     let port = ctx.profile.server.port;
     let pid = |h: &PortHolder| h.pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
     let outcome = match &ctx.port_holder {
         None => Outcome::Pass,
         Some(h) if h.profile_id.is_some() => Outcome::Warn(format!(
-            "port {port} is serving llamactl profile `{}`{} — launching stops that server first and takes the port over",
+            "port {port} is serving Llama FIDIM profile `{}`{} — launching stops that server first and takes the port over",
             h.profile_id.as_deref().unwrap_or("?"),
             pid(h)
         )),
         Some(h) => Outcome::Block(format!(
-            "port {port} is in use by {}{} — not a llamactl server; stop it or pick another port",
+            "port {port} is in use by {}{} — not a Llama FIDIM server; stop it or pick another port",
             h.process_name.as_deref().unwrap_or("an unknown process"),
             pid(h)
         )),
     };
-    CheckResult { id: "port-free", spec_number: 8, title: "Requested port is free or held by a llamactl server", outcome }
+    CheckResult { id: "port-free", spec_number: 8, title: "Requested port is free or held by a Llama FIDIM server", outcome }
 }
 
 fn check_alias(ctx: &LaunchContext) -> CheckResult {
@@ -572,6 +579,7 @@ mod tests {
 
     fn healthy_ctx() -> LaunchContext {
         LaunchContext {
+            allow_integrated: false,
             profile: profile(),
             build_version_output: Some("version: 9817 (5397c3619)".into()),
             missing_files: vec![],

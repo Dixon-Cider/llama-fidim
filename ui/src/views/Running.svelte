@@ -117,7 +117,7 @@
 
 <h1>
   Running
-  <span class="sub">Each server llamactl started, sampled once a second.</span>
+  <span class="sub">Each server Llama FIDIM started, sampled once a second.</span>
 </h1>
 
 <div class="strip">

@@ -6,7 +6,7 @@
 //! quantizer's repo is tried second. Gated repos (Gemma, Llama) return 401
 //! without a token — `HF_TOKEN` in the environment or `config.hf_token`
 //! is sent as a bearer when present. Results are cached for a week under
-//! `~/.llamactl/hf-cache/`, because the answer does not change.
+//! `~/.fidim/hf-cache/`, because the answer does not change.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -80,7 +80,7 @@ fn fetch_generation_config(cfg: &Config, repo: &str) -> Result<CreatorDefaults> 
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(30))
         .build();
-    let mut req = agent.get(&url).set("User-Agent", concat!("llamactl/", env!("CARGO_PKG_VERSION")));
+    let mut req = agent.get(&url).set("User-Agent", concat!("llama-fidim/", env!("CARGO_PKG_VERSION")));
     if let Some(t) = token(cfg) {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }
@@ -128,7 +128,7 @@ fn base_model_via_api(cfg: &Config, repo: &str) -> Result<Vec<String>> {
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(30))
         .build();
-    let mut req = agent.get(&url).set("User-Agent", concat!("llamactl/", env!("CARGO_PKG_VERSION")));
+    let mut req = agent.get(&url).set("User-Agent", concat!("llama-fidim/", env!("CARGO_PKG_VERSION")));
     if let Some(t) = token(cfg) {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }

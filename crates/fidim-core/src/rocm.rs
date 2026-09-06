@@ -27,7 +27,7 @@ use crate::{Error, Result};
 
 pub const RELEASE_ROOT: &str = "https://repo.radeon.com/rocm/windows/";
 pub const NIGHTLY_ROOT: &str = "https://rocm.nightlies.amd.com/v2/";
-pub const MANIFEST_NAME: &str = "llamactl-runtime.json";
+pub const MANIFEST_NAME: &str = "fidim-runtime.json";
 /// Nightlies pile up (hundreds); the picker shows the newest few.
 const NIGHTLIES_SHOWN: usize = 8;
 
@@ -87,7 +87,7 @@ fn agent() -> ureq::Agent {
 fn get_text(url: &str) -> Result<String> {
     agent()
         .get(url)
-        .set("User-Agent", concat!("llamactl/", env!("CARGO_PKG_VERSION")))
+        .set("User-Agent", concat!("llama-fidim/", env!("CARGO_PKG_VERSION")))
         .call()
         .map_err(|e| err(format!("{url}: {e}")))?
         .into_string()
@@ -241,8 +241,33 @@ pub fn runtimes_root(cfg: &Config) -> PathBuf {
     cfg.install_root
         .clone()
         .or_else(|| cfg.build_roots.first().cloned())
-        .unwrap_or_else(Config::config_dir)
+        .unwrap_or_else(|| Config::config_dir().join("builds"))
         .join("rocm")
+}
+
+/// Nightly-index family for a card, from its marketing name. RDNA4 (RX
+/// 9000, Radeon AI PRO R9700) is gfx120X; RDNA3 (RX 7000, W7000) is
+/// gfx110X; RDNA2 (RX 6000) is gfx103X; the Strix APUs have their own.
+/// None when nothing matches: the user picks in Settings.
+pub fn guess_family(names: &[String]) -> Option<String> {
+    let n: Vec<String> = names.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let has = |needle: &str| n.iter().any(|s| s.contains(needle));
+    if has("r9700") || has("rx 90") || has("rx 9") || has("ai pro r9") {
+        return Some("gfx120X-all".into());
+    }
+    if has("8060s") || has("8050s") || has("8040s") {
+        return Some("gfx1151".into());
+    }
+    if has("880m") || has("890m") {
+        return Some("gfx1150".into());
+    }
+    if has("rx 7") || has("w7") || has("780m") || has("760m") {
+        return Some("gfx110X-all".into());
+    }
+    if has("rx 6") || has("w6") {
+        return Some("gfx103X-all".into());
+    }
+    None
 }
 
 pub fn install_dir(cfg: &Config, version: &str) -> PathBuf {
@@ -257,7 +282,8 @@ pub fn installed(cfg: &Config) -> Vec<(PathBuf, RuntimeManifest)> {
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .filter_map(|p| {
-            let m: RuntimeManifest = serde_json::from_str(&std::fs::read_to_string(p.join(MANIFEST_NAME)).ok()?).ok()?;
+            let mp = [p.join(MANIFEST_NAME), p.join("llamactl-runtime.json")].into_iter().find(|m| m.is_file())?;
+            let m: RuntimeManifest = serde_json::from_str(&std::fs::read_to_string(mp).ok()?).ok()?;
             Some((p, m))
         })
         .collect()
@@ -400,6 +426,16 @@ mod tests {
         assert_eq!(n[0].version, "7.14.0a20260612");
         assert_eq!(n[0].core_url, "https://rocm.nightlies.amd.com/v2/gfx120X-all/rocm_sdk_core-7.14.0a20260612-py3-none-win_amd64.whl");
         assert_eq!(n[0].family.as_deref(), Some("gfx120X-all"));
+    }
+
+    #[test]
+    fn family_guess_from_card_names() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(guess_family(&s(&["AMD Radeon AI PRO R9700", "AMD Radeon(TM) Graphics"])).as_deref(), Some("gfx120X-all"));
+        assert_eq!(guess_family(&s(&["AMD Radeon RX 7900 XTX"])).as_deref(), Some("gfx110X-all"));
+        assert_eq!(guess_family(&s(&["AMD Radeon 8060S Graphics"])).as_deref(), Some("gfx1151"));
+        assert_eq!(guess_family(&s(&["AMD Radeon RX 6800"])).as_deref(), Some("gfx103X-all"));
+        assert_eq!(guess_family(&s(&["NVIDIA GeForce RTX 3060"])), None);
     }
 
     #[test]

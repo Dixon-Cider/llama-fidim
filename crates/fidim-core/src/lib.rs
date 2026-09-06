@@ -1,4 +1,4 @@
-//! llamactl-core — all logic for discovering llama.cpp builds/models, enumerating
+//! fidim-core — all logic for discovering llama.cpp builds/models, enumerating
 //! GPUs by stable key, validating launch configurations, and supervising servers.
 //!
 //! The UI layers (CLI now, Tauri later) are thin wrappers over this crate.

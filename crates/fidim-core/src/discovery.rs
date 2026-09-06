@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn pairing_separates_mmproj_and_mtp_from_models() {
-        let dir = std::env::temp_dir().join(format!("llamactl-disc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fidim-disc-{}", std::process::id()));
         let mtp = dir.join("MTP");
         std::fs::create_dir_all(&mtp).unwrap();
         // Minimal valid GGUF: magic, v3, 0 tensors, 0 kvs.

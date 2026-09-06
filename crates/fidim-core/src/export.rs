@@ -1,5 +1,5 @@
 //! Script export (R-12): any profile emits a standalone `.bat` or `.ps1`
-//! that reproduces the LaunchPlan exactly — no llamactl required, and the
+//! that reproduces the LaunchPlan exactly — no Llama FIDIM required, and the
 //! export doubles as an audit of what the tool would run.
 
 use crate::launch::LaunchPlan;
@@ -9,7 +9,7 @@ pub fn to_bat(profile: &Profile, plan: &LaunchPlan) -> String {
     let mut s = String::new();
     s.push_str("@echo off\r\n");
     s.push_str(&format!(
-        "REM Exported by llamactl from profile {:?} ({}). Runs standalone.\r\n",
+        "REM Exported by Llama FIDIM from profile {:?} ({}). Runs standalone.\r\n",
         profile.id, profile.name
     ));
     s.push_str(&format!(
@@ -22,7 +22,7 @@ pub fn to_bat(profile: &Profile, plan: &LaunchPlan) -> String {
             .join(", "),
         plan.visibility_env
     ));
-    s.push_str("REM Regenerate with: llamactl export ");
+    s.push_str("REM Regenerate with: fidim export ");
     s.push_str(&profile.id);
     s.push_str("\r\n\r\n");
     if let Some(rocm) = &plan.path_prepend {
@@ -50,7 +50,7 @@ pub fn to_bat(profile: &Profile, plan: &LaunchPlan) -> String {
 pub fn to_ps1(profile: &Profile, plan: &LaunchPlan) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "# Exported by llamactl from profile '{}' ({}). Runs standalone.\r\n",
+        "# Exported by Llama FIDIM from profile '{}' ({}). Runs standalone.\r\n",
         profile.id, profile.name
     ));
     s.push_str(&format!(
