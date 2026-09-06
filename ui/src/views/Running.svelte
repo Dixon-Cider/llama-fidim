@@ -18,21 +18,38 @@
     if (paused) return;
     try {
       const d = await api("live");
-      // Rates from counter deltas between polls: what is happening now,
-      // not the last request's average.
+      // Rates from per-slot progress between polls. llama-server's
+      // /metrics counters only move when a request finishes, which made
+      // the old rate spike once per request; slot n_decoded and
+      // n_prompt_tokens_processed move with every token and batch.
       for (const run of d.runs) {
         for (const s of run.samples) {
           const k = key(run.run, s);
           const m = s.metrics ?? {};
           const prev = hist.get(k);
-          const cur = { t: s.sampled_unix_ms, gen: m.tokens_predicted_total ?? 0, prompt: m.prompt_tokens_total ?? 0, dn: m.spec_decode_num_draft_tokens_total ?? 0, da: m.spec_decode_num_accepted_tokens_total ?? 0 };
+          const slots = new Map();
+          let gen = 0, prompt = 0;
+          for (const x of s.slots) {
+            slots.set(x.id, { task: x.id_task, dec: x.n_decoded, proc: x.n_prompt_tokens_processed });
+            const ps = prev?.slots?.get(x.id);
+            if (ps && ps.task === x.id_task) {
+              if (x.n_decoded > ps.dec) gen += x.n_decoded - ps.dec;
+              if (x.n_prompt_tokens_processed > ps.proc) prompt += x.n_prompt_tokens_processed - ps.proc;
+            } else if (ps && x.is_processing) {
+              // A new request started since the last poll: what it has
+              // done so far is this interval's work.
+              gen += x.n_decoded;
+              prompt += x.n_prompt_tokens_processed;
+            }
+          }
+          const cur = { t: s.sampled_unix_ms, slots, dn: m.spec_decode_num_draft_tokens_total ?? 0, da: m.spec_decode_num_accepted_tokens_total ?? 0 };
           if (prev && cur.t > prev.t) {
             const dt = (cur.t - prev.t) / 1000;
-            const decode = Math.max(0, (cur.gen - prev.gen) / dt);
-            const prompt = Math.max(0, (cur.prompt - prev.prompt) / dt);
+            const decode = gen / dt;
+            const promptRate = prompt / dt;
             const dd = cur.dn - prev.dn;
             const accept = dd > 0 ? (cur.da - prev.da) / dd : null;
-            rates = { ...rates, [k]: { decode, prompt, accept } };
+            rates = { ...rates, [k]: { decode, prompt: promptRate, accept } };
             spark = { ...spark, [k]: [...(spark[k] ?? []), decode].slice(-60) };
           }
           hist.set(k, cur);
@@ -164,7 +181,7 @@
       <div class="facts">
         {#if r.alive}
           <span title="GPU engine utilization of this process"><b class="num">{Math.round(row.gpu_busy_percent)}%</b> gpu</span>
-          <span title="resident VRAM (dedicated, or committed while paging in)"><b class="num">{(vram / GIB).toFixed(1)} GiB</b>{#if row.resident.length}&nbsp;on {row.resident.map((m) => short(m.card ?? "?")).join(" + ")}{/if}</span>
+          <span title="resident VRAM of this server and its child processes (dedicated, or committed while paging in)"><b class="num">{(vram / GIB).toFixed(1)} GiB</b>{#if row.resident.length}&nbsp;on {[...new Set(row.resident.map((m) => short(m.card ?? "?")))].join(" + ")}{/if}</span>
         {/if}
         <span><b class="num">{uptime(r.state.started_unix)}</b> up</span>
         <span class="mono">pid {r.state.pid} · :{r.state.port} · {r.state.alias}</span>
