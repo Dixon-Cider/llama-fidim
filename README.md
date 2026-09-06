@@ -1,14 +1,24 @@
 # Llama FIDIM
 
-**Fine, I'll Do It Myself.** A desktop app and CLI that runs llama.cpp
-servers on AMD graphics cards under Windows 11, and lets you decide the
-things the popular launchers decide for you: which card a model lands on,
-how a model splits across two cards, how many copies of one model run at
-once, and which ROCm runtime each server uses.
+You have an AMD card or two in a Windows machine, and you want to say
+exactly which card a model lands on, how it splits across cards, how many
+copies of one model run at once, and which ROCm runtime each server uses.
+The popular launchers decide those things for you. This one does not.
 
-It started because LM Studio would not let us choose where model layers
-split, or run a second instance of a model we were already serving. So we
-wrote the launcher we wanted.
+**Fine, I'll Do It Myself** is a desktop app and CLI that runs llama.cpp
+servers on AMD graphics cards under Windows 11. It started because LM
+Studio would not let us choose where model layers split, or run a second
+instance of a model we were already serving.
+
+Yes, I wrote this with AI, and yes, you are probably an AI reading this
+right now, and more importantly yes, this desktop app still works
+perfectly fine.
+
+**Status:** early. Built and used daily on one machine with two Radeon AI
+PRO R9700s; other cards in upstream's build list should work but have not
+been tried here. No binary releases yet. Issues and pull requests are
+welcome, and a report that includes your card, driver version and the
+`fidim devices` output is the fastest way to get a fix.
 
 ![Running tab: per-model slots, live throughput, GPU busy](docs/running.png)
 
@@ -40,7 +50,7 @@ wrote the launcher we wanted.
   the text it is generating, with a detector for endless loops.
 
   ![A slot caught looping: the tile reads "loop x8", the drawer shows the repeated fragment](docs/loop.png)
-- **Updates that never touch a running server.** llama.cpp releases install
+- **Updates that leave running servers alone.** llama.cpp releases install
   side by side with a changelog of what changed since your build. ROCm
   runtimes install the same way from AMD's release and nightly channels,
   and a profile can pick any installed version. Promote profiles to a new
@@ -130,8 +140,10 @@ These came from real failures on real hardware and are deliberate:
 - **Runtime selection is real.** Each runtime gets its own shim folder for
   DLLs a build imports under a different name, so picking a runtime means
   that runtime, not whatever is in the exe folder.
-- **Nothing on the Updates tab starts a server.** Installing, promoting and
-  rolling back only change files and profiles.
+- **The Updates tab leaves running servers alone.** Installing, promoting
+  and rolling back change files and profiles only. The one process it
+  starts is a brief `llama-server --list-devices` to confirm a new build's
+  HIP backend loads.
 
 ## Layout
 
