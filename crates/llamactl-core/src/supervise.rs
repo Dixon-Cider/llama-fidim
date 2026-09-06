@@ -395,40 +395,64 @@ pub fn probe_health(state: &RunState, deep: bool) -> Health {
 }
 
 pub fn process_alive(pid: u32) -> bool {
-    // tasklist filters by PID; output contains the PID only when it exists.
+    process_image(pid).is_some()
+}
+
+/// Image name of a live process (`llama-server.exe`), or None when no
+/// process has that pid. tasklist CSV: `"image","pid","session",...`.
+pub fn process_image(pid: u32) -> Option<String> {
     let mut cmd = std::process::Command::new("tasklist");
     cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
     crate::launch::hide_console(&mut cmd);
-    let out = cmd.output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")),
-        Err(_) => false,
-    }
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.contains(&format!("\"{pid}\"")))?;
+    Some(line.trim_start_matches('"').split('"').next().unwrap_or("").to_string())
+}
+
+/// True only when `pid` is alive AND is the kind of process we started.
+/// A pid from a run state that is weeks old can belong to anything by now
+/// (Windows reuses pids), so "alive" for a run means "still our server",
+/// never merely "some process has this number".
+pub fn process_alive_as(pid: u32, image_contains: &str) -> bool {
+    process_image(pid).map(|img| img.to_ascii_lowercase().contains(image_contains)).unwrap_or(false)
 }
 
 /// Stop a server. llama-server has no shutdown endpoint; on Windows a
 /// process-tree terminate is the clean stop (§04 clean-stop requirement).
+///
+/// A run whose process is gone (or whose pid now belongs to something
+/// else) is only forgotten: the state file goes, nothing is killed.
 pub fn stop(state: &RunState, runs_dir: &Path) -> Result<()> {
     if let Some(kp) = state.keepalive_pid {
-        let mut k = std::process::Command::new("taskkill");
-        k.args(["/PID", &kp.to_string(), "/F"]);
-        crate::launch::hide_console(&mut k);
-        let _ = k.output();
-    }
-    let mut cmd = std::process::Command::new("taskkill");
-    cmd.args(["/PID", &state.pid.to_string(), "/T", "/F"]);
-    crate::launch::hide_console(&mut cmd);
-    let out = cmd.output().map_err(|e| Error::Platform(format!("taskkill: {e}")))?;
-    if !out.status.success() {
-        let text = String::from_utf8_lossy(&out.stderr).into_owned();
-        // Already gone counts as stopped.
-        if !text.contains("not found") && !text.contains("not be found") {
-            return Err(Error::Platform(format!("taskkill failed: {text}")));
+        if process_alive_as(kp, "llamactl") {
+            let mut k = std::process::Command::new("taskkill");
+            k.args(["/PID", &kp.to_string(), "/F"]);
+            crate::launch::hide_console(&mut k);
+            let _ = k.output();
         }
     }
+    if process_alive_as(state.pid, "llama-server") {
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &state.pid.to_string(), "/T", "/F"]);
+        crate::launch::hide_console(&mut cmd);
+        let out = cmd.output().map_err(|e| Error::Platform(format!("taskkill: {e}")))?;
+        if !out.status.success() {
+            let text = String::from_utf8_lossy(&out.stderr).into_owned();
+            // Already gone counts as stopped.
+            if !text.contains("not found") && !text.contains("not be found") {
+                return Err(Error::Platform(format!("taskkill failed: {text}")));
+            }
+        }
+    }
+    forget(state, runs_dir);
+    Ok(())
+}
+
+/// Drop the run state without touching any process.
+pub fn forget(state: &RunState, runs_dir: &Path) {
     let p = RunState::state_path(runs_dir, &state.profile_id, state.port);
     std::fs::remove_file(&p).ok();
-    Ok(())
 }
 
 /// A run state re-checked against reality.
@@ -457,7 +481,7 @@ pub fn reattach(runs_dir: &Path) -> Vec<AttachedRun> {
         }
         let Ok(text) = std::fs::read_to_string(&p) else { continue };
         let Ok(state) = serde_json::from_str::<RunState>(text.trim_start_matches('\u{feff}')) else { continue };
-        let alive = process_alive(state.pid);
+        let alive = process_alive_as(state.pid, "llama-server");
         let health = if alive { probe_health(&state, false) } else { Health::Dead };
         out.push(AttachedRun { crashed: !alive, alive, health, state });
     }
@@ -504,6 +528,10 @@ mod tests {
     #[test]
     fn process_alive_matches_reality() {
         assert!(process_alive(std::process::id()));
+        // Our own image is the test binary, not llama-server.
+        assert!(process_image(std::process::id()).unwrap().to_ascii_lowercase().ends_with(".exe"));
+        assert!(!process_alive_as(std::process::id(), "llama-server"));
+        assert!(!process_alive_as(4_000_000, "llama-server"));
         // PID 4 is System; PID 0 idle — use an absurd value instead.
         assert!(!process_alive(4_000_000));
     }

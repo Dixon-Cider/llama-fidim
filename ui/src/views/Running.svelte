@@ -152,7 +152,8 @@
         <span><b class="num">{uptime(r.state.started_unix)}</b> up</span>
         <span class="mono">pid {r.state.pid} · :{r.state.port} · {r.state.alias}</span>
       </div>
-      {#if r.alive}<button class="btn danger" onclick={() => stop(r.state.profile_id)}>Stop</button>{/if}
+      {#if r.alive}<button class="btn danger" onclick={() => stop(r.state.profile_id)}>Stop</button>
+      {:else}<button class="btn" onclick={() => stop(r.state.profile_id)} title="forget this run; the log file stays">Dismiss</button>{/if}
     </header>
 
     {#each row.samples as s}
