@@ -17,6 +17,7 @@ pub mod live;
 pub mod platform;
 pub mod preflight;
 pub mod profile;
+pub mod rocm;
 pub mod router;
 pub mod runtime;
 pub mod supervise;

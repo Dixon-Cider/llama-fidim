@@ -88,7 +88,7 @@
     {/each}
     <div class="spacer"></div>
     <div class="foot">
-      {inTauri ? "2× R9700 · Windows" : "MOCK DATA\nbrowser preview"}
+      {inTauri ? "connected" : "MOCK DATA\nbrowser preview"}
     </div>
   </nav>
   <main class="view">

@@ -74,11 +74,11 @@ const MOCK_DEVICES = [
 
 const MOCK_PROFILE = {
   schema: 1, id: "worker-pool", name: "Subagent worker pool",
-  build: { path: "C:\\...\\llama.cpp\\build-hip-vision", version: "b9817" },
+  build: { path: "D:\\llama.cpp\\build-hip-vision", version: "b9817" },
   model: {
-    path: "E:\\models\\unsloth\\gemma-4-26B-A4B-it-qat-GGUF\\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+    path: "D:\\models\\unsloth\\gemma-4-26B-A4B-it-qat-GGUF\\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
     mmproj: null,
-    draft: { path: "E:\\models\\...\\MTP\\mtp-gemma-4-26B-A4B-it-Q8_0.gguf", enabled: false },
+    draft: { path: "D:\\models\\...\\MTP\\mtp-gemma-4-26B-A4B-it-Q8_0.gguf", enabled: false },
   },
   devices: [{ key: "pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus08", split_fraction: null, resolved_index_last_launch: 2 }],
   split_mode: null, main_device: 0,
@@ -103,7 +103,7 @@ const MOCK_PROFILE = {
 const MOCK_SPLIT_PROFILE = {
   ...MOCK_PROFILE,
   id: "qwen-split", name: "Qwen3.6-35B Q4 split across both R9700s",
-  model: { path: "E:\\models\\lmstudio-community\\Qwen3.6-35B-A3B-GGUF\\Qwen3.6-35B-A3B-Q4_K_M.gguf", mmproj: null, draft: null },
+  model: { path: "D:\\models\\lmstudio-community\\Qwen3.6-35B-A3B-GGUF\\Qwen3.6-35B-A3B-Q4_K_M.gguf", mmproj: null, draft: null },
   devices: [
     { key: "pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus03", split_fraction: 0.5, resolved_index_last_launch: 0 },
     { key: "pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus08", split_fraction: 0.5, resolved_index_last_launch: 2 },
@@ -150,7 +150,7 @@ const MOCK_RUN = {
   state: {
     profile_id: "worker-pool", pid: 26388, port: 9701, host: "127.0.0.1",
     alias: "gemma-4-worker", started_unix: Math.floor(Date.now() / 1000) - 1830,
-    log_path: "C:\\Users\\Paul\\.llamactl\\runs\\worker-pool-9701.log",
+    log_path: "C:\\Users\\me\\.llamactl\\runs\\worker-pool-9701.log",
     command_line: "llama-server.exe -m ... --port 9701",
     visibility_env: "2",
     device_keys: ["pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus08"],
@@ -239,13 +239,13 @@ async function mock(cmd, args) {
       return { runs: [runRouter, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
     }
     case "get_config":
-      return { path: "C:\\Users\\Paul\\.llamactl\\config.json", config: { build_roots: ["C:\\llama.cpp"], model_roots: ["E:\\models"], rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\Paul\\.llamactl\\profiles", runs_dir: "C:\\Users\\Paul\\.llamactl\\runs", keep_alive_seconds: 0, runtimes: [] } };
+      return { path: "C:\\Users\\me\\.llamactl\\config.json", config: { build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models"], rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.llamactl\\profiles", runs_dir: "C:\\Users\\me\\.llamactl\\runs", keep_alive_seconds: 0, runtimes: [] } };
     case "list_runtimes":
-      return [{ name: "default", source: "config", version: "7.1", available: true, is_default: true, dirs: ["C:\\Program Files\\AMD\\ROCm\\7.1\\bin"] }, { name: "comfyui-comfyamd-7.14.0", source: "ComfyUI venv", version: "7.14.0", available: true, is_default: false, dirs: ["...\\_rocm_sdk_libraries\\bin", "...\\_rocm_sdk_core\\bin"] }];
+      return [{ name: "default", source: "config", version: "7.1", available: true, is_default: true, dirs: ["C:\\Program Files\\AMD\\ROCm\\7.1\\bin"] }, { name: "rocm-7.14.0a20260612", source: "amd-nightly", version: "7.14.0a20260612", available: true, is_default: false, is_latest: true, dirs: ["D:\\llama.cpp\\rocm\\7.14.0a20260612\\bin"] }];
     case "router_get":
       return { host: "127.0.0.1", port: 1234, models_max: 3, autoload: true, build: null, rocm_runtime: null, members: [{ profile_id: "worker-pool", load_on_startup: true }] };
     case "router_ini":
-      return { text: "[gemma-4-worker]\nmodel = E:\\models\\...\\gemma-4-26B-A4B.gguf\ndevice = ROCm2\nload-on-startup = true\n" };
+      return { text: "[gemma-4-worker]\nmodel = D:\\models\\...\\gemma-4-26B-A4B.gguf\ndevice = ROCm2\nload-on-startup = true\n" };
     case "router_status":
       return { alive: true, state: { pid: 24304, port: 1234 } };
     case "router_models":
@@ -254,12 +254,25 @@ async function mock(cmd, args) {
       return { latest: { tag: "b10819", published_at: "2026-09-05" }, update_available: false, behind: 0, already_installed: true, newest_installed: { version: "b10819", path: "C:\\llama.cpp\\b10819-rocm" }, install_dir: "C:\\llama.cpp\\b10819-rocm", assets: [{ name: "llama-b10819-bin-win-cpu-x64.zip", size: 21e6 }], asset_error: null };
     case "update_history":
       return [];
+    case "rocm_families":
+      return ["gfx103X-all", "gfx110X-all", "gfx1151", "gfx120X-all"];
+    case "rocm_available":
+      return { runtimes: [
+        { version: "7.14.0a20260612", channel: "nightly", family: args.family, core_url: "", libraries_url: "" },
+        { version: "7.2.1", channel: "release", family: null, core_url: "", libraries_url: "" },
+        { version: "7.1.1", channel: "release", family: null, core_url: "", libraries_url: "" },
+      ], problems: [] };
+    case "rocm_install":
+      await new Promise((r) => setTimeout(r, 1500));
+      return { dir: "D:\\llama.cpp\\rocm\\" + args.runtime.version, name: "rocm-" + args.runtime.version };
+    case "rocm_remove":
+      return null;
     case "stop_run":
     case "save_profile":
     case "delete_profile":
       return null;
     case "export_profile":
-      return { path: "C:\\Users\\Paul\\.llamactl\\profiles\\worker-pool.bat", text: "@echo off\r\nset \"HIP_VISIBLE_DEVICES=2\"\r\n\"llama-server.exe\" -m ..." };
+      return { path: "C:\\Users\\me\\.llamactl\\profiles\\worker-pool.bat", text: "@echo off\r\nset \"HIP_VISIBLE_DEVICES=2\"\r\n\"llama-server.exe\" -m ..." };
     case "scan":
       return { builds: [], models: [] };
     default:

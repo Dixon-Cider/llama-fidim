@@ -20,18 +20,19 @@
   let manualRuntimesText = $state("");
 
   const HINTS = {
-    build_roots: "Folders scanned one level deep for <dir>\\bin\\llama-server.exe. Your llama.cpp checkout is one; Updates installs new builds under the first root.",
-    model_roots: "Folders scanned recursively for *.gguf. Point one at LM Studio's download folder (Settings → Models) to serve what it downloads.",
-    rocm_bin: "DLL folder of the default ROCm runtime, prepended to PATH for every server and probe. HIP SDK 7.1 today.",
-    default_runtime: "Which discovered runtime profiles use when they name none. Leave on 'default' to keep rocm_bin.",
-    install_root: "Where Updates puts new builds (<tag>-rocm). Empty = the first build root.",
+    build_roots: "Folders scanned one level deep for <dir>\\bin\\llama-server.exe. Updates installs new builds under the first one unless an install root is set.",
+    model_roots: "Folders scanned for *.gguf, recursively. LM Studio's download folder works as one.",
+    rocm_bin: "DLL folder of the fallback ROCm runtime, prepended to PATH for every server and probe. Usually a HIP SDK bin folder.",
+    default_runtime: "Runtime used when a profile names none.",
+    rocm_family: "GPU family for AMD's nightly ROCm index. RDNA4 (Radeon AI PRO R9700, RX 9000) is gfx120X-all; RDNA3 is gfx110X-all.",
+    install_root: "Where Updates puts new builds and ROCm runtimes. Empty = the first build root.",
     llama_cpp_source: "git checkout used by 'Build from source'. Empty = the first build root.",
     source_build_script: "Script run as <script> <checkout> <tag> <out dir> for source builds.",
-    hf_token: "Hugging Face token, only used to read generation_config.json from gated repos. HF_TOKEN in the environment overrides it.",
-    integrated_name_patterns: "Device names containing any of these are classified as the iGPU and never bound (one per line).",
+    hf_token: "Hugging Face token, used only to read generation_config.json from gated repos. HF_TOKEN in the environment wins.",
+    integrated_name_patterns: "Device names containing any of these count as the iGPU and are never bound (one per line).",
     profile_dir: "Where profile JSON files live.",
     runs_dir: "Run state and captured server logs.",
-    runtimes: "Extra runtimes by hand, JSON list: [{\"name\":\"x\",\"dirs\":[\"C:\\\\a\\\\bin\"],\"version\":\"9.9\"}]",
+    runtimes: "Runtimes added by hand, JSON list: [{\"name\":\"x\",\"dirs\":[\"C:\\\\a\\\\bin\"],\"version\":\"9.9\"}]",
   };
 
   async function load() {
@@ -54,7 +55,7 @@
     out.build_roots = unlines(buildRootsText);
     out.model_roots = unlines(modelRootsText);
     out.integrated_name_patterns = unlines(igpuText);
-    for (const k of ["rocm_bin", "install_root", "llama_cpp_source", "source_build_script", "hf_token", "default_runtime"])
+    for (const k of ["rocm_bin", "install_root", "llama_cpp_source", "source_build_script", "hf_token", "default_runtime", "rocm_family"])
       if (out[k] === "" || out[k] === undefined) out[k] = null;
     out.keep_alive_seconds = Math.max(0, Math.round(Number(out.keep_alive_seconds) || 0));
     if (out.default_runtime === "default") out.default_runtime = null;
@@ -70,7 +71,7 @@
     try {
       const c = assembled();
       await api("save_config", { config: c });
-      saved = "Saved. Caches cleared — Profiles and Devices will rescan.";
+      saved = "Saved. Profiles and Devices will rescan.";
       log("settings saved");
       await load();
     } catch (e) { error = String(e); }
@@ -94,8 +95,8 @@
   }
 </script>
 
-<h1>Settings <span class="sub">the tool's own configuration — not a model's, not a server's</span></h1>
-<p class="lede">Stored at <span class="mono">{path}</span>. Hover any label for what it does. Saving clears the scan and device caches.</p>
+<h1>Settings <span class="sub">llamactl's own settings.</span></h1>
+<p class="lede">Stored at <span class="mono">{path}</span>. Hover a label for help. Saving rescans models, builds and devices.</p>
 
 {#if error}<div class="card"><span class="chip block">error</span> <span class="mono" >{error}</span></div>{/if}
 {#if saved}<div class="card"><span class="chip pass">ok</span> {saved}</div>{/if}
@@ -147,16 +148,21 @@
         <select bind:value={cfg.default_runtime}>
           <option value={null}>default (rocm_bin above)</option>
           {#each runtimes.filter((r) => r.name !== "default") as r}
-            <option value={r.name} disabled={!r.available}>{r.name}{r.version ? ` · ${r.version}` : ""}{r.available ? "" : " (missing)"}</option>
+            <option value={r.name} disabled={!r.available}>{r.name}{r.version ? ` · ${r.version}` : ""}{r.is_latest ? " (latest)" : ""}{r.available ? "" : " (missing)"}</option>
           {/each}
         </select>
+      </label>
+      <label class="field" style="grid-column: span 3;" title={HINTS.rocm_family}>
+        <span class="k">GPU family for AMD downloads</span>
+        <input bind:value={cfg.rocm_family} placeholder="gfx120X-all" list="rocm-families" />
+        <datalist id="rocm-families"><option value="gfx120X-all"></option><option value="gfx110X-all"></option><option value="gfx103X-all"></option><option value="gfx1151"></option><option value="gfx1150"></option></datalist>
       </label>
       <label class="field" style="grid-column: 1 / -1;" title={HINTS.runtimes}>
         <span class="k">manual runtimes (JSON)</span>
         <textarea rows="3" bind:value={manualRuntimesText} spellcheck="false"></textarea>
       </label>
     </div>
-    <div class="faint small" style=" margin-top: 6px;">Discovered right now: {runtimes.map((r) => r.name + (r.available ? "" : " (missing)")).join(" · ") || "none"}</div>
+    <div class="faint small" style="margin-top: 6px;">Found now, newest first: {runtimes.map((r) => r.name + (r.is_latest ? " (latest)" : "") + (r.available ? "" : " (missing)")).join(" · ") || "none"}. Install more from the Updates tab.</div>
   </div>
 
   <div class="card">
@@ -166,7 +172,7 @@
         <span class="k">iGPU name patterns (one per line)</span>
         <textarea rows="2" bind:value={igpuText}></textarea>
       </label>
-      <label class="field" style="grid-column: span 3;" title="Off by default. The eviction root cause is the PCIe Link State Power Management power setting (pre-flight check 12 warns if it is not Off). Only if that cannot be Off: a 1-token request every N seconds keeps the GPU busy so Windows never powers the adapter down. Profiles can override.">
+      <label class="field" style="grid-column: span 3;" title="Off by default. VRAM eviction on idle is caused by the PCIe Link State Power Management power setting; pre-flight check 12 warns when it is not Off. If it cannot be Off, a 1-token request every N seconds keeps the GPU awake. Profiles can override.">
         <span class="k">keep-alive interval (seconds, 0 = off)</span>
         <input type="number" min="0" max="60" bind:value={cfg.keep_alive_seconds} />
       </label>

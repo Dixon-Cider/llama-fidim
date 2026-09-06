@@ -72,8 +72,13 @@ enum Cmd {
     },
     /// List saved profiles with validation findings.
     Profiles,
-    /// List ROCm runtimes (HIP SDK, ComfyUI, LM Studio, manual) a profile can name.
+    /// List ROCm runtimes (HIP SDK, installed from AMD, LM Studio, manual) a profile can name.
     Runtimes,
+    /// ROCm runtimes from AMD: list what is installable, install one, remove one.
+    Rocm {
+        #[command(subcommand)]
+        cmd: RocmCmd,
+    },
     /// The model author's published sampling defaults (Hugging Face generation_config.json).
     CreatorDefaults { model_path: PathBuf },
     /// Parse one GGUF header and report what the scanner would see (and how long it took).
@@ -148,8 +153,6 @@ enum Cmd {
         #[arg(long)]
         no_save: bool,
     },
-    /// Write starter profiles translated from the existing batch files.
-    Seed,
     /// Check upstream llama.cpp releases; optionally install, promote, roll back.
     /// Never launches a server or loads a model.
     Update {
@@ -239,7 +242,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Bench { profile_id, concurrency, tokens, warmups, no_save } => {
             cmd_bench(&cfg, &platform, &profile_id, concurrency, tokens, warmups, no_save)
         }
-        Cmd::Seed => cmd_seed(&cfg),
+        Cmd::Rocm { cmd } => cmd_rocm(&cfg, cli.json, cmd),
         Cmd::Update { install, source, promote, all, rollback, tag } => {
             cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag)
         }
@@ -247,6 +250,63 @@ fn main() -> anyhow::Result<()> {
 }
 
 // -------------------------------------------------------------- runtimes ----
+
+#[derive(Subcommand, Debug)]
+enum RocmCmd {
+    /// Versions installable from AMD's release and nightly channels, newest first.
+    List {
+        /// GPU family for nightlies (default: config.rocm_family, else gfx120X-all).
+        #[arg(long)]
+        family: Option<String>,
+    },
+    /// Download and unpack a version into <install root>\rocm\<version>.
+    Install {
+        version: String,
+        #[arg(long)]
+        family: Option<String>,
+    },
+    /// Delete an installed version (never the default).
+    Remove { version: String },
+}
+
+fn cmd_rocm(cfg: &Config, json: bool, cmd: RocmCmd) -> anyhow::Result<()> {
+    use llamactl_core::rocm;
+    let fam = |f: Option<String>| f.or_else(|| cfg.rocm_family.clone()).unwrap_or_else(|| "gfx120X-all".to_string());
+    match cmd {
+        RocmCmd::List { family } => {
+            let family = fam(family);
+            let (list, problems) = rocm::available(&family)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "family": family, "runtimes": list, "problems": problems }))?);
+                return Ok(());
+            }
+            let installed: Vec<String> = rocm::installed(cfg).into_iter().map(|(_, m)| m.version).collect();
+            println!("{:<22} {:<8} {}", "VERSION", "CHANNEL", "STATE");
+            for a in &list {
+                println!("{:<22} {:<8} {}", a.version, a.channel, if installed.contains(&a.version) { "installed" } else { "" });
+            }
+            for p in problems {
+                eprintln!("note: {p}");
+            }
+            println!("\nnightlies are for family {family}; `llamactl rocm install <version>` puts one under {}", rocm::runtimes_root(cfg).display());
+        }
+        RocmCmd::Install { version, family } => {
+            let (list, _) = rocm::available(&fam(family))?;
+            let a = list
+                .into_iter()
+                .find(|a| a.version == version)
+                .ok_or_else(|| anyhow::anyhow!("ROCm {version} is not on either channel; see `llamactl rocm list`"))?;
+            let mut progress = |line: String| println!("{line}");
+            let dir = rocm::install(cfg, &a, &mut progress)?;
+            println!("installed {} -> select it as runtime `rocm-{}`", dir.display(), a.version);
+        }
+        RocmCmd::Remove { version } => {
+            rocm::remove(cfg, &version)?;
+            println!("removed ROCm {version}");
+        }
+    }
+    Ok(())
+}
 
 fn cmd_runtimes(cfg: &Config, json: bool) -> anyhow::Result<()> {
     let all = llamactl_core::runtime::discover(cfg);
@@ -302,11 +362,11 @@ fn cmd_update(
     }
 
     let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
-    let release = match &tag {
-        Some(t) => update::release_by_tag(t)?,
-        None => update::latest_release()?,
+    let check = match &tag {
+        Some(t) => update::check_against(cfg, &builds, update::release_by_tag(t)?)?,
+        None => update::check(cfg)?,
     };
-    let check = update::check_against(cfg, &builds, release.clone())?;
+    let release = check.latest.clone();
     let previous = check.newest_installed.clone();
     if !json {
         println!("upstream latest : {} ({})", check.latest.tag, check.latest.published_at);
@@ -320,6 +380,12 @@ fn cmd_update(
             None => println!("newest installed: none"),
         }
         println!("install dir     : {}{}", check.install_dir.display(), if check.already_installed { "  [present]" } else { "" });
+        if !check.changes.is_empty() {
+            println!("what changed{}:", if check.changes_complete { "" } else { " (newest 100 only)" });
+            for c in &check.changes {
+                println!("  {:<8} {}  {}", c.tag, c.published_at.get(..10).unwrap_or(""), c.title);
+            }
+        }
         if let Some(e) = &check.asset_error {
             println!("prebuilt        : unavailable — {e}");
         }
@@ -1102,64 +1168,6 @@ fn cmd_bench(
 
 /// Starter profiles translated from tools/start-gemma-*.bat — the parity
 /// baseline for the export acceptance test.
-fn cmd_seed(cfg: &Config) -> anyhow::Result<()> {
-    let worker = serde_json::json!({
-        "schema": 1,
-        "id": "worker-pool",
-        "name": "Subagent worker pool (from start-gemma-workers.bat)",
-        "build": { "path": "C:\\Users\\Paul\\Documents\\Claude\\Projects\\AMD GPU Programming\\llama.cpp\\build-hip-vision", "version": "b9817" },
-        "model": {
-            "path": "E:\\models\\unsloth\\gemma-4-26B-A4B-it-qat-GGUF\\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
-            "draft": { "path": "E:\\models\\unsloth\\gemma-4-26B-A4B-it-qat-GGUF\\MTP\\mtp-gemma-4-26B-A4B-it-Q8_0.gguf", "enabled": false }
-        },
-        "devices": [ { "key": "pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus08" } ],
-        "server": { "port": 9701, "alias": "gemma-4-worker", "host": "127.0.0.1" },
-        "runtime": {
-            "n_gpu_layers": 99, "ctx_total": 393216, "slots": 6,
-            "kv_type_k": "q8_0", "kv_type_v": "q8_0", "flash_attn": "on",
-            "batch_logical": 2048, "batch_physical": 256, "cont_batching": true
-        },
-        "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 64, "dry_multiplier": 0.8 },
-        "chat": { "enable_thinking": false },
-        "env": { "GPU_MAX_HW_QUEUES": "1", "ROCBLAS_USE_HIPBLASLT": "0" },
-        "notes": "Knee is at 6 slots; 6->8 buys +2.4% aggregate for -23% per-stream. Swept 2026-07-29."
-    });
-    let orchestrator = serde_json::json!({
-        "schema": 1,
-        "id": "orchestrator",
-        "name": "Orchestrator 31B (from start-gemma-moe.bat lineage)",
-        "build": { "path": "C:\\Users\\Paul\\Documents\\Claude\\Projects\\AMD GPU Programming\\llama.cpp\\build-hip", "version": "b9553" },
-        "model": {
-            "path": "E:\\models\\gemma-4-31B\\gemma-4-31B-it-UD-Q5_K_XL.gguf",
-            "draft": { "path": "E:\\models\\gemma-4-31B\\MTP\\gemma-4-31B-it-Q8_0-MTP.gguf", "enabled": false }
-        },
-        "devices": [ { "key": "pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus03" } ],
-        "server": { "port": 9700, "alias": "gemma-4", "host": "127.0.0.1" },
-        "runtime": {
-            "n_gpu_layers": 99, "ctx_total": 215040, "slots": 1,
-            "kv_type_k": "q4_0", "kv_type_v": "q4_0", "flash_attn": "on",
-            "batch_logical": 2048, "batch_physical": 512, "cont_batching": true
-        },
-        "sampling": { "dry_multiplier": 0.8 },
-        "chat": { "enable_thinking": false },
-        "env": { "GPU_MAX_HW_QUEUES": "1", "ROCBLAS_USE_HIPBLASLT": "0" },
-        "notes": "q4_0 KV validated to 246K multi-hop; ~29.25GB at 210K ctx, ~43 t/s decode."
-    });
-    std::fs::create_dir_all(&cfg.profile_dir)?;
-    for p in [worker, orchestrator] {
-        let parsed: Profile = serde_json::from_value(p)?;
-        let path = cfg.profile_dir.join(format!("{}.json", parsed.id));
-        if path.exists() {
-            println!("kept existing {}", path.display());
-            continue;
-        }
-        parsed.save(&path)?;
-        println!("wrote {}", path.display());
-    }
-    println!("\nNOTE: verify the draft-model paths — seed guesses the MTP filenames; `llamactl scan` shows the real ones.");
-    Ok(())
-}
-
 // ---------------------------------------------------------------- router ----
 
 fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {

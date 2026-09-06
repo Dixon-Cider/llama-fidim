@@ -117,7 +117,7 @@
 
 <h1>
   Running
-  <span class="sub">Every server llamactl started, sampled once a second: which slots are busy, how far along each request is, and what the cards are doing.</span>
+  <span class="sub">Each server llamactl started, sampled once a second.</span>
 </h1>
 
 <div class="strip">

@@ -6,8 +6,8 @@
 //!
 //! Known sources:
 //! - **HIP SDK**: `C:\Program Files\AMD\ROCm\<ver>\bin`
-//! - **ComfyUI**: AMD's pip-distributed ROCm inside a ComfyUI venv,
-//!   `_rocm_sdk_libraries\bin` (+ `_rocm_sdk_core\bin` for the HIP runtime)
+//! - **installed**: AMD's release or nightly wheels unpacked by the Updates
+//!   tab into `<install root>\rocm\<version>\bin` (see `rocm.rs`)
 //! - **LM Studio**: `~/.lmstudio/extensions/backends/vendor/win-llama-rocm-vendor-*/bin`
 //! - **manual**: `config.runtimes` entries
 //!
@@ -28,7 +28,7 @@ pub const DEFAULT_NAME: &str = "default";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Runtime {
     pub name: String,
-    /// `hip-sdk`, `comfyui`, `lmstudio`, `manual`, or `default`.
+    /// `hip-sdk`, `amd-release`, `amd-nightly`, `lmstudio`, `manual`, or `default`.
     pub source: String,
     pub version: Option<String>,
     /// Search-path directories, first wins. All must exist for `available`.
@@ -36,6 +36,9 @@ pub struct Runtime {
     pub available: bool,
     /// Whether this is what profiles get when they name no runtime.
     pub is_default: bool,
+    /// The newest available runtime by version; pickers label it.
+    #[serde(default)]
+    pub is_latest: bool,
 }
 
 /// A user-declared runtime in config.
@@ -83,14 +86,6 @@ fn dir_name(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// Version from a ComfyUI-style site-packages: `rocm_sdk_core-7.14.0.dist-info`.
-fn comfy_rocm_version(site_packages: &Path) -> Option<String> {
-    subdirs(site_packages).into_iter().find_map(|d| {
-        let n = dir_name(&d);
-        n.strip_prefix("rocm_sdk_core-")?.strip_suffix(".dist-info").map(|v| v.to_string())
-    })
-}
-
 /// Everything discoverable on this machine plus manual config entries,
 /// default first. Pure filesystem probing; nothing is executed.
 pub fn discover(cfg: &Config) -> Vec<Runtime> {
@@ -111,6 +106,7 @@ pub fn discover(cfg: &Config) -> Vec<Runtime> {
                 dirs: vec![bin.clone()],
                 available: false,
                 is_default: default_name == DEFAULT_NAME,
+                is_latest: false,
             }
             .with_availability(),
         );
@@ -135,42 +131,26 @@ pub fn discover(cfg: &Config) -> Vec<Runtime> {
                 dirs: vec![bin],
                 available: false,
                 is_default: false,
+                is_latest: false,
             }
             .with_availability(),
         );
     }
 
-    // ComfyUI desktop installs carrying AMD's pip ROCm.
-    if let Some(local) = env_path("LOCALAPPDATA") {
-        let installs = local.join("Comfy-Desktop").join("ComfyUI-Installs");
-        for inst in subdirs(&installs) {
-            let sp = inst.join("ComfyUI").join(".venv").join("Lib").join("site-packages");
-            let libs = sp.join("_rocm_sdk_libraries").join("bin");
-            let core = sp.join("_rocm_sdk_core").join("bin");
-            if !libs.is_dir() {
-                continue;
+    // Runtimes installed from AMD's channels (Updates tab / `llamactl rocm`).
+    for (dir, m) in crate::rocm::installed(cfg) {
+        out.push(
+            Runtime {
+                name: format!("rocm-{}", m.version),
+                source: format!("amd-{}", m.channel),
+                version: Some(m.version.clone()),
+                dirs: vec![dir.join("bin")],
+                available: false,
+                is_default: false,
+                is_latest: false,
             }
-            let version = comfy_rocm_version(&sp);
-            let mut dirs = vec![libs];
-            if core.is_dir() {
-                dirs.push(core);
-            }
-            out.push(
-                Runtime {
-                    name: format!(
-                        "comfyui-{}{}",
-                        dir_name(&inst).to_lowercase().replace(' ', "-"),
-                        version.as_ref().map(|v| format!("-{v}")).unwrap_or_default()
-                    ),
-                    source: "comfyui".into(),
-                    version,
-                    dirs,
-                    available: false,
-                    is_default: false,
-                }
-                .with_availability(),
-            );
-        }
+            .with_availability(),
+        );
     }
 
     // LM Studio's vendored runtime.
@@ -193,6 +173,7 @@ pub fn discover(cfg: &Config) -> Vec<Runtime> {
                     dirs: vec![bin],
                     available: false,
                     is_default: false,
+                    is_latest: false,
                 }
                 .with_availability(),
             );
@@ -208,6 +189,7 @@ pub fn discover(cfg: &Config) -> Vec<Runtime> {
                 dirs: m.dirs.clone(),
                 available: false,
                 is_default: false,
+                is_latest: false,
             }
             .with_availability(),
         );
@@ -219,10 +201,73 @@ pub fn discover(cfg: &Config) -> Vec<Runtime> {
             r.is_default = r.name == default_name;
         }
     }
-    // Stable order: default first, then by name; drop exact duplicates.
-    out.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
+    // Order: default first, then newest version first, then by name.
+    out.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| match (&a.version, &b.version) {
+                (Some(x), Some(y)) => crate::rocm::version_key(y).cmp(&crate::rocm::version_key(x)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.name.cmp(&b.name))
+    });
     out.dedup_by(|a, b| a.name == b.name);
+    // Label the newest available one so pickers can say "latest".
+    if let Some(i) = out
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.available && r.version.is_some())
+        .max_by_key(|(_, r)| crate::rocm::version_key(r.version.as_deref().unwrap_or("")))
+        .map(|(i, _)| i)
+    {
+        out[i].is_latest = true;
+    }
     out
+}
+
+/// Some builds import DLLs by a name a runtime ships as `lib<name>`
+/// (upstream's ROCm zip wants `hipblas.dll`; the HIP SDK has
+/// `libhipblas.dll`). Windows resolves DLLs from the exe's own folder first,
+/// so a shim copied into the build would shadow every other runtime. Each
+/// runtime therefore gets its own shim folder under `~/.llamactl/shims/`,
+/// prepended ahead of its dirs, so the pick is honoured.
+pub fn shim_dir(rt: &Runtime, exe: &Path) -> Option<PathBuf> {
+    let bytes = std::fs::read(exe).ok()?;
+    let dir = Config::config_dir().join("shims").join(&rt.name);
+    let mut any = false;
+    for name in crate::update::imported_dll_names(&bytes) {
+        if rt.dirs.iter().any(|d| d.join(&name).is_file()) {
+            continue;
+        }
+        let Some(src) = rt.dirs.iter().map(|d| d.join(format!("lib{name}"))).find(|p| p.is_file()) else { continue };
+        let dst = dir.join(&name);
+        let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let fresh = dst.is_file() && mtime(&dst) >= mtime(&src);
+        if !fresh {
+            std::fs::create_dir_all(&dir).ok()?;
+            std::fs::copy(&src, &dst).ok()?;
+        }
+        any = true;
+    }
+    any.then_some(dir)
+}
+
+/// PATH prefix for running `exe` against `rt`: its shim folder (if any) then
+/// its dirs.
+pub fn prepend_for(rt: &Runtime, exe: &Path) -> Option<PathBuf> {
+    let mut dirs = rt.dirs.clone();
+    if let Some(s) = shim_dir(rt, exe) {
+        dirs.insert(0, s);
+    }
+    Runtime { dirs, ..rt.clone() }.path_prepend()
+}
+
+/// The config-default runtime's PATH prefix for `exe`, or None when no
+/// runtime is configured at all.
+pub fn default_prepend(cfg: &Config, exe: &Path) -> Option<PathBuf> {
+    resolve(cfg, None).ok().and_then(|rt| prepend_for(&rt, exe))
 }
 
 /// The runtime a profile launches with: its named choice, else the config
@@ -274,6 +319,7 @@ mod tests {
             dirs: vec![PathBuf::from(r"C:\a"), PathBuf::from(r"C:\b c")],
             available: true,
             is_default: false,
+            is_latest: false,
         };
         assert_eq!(r.path_prepend().unwrap().to_string_lossy(), r"C:\a;C:\b c");
     }
@@ -317,11 +363,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn comfy_version_parsed_from_dist_info() {
-        let tmp = std::env::temp_dir().join(format!("llamactl-rt3-{}", std::process::id()));
-        std::fs::create_dir_all(tmp.join("rocm_sdk_core-7.14.0.dist-info")).unwrap();
-        assert_eq!(comfy_rocm_version(&tmp).as_deref(), Some("7.14.0"));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
 }

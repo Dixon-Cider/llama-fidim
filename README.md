@@ -28,7 +28,6 @@ llamactl bench <id>           # warmups + serial + concurrent sweep -> baseline
 llamactl stop <id|port>       # clean stop
 llamactl export <id>          # standalone .bat/.ps1 (runs without llamactl)
 llamactl logs <id>            # log path + tail
-llamactl seed                 # starter profiles from the old batch files
 ```
 
 Config lives at `~/.llamactl/config.json` (build/model roots, ROCm bin);
@@ -51,5 +50,5 @@ profiles at `~/.llamactl/profiles/*.json` (hand-editable, schema v1, plural
 
 ```
 cargo build --release
-cargo test              # includes live parses of E:\models when present
+cargo test              # set LLAMACTL_TEST_MODELS=<folder of .gguf> to also parse real files
 ```

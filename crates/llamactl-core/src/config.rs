@@ -23,6 +23,10 @@ pub struct Config {
     /// `runtime::discover`). None = `default` = `rocm_bin`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_runtime: Option<String>,
+    /// GPU family for AMD's nightly ROCm index (`gfx120X-all` = RDNA4).
+    /// None = guess from the cards, else `gfx120X-all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rocm_family: Option<String>,
     /// Extra runtimes declared by hand, on top of the auto-discovered ones.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtimes: Vec<crate::runtime::ManualRuntime>,
@@ -62,6 +66,22 @@ pub struct Config {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// `C:\Program Files\AMD\ROCm\<newest>\bin` when a HIP SDK is installed.
+fn newest_hip_sdk_bin() -> Option<PathBuf> {
+    let root = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+        .join("AMD")
+        .join("ROCm");
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("bin").join("amdhip64_7.dll").is_file() || p.join("bin").join("amdhip64.dll").is_file())
+        .max_by_key(|p| crate::rocm::version_key(&p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))
+        .map(|p| p.join("bin"))
+}
+
 fn default_igpu_patterns() -> Vec<String> {
     vec!["Radeon(TM) Graphics".into()]
 }
@@ -85,26 +105,23 @@ impl Config {
         Self::config_dir().join("config.json")
     }
 
-    /// Defaults matched to the machine this tool is being built for; edit the
-    /// JSON to point elsewhere.
+    /// First-run defaults: no roots (the Settings tab asks for them), the
+    /// newest HIP SDK found under Program Files as the fallback runtime.
     pub fn default_for_machine() -> Self {
         let dir = Self::config_dir();
         Config {
-            build_roots: vec![PathBuf::from(
-                r"C:\Users\Paul\Documents\Claude\Projects\AMD GPU Programming\llama.cpp",
-            )],
-            model_roots: vec![PathBuf::from(r"E:\models")],
-            rocm_bin: Some(PathBuf::from(r"C:\Program Files\AMD\ROCm\7.1\bin")),
+            build_roots: vec![],
+            model_roots: vec![],
+            rocm_bin: newest_hip_sdk_bin(),
             default_runtime: None,
+            rocm_family: None,
             runtimes: Vec::new(),
             integrated_name_patterns: default_igpu_patterns(),
             profile_dir: dir.join("profiles"),
             runs_dir: dir.join("runs"),
             install_root: None,
             llama_cpp_source: None,
-            source_build_script: Some(PathBuf::from(
-                r"C:\Users\Paul\Documents\Claude\Projects\llamactl\scripts\build-from-tag.bat",
-            )),
+            source_build_script: None,
             hf_token: None,
             keep_alive_seconds: default_keep_alive(),
             extra: serde_json::Map::new(),
