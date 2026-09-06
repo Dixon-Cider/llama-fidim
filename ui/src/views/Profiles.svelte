@@ -424,78 +424,105 @@
     toastTimer = setTimeout(() => (toast = null), 6000);
   }
 </script>
-
-<h1>Profiles <span class="sub">saved launch configurations — the editor runs the same pre-flight as launch</span></h1>
+<h1>
+  Profiles
+  <span class="sub">A saved launch: model, build, GPU placement and every server flag. The editor runs the same pre-flight as launch, so what passes here is what launches.</span>
+</h1>
 {#if loadErrors.length}
   <div class="card">
     {#each loadErrors as [name, msg]}
-      <div><span class="chip block">{name} failed</span> <span class="mono">{msg}</span></div>
+      <div class="notice"><span class="chip block">{name} failed</span> <span class="mono">{msg}</span></div>
     {/each}
-    <div class="faint small" style=" margin-top: 4px;">Check the roots on the Settings tab, then Rescan.</div>
+    <div class="faint small" style="margin-top: 6px;">Check the roots on the Settings tab, then Rescan.</div>
   </div>
 {:else if !loading && (!models.length || !builds.length || !devices.length)}
-  <div class="card">
+  <div class="card notice">
     <span class="chip warn">nothing to pick from</span>
-    <span >
-      {models.length} models · {builds.length} builds · {devices.length} GPUs —
-      set the model and build roots on the <b>Settings</b> tab (scanning {models.length ? "" : "found no GGUF files"}{!builds.length ? (models.length ? "" : "; ") + "found no bin\\llama-server.exe" : ""}).
+    <span>
+      {models.length} models · {builds.length} builds · {devices.length} GPUs.
+      Set the model and build roots on the <b>Settings</b> tab{models.length ? "" : " (no GGUF files found)"}{!builds.length ? (models.length ? "" : "; ") + " no bin\\llama-server.exe found" : ""}.
     </span>
   </div>
 {/if}
 
-<div style="display: flex; gap: 16px; align-items: flex-start;">
+<div class="pf">
   <!-- list -->
-  <div style="width: 250px; flex: none;">
-    <div class="toolbar">
+  <aside class="list">
+    <div class="toolbar" style="margin-bottom: 10px;">
       <button class="btn" onclick={newProfile}>New</button>
       <button class="btn" onclick={duplicate} disabled={!draft}>Duplicate</button>
-      <button class="btn" onclick={rescan} disabled={busy === "scan"} title="rescan build and model roots">{busy === "scan" ? "…" : "Rescan"}</button>
+      <div class="grow"></div>
+      <button class="btn small" onclick={rescan} disabled={busy === "scan"} title="rescan build and model roots">{busy === "scan" ? "…" : "Rescan"}</button>
     </div>
-    <div class="card" style="padding: 8px;">
+    <div class="rows">
       {#each profiles as row}
-        <button
-          class="btn"
-          style="width: 100%; text-align: left; margin: 2px 0; border-color: {selectedId === row.profile.id ? 'var(--accent)' : 'var(--rule)'};"
-          onclick={() => select(row.profile.id)}
-        >
-          <div style="display: flex; justify-content: space-between; align-items: baseline;">
-            <span>{row.profile.id}</span>
-            <span class="mono faint">:{row.profile.server.port}</span>
+        {@const p = row.profile}
+        <button class="row" class:active={selectedId === p.id} onclick={() => select(p.id)}>
+          <div class="r1"><span class="id">{p.id}</span><span class="mono faint">:{p.server.port}</span></div>
+          <div class="r2">{base(p.model.path) || "no model"}</div>
+          <div class="r3">
+            <span class="mono">{p.build.version ?? "?"}</span>
+            <span>{p.devices.length} GPU{p.devices.length === 1 ? "" : "s"}{p.split_mode ? `, ${p.split_mode} split` : ""}</span>
+            {#if p.baseline}<span class="tok num">{p.baseline.serial_tok_s} tok/s</span>{/if}
+            {#if row.findings.length}<span class="chip warn">{row.findings.length}</span>{/if}
           </div>
-          <div class="faint small" style="font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-            {base(row.profile.model.path)}
-          </div>
-          <div class="faint small" style="font-weight: 400;">
-            {row.profile.build.version ?? "?"} · {row.profile.devices.length} device{row.profile.devices.length === 1 ? "" : "s"}{row.profile.split_mode ? ` · ${row.profile.split_mode} split` : ""}
-            {#if row.profile.baseline}
-              · {row.profile.baseline.serial_tok_s} tok/s
-            {/if}
-          </div>
-          {#if row.findings.length}
-            <span class="chip warn" style="margin-top: 3px;">{row.findings.length} finding{row.findings.length === 1 ? "" : "s"}</span>
-          {/if}
         </button>
       {:else}
-        <div class="empty">No profiles — New, or `llamactl seed`</div>
+        <div class="empty">No profiles yet. New, or <span class="mono">llamactl seed</span>.</div>
       {/each}
     </div>
-  </div>
+  </aside>
 
   <!-- editor -->
   {#if draft}
-    <div style="flex: 1; min-width: 0;">
-      <!-- identity + model + build -->
-      <div class="card">
+    {@const kinds = (check?.results ?? []).map((r) => outcomeKind(r.outcome))}
+    {@const nPass = kinds.filter((k) => k === "pass").length}
+    {@const nWarn = kinds.filter((k) => k === "warn" || k === "note").length}
+    {@const nBlock = kinds.filter((k) => k === "block").length}
+    <div class="editor">
+      <div class="editbar">
+        <div class="who">
+          <span class="name">{draft.name || draft.id}</span>
+          <span class="meta"><span class="mono muted">{draft.id} · :{draft.server.port} · {draft.server.alias}</span>{#if !selectedId}<span class="chip accent">unsaved</span>{/if}
+          <span class="pfsum" title="pre-flight, re-run on every edit">
+          {#if checking}<span class="chip plain live">checking</span>
+          {:else if check?.error}<span class="chip block">check failed</span>
+          {:else if kinds.length}
+            <span class="chip pass">{nPass} pass</span>
+            {#if nWarn}<span class="chip warn">{nWarn} warn</span>{/if}
+            {#if nBlock}<span class="chip block">{nBlock} block</span>{/if}
+          {/if}
+          </span></span>
+        </div>
+        <div class="actions">
+          <button class="btn primary" onclick={save} disabled={!!busy}>Save</button>
+          <button class="btn" onclick={() => launch(false)} disabled={!!busy || anyBlock}>{busy === "launch" ? "Loading…" : "Save & load"}</button>
+          {#if anyBlock}
+            <button class="btn danger" onclick={() => launch(true)} disabled={!!busy}>Override blocks &amp; load</button>
+          {/if}
+          <button class="btn" onclick={() => exportScript("bat")} disabled={!!busy} title="write a standalone .bat that launches this profile">Export .bat</button>
+          <button class="btn" onclick={() => exportScript("ps1")} disabled={!!busy} title="write a standalone .ps1 that launches this profile">Export .ps1</button>
+          <button class="btn danger" onclick={remove} disabled={!!busy || !selectedId}>Delete</button>
+        </div>
+      </div>
+
+      <!-- identity -->
+      <section class="card">
+        <div class="sec">Identity <span class="faint">what the CLI, the router and clients call it</span></div>
         <div class="formgrid">
           <label class="field" title="Profile identifier: the file name under the profile directory and what the CLI uses (llamactl launch <id>). Letters, digits, dashes."><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
           <label class="field" style="grid-column: span 2;" title="Free-text display name."><span class="k">name</span><input bind:value={draft.name} /></label>
           <label class="field" title="TCP port the server listens on. Each running profile needs its own; pre-flight checks it is free."><span class="k">port</span><input type="number" bind:value={draft.server.port} oninput={scheduleCheck} /></label>
-          <label class="field" title="Model name the server reports on /v1/models and what clients pass as 'model'. Unique across running servers."><span class="k">alias</span><input bind:value={draft.server.alias} oninput={scheduleCheck} /></label>
+          <label class="field" style="grid-column: span 2;" title="Model name the server reports on /v1/models and what clients pass as 'model'. Unique across running servers; the router uses it as the model id."><span class="k">alias</span><input bind:value={draft.server.alias} oninput={scheduleCheck} /></label>
         </div>
+      </section>
 
-        <div class="formgrid" style="margin-top: 12px;">
+      <!-- model + build -->
+      <section class="card">
+        <div class="sec">Model <span class="faint">{models.length} GGUF files under the model roots</span></div>
+        <div class="formgrid">
           <label class="field" style="grid-column: 1 / -1;">
-            <span class="k">model <span class="faint" style="text-transform: none; letter-spacing: 0;">— {models.length} GGUF files under the model roots</span></span>
+            <span class="k">weights</span>
             <select value={models.find((m) => samePath(m.path, draft.model.path))?.path ?? ""} onchange={(e) => onModelPick(e.target.value)}>
               <option value="" disabled>choose a model…</option>
               {#each models as m}
@@ -504,15 +531,20 @@
             </select>
           </label>
           {#if header}
-            <div class="path" style="grid-column: 1 / -1; color: var(--ink-muted);">
-              {header.model_name ?? base(draft.model.path)} · {header.architecture} · {header.size_label ?? ""} · {header.block_count} layers · trained context {fmtInt(header.context_length ?? 0)}
-              {#if header.source_repo} · <span title="from GGUF general.base_model">{header.source_repo}</span>{/if}
-              <br /><span style="opacity: .7; word-break: break-all;">{draft.model.path}</span>
+            <div class="facts" style="grid-column: 1 / -1;">
+              <span><b>{header.model_name ?? base(draft.model.path)}</b></span>
+              <span>{header.architecture}</span>
+              {#if header.size_label}<span>{header.size_label}</span>{/if}
+              <span>{header.block_count} layers</span>
+              <span>trained context {fmtInt(header.context_length ?? 0)}</span>
+              {#if header.source_repo}<span title="from GGUF general.base_model">{header.source_repo}</span>{/if}
+              {#if mtpBuiltIn}<span class="chip pass">MTP built in</span>{/if}
+              <span class="path" style="flex-basis: 100%;">{draft.model.path}</span>
             </div>
           {:else if draft.model.path}
-            <div class="path" style="grid-column: 1 / -1;">{draft.model.path} <span class="chip warn">not in scan</span></div>
+            <div class="facts" style="grid-column: 1 / -1;"><span class="chip warn">not in scan</span><span class="path">{draft.model.path}</span></div>
           {/if}
-          <label class="field" style="grid-column: span 2;">
+          <label class="field" style="grid-column: span 3;" title="Multimodal projector paired with the weights; lets the server read images.">
             <span class="k">vision projector (mmproj)</span>
             <select bind:value={draft.model.mmproj} onchange={scheduleCheck}>
               <option value={null}>none</option>
@@ -522,8 +554,8 @@
               {/if}
             </select>
           </label>
-          <label class="field" style="grid-column: span 2;">
-            <span class="k">speculative draft model</span>
+          <label class="field" style="grid-column: span 3;" title="A small draft model or MTP sidecar file for speculative decoding. Turned on in the Speculative decoding section.">
+            <span class="k">speculative draft file</span>
             <select value={draft.model.draft?.path ?? ""} onchange={(e) => onDraftPick(e.target.value)}>
               <option value="">none</option>
               {#each selectedModel?.draft_candidates ?? [] as c}<option value={c}>{base(c)}</option>{/each}
@@ -532,13 +564,7 @@
               {/if}
             </select>
           </label>
-          {#if draft.model.draft}
-            <div class="faint small" style=" align-self: end;">used by the Speculative decoding section below</div>
-          {/if}
-        </div>
-
-        <div class="formgrid" style="margin-top: 12px;">
-          <label class="field" style="grid-column: span 3;">
+          <label class="field" style="grid-column: span 3;" title="Which llama.cpp build launches this profile. Updates installs new builds side by side and can promote profiles to them.">
             <span class="k">llama.cpp build</span>
             <select value={selectedBuild?.path ?? ""} onchange={(e) => onBuildPick(e.target.value)}>
               <option value="" disabled>choose a build…</option>
@@ -548,7 +574,7 @@
               {#if draft.build.path && !selectedBuild}<option value={draft.build.path}>{draft.build.path} (not in scan)</option>{/if}
             </select>
           </label>
-          <label class="field" style="grid-column: span 3;">
+          <label class="field" style="grid-column: span 3;" title="ROCm runtime DLL folder prepended to PATH for this server. Config default is the HIP SDK.">
             <span class="k">ROCm runtime</span>
             <select bind:value={draft.rocm_runtime} onchange={scheduleCheck}>
               <option value={null}>config default ({runtimes.find((r) => r.is_default)?.name ?? "default"}{runtimes.find((r) => r.is_default)?.version ? ` · ${runtimes.find((r) => r.is_default).version}` : ""})</option>
@@ -558,38 +584,44 @@
             </select>
           </label>
         </div>
-      </div>
+      </section>
 
       <!-- devices -->
-      <div class="card">
-        <div class="sec">
-          GPU
-          <span class="faint" style="font-weight: 400;">— one card loads the whole model there; two cards span it (layer split)</span>
+      <section class="card">
+        <div class="sec">GPU placement <span class="faint">one card holds the whole model; two cards span it by layer</span></div>
+        <div class="devrows">
+          {#each devices.filter((d) => !d.integrated) as dev}
+            {@const entry = draft.devices.find((x) => x.key === dev.stable_key)}
+            {@const used = dev.total_mib - dev.free_mib}
+            <label class="devrow" class:on={!!entry}>
+              <input type="checkbox" checked={!!entry} onchange={() => toggleDevice(dev)} />
+              <span class="dname">
+                <b>{dev.name.replace(/^AMD /, "")}</b>
+                <span class="mono faint">{dev.stable_key.split(":").pop()} · {dev.backend}{dev.hip_index}</span>
+                {#if dev.display}<span class="chip warn">display attached</span>{/if}
+              </span>
+              <span class="dmeter">
+                <span class="meter"><span class="fill {used / dev.total_mib > 0.9 ? 'block' : used / dev.total_mib > 0.7 ? 'warn' : 'pass'}" style="width: {Math.round(100 * used / Math.max(1, dev.total_mib))}%;"></span></span>
+                <span class="mono faint num">{(dev.free_mib / 1024).toFixed(1)} of {(dev.total_mib / 1024).toFixed(0)} GiB free</span>
+              </span>
+              {#if entry && draft.devices.length > 1}
+                <span class="frac" title="Share of the layers placed on this card. Blank = split evenly.">
+                  <span class="k">fraction</span>
+                  <input type="number" step="0.05" min="0" max="1" placeholder="auto" bind:value={entry.split_fraction} oninput={scheduleCheck} />
+                </span>
+              {/if}
+            </label>
+          {/each}
         </div>
-        {#each devices.filter((d) => !d.integrated) as dev}
-          {@const entry = draft.devices.find((x) => x.key === dev.stable_key)}
-          <div style="display: flex; gap: 10px; align-items: center; padding: 5px 0;">
-            <input type="checkbox" style="width: auto;" checked={!!entry} onchange={() => toggleDevice(dev)} />
-            <span style="flex: 1;">{dev.name} <span class="path">{dev.stable_key.split(":").pop()}</span></span>
-            <span class="path">{dev.backend}{dev.hip_index} · {(dev.free_mib / 1024).toFixed(1)} / {(dev.total_mib / 1024).toFixed(1)} GiB free{dev.display ? " · display attached" : ""}</span>
-            {#if entry && draft.devices.length > 1}
-              <label class="field" style="width: 90px;">
-                <span class="k">fraction</span>
-                <input type="number" step="0.05" min="0" max="1" placeholder="auto"
-                  bind:value={entry.split_fraction} oninput={scheduleCheck} />
-              </label>
-            {/if}
-          </div>
-        {/each}
         {#if draft.devices.length > 1}
-          <div class="formgrid" style="margin-top: 6px;">
-            <label class="field" title="layer: whole layers per card (supported, no cross-GPU collectives). row: split each tensor across cards (experimental on this stack)."><span class="k">split mode</span>
+          <div class="formgrid" style="margin-top: 14px;">
+            <label class="field" style="grid-column: span 2;" title="layer: whole layers per card (supported, no cross-GPU collectives). row: split each tensor across cards (experimental on this stack)."><span class="k">split mode</span>
               <select bind:value={draft.split_mode} onchange={scheduleCheck}>
                 <option value="layer">layer (supported)</option>
                 <option value="row">row (experimental)</option>
               </select>
             </label>
-            <label class="field" title="Which selected card holds the KV cache and small tensors — index into the checked cards above, in order."><span class="k">main device (list index)</span>
+            <label class="field" style="grid-column: span 2;" title="Which selected card holds the KV cache and small tensors — index into the checked cards above, in order."><span class="k">main device (list index)</span>
               <input type="number" min="0" bind:value={draft.main_device} oninput={scheduleCheck} />
             </label>
           </div>
@@ -599,22 +631,23 @@
             {#each budgets as b}
               <div>
                 <div class="cap">
-                  <span>{b.name} <span class="faint">({b.key.split(":").pop()})</span></span>
-                  <span>{b.estGib.toFixed(2)} / {b.freeGib.toFixed(2)} GiB free ({Math.round(b.frac * 100)}%)</span>
+                  <span>estimated need on {b.name.replace(/^AMD /, "")} <span class="faint">({b.key.split(":").pop()})</span></span>
+                  <span><span class="num">{b.estGib.toFixed(2)}</span> of <span class="num">{b.freeGib.toFixed(2)}</span> GiB free · {Math.round(b.frac * 100)}%</span>
                 </div>
                 <div class="bar" title={b.detail}>
                   <div class="fill {b.kind}" style="width: {Math.min(100, b.frac * 100)}%;"></div>
                   <div class="mark" style="left: 90%;"></div>
                 </div>
+                <div class="faint small" style="margin-top: 4px;">{b.detail}</div>
               </div>
             {/each}
           </div>
         {/if}
-      </div>
+      </section>
 
       <!-- context & offload -->
-      <div class="card">
-        <div class="sec">Context and offload</div>
+      <section class="card">
+        <div class="sec">Context and offload <span class="faint">what the server allocates at start</span></div>
         <div class="formgrid">
           <Range bind:value={draft.runtime.ctx_total} label="context length" title="Total tokens of context the server allocates (split across slots). VRAM is nearly flat with context on Gemma 4's sliding-window layers; on dense models it grows linearly." min={512} max={ctxMax} step={256}
             hint={header ? `model supports up to ${fmtInt(ctxMax)} tokens` : "no model header — default cap"} format={fmtInt} onchange={scheduleCheck} span={3} />
@@ -622,64 +655,20 @@
             hint={header ? `${layerMax} layers; ≥ ${layerMax} = all` : "99 = all"} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.runtime.slots} label="max concurrent requests (slots)" title="-np: parallel request slots. Context divides evenly across them. Measured knee on the 26B-A4B: 6 slots." min={1} max={16} step={1}
             hint={`per-slot context = ${fmtInt(Math.floor(draft.runtime.ctx_total / Math.max(1, draft.runtime.slots)))}`} onchange={scheduleCheck} span={3} />
-          <label class="field" style="grid-column: span 3; justify-content: end;">
+          <label class="field" style="grid-column: span 3; justify-content: end;" title="One shared KV pool across slots instead of a fixed share per slot. Experimental.">
             <span class="k">unified KV cache</span>
-            <span><input type="checkbox" style="width: auto;" bind:checked={draft.runtime.kv_unified} onchange={scheduleCheck} /> one shared KV pool across slots (experimental)</span>
+            <span><input type="checkbox" bind:checked={draft.runtime.kv_unified} onchange={scheduleCheck} /> one shared KV pool across slots</span>
           </label>
         </div>
-      </div>
-
-      <!-- advanced -->
-      <div class="card">
-        <div class="sec">Advanced</div>
-        <div class="formgrid">
-          <Range bind:value={draft.keep_alive_seconds} label="keep model resident (keep-alive, seconds)" min={0} max={30} step={1} nullable placeholder={keepAliveDefault}
-            hint={`config default ${keepAliveDefault} s · 0 = off`} onchange={scheduleCheck} span={3}
-            title="Workaround, off by default: the eviction root cause is the PCIe Link State Power Management power setting (pre-flight check 12). Only if that cannot be Off: a 1-token request this often keeps the GPU busy so Windows never powers the adapter down. 5 s measured sufficient; ~70 ms of GPU time per ping." />
-          <Range bind:value={draft.runtime.threads} label="CPU thread pool size" title="-t: CPU threads for layers not offloaded and for tokenisation. Irrelevant when everything is on the GPU." min={1} max={32} step={1} nullable placeholder={8}
-            hint="only matters for layers left on CPU" onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse (min chunk)" title="--cache-reuse: reuse KV cache for a prompt that shares a prefix with a previous one, in chunks of at least this many tokens. 0 = off." min={0} max={2048} step={32} nullable placeholder={256}
-            hint="--cache-reuse" onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.batch_logical} label="evaluation batch size (-b)" title="-b: logical batch, the per-iteration token budget shared by prefill and decode." min={64} max={8192} step={64}
-            hint="shared per-iteration budget" format={fmtInt} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.batch_physical} label="physical batch size (-ub)" title="-ub: micro-batch actually pushed through the GPU; sizes the compute buffer. 256 measured best on the R9700 at long context." min={32} max={2048} step={32}
-            hint="sizes the compute buffer; 256 = R9700 sweet spot" format={fmtInt} onchange={scheduleCheck} span={3} />
-          <label class="field" title="Fused attention kernel: less VRAM, faster prefill. Must be on for V-cache quantisation. 'auto' lets llama.cpp decide."><span class="k">flash attention</span>
-            <select bind:value={draft.runtime.flash_attn} onchange={scheduleCheck}>
-              <option value="on">on</option><option value="off">off</option><option value="auto">auto</option>
-            </select>
-          </label>
-          <label class="field" title="Storage type of the attention key cache. q8_0 is visually lossless and halves KV VRAM; q4_0 quarters it with some quality cost."><span class="k">K cache quant</span>
-            <select bind:value={draft.runtime.kv_type_k} onchange={scheduleCheck}>
-              {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
-            </select>
-          </label>
-          <label class="field" title="Storage type of the attention value cache. Needs flash attention on for anything but f16."><span class="k">V cache quant</span>
-            <select bind:value={draft.runtime.kv_type_v} onchange={scheduleCheck}>
-              {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
-            </select>
-          </label>
-          <label class="field" title="Serve concurrent requests inside one forward pass instead of queueing them. Leave on."><span class="k">continuous batching</span>
-            <span><input type="checkbox" style="width: auto;" bind:checked={draft.runtime.cont_batching} onchange={scheduleCheck} /> -cb</span>
-          </label>
-          <label class="field" style="grid-column: 1 / -1;" title="Anything this editor does not model, e.g. --spec-type mtp --draft-max 3 or --no-mmap. Passed to llama-server unchanged."><span class="k">extra llama-server flags (space-separated, passed through verbatim)</span>
-            <input value={Array.isArray(draft.runtime.extra_flags) ? draft.runtime.extra_flags.join(" ") : draft.runtime.extra_flags}
-              oninput={(e) => { draft.runtime.extra_flags = e.target.value; scheduleCheck(); }} placeholder="--spec-type mtp --draft-max 3" />
-          </label>
-        </div>
-        <div class="faint small" style=" margin-top: 6px;">
-          KV quantisation is where the VRAM is on this architecture (q8_0 ≈ f16 quality); flash attention must be on for V-cache quant.
-        </div>
-      </div>
+      </section>
 
       <!-- speculative decoding -->
-      <div class="card">
-        <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
-          <span class="sec-title">Speculative decoding</span>
+      <section class="card">
+        <div class="sec">
+          Speculative decoding
           {#if mtpBuiltIn}<span class="chip pass">model supports MTP</span>{/if}
-          <span class="faint small" style="">drafts several tokens per step and verifies them in one pass — free speed when the draft is right</span>
-          <div style="flex: 1;"></div>
-          <button class="btn" onclick={applySpecDefaults} disabled={draft.speculative.mode === "off"} title="engine defaults: 3 max, 0 min, 0.0 probability">Apply creator defaults</button>
+          <span class="faint">drafts several tokens per step and verifies them in one pass; free speed when the draft is right</span>
+          <span style="margin-left: auto;"><button class="btn small" onclick={applySpecDefaults} disabled={draft.speculative.mode === "off"} title="engine defaults: 3 max, 0 min, 0.0 probability">Engine defaults</button></span>
         </div>
         <div class="formgrid">
           <label class="field" style="grid-column: span 3;" title="How drafts are produced. MTP uses the model's own multi-token head (built in for Qwen 3.5+/3.8, a sidecar file for Gemma 4). draft = a separate small model. DFlash = a DFlash draft file. n-gram = prompt lookup, no model.">
@@ -689,6 +678,7 @@
             </select>
           </label>
           {#if draft.speculative.mode !== "off"}
+            <div style="grid-column: span 3;"></div>
             <Range bind:value={draft.speculative.n_max} label="max draft tokens" min={1} max={16} step={1} nullable placeholder={3}
               hint="engine default 3" onchange={scheduleCheck} span={3}
               title="--spec-draft-n-max: how many tokens the draft proposes per step. Higher = more speed when accepted, more waste when rejected." />
@@ -701,32 +691,39 @@
           {/if}
         </div>
         {#if draft.speculative.mode === "mtp" && !mtpBuiltIn && !draft.model.draft?.path}
-          <div class="chip block nodot" style="margin-top: 8px; white-space: normal;">MTP needs either a model with a built-in head or an MTP sidecar chosen above</div>
+          <div class="notice" style="margin-top: 10px;"><span class="chip block">needs a head</span><span>MTP needs either a model with a built-in head or an MTP sidecar chosen above.</span></div>
         {/if}
-      </div>
+      </section>
 
       <!-- inference -->
-      <div class="card">
-        <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
-          <span class="sec-title">Inference</span>
-          <span class="faint small" style="">unchecked = the engine's own default</span>
-          <div class="grow" style="flex: 1;"></div>
-          <button class="btn" onclick={fetchCreator} disabled={creatorBusy || !draft.model.path} title="look up generation_config.json on Hugging Face">
-            {creatorBusy ? "Fetching…" : embedded ? "Re-check on Hugging Face" : "Creator defaults"}
-          </button>
-          {#if creatorShown}
-            <button class="btn primary" onclick={applyCreator}>Apply creator defaults</button>
-          {/if}
+      <section class="card">
+        <div class="sec">
+          Inference
+          <span class="faint">unchecked = the engine's own default</span>
+          <span style="margin-left: auto; display: flex; gap: 8px;">
+            <button class="btn small" onclick={fetchCreator} disabled={creatorBusy || !draft.model.path} title="look up generation_config.json on Hugging Face">
+              {creatorBusy ? "Fetching…" : embedded ? "Re-check on Hugging Face" : "Creator defaults"}
+            </button>
+            {#if creatorShown}
+              <button class="btn small primary" onclick={applyCreator}>Apply creator defaults</button>
+            {/if}
+          </span>
         </div>
         {#if creatorShown || creator?.error}
-          <div class="mono" style="margin-bottom: 12px; padding: 10px 12px; background: var(--ground-inset); border-radius: 6px; line-height: 1.7;">
+          <div class="creator">
             {#if creator?.error}
-              <span class="chip block">hugging face</span> {creator.error}<br />
+              <div class="notice"><span class="chip block">hugging face</span><span class="mono">{creator.error}</span></div>
             {/if}
             {#if creatorShown}
-              <span class="chip accent">{creatorShown.repo}</span>
-              temperature {creatorShown.temperature ?? "—"} · top_p {creatorShown.top_p ?? "—"} · top_k {creatorShown.top_k ?? "—"} · min_p {creatorShown.min_p ?? "—"} · repetition_penalty {creatorShown.repetition_penalty ?? "—"}
-              <span class="faint">({creatorShown.embedded ? "embedded in the GGUF header by the converter" : (creatorShown.from_cache ? "cached" : "fetched") + " from generation_config.json"})</span>
+              <div class="facts">
+                <span class="chip accent">{creatorShown.repo}</span>
+                <span>temperature <b class="num">{creatorShown.temperature ?? "—"}</b></span>
+                <span>top_p <b class="num">{creatorShown.top_p ?? "—"}</b></span>
+                <span>top_k <b class="num">{creatorShown.top_k ?? "—"}</b></span>
+                <span>min_p <b class="num">{creatorShown.min_p ?? "—"}</b></span>
+                <span>repetition_penalty <b class="num">{creatorShown.repetition_penalty ?? "—"}</b></span>
+                <span class="faint">{creatorShown.embedded ? "embedded in the GGUF header by the converter" : (creatorShown.from_cache ? "cached" : "fetched") + " from generation_config.json"}</span>
+              </div>
             {/if}
           </div>
         {/if}
@@ -754,27 +751,76 @@
           <Range bind:value={draft.sampling.dry_multiplier} label="DRY multiplier" title="DRY (Don't Repeat Yourself) sampler strength: penalises repeating whole sequences, not single tokens. 0 = off." min={0} max={2} step={0.05} nullable placeholder={0}
             hint="0 = off; repetition suppression" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
         </div>
-        <label class="field" style="margin-top: 10px;" title="Why this profile exists, what was measured, what to remember. Free text, kept with the profile."><span class="k">notes</span>
-          <textarea rows="2" bind:value={draft.notes}></textarea>
-        </label>
-      </div>
+      </section>
+
+      <!-- advanced -->
+      <section class="card">
+        <div class="sec">Advanced <span class="faint">batching, KV storage and pass-through flags</span></div>
+        <div class="formgrid">
+          <Range bind:value={draft.runtime.batch_logical} label="evaluation batch size (-b)" title="-b: logical batch, the per-iteration token budget shared by prefill and decode." min={64} max={8192} step={64}
+            hint="shared per-iteration budget" format={fmtInt} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.batch_physical} label="physical batch size (-ub)" title="-ub: micro-batch actually pushed through the GPU; sizes the compute buffer. 256 measured best on the R9700 at long context." min={32} max={2048} step={32}
+            hint="sizes the compute buffer; 256 = R9700 sweet spot" format={fmtInt} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse (min chunk)" title="--cache-reuse: reuse KV cache for a prompt that shares a prefix with a previous one, in chunks of at least this many tokens. 0 = off." min={0} max={2048} step={32} nullable placeholder={256}
+            hint="--cache-reuse" onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.threads} label="CPU thread pool size" title="-t: CPU threads for layers not offloaded and for tokenisation. Irrelevant when everything is on the GPU." min={1} max={32} step={1} nullable placeholder={8}
+            hint="only matters for layers left on CPU" onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.keep_alive_seconds} label="keep model resident (keep-alive, seconds)" min={0} max={30} step={1} nullable placeholder={keepAliveDefault}
+            hint={`config default ${keepAliveDefault} s · 0 = off`} onchange={scheduleCheck} span={3}
+            title="Workaround, off by default: the eviction root cause is the PCIe Link State Power Management power setting (pre-flight check 12). Only if that cannot be Off: a 1-token request this often keeps the GPU busy so Windows never powers the adapter down. 5 s measured sufficient; ~70 ms of GPU time per ping." />
+          <div style="grid-column: span 3;"></div>
+          <label class="field" style="grid-column: span 2;" title="Fused attention kernel: less VRAM, faster prefill. Must be on for V-cache quantisation. 'auto' lets llama.cpp decide."><span class="k">flash attention</span>
+            <select bind:value={draft.runtime.flash_attn} onchange={scheduleCheck}>
+              <option value="on">on</option><option value="off">off</option><option value="auto">auto</option>
+            </select>
+          </label>
+          <label class="field" title="Storage type of the attention key cache. q8_0 is visually lossless and halves KV VRAM; q4_0 quarters it with some quality cost."><span class="k">K cache quant</span>
+            <select bind:value={draft.runtime.kv_type_k} onchange={scheduleCheck}>
+              {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
+            </select>
+          </label>
+          <label class="field" title="Storage type of the attention value cache. Needs flash attention on for anything but f16."><span class="k">V cache quant</span>
+            <select bind:value={draft.runtime.kv_type_v} onchange={scheduleCheck}>
+              {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
+            </select>
+          </label>
+          <label class="field" style="grid-column: span 2;" title="Serve concurrent requests inside one forward pass instead of queueing them. Leave on."><span class="k">continuous batching</span>
+            <span><input type="checkbox" bind:checked={draft.runtime.cont_batching} onchange={scheduleCheck} /> on (-cb)</span>
+          </label>
+          <label class="field" style="grid-column: 1 / -1;" title="Anything this editor does not model, e.g. --no-mmap. Passed to llama-server unchanged."><span class="k">extra llama-server flags (space-separated, passed through verbatim)</span>
+            <input value={Array.isArray(draft.runtime.extra_flags) ? draft.runtime.extra_flags.join(" ") : draft.runtime.extra_flags}
+              oninput={(e) => { draft.runtime.extra_flags = e.target.value; scheduleCheck(); }} placeholder="--no-mmap" />
+          </label>
+        </div>
+        <div class="faint small" style="margin-top: 10px;">
+          KV quantisation is where the VRAM is on this architecture (q8_0 ≈ f16 quality); flash attention must be on for V-cache quant.
+        </div>
+      </section>
+
+      <!-- notes -->
+      <section class="card">
+        <div class="sec">Notes <span class="faint">why this profile exists, what was measured, what to remember</span></div>
+        <textarea rows="3" bind:value={draft.notes} placeholder="Knee is at 6 slots; 6→8 buys +2.4% aggregate for −23% per-stream."></textarea>
+      </section>
 
       {#if check?.findings?.length}
-        <div class="card">
+        <section class="card">
+          <div class="sec">Findings <span class="faint">problems with the profile itself</span></div>
           {#each check.findings as f}
-            <div style="display: flex; gap: 8px; align-items: baseline; padding: 3px 0;">
+            <div class="notice" style="padding: 4px 0;">
               <span class="chip {f.severity === 'error' ? 'block' : 'warn'}">{f.severity}</span>
-              <span >{f.message}</span>
+              <span>{f.message}</span>
             </div>
           {/each}
-        </div>
+        </section>
       {/if}
 
       <!-- live pre-flight -->
-      <div class="card">
-        <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
-          <span class="sec-title">Pre-flight</span>
-          {#if checking}<span class="path">re-checking…</span>{/if}
+      <section class="card">
+        <div class="sec">
+          Pre-flight
+          <span class="faint">the same checks launch runs, re-run on every edit</span>
+          {#if checking}<span class="chip plain live" style="margin-left: auto;">re-checking</span>{/if}
           {#if check?.error}<span class="chip block">{check.error}</span>{/if}
         </div>
         {#if check?.results}
@@ -782,7 +828,7 @@
             {#each check.results as r}
               {@const kind = outcomeKind(r.outcome)}
               {@const msg = outcomeMsg(r.outcome)}
-              <div class="row" class:has-msg={!!msg}>
+              <div class="row">
                 <span class="n">{r.spec_number}</span>
                 <span class="t">{r.title}</span>
                 <span class="chip {kind}">{kind}</span>
@@ -791,56 +837,91 @@
             {/each}
           </div>
           {#if check.command_line}
-            <div class="path" style="margin-top: 10px;">
-              {check.command_line}
-            </div>
-            <div class="path">
-              env: {(check.env ?? []).map(([k, v]) => `${k}=${v}`).join("  ")}
+            <div class="cmd">
+              <div class="k">command</div>
+              <div class="path">{check.command_line}</div>
+              <div class="k" style="margin-top: 8px;">environment</div>
+              <div class="path">{(check.env ?? []).map(([k, v]) => `${k}=${v}`).join("  ")}</div>
             </div>
           {/if}
         {:else if !checking}
           <div class="empty">Edit any field to run pre-flight</div>
         {/if}
-      </div>
-
-      <div class="toolbar">
-        <button class="btn primary" onclick={save} disabled={!!busy}>Save</button>
-        <button class="btn" onclick={() => launch(false)} disabled={!!busy || anyBlock}>
-          {busy === "launch" ? "Loading…" : "Save & load"}
-        </button>
-        {#if anyBlock}
-          <button class="btn danger" onclick={() => launch(true)} disabled={!!busy}>
-            Override blocks &amp; load
-          </button>
-        {/if}
-        <button class="btn" onclick={() => exportScript("bat")} disabled={!!busy}>Export .bat</button>
-        <button class="btn" onclick={() => exportScript("ps1")} disabled={!!busy}>Export .ps1</button>
-        <div class="grow"></div>
-        <button class="btn danger" onclick={remove} disabled={!!busy || !selectedId}>Delete</button>
-      </div>
+      </section>
 
       {#if draft.baseline}
-        <div class="card">
-          <div class="sec">
-            Last baseline <span class="faint mono">{draft.baseline.measured_at} · driver {draft.baseline.driver} · {draft.baseline.sdk}</span>
-          </div>
-          <div class="mono" >
-            serial {draft.baseline.serial_tok_s} tok/s
+        <section class="card">
+          <div class="sec">Last baseline <span class="faint">{draft.baseline.measured_at} · driver {draft.baseline.driver} · {draft.baseline.sdk}</span>{#if draft.baseline.cold_cache}<span class="chip warn">cold cache</span>{/if}</div>
+          <div class="stats">
+            <div class="stat"><span class="v">{draft.baseline.serial_tok_s}<small>tok/s</small></span><span class="l">serial decode</span></div>
             {#if draft.baseline.concurrent}
-              · n={draft.baseline.concurrent.n}: {draft.baseline.concurrent.decode_aggregate_tok_s ?? draft.baseline.concurrent.aggregate_tok_s} tok/s decode-agg,
-              {draft.baseline.concurrent.per_stream_tok_s} per-stream
+              <div class="stat"><span class="v">{draft.baseline.concurrent.decode_aggregate_tok_s ?? draft.baseline.concurrent.aggregate_tok_s}<small>tok/s</small></span><span class="l">aggregate at n = {draft.baseline.concurrent.n}</span></div>
+              <div class="stat"><span class="v">{draft.baseline.concurrent.per_stream_tok_s}<small>tok/s</small></span><span class="l">per stream</span></div>
             {/if}
-            · {draft.baseline.vram_gb} GiB resident
-            {#if draft.baseline.cold_cache}<span class="chip warn">cold cache</span>{/if}
+            <div class="stat"><span class="v">{draft.baseline.vram_gb}<small>GiB</small></span><span class="l">resident</span></div>
           </div>
-        </div>
+        </section>
       {/if}
     </div>
   {:else}
-    <div class="empty" style="flex: 1;">Select or create a profile</div>
+    <div class="card" style="flex: 1;"><div class="empty">Select a profile on the left, or create one.</div></div>
   {/if}
 </div>
 
 {#if toast}
   <div class="toast" class:error={toast.isError}>{toast.text}</div>
 {/if}
+
+<style>
+  .pf { display: flex; gap: 20px; align-items: flex-start; }
+  .list { width: 280px; flex: none; position: sticky; top: 0; max-height: calc(100vh - 32px); overflow: auto; }
+  .rows { display: flex; flex-direction: column; gap: 6px; }
+  .row {
+    all: unset; cursor: pointer; display: flex; flex-direction: column; gap: 4px; padding: 10px 12px;
+    background: var(--ground-raised); border: 1px solid var(--rule); border-radius: var(--radius-sm); font-family: var(--sans);
+  }
+  .row:hover { border-color: var(--rule-strong); background: var(--ground-inset); }
+  .row.active { border-color: var(--accent-line); background: var(--accent-soft); }
+  .row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .row .r1 { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .row .id { font-family: var(--mono); font-weight: 700; font-size: 13.5px; color: var(--ink); }
+  .row.active .id { color: var(--accent); }
+  .row .r2 { font-size: 12px; color: var(--ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .r3 { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: var(--ink-faint); flex-wrap: wrap; }
+  .row .tok { color: var(--ink-muted); }
+
+  .editor { flex: 1; min-width: 0; }
+  .editbar {
+    position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    background: var(--ground); padding: 6px 0 12px; margin-bottom: 4px; border-bottom: 1px solid var(--rule);
+  }
+  .editbar .who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .editbar .name { font-family: var(--display); font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
+  .editbar .who .mono { font-size: 11.5px; }
+  .editbar .meta { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .pfsum { display: inline-flex; gap: 6px; align-items: center; }
+  .actions { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+  .editor section.card { padding: 18px 20px; }
+  .editor :global(.formgrid) { gap: 16px 20px; }
+
+  .facts { display: flex; gap: 6px 18px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-muted); align-items: center; }
+  .facts b { color: var(--ink); font-weight: 600; }
+  .creator { margin-bottom: 14px; padding: 10px 12px; background: var(--ground-inset); border-radius: 6px; }
+
+  .devrows { display: flex; flex-direction: column; gap: 8px; }
+  .devrow {
+    display: grid; grid-template-columns: auto 1fr 240px auto; gap: 16px; align-items: center;
+    padding: 10px 14px; border: 1px solid var(--rule); border-radius: var(--radius-sm); background: var(--ground-inset); cursor: pointer;
+  }
+  .devrow.on { border-color: var(--accent-line); background: var(--accent-soft); }
+  .devrow .dname { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+  .devrow .dmeter { display: flex; flex-direction: column; gap: 4px; }
+  .devrow .meter { display: block; }
+  .devrow .meter .fill { display: block; }
+  .devrow .frac { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--ink-muted); }
+  .devrow .frac input { width: 84px; }
+
+  .cmd { margin-top: 12px; }
+  .cmd .k { font-size: 11.5px; font-weight: 600; color: var(--ink-muted); margin-bottom: 2px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px 20px; }
+</style>
