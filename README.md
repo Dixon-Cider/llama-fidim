@@ -38,6 +38,8 @@ wrote the launcher we wanted.
   speculative-decoding acceptance, GPU busy and VRAM held per card. Turn on
   trace tokens in a profile and each slot also shows its last prompt and
   the text it is generating, with a detector for endless loops.
+
+  ![A slot caught looping: the tile reads "loop x8", the drawer shows the repeated fragment](docs/loop.png)
 - **Updates that never touch a running server.** llama.cpp releases install
   side by side with a changelog of what changed since your build. ROCm
   runtimes install the same way from AMD's release and nightly channels,
