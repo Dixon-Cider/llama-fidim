@@ -46,7 +46,7 @@
         <span class="mono chip {d.integrated ? 'plain' : 'accent'}">{d.backend}{d.hip_index}{d.correlation_assumed ? " ~" : ""}</span>
         <span class="name">{d.name}</span>
         <span style="margin-left: auto;">
-          {#if d.integrated}<span class="chip plain">iGPU · never bound</span>{:else}<span class="chip pass">discrete</span>{/if}
+          {#if d.integrated}<span class="chip plain" title="bound only when Settings allows integrated graphics">iGPU</span>{:else}<span class="chip pass">discrete</span>{/if}
         </span>
       </div>
       <div>

@@ -355,7 +355,7 @@
     </table>
     {#each avail.problems as p}<div class="faint small" style="margin-top: 6px;">{p}</div>{/each}
     <p class="faint small" style="margin: 10px 0 0;">
-      Two wheels per version, about 1.5 GB to download and 5 GB unpacked. Only the <span class="mono">bin</span> trees are kept.
+      Two wheels per version, roughly 1.5 GB to download and a few GB unpacked. Only the <span class="mono">bin</span> trees are kept.
       A new runtime takes effect the next time a server that names it starts.
     </p>
   {:else}
