@@ -787,6 +787,9 @@
           <label class="field" style="grid-column: span 2;" title="Serve concurrent requests inside one forward pass instead of queueing them. Leave on."><span class="k">continuous batching</span>
             <span><input type="checkbox" bind:checked={draft.runtime.cont_batching} onchange={scheduleCheck} /> on (-cb)</span>
           </label>
+          <label class="field" style="grid-column: span 4;" title="Sets LLAMA_SERVER_SLOTS_DEBUG=1 for the server, so /slots carries each slot's last prompt and the text generated so far. The Running tab shows both per slot and flags endless loops. Costs the server one detokenize per poll; the router inherits it from any member. Takes effect on the next load."><span class="k">trace tokens</span>
+            <span><input type="checkbox" checked={draft.env?.LLAMA_SERVER_SLOTS_DEBUG === "1"} onchange={(e) => { if (e.target.checked) draft.env.LLAMA_SERVER_SLOTS_DEBUG = "1"; else delete draft.env.LLAMA_SERVER_SLOTS_DEBUG; scheduleCheck(); }} /> show each slot's last prompt and generated text on the Running tab, with loop detection</span>
+          </label>
           <label class="field" style="grid-column: 1 / -1;" title="Anything this editor does not model, e.g. --no-mmap. Passed to llama-server unchanged."><span class="k">extra llama-server flags (space-separated, passed through verbatim)</span>
             <input value={Array.isArray(draft.runtime.extra_flags) ? draft.runtime.extra_flags.join(" ") : draft.runtime.extra_flags}
               oninput={(e) => { draft.runtime.extra_flags = e.target.value; scheduleCheck(); }} placeholder="--no-mmap" />
