@@ -18,78 +18,73 @@
     loading = false;
   }
   load(false);
+
+  const short = (k) => String(k ?? "").split(":").pop();
+  const gib = (mib) => (mib / 1024).toFixed(1);
+  function usedKind(d) {
+    const used = 1 - d.free_mib / Math.max(1, d.total_mib);
+    return used > 0.9 ? "block" : used > 0.7 ? "warn" : "pass";
+  }
 </script>
 
 <h1>
   Devices
-  <span class="sub">enumerated fresh via llama-server --list-devices — the canonical index space</span>
+  <span class="sub">Enumerated fresh from <span class="mono">llama-server --list-devices</span>, the index space every profile launches against. Profiles bind to the stable key; the index is resolved at launch and never trusted from disk.</span>
 </h1>
-<p class="lede">
-  Stable keys are what profiles bind to; indices are resolved at every launch and never trusted from disk.
-</p>
 
 <div class="toolbar">
-  <button class="btn" onclick={() => load(true)} disabled={loading}>
-    {loading ? "Enumerating…" : "Re-enumerate"}
-  </button>
+  <button class="btn" onclick={() => load(true)} disabled={loading}>{loading ? "Enumerating…" : "Re-enumerate"}</button>
   {#if error}<span class="chip block">{error}</span>{/if}
 </div>
 
-<div class="card" style="padding: 0; overflow-x: auto;">
-  <table class="grid">
-    <thead>
-      <tr>
-        <th>Index</th><th>Name</th><th>Stable key</th><th>VRAM free / total</th>
-        <th>Class</th><th>Display</th><th>Driver</th><th>Occupied by</th>
-      </tr>
-    </thead>
-    <tbody>
-      {#each rows as row}
-        {@const d = row.device}
-        <tr>
-          <td class="mono">{d.backend}{d.hip_index}{d.correlation_assumed ? " ~" : ""}</td>
-          <td>{d.name}</td>
-          <td class="mono faint">{d.stable_key}</td>
-          <td class="num">{(d.free_mib / 1024).toFixed(1)} / {(d.total_mib / 1024).toFixed(1)} GiB</td>
-          <td>
-            {#if d.integrated}<span class="chip block">iGPU</span>
-            {:else}<span class="chip pass">discrete</span>{/if}
-          </td>
-          <td>
-            {#if d.display}
-              <span class="chip warn">{d.display.width}x{d.display.height}@{d.display.refresh_hz}</span>
-            {:else}<span class="faint">—</span>{/if}
-          </td>
-          <td class="mono faint">{d.driver_version ?? "—"}</td>
-          <td>
-            {#if row.occupied_by.length}
-              {#each row.occupied_by as p}<span class="chip accent">{p}</span>{/each}
-            {:else}<span class="faint">—</span>{/if}
-          </td>
-        </tr>
-      {:else}
-        <tr><td colspan="8"><div class="empty">{loading ? "Enumerating devices…" : "No devices found"}</div></td></tr>
-      {/each}
-    </tbody>
-  </table>
+<div class="tiles">
+  {#each rows as row}
+    {@const d = row.device}
+    {@const used = d.total_mib - d.free_mib}
+    <div class="tile" class:dim={d.integrated}>
+      <div class="head">
+        <span class="mono chip {d.integrated ? 'plain' : 'accent'}">{d.backend}{d.hip_index}{d.correlation_assumed ? " ~" : ""}</span>
+        <span class="name">{d.name}</span>
+        <span style="margin-left: auto;">
+          {#if d.integrated}<span class="chip plain">iGPU · never bound</span>{:else}<span class="chip pass">discrete</span>{/if}
+        </span>
+      </div>
+      <div>
+        <div class="cap"><span class="num" style="color: var(--ink);">{gib(d.free_mib)} GiB free</span><span class="faint">{gib(used)} used of {gib(d.total_mib)} GiB</span></div>
+        <div class="meter"><div class="fill {usedKind(d)}" style="width: {Math.round(100 * used / Math.max(1, d.total_mib))}%;"></div></div>
+      </div>
+      <dl class="kv">
+        <dt>display</dt>
+        <dd>{#if d.display}<span class="chip warn">{d.display.width}×{d.display.height} @ {d.display.refresh_hz} Hz</span>{:else}<span class="faint">none attached</span>{/if}</dd>
+        <dt>occupied by</dt>
+        <dd>{#if row.occupied_by.length}{#each row.occupied_by as p}<span class="chip accent">{p}</span> {/each}{:else}<span class="faint">no llamactl server</span>{/if}</dd>
+        <dt>driver</dt>
+        <dd class="mono">{d.driver_version ?? "—"}</dd>
+        <dt>stable key</dt>
+        <dd class="mono faint" style="font-size: 11px; word-break: break-all;">{d.stable_key}</dd>
+      </dl>
+    </div>
+  {:else}
+    <div class="card" style="grid-column: 1 / -1;"><div class="empty">{loading ? "Enumerating devices…" : "No devices found"}</div></div>
+  {/each}
 </div>
-<p class="faint mono" style="font-size: 10.5px;">
-  ~ identical-name correlation by bus order — verified at launch by per-process residency ·
-  display attached = compositing can consume VRAM and preempt compute (R-06)
+<p class="faint small" style="margin: 10px 0 0;">
+  ~ marks an index correlated by bus order between identically named cards; it is verified at launch by per-process residency.
+  A display on a compute card costs VRAM to the compositor and can pre-empt compute.
 </p>
 
-<h2 style="margin-top: 18px;">ROCm runtimes <span class="sub">DLL search paths a profile can launch against; discovered from the HIP SDK, ComfyUI, LM Studio, and config</span></h2>
-<div class="card" style="padding: 0; overflow-x: auto;">
+<h2>ROCm runtimes <span class="sub">DLL search paths a profile can launch against, discovered from the HIP SDK, ComfyUI, LM Studio and your config</span></h2>
+<div class="card flush" style="overflow-x: auto;">
   <table class="grid">
-    <thead><tr><th>Name</th><th>Source</th><th>Version</th><th>Available</th><th>Directories</th></tr></thead>
+    <thead><tr><th>Name</th><th>Source</th><th>Version</th><th>State</th><th>Directories</th></tr></thead>
     <tbody>
       {#each runtimes as r}
         <tr>
           <td class="mono">{r.name}{#if r.is_default} <span class="chip accent">default</span>{/if}</td>
           <td>{r.source}</td>
           <td class="mono">{r.version ?? "—"}</td>
-          <td>{#if r.available}<span class="chip pass">yes</span>{:else}<span class="chip block">missing</span>{/if}</td>
-          <td class="mono faint" style="font-size: 10.5px;">{r.dirs.join(" ; ")}</td>
+          <td>{#if r.available}<span class="chip pass">available</span>{:else}<span class="chip block">missing</span>{/if}</td>
+          <td class="path">{r.dirs.join(" ; ")}</td>
         </tr>
       {:else}
         <tr><td colspan="5"><div class="empty">No runtimes discovered</div></td></tr>
@@ -97,3 +92,7 @@
     </tbody>
   </table>
 </div>
+
+<style>
+  .cap { display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 6px; }
+</style>

@@ -97,12 +97,12 @@
 <h1>Settings <span class="sub">the tool's own configuration — not a model's, not a server's</span></h1>
 <p class="lede">Stored at <span class="mono">{path}</span>. Hover any label for what it does. Saving clears the scan and device caches.</p>
 
-{#if error}<div class="card"><span class="chip block">error</span> <span class="mono" style="font-size: 12px;">{error}</span></div>{/if}
+{#if error}<div class="card"><span class="chip block">error</span> <span class="mono" >{error}</span></div>{/if}
 {#if saved}<div class="card"><span class="chip pass">ok</span> {saved}</div>{/if}
 
 {#if cfg}
   <div class="card">
-    <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Where things are</div>
+    <div class="sec">Where things are</div>
     <div class="formgrid">
       <label class="field" style="grid-column: span 3;" title={HINTS.model_roots}>
         <span class="k">model roots (one per line)</span>
@@ -136,7 +136,7 @@
   </div>
 
   <div class="card">
-    <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">ROCm runtime</div>
+    <div class="sec">ROCm runtime</div>
     <div class="formgrid">
       <label class="field" style="grid-column: span 3;" title={HINTS.rocm_bin}>
         <span class="k">default runtime DLL folder (rocm_bin)</span>
@@ -156,11 +156,11 @@
         <textarea rows="3" bind:value={manualRuntimesText} spellcheck="false"></textarea>
       </label>
     </div>
-    <div class="faint" style="font-size: 11px; margin-top: 6px;">Discovered right now: {runtimes.map((r) => r.name + (r.available ? "" : " (missing)")).join(" · ") || "none"}</div>
+    <div class="faint small" style=" margin-top: 6px;">Discovered right now: {runtimes.map((r) => r.name + (r.available ? "" : " (missing)")).join(" · ") || "none"}</div>
   </div>
 
   <div class="card">
-    <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Devices and Hugging Face</div>
+    <div class="sec">Devices and Hugging Face</div>
     <div class="formgrid">
       <label class="field" style="grid-column: span 3;" title={HINTS.integrated_name_patterns}>
         <span class="k">iGPU name patterns (one per line)</span>
@@ -186,14 +186,14 @@
 
   {#if diag}
     <div class="card">
-      <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Diagnostics <span class="faint mono" style="font-weight: 400; font-size: 10.5px;">{diag.ms} ms · also written to ~/.llamactl/ui.log</span></div>
-      {#each diag.errors as e}<div><span class="chip block">failed</span> <span class="mono" style="font-size: 11.5px;">{e}</span></div>{/each}
+      <div class="sec">Diagnostics <span class="faint mono">{diag.ms} ms · also written to ~/.llamactl/ui.log</span></div>
+      {#each diag.errors as e}<div><span class="chip block">failed</span> <span class="mono">{e}</span></div>{/each}
       <table class="grid" style="margin-top: 6px;">
         <tbody>
-          <tr><th>builds</th><td class="mono">{diag.builds.length}</td><td class="mono faint" style="font-size: 10.5px;">{diag.builds.map((b) => `${b.tag} ${b.version ?? "broken"}`).join(" · ")}</td></tr>
-          <tr><th>models</th><td class="mono">{diag.models.length}</td><td class="mono faint" style="font-size: 10.5px;">{diag.models.filter((m) => m.header_error).length} with header errors</td></tr>
-          <tr><th>devices</th><td class="mono">{diag.devices.length}</td><td class="mono faint" style="font-size: 10.5px;">{diag.devices.map((d) => `${d.backend}${d.hip_index} ${d.name}`).join(" · ")}</td></tr>
-          <tr><th>runtimes</th><td class="mono">{diag.runtimes.length}</td><td class="mono faint" style="font-size: 10.5px;">{diag.runtimes.map((r) => r.name).join(" · ")}</td></tr>
+          <tr><th>builds</th><td class="mono">{diag.builds.length}</td><td class="path">{diag.builds.map((b) => `${b.tag} ${b.version ?? "broken"}`).join(" · ")}</td></tr>
+          <tr><th>models</th><td class="mono">{diag.models.length}</td><td class="path">{diag.models.filter((m) => m.header_error).length} with header errors</td></tr>
+          <tr><th>devices</th><td class="mono">{diag.devices.length}</td><td class="path">{diag.devices.map((d) => `${d.backend}${d.hip_index} ${d.name}`).join(" · ")}</td></tr>
+          <tr><th>runtimes</th><td class="mono">{diag.runtimes.length}</td><td class="path">{diag.runtimes.map((r) => r.name).join(" · ")}</td></tr>
         </tbody>
       </table>
     </div>

@@ -57,7 +57,7 @@
         oninput={fromInput}
         style="width: 100%; --pct: {pct}%;"
       />
-      <span class="faint mono" style="font-size: 10px; display: flex; justify-content: space-between;">
+      <span class="faint mono" style="font-size: 11px; display: flex; justify-content: space-between;">
         <span>{format(min)}</span>
         <span>{disabled ? "engine default" : format(value)}</span>
         <span>{format(max)}</span>
@@ -70,7 +70,7 @@
       placeholder={disabled ? (placeholder ?? "default") : ""}
       {disabled}
       oninput={fromInput}
-      style="width: 92px; text-align: right; flex: none;"
+      style="width: 104px; text-align: right; flex: none;"
     />
   </span>
 </label>

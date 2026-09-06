@@ -54,10 +54,10 @@
   {#if !liveRunIds.includes(selected)}
     <span class="chip plain">server not running — launch it first</span>
   {/if}
-  {#if message}<span class="muted" style="font-size: 12px;">{message}</span>{/if}
+  {#if message}<span class="muted">{message}</span>{/if}
 </div>
 
-<div class="card" style="padding: 0; overflow-x: auto;">
+<div class="card flush" style="overflow-x: auto;">
   <table class="grid">
     <thead>
       <tr>
@@ -75,7 +75,7 @@
           <td class="num">{h.concurrent?.aggregate_tok_s ?? "—"}</td>
           <td class="num">{h.concurrent?.per_stream_tok_s ?? "—"}</td>
           <td class="num">{h.vram_gb} GiB</td>
-          <td class="mono faint" style="font-size: 10.5px;">{h.driver}<br />{h.sdk}</td>
+          <td class="path">{h.driver}<br />{h.sdk}</td>
           <td class="mono faint">{h.split ? `${h.split.mode} ${JSON.stringify(h.split.fractions)}` : "—"}</td>
           <td>{#if h.cold_cache}<span class="chip warn">cold</span>{/if}</td>
         </tr>

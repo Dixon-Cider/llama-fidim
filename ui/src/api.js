@@ -219,6 +219,40 @@ async function mock(cmd, args) {
     case "launch_profile":
       await new Promise((r) => setTimeout(r, 2000));
       return { blocked: false, results: mockCheckResults(null), state: MOCK_RUN.state, cold_start: false, placement: [{ key: MOCK_RUN.state.device_keys[0], expected_bytes: 20.7e9, dedicated_bytes: 21.3e9, committed_bytes: 19.3e9 }] };
+    case "live": {
+      const t = Date.now();
+      const tick = Math.floor(t / 1000);
+      const slot = (id, phase, extra = {}) => ({ id, n_ctx: 32768, is_processing: phase !== "idle", phase, n_prompt_tokens: 2468, n_prompt_tokens_processed: phase === "prefill" ? 900 + (tick * 137) % 1500 : 2468, n_prompt_tokens_cache: 0, n_decoded: phase === "decode" ? 40 + (tick * 7) % 300 : 0, n_remain: phase === "decode" ? 400 : 0, prefill_fraction: phase === "prefill" ? ((900 + (tick * 137) % 1500) / 2468) : phase === "decode" ? 1 : 0, ctx_fraction: phase === "idle" ? 0.08 : 0.21 + (id % 3) * 0.2, ...extra });
+      const metrics = (gen, prompt, drafts) => ({ tokens_predicted_total: gen, prompt_tokens_total: prompt, requests_processing: 1, requests_deferred: 0, spec_decode_num_draft_tokens_total: drafts, spec_decode_num_accepted_tokens_total: Math.round(drafts * 0.62) });
+      const runRouter = {
+        run: { state: { profile_id: "router", pid: 24304, port: 1234, host: "127.0.0.1", alias: "router", started_unix: Math.floor(t / 1000) - 4560, log_path: "", command_line: "", visibility_env: null, device_keys: MOCK_DEVICES.map((d) => d.device.stable_key), free_mib_before: [], cold_start: false }, alive: true, health: "healthy", crashed: false },
+        samples: [
+          { model: "bonsai", sampled_unix_ms: t, phase: "idle", slots: [0, 1, 2, 3].map((i) => slot(i, "idle")), metrics: metrics(120000, 400000, 0), error: null },
+          { model: "dd", sampled_unix_ms: t, phase: "decode", slots: [slot(0, "decode"), slot(1, "idle")], metrics: metrics(30000 + tick * 29, 90000 + tick * 3, 8000 + tick * 40), error: null },
+          { model: "gemma4", sampled_unix_ms: t, phase: "prefill", slots: [slot(0, "prefill"), slot(1, "decode"), ...[2, 3, 4, 5, 6, 7].map((i) => slot(i, "idle"))], metrics: metrics(50000 + tick * 50, 200000 + tick * 230, 0), error: null },
+        ],
+        resident: [{ card: MOCK_DEVICES[0].device.stable_key, dedicated_bytes: 26.2e9, committed_bytes: 26.2e9 }, { card: MOCK_DEVICES[2].device.stable_key, dedicated_bytes: 13.1e9, committed_bytes: 13.1e9 }],
+        gpu_busy_percent: 67,
+      };
+      const runCrashed = { run: { ...MOCK_RUN, alive: false, health: "dead", crashed: true }, samples: [], resident: [], gpu_busy_percent: 0 };
+      return { runs: [runRouter, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
+    }
+    case "get_config":
+      return { path: "C:\\Users\\me\\.llamactl\\config.json", config: { build_roots: ["C:\\llama.cpp"], model_roots: ["E:\\models"], rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.llamactl\\profiles", runs_dir: "C:\\Users\\me\\.llamactl\\runs", keep_alive_seconds: 0, runtimes: [] } };
+    case "list_runtimes":
+      return [{ name: "default", source: "config", version: "7.1", available: true, is_default: true, dirs: ["C:\\Program Files\\AMD\\ROCm\\7.1\\bin"] }, { name: "comfyui-comfyamd-7.14.0", source: "ComfyUI venv", version: "7.14.0", available: true, is_default: false, dirs: ["...\\_rocm_sdk_libraries\\bin", "...\\_rocm_sdk_core\\bin"] }];
+    case "router_get":
+      return { host: "127.0.0.1", port: 1234, models_max: 3, autoload: true, build: null, rocm_runtime: null, members: [{ profile_id: "worker-pool", load_on_startup: true }] };
+    case "router_ini":
+      return { text: "[gemma-4-worker]\nmodel = E:\\models\\...\\gemma-4-26B-A4B.gguf\ndevice = ROCm2\nload-on-startup = true\n" };
+    case "router_status":
+      return { alive: true, state: { pid: 24304, port: 1234 } };
+    case "router_models":
+      return [{ id: "gemma-4-worker", status: "loaded" }, { id: "qwen-split", status: "unloaded" }];
+    case "update_check":
+      return { latest: { tag: "b10819", published_at: "2026-09-05" }, update_available: false, behind: 0, already_installed: true, newest_installed: { version: "b10819", path: "C:\\llama.cpp\\b10819-rocm" }, install_dir: "C:\\llama.cpp\\b10819-rocm", assets: [{ name: "llama-b10819-bin-win-cpu-x64.zip", size: 21e6 }], asset_error: null };
+    case "update_history":
+      return [];
     case "stop_run":
     case "save_profile":
     case "delete_profile":

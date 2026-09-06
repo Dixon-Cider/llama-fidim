@@ -47,7 +47,7 @@
     <input type="checkbox" style="width: auto;" bind:checked={follow} /> follow
   </label>
   <div class="grow"></div>
-  <span class="mono faint" style="font-size: 10.5px;">{totalMatching} matching · {path}</span>
+  <span class="path">{totalMatching} matching · {path}</span>
 </div>
 
 <div class="logbox">

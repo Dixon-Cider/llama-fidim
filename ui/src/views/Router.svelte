@@ -102,7 +102,7 @@
 {#if rc}
   <div class="card">
     <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
-      <span style="font-weight: 700; font-size: 12.5px;">Router</span>
+      <span class="sec-title">Router</span>
       {#if status?.alive}
         <span class="chip pass">running · pid {status.state.pid} · port {status.state.port}</span>
       {:else}
@@ -138,7 +138,7 @@
   </div>
 
   <div class="card">
-    <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Members <span class="faint" style="font-weight: 400;">— profiles served by this router; the model id is the profile's alias</span></div>
+    <div class="sec">Members <span class="faint" style="font-weight: 400;">— profiles served by this router; the model id is the profile's alias</span></div>
     <table class="grid">
       <thead><tr><th></th><th>Profile</th><th>Model id</th><th>Model</th><th>GPU</th><th>Load on startup</th></tr></thead>
       <tbody>
@@ -147,14 +147,14 @@
             <td><input type="checkbox" style="width: auto;" checked={isMember(p.id)} onchange={() => toggle(p.id)} /></td>
             <td class="mono">{p.id}</td>
             <td class="mono">{p.server.alias || p.id}</td>
-            <td class="faint" style="font-size: 11.5px;">{base(p.model.path)}</td>
-            <td class="mono faint" style="font-size: 10.5px;">{p.devices.map((d) => d.key.split(":").pop()).join(", ")}</td>
+            <td class="faint">{base(p.model.path)}</td>
+            <td class="path">{p.devices.map((d) => d.key.split(":").pop()).join(", ")}</td>
             <td>{#if isMember(p.id)}<input type="checkbox" style="width: auto;" checked={member(p.id)?.load_on_startup ?? false} onchange={(e) => { member(p.id).load_on_startup = e.target.checked; preview(); }} />{/if}</td>
           </tr>
         {/each}
       </tbody>
     </table>
-    <div class="faint" style="font-size: 11px; margin-top: 6px;">
+    <div class="faint small" style=" margin-top: 6px;">
       Each member's own port, alias and visibility pin are replaced by the router's; GPU placement becomes
       <span class="mono">device = ROCmN</span>. Per-model VRAM is not pre-checked at load time — size <span class="mono">models loaded at once</span> for your cards.
     </div>
@@ -165,12 +165,12 @@
     <button class="btn primary" onclick={launch} disabled={!!busy || !rc.members.length}>{busy === "launch" ? "Launching…" : status?.alive ? "Relaunch router" : "Launch router"}</button>
     <button class="btn danger" onclick={stop} disabled={!!busy || !status?.alive}>Stop router</button>
     <div class="grow"></div>
-    <span class="faint mono" style="font-size: 10.5px;">clients: http://{rc.host}:{rc.port}/v1 · model = alias</span>
+    <span class="path">clients: http://{rc.host}:{rc.port}/v1 · model = alias</span>
   </div>
 
   {#if status?.alive}
     <div class="card">
-      <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Models on the router</div>
+      <div class="sec">Models on the router</div>
       <table class="grid">
         <thead><tr><th>Model id</th><th>Status</th><th></th></tr></thead>
         <tbody>
@@ -200,7 +200,7 @@
   {/if}
 
   <div class="card">
-    <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Preset file preview <span class="faint mono" style="font-weight: 400; font-size: 10.5px;">written to ~/.llamactl/router.ini on launch</span></div>
+    <div class="sec">Preset file preview <span class="faint mono">written to ~/.llamactl/router.ini on launch</span></div>
     <pre class="logbox" style="max-height: 320px;">{ini}</pre>
   </div>
 {/if}
