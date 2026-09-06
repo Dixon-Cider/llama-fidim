@@ -118,15 +118,32 @@ pub struct Model {
     pub draft_candidates: Vec<PathBuf>,
 }
 
+/// Every auxiliary file seen under the roots, wherever it sits. The picker
+/// offers these as "elsewhere" so a draft downloaded into its own folder
+/// (a different publisher's repo, say) can still be paired by hand.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AuxFiles {
+    pub drafts: Vec<PathBuf>,
+    pub mmproj: Vec<PathBuf>,
+}
+
 /// Recursively scan model roots for `.gguf` files, pairing auxiliary files.
 ///
 /// Pairing rules (from how the real model tree is laid out):
 /// - a file named `mmproj-*.gguf` is a projector for the models in its
 ///   directory, not a model itself;
 /// - files under an `MTP/` subdirectory, or with `mtp` in the stem, are draft
-///   models for the models in the parent directory.
+///   models for the models in the parent directory;
+/// - a draft or projector anywhere under the roots whose name carries the
+///   same model name as a model (quant suffix aside) is offered to it too,
+///   after the siblings. Publishers ship MTP heads in their own repos.
 pub fn scan_models(roots: &[PathBuf]) -> Vec<Model> {
+    scan_models_and_aux(roots).0
+}
+
+pub fn scan_models_and_aux(roots: &[PathBuf]) -> (Vec<Model>, AuxFiles) {
     let mut models = Vec::new();
+    let mut all = AuxFiles::default();
     for root in roots {
         let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
@@ -155,6 +172,8 @@ pub fn scan_models(roots: &[PathBuf]) -> Vec<Model> {
                     }
                 }
             }
+            all.mmproj.extend(mmproj.iter().cloned());
+            all.drafts.extend(drafts.iter().cloned());
             for path in main {
                 models.push(load_model(path, &mmproj, &drafts));
             }
@@ -166,8 +185,65 @@ pub fn scan_models(roots: &[PathBuf]) -> Vec<Model> {
             );
         }
     }
+    // Second pass: name-matched drafts and projectors from anywhere.
+    for m in &mut models {
+        let stem = stem_lower(&m.path);
+        for d in &all.drafts {
+            if !m.draft_candidates.contains(d) && names_match(&stem, &stem_lower(d)) {
+                m.draft_candidates.push(d.clone());
+            }
+        }
+        for p in &all.mmproj {
+            if !m.mmproj_candidates.contains(p) && names_match(&stem, &stem_lower(p)) {
+                m.mmproj_candidates.push(p.clone());
+            }
+        }
+    }
     models.sort_by(|a, b| a.path.cmp(&b.path));
-    models
+    all.drafts.sort();
+    all.drafts.dedup();
+    all.mmproj.sort();
+    all.mmproj.dedup();
+    (models, all)
+}
+
+/// `gemma-4-e4b-it-q8_0` and `mtp-gemma-4-e4b-it-q8_0` name the same model:
+/// drop the `mtp-`/`mmproj-` prefix and any trailing quant tokens, then the
+/// remainders must be equal. A bare `mmproj-f32` names nothing and matches
+/// nothing (the sibling rule covers it).
+pub fn names_match(model_stem: &str, aux_stem: &str) -> bool {
+    let a = base_name(model_stem);
+    let mut b = aux_stem.to_string();
+    for prefix in ["mtp-", "mtp_", "mmproj-", "mmproj_", "draft-"] {
+        if let Some(rest) = b.strip_prefix(prefix) {
+            b = rest.to_string();
+            break;
+        }
+    }
+    let b = base_name(&b);
+    !a.is_empty() && a.len() >= 6 && a == b
+}
+
+fn base_name(stem: &str) -> String {
+    let mut s = stem.to_lowercase().replace('_', "-");
+    loop {
+        let Some(i) = s.rfind('-') else { break };
+        let tail = &s[i + 1..];
+        let quantish = tail == "ud"
+            || tail == "bf16"
+            || tail == "f16"
+            || tail == "f32"
+            || tail == "qat"
+            || ((tail.starts_with('q') || tail.starts_with("iq")) && tail.chars().any(|c| c.is_ascii_digit()))
+            || tail.chars().all(|c| c.is_ascii_digit())
+            || ["xl", "xs", "s", "m", "l", "k", "nl", "xxs"].contains(&tail);
+        if quantish && i > 0 {
+            s.truncate(i);
+        } else {
+            break;
+        }
+    }
+    s
 }
 
 fn is_gguf(p: &Path) -> bool {
@@ -223,6 +299,16 @@ mod tests {
             parse_version_output(text),
             Some(("b9817".into(), "5397c3619".into()))
         );
+    }
+
+    #[test]
+    fn drafts_pair_by_model_name_across_folders() {
+        assert!(names_match("gemma-4-e4b-it-q8_0", "mtp-gemma-4-e4b-it-q8_0"));
+        assert!(names_match("gemma-4-26b-a4b-it-qat-ud-q4_k_xl", "mtp-gemma-4-26b-a4b-it-q8_0"));
+        assert!(names_match("gemma-4-e4b-it-q8_0", "mmproj-gemma-4-e4b-it-bf16"));
+        assert!(!names_match("gemma-4-e4b-it-q8_0", "mtp-gemma-4-26b-a4b-it-q8_0"));
+        assert!(!names_match("gemma-4-e4b-it-q8_0", "mmproj-f32"));
+        assert!(!names_match("qwen3.8-27b-ud-q4_k_xl", "mtp-gemma-4-e4b-it-q8_0"));
     }
 
     #[test]

@@ -125,8 +125,8 @@ async fn scan(state: tauri::State<'_, AppState>, refresh: Option<bool>) -> Resul
         }
         let cfg = cfg()?;
         let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-        let models = discovery::scan_models(&cfg.model_roots);
-        let v = serde_json::json!({ "builds": builds, "models": models });
+        let (models, aux) = discovery::scan_models_and_aux(&cfg.model_roots);
+        let v = serde_json::json!({ "builds": builds, "models": models, "drafts": aux.drafts, "mmproj": aux.mmproj });
         cache.lock().unwrap().scan = Some((Instant::now(), v.clone()));
         Ok(v)
     })

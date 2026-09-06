@@ -10,6 +10,8 @@
   let runtimes = $state([]);
   let builds = $state([]);
   let models = $state([]);
+  let allDrafts = $state([]);   // every draft/MTP file under the roots
+  let allMmproj = $state([]);   // every projector under the roots
   let selectedId = $state(null);
   let draft = $state(null); // deep-copied profile being edited
   let check = $state(null); // live_check result
@@ -59,6 +61,8 @@
     runtimes = r;
     builds = s.builds ?? [];
     models = (s.models ?? []).slice().sort((a, b) => a.path.localeCompare(b.path));
+    allDrafts = s.drafts ?? [];
+    allMmproj = s.mmproj ?? [];
     loadErrors = errs;
     loading = false;
     if (!selectedId && profiles.length) select(profiles[0].profile.id);
@@ -71,6 +75,8 @@
       const s = await api("scan", { refresh: true });
       builds = s.builds ?? [];
       models = (s.models ?? []).slice().sort((a, b) => a.path.localeCompare(b.path));
+      allDrafts = s.drafts ?? [];
+      allMmproj = s.mmproj ?? [];
       toastMsg(`Found ${builds.length} builds, ${models.length} models`);
     } catch (e) { toastMsg(String(e), true); }
     busy = "";
@@ -572,17 +578,27 @@
             <select bind:value={draft.model.mmproj} onchange={scheduleCheck}>
               <option value={null}>none</option>
               {#each selectedModel?.mmproj_candidates ?? [] as c}<option value={c}>{base(c)}</option>{/each}
-              {#if draft.model.mmproj && !(selectedModel?.mmproj_candidates ?? []).includes(draft.model.mmproj)}
+              {#if allMmproj.some((p) => !(selectedModel?.mmproj_candidates ?? []).includes(p))}
+                <optgroup label="elsewhere under your model folders">
+                  {#each allMmproj.filter((p) => !(selectedModel?.mmproj_candidates ?? []).includes(p)) as c}<option value={c}>{base(c)} — {c.split(/[\\/]/).slice(-2, -1)[0]}</option>{/each}
+                </optgroup>
+              {/if}
+              {#if draft.model.mmproj && !(selectedModel?.mmproj_candidates ?? []).includes(draft.model.mmproj) && !allMmproj.includes(draft.model.mmproj)}
                 <option value={draft.model.mmproj}>{base(draft.model.mmproj)}</option>
               {/if}
             </select>
           </label>
-          <label class="field" style="grid-column: span 3;" title="A small draft model or MTP sidecar file for speculative decoding. Turned on in the Speculative decoding section.">
+          <label class="field" style="grid-column: span 3;" title="A small draft model or MTP sidecar file for speculative decoding. Files beside the model come first, then any whose name matches this model, then everything else under your model folders. Turned on in the Speculative decoding section.">
             <span class="k">speculative draft file</span>
             <select value={draft.model.draft?.path ?? ""} onchange={(e) => onDraftPick(e.target.value)}>
               <option value="">none</option>
               {#each selectedModel?.draft_candidates ?? [] as c}<option value={c}>{base(c)}</option>{/each}
-              {#if draft.model.draft?.path && !(selectedModel?.draft_candidates ?? []).includes(draft.model.draft.path)}
+              {#if allDrafts.some((p) => !(selectedModel?.draft_candidates ?? []).includes(p))}
+                <optgroup label="elsewhere under your model folders">
+                  {#each allDrafts.filter((p) => !(selectedModel?.draft_candidates ?? []).includes(p)) as c}<option value={c}>{base(c)} — {c.split(/[\\/]/).slice(-2, -1)[0]}</option>{/each}
+                </optgroup>
+              {/if}
+              {#if draft.model.draft?.path && !(selectedModel?.draft_candidates ?? []).includes(draft.model.draft.path) && !allDrafts.includes(draft.model.draft.path)}
                 <option value={draft.model.draft.path}>{base(draft.model.draft.path)}</option>
               {/if}
             </select>
