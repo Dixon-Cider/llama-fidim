@@ -16,7 +16,7 @@ perfectly fine.
 
 **Status:** early. Built and used daily on one machine with two Radeon AI
 PRO R9700s; other cards in upstream's build list should work but have not
-been tried here. No binary releases yet. Issues and pull requests are
+been tried here. Issues and pull requests are
 welcome, and a report that includes your card, driver version and the
 `fidim devices` output is the fastest way to get a fix.
 
@@ -74,7 +74,13 @@ welcome, and a report that includes your card, driver version and the
 
 ## Install
 
-There are no binary releases yet. Build and install from the repo:
+**From a release.** Download `llama-fidim-vX.Y.Z-win-x64.zip` from the
+[releases page](https://github.com/Dixon-Cider/llama-fidim/releases),
+extract it anywhere, and run `llama-fidim.exe`. The `fidim.exe` beside it is
+the CLI; add the folder to your PATH if you want it in every shell. A
+`.sha256` file sits next to each zip.
+
+**From source.** Build and install from the repo:
 
 ```
 git clone https://github.com/Dixon-Cider/llama-fidim
