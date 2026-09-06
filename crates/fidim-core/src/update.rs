@@ -33,9 +33,9 @@ use crate::profile::Profile;
 use crate::{Error, Result};
 
 const RELEASES_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp/releases";
-const USER_AGENT: &str = concat!("llamactl/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("llama-fidim/", env!("CARGO_PKG_VERSION"));
 /// Manifest written into every build directory this module creates.
-pub const MANIFEST_NAME: &str = "llamactl-build.json";
+pub const MANIFEST_NAME: &str = "fidim-build.json";
 
 fn upd(msg: impl Into<String>) -> Error {
     Error::Update(msg.into())
@@ -260,7 +260,7 @@ pub fn newest_installed(builds: &[Build]) -> Option<InstalledRef> {
 }
 
 pub fn check(cfg: &Config) -> Result<UpdateCheck> {
-    let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+    let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
     // One list serves both the latest pick and the changelog.
     let json = get_json(&format!("{RELEASES_API}?per_page=100"))?;
     let latest = pick_latest_binary_release(&json)?;
@@ -310,8 +310,18 @@ pub fn install_dir(cfg: &Config, tag: &str, flavor: &str) -> Result<PathBuf> {
         .install_root
         .clone()
         .or_else(|| cfg.build_roots.first().cloned())
-        .ok_or_else(|| upd("no install_root and no build_roots configured"))?;
+        .unwrap_or_else(|| Config::config_dir().join("builds"));
     Ok(root.join(format!("{tag}-{flavor}")))
+}
+
+/// Builds installed before the rename carry `llamactl-build.json`.
+pub fn manifest_path(dir: &Path) -> PathBuf {
+    let new = dir.join(MANIFEST_NAME);
+    if new.is_file() {
+        return new;
+    }
+    let old = dir.join("llamactl-build.json");
+    if old.is_file() { old } else { new }
 }
 
 // ------------------------------------------------------------------ verify ----
@@ -457,7 +467,7 @@ pub fn download_url(url: &str, name: &str, to: &Path, progress: &mut dyn FnMut(S
 pub fn retire_build_shims(exe: &Path) {
     let Some(bin) = exe.parent() else { return };
     let Some(dir) = bin.parent() else { return };
-    let Ok(text) = std::fs::read_to_string(dir.join(MANIFEST_NAME)) else { return };
+    let Ok(text) = std::fs::read_to_string(manifest_path(dir)) else { return };
     let Ok(m) = serde_json::from_str::<Manifest>(&text) else { return };
     for a in &m.assets {
         let Some(rest) = a.strip_prefix("shim:") else { continue };
@@ -553,7 +563,7 @@ pub fn install_prebuilt(
         let verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
         // Refresh the manifest: a re-verify after a runtime change (or a
         // shim added by a newer tool) is the record that matters.
-        let manifest_path = dir.join(MANIFEST_NAME);
+        let manifest_path = manifest_path(&dir);
         let mut m: Manifest = std::fs::read_to_string(&manifest_path)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
@@ -578,7 +588,7 @@ pub fn install_prebuilt(
     }
     let (cpu, rocm) = select_assets(release)?;
     let parent = dir.parent().ok_or_else(|| upd("install dir has no parent"))?.to_path_buf();
-    let tmp = parent.join(format!(".llamactl-download-{}", release.tag));
+    let tmp = parent.join(format!(".fidim-download-{}", release.tag));
     std::fs::create_dir_all(&tmp).map_err(|e| Error::io(&tmp, e))?;
 
     let result = (|| -> Result<Vec<String>> {
@@ -966,7 +976,7 @@ mod tests {
 
     #[test]
     fn shim_copies_lib_prefixed_dll_under_the_imported_name() {
-        let tmp = std::env::temp_dir().join(format!("llamactl-shim-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("fidim-shim-{}", std::process::id()));
         let bin = tmp.join("bin");
         let rocm = tmp.join("rocm");
         std::fs::create_dir_all(&bin).unwrap();

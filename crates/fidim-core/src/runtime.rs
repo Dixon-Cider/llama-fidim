@@ -137,7 +137,7 @@ pub fn discover(cfg: &Config) -> Vec<Runtime> {
         );
     }
 
-    // Runtimes installed from AMD's channels (Updates tab / `llamactl rocm`).
+    // Runtimes installed from AMD's channels (Updates tab / `fidim rocm`).
     for (dir, m) in crate::rocm::installed(cfg) {
         out.push(
             Runtime {
@@ -231,7 +231,7 @@ pub fn discover(cfg: &Config) -> Vec<Runtime> {
 /// (upstream's ROCm zip wants `hipblas.dll`; the HIP SDK has
 /// `libhipblas.dll`). Windows resolves DLLs from the exe's own folder first,
 /// so a shim copied into the build would shadow every other runtime. Each
-/// runtime therefore gets its own shim folder under `~/.llamactl/shims/`,
+/// runtime therefore gets its own shim folder under `~/.fidim/shims/`,
 /// prepended ahead of its dirs, so the pick is honoured.
 pub fn shim_dir(rt: &Runtime, exe: &Path) -> Option<PathBuf> {
     let bytes = std::fs::read(exe).ok()?;
@@ -282,7 +282,7 @@ pub fn resolve(cfg: &Config, name: Option<&str>) -> Result<Runtime> {
     let r = all
         .into_iter()
         .find(|r| r.name == wanted)
-        .ok_or_else(|| Error::Config(format!("ROCm runtime `{wanted}` is not known — see `llamactl runtimes`")))?;
+        .ok_or_else(|| Error::Config(format!("ROCm runtime `{wanted}` is not known — see `fidim runtimes`")))?;
     if !r.available {
         return Err(Error::Config(format!(
             "ROCm runtime `{}` is not available: missing {}",
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn default_runtime_is_the_legacy_rocm_bin_and_listed_first() {
-        let tmp = std::env::temp_dir().join(format!("llamactl-rt-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("fidim-rt-{}", std::process::id()));
         let bin = tmp.join("7.1").join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let cfg = cfg_with(Some(bin.clone()), vec![], None);
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn manual_runtime_selectable_by_name_and_unavailable_when_missing() {
-        let tmp = std::env::temp_dir().join(format!("llamactl-rt2-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("Llama FIDIM-rt2-{}", std::process::id()));
         let have = tmp.join("have");
         std::fs::create_dir_all(&have).unwrap();
         let cfg = cfg_with(

@@ -450,6 +450,7 @@ pub fn prepare_with_inputs(
 
     let context = LaunchContext {
         profile: profile.clone(),
+        allow_integrated: cfg.allow_integrated,
         build_version_output,
         missing_files: missing,
         resolved,
@@ -488,7 +489,7 @@ pub fn parse_powercfg_ac_index(text: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-/// Who holds `port`, if anyone: a live llamactl run (by its state file),
+/// Who holds `port`, if anyone: a live Llama FIDIM run (by its state file),
 /// else whatever netstat says is listening there.
 pub fn port_holder(host: &str, port: u16, runs_dir: &Path) -> Option<PortHolder> {
     if port_is_free(host, port) {

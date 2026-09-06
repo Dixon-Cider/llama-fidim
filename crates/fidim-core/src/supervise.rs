@@ -45,7 +45,7 @@ pub struct RunState {
     /// its full `estimated_bytes` counts against a subsequent launch.
     #[serde(default)]
     pub ready: bool,
-    /// PID of the keep-alive helper (`llamactl keepalive`) started for this
+    /// PID of the keep-alive helper (`fidim keepalive`) started for this
     /// run, if any. Killed by `stop`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepalive_pid: Option<u32>,
@@ -117,7 +117,7 @@ pub fn record_model_loaded(config_dir: &Path, model_path: &Path) -> Result<()> {
 }
 
 /// Spawn the plan detached: new process group, no console window, stdout and
-/// stderr appended to a log file. Closing llamactl later must not kill it.
+/// stderr appended to a log file. Closing Llama FIDIM later must not kill it.
 pub fn spawn(
     plan: &LaunchPlan,
     profile: &Profile,
@@ -297,8 +297,8 @@ fn dechunk(mut b: &[u8]) -> Vec<u8> {
 /// inheritable handle in the parent comes along — including the pipe a
 /// shell created to capture OUR output. The server then holds that pipe's
 /// write end for its whole lifetime and the shell's reader never sees EOF:
-/// `llamactl launch … | Out-String` (2026-09-02, 2.5 h hang) and
-/// `llamactl launch … | tail` both deadlocked this way. The server's own
+/// `fidim launch … | Out-String` (2026-09-02, 2.5 h hang) and
+/// `fidim launch … | tail` both deadlocked this way. The server's own
 /// stdio is set explicitly to the log file, so it loses nothing.
 #[cfg(windows)]
 fn stop_inheriting_std_handles() {
@@ -425,7 +425,7 @@ pub fn process_alive_as(pid: u32, image_contains: &str) -> bool {
 /// else) is only forgotten: the state file goes, nothing is killed.
 pub fn stop(state: &RunState, runs_dir: &Path) -> Result<()> {
     if let Some(kp) = state.keepalive_pid {
-        if process_alive_as(kp, "llamactl") {
+        if process_alive_as(kp, "fidim") {
             let mut k = std::process::Command::new("taskkill");
             k.args(["/PID", &kp.to_string(), "/F"]);
             crate::launch::hide_console(&mut k);
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn cold_start_until_a_load_postdates_mtime() {
-        let dir = std::env::temp_dir().join(format!("llamactl-hist-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fidim-hist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let model = dir.join("model.gguf");
         std::fs::write(&model, b"GGUF").unwrap();
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn run_state_round_trips() {
-        let dir = std::env::temp_dir().join(format!("llamactl-runs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fidim-runs-{}", std::process::id()));
         let state = RunState {
             profile_id: "worker-pool".into(),
             pid: 1234,
@@ -586,14 +586,14 @@ mod tests {
 
 // ---------------------------------------------------------------- keep-alive ----
 
-/// The CLI binary that hosts the `keepalive` loop: `llamactl.exe` beside the
+/// The CLI binary that hosts the `keepalive` loop: `fidim.exe` beside the
 /// running executable (the GUI ships next to it), or the executable itself.
 pub fn keepalive_exe() -> Option<std::path::PathBuf> {
     let me = std::env::current_exe().ok()?;
-    if me.file_name().is_some_and(|n| n.eq_ignore_ascii_case("llamactl.exe")) {
+    if me.file_name().is_some_and(|n| n.eq_ignore_ascii_case("fidim.exe")) {
         return Some(me);
     }
-    let sibling = me.parent()?.join("llamactl.exe");
+    let sibling = me.parent()?.join("fidim.exe");
     sibling.is_file().then_some(sibling)
 }
 
@@ -622,7 +622,7 @@ pub fn spawn_keepalive(state: &mut RunState, runs_dir: &Path, interval_s: u32) -
         return Ok(None);
     }
     let exe = keepalive_exe().ok_or_else(|| {
-        Error::Platform("keep-alive helper llamactl.exe not found beside the running executable".into())
+        Error::Platform("keep-alive helper fidim.exe not found beside the running executable".into())
     })?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(keepalive_args(&state.host, state.port, interval_s, state.pid))
@@ -643,7 +643,7 @@ pub fn spawn_keepalive(state: &mut RunState, runs_dir: &Path, interval_s: u32) -
     Ok(Some(child.id()))
 }
 
-/// The keep-alive loop itself (runs inside `llamactl keepalive`). Exits when
+/// The keep-alive loop itself (runs inside `fidim keepalive`). Exits when
 /// the server process is gone. Request failures are ignored: a busy or
 /// restarting server is not a reason to stop trying.
 pub fn run_keepalive(host: &str, port: u16, interval_s: u32, server_pid: u32) {

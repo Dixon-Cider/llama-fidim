@@ -35,7 +35,7 @@
 param(
   [int[]]$Phases = @(1, 2, 3),
   [int]$MaxCommitPercent = 75,
-  [string]$Cli = "$PSScriptRoot\..\target\debug\llamactl.exe"
+  [string]$Cli = "$PSScriptRoot\..\target\debug\fidim.exe"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -130,7 +130,7 @@ function Format-Card($map, $luid) {
 }
 
 function Get-RunState($profileId) {
-  $f = Get-ChildItem "$env:USERPROFILE\.llamactl\runs\*.json" -ErrorAction SilentlyContinue |
+  $f = Get-ChildItem "$env:USERPROFILE\.fidim\runs\*.json" -ErrorAction SilentlyContinue |
        Where-Object { $_.BaseName -like "$profileId-*" } | Select-Object -First 1
   if (-not $f) { return $null }
   return Get-Content $f.FullName -Raw | ConvertFrom-Json
@@ -236,7 +236,7 @@ function Invoke-Phase1 {
   $lineA = ($status -split "`r?`n" | Where-Object { $_ -match ('^\s*' + [regex]::Escape($a) + '\s') } | Select-Object -First 1)
   $lineB = ($status -split "`r?`n" | Where-Object { $_ -match ('^\s*' + [regex]::Escape($b) + '\s') } | Select-Object -First 1)
   if ($lineA -match '\bhealthy\b' -and $lineB -match '\bhealthy\b') {
-    Record 'Closing and reopening the tool re-attaches to running servers' 'PASS' ("a new llamactl process listed both servers as healthy from run state alone:`n" + $lineA.Trim() + "`n" + $lineB.Trim())
+    Record 'Closing and reopening the tool re-attaches to running servers' 'PASS' ("a new Llama FIDIM process listed both servers as healthy from run state alone:`n" + $lineA.Trim() + "`n" + $lineB.Trim())
   } else {
     Record 'Closing and reopening the tool re-attaches to running servers' 'FAIL' $status.Trim()
   }
@@ -265,7 +265,7 @@ function Invoke-Phase2 {
 
   # Cold-cache handling: either it was marked cold and withheld, or it was a
   # warm run and got stored. Both are correct; silence would not be.
-  $profPath = "$env:USERPROFILE\.llamactl\profiles\$target.json"
+  $profPath = "$env:USERPROFILE\.fidim\profiles\$target.json"
   if ($out -match 'baseline NOT saved: cold-cache') {
     Record 'Cold-cache first run marked and excluded from baselines' 'PASS' `
       'run flagged cold; sweep recorded to history but withheld from the profile baseline'
@@ -341,7 +341,7 @@ $startMem = $null
 try {
   Write-Host "M10 acceptance run - spec section 09 v1.1" -ForegroundColor White
   Write-Host "guard: abort if projected commit exceeds $MaxCommitPercent pct" -ForegroundColor DarkGray
-  if (-not (Test-Path $Cli)) { throw "llamactl not found at $Cli - run cargo build first" }
+  if (-not (Test-Path $Cli)) { throw "Llama FIDIM not found at $Cli - run cargo build first" }
   $startMem = Assert-Headroom 'start'
 
   if ($Phases -contains 1) { Invoke-Phase1 }

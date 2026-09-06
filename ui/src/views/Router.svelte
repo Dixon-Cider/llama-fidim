@@ -7,7 +7,7 @@
   let builds = $state([]);
   let runtimes = $state([]);
   let ini = $state("");           // rendered preview
-  let status = $state(null);      // { alive, state } from llamactl run state
+  let status = $state(null);      // { alive, state } from Llama FIDIM run state
   let models = $state([]);        // router /models
   let busy = $state("");
   let error = $state("");
@@ -110,7 +110,7 @@
       {/if}
     </div>
     <div class="formgrid">
-      <label class="field" title="TCP port clients connect to. Any llamactl server already on it is stopped when the router launches; a foreign process blocks.">
+      <label class="field" title="TCP port clients connect to. Any Llama FIDIM server already on it is stopped when the router launches; a foreign process blocks.">
         <span class="k">port</span><input type="number" bind:value={rc.port} />
       </label>
       <label class="field" title="--models-max: how many model instances may be loaded at the same time. 0 = unlimited. With two cards, 2 keeps one per card; VRAM is NOT pre-checked per load, so keep this honest.">
@@ -200,7 +200,7 @@
   {/if}
 
   <div class="card">
-    <div class="sec">Preset file <span class="faint">written to ~/.llamactl/router.ini on launch</span></div>
+    <div class="sec">Preset file <span class="faint">written to ~/.fidim/router.ini on launch</span></div>
     <pre class="logbox" style="max-height: 320px;">{ini}</pre>
   </div>
 {/if}

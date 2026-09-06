@@ -468,7 +468,7 @@
           </div>
         </button>
       {:else}
-        <div class="empty">No profiles yet. New, or <span class="mono">llamactl seed</span>.</div>
+        <div class="empty">No profiles yet. New, or <span class="mono">fidim seed</span>.</div>
       {/each}
     </div>
   </aside>
@@ -510,7 +510,7 @@
       <section class="card">
         <div class="sec">Identity <span class="faint">names the CLI, the router and clients use</span></div>
         <div class="formgrid">
-          <label class="field" title="Profile identifier: the file name under the profile directory and what the CLI uses (llamactl launch <id>). Letters, digits, dashes."><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
+          <label class="field" title="Profile identifier: the file name under the profile directory and what the CLI uses (fidim launch <id>). Letters, digits, dashes."><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
           <label class="field" style="grid-column: span 2;" title="Free-text display name."><span class="k">name</span><input bind:value={draft.name} /></label>
           <label class="field" title="TCP port the server listens on. Each running profile needs its own; pre-flight checks it is free."><span class="k">port</span><input type="number" bind:value={draft.server.port} oninput={scheduleCheck} /></label>
           <label class="field" style="grid-column: span 2;" title="Model name the server reports on /v1/models and what clients pass as 'model'. Unique across running servers; the router uses it as the model id."><span class="k">alias</span><input bind:value={draft.server.alias} oninput={scheduleCheck} /></label>

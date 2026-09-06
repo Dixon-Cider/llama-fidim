@@ -1,5 +1,5 @@
 // Command bridge. Inside Tauri every call hits the Rust command layer
-// (llamactl-core). In a plain browser (vite dev without Tauri) a mock layer
+// (fidim-core). In a plain browser (vite dev without Tauri) a mock layer
 // answers with the real target machine's topology so the UI can be exercised
 // visually without hardware access.
 
@@ -15,7 +15,7 @@ export async function api(cmd, args = {}) {
   try {
     return await invoke(cmd, args);
   } catch (e) {
-    // Surface every failed command in ~/.llamactl/ui.log so problems inside
+    // Surface every failed command in ~/.fidim/ui.log so problems inside
     // the web view can be diagnosed from outside it.
     if (cmd !== "ui_log") log(`command ${cmd} failed: ${String(e)}`);
     throw e;
@@ -150,7 +150,7 @@ const MOCK_RUN = {
   state: {
     profile_id: "worker-pool", pid: 26388, port: 9701, host: "127.0.0.1",
     alias: "gemma-4-worker", started_unix: Math.floor(Date.now() / 1000) - 1830,
-    log_path: "C:\\Users\\me\\.llamactl\\runs\\worker-pool-9701.log",
+    log_path: "C:\\Users\\me\\.fidim\\runs\\worker-pool-9701.log",
     command_line: "llama-server.exe -m ... --port 9701",
     visibility_env: "2",
     device_keys: ["pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus08"],
@@ -239,7 +239,7 @@ async function mock(cmd, args) {
       return { runs: [runRouter, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
     }
     case "get_config":
-      return { path: "C:\\Users\\me\\.llamactl\\config.json", config: { build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models"], rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.llamactl\\profiles", runs_dir: "C:\\Users\\me\\.llamactl\\runs", keep_alive_seconds: 0, runtimes: [] } };
+      return { path: "C:\\Users\\me\\.fidim\\config.json", config: { build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models"], rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.fidim\\profiles", runs_dir: "C:\\Users\\me\\.fidim\\runs", keep_alive_seconds: 0, runtimes: [] } };
     case "list_runtimes":
       return [{ name: "default", source: "config", version: "7.1", available: true, is_default: true, dirs: ["C:\\Program Files\\AMD\\ROCm\\7.1\\bin"] }, { name: "rocm-7.14.0a20260612", source: "amd-nightly", version: "7.14.0a20260612", available: true, is_default: false, is_latest: true, dirs: ["D:\\llama.cpp\\rocm\\7.14.0a20260612\\bin"] }];
     case "router_get":
@@ -272,7 +272,7 @@ async function mock(cmd, args) {
     case "delete_profile":
       return null;
     case "export_profile":
-      return { path: "C:\\Users\\me\\.llamactl\\profiles\\worker-pool.bat", text: "@echo off\r\nset \"HIP_VISIBLE_DEVICES=2\"\r\n\"llama-server.exe\" -m ..." };
+      return { path: "C:\\Users\\me\\.fidim\\profiles\\worker-pool.bat", text: "@echo off\r\nset \"HIP_VISIBLE_DEVICES=2\"\r\n\"llama-server.exe\" -m ..." };
     case "scan":
       return { builds: [], models: [] };
     default:

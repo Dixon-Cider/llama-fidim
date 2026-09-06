@@ -3,17 +3,17 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use llamactl_core::config::Config;
-use llamactl_core::discovery::{self, Build};
-use llamactl_core::launch;
-use llamactl_core::platform::{Platform, WindowsPlatform};
-use llamactl_core::preflight::{self, Outcome};
-use llamactl_core::profile::{self, Profile};
-use llamactl_core::supervise::{self, Health};
-use llamactl_core::{export, gguf};
+use fidim_core::config::Config;
+use fidim_core::discovery::{self, Build};
+use fidim_core::launch;
+use fidim_core::platform::{Platform, WindowsPlatform};
+use fidim_core::preflight::{self, Outcome};
+use fidim_core::profile::{self, Profile};
+use fidim_core::supervise::{self, Health};
+use fidim_core::{export, gguf};
 
 #[derive(Parser)]
-#[command(name = "llamactl", version, about = "llama.cpp build/config manager")]
+#[command(name = "fidim", version, about = "llama.cpp build/config manager")]
 struct Cli {
     /// Emit JSON instead of tables.
     #[arg(long, global = true)]
@@ -179,7 +179,7 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let cfg = Config::load_or_init().context("loading llamactl config")?;
+    let cfg = Config::load_or_init().context("loading Llama FIDIM config")?;
     let platform = WindowsPlatform;
     match cli.command {
         Cmd::Scan => cmd_scan(&cfg, cli.json),
@@ -217,7 +217,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::CreatorDefaults { model_path } => {
-            let d = llamactl_core::hf::creator_defaults(&cfg, &model_path)?;
+            let d = fidim_core::hf::creator_defaults(&cfg, &model_path)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&d)?);
             } else {
@@ -270,7 +270,7 @@ enum RocmCmd {
 }
 
 fn cmd_rocm(cfg: &Config, json: bool, cmd: RocmCmd) -> anyhow::Result<()> {
-    use llamactl_core::rocm;
+    use fidim_core::rocm;
     let fam = |f: Option<String>| f.or_else(|| cfg.rocm_family.clone()).unwrap_or_else(|| "gfx120X-all".to_string());
     match cmd {
         RocmCmd::List { family } => {
@@ -288,14 +288,14 @@ fn cmd_rocm(cfg: &Config, json: bool, cmd: RocmCmd) -> anyhow::Result<()> {
             for p in problems {
                 eprintln!("note: {p}");
             }
-            println!("\nnightlies are for family {family}; `llamactl rocm install <version>` puts one under {}", rocm::runtimes_root(cfg).display());
+            println!("\nnightlies are for family {family}; `fidim rocm install <version>` puts one under {}", rocm::runtimes_root(cfg).display());
         }
         RocmCmd::Install { version, family } => {
             let (list, _) = rocm::available(&fam(family))?;
             let a = list
                 .into_iter()
                 .find(|a| a.version == version)
-                .ok_or_else(|| anyhow::anyhow!("ROCm {version} is not on either channel; see `llamactl rocm list`"))?;
+                .ok_or_else(|| anyhow::anyhow!("ROCm {version} is not on either channel; see `fidim rocm list`"))?;
             let mut progress = |line: String| println!("{line}");
             let dir = rocm::install(cfg, &a, &mut progress)?;
             println!("installed {} -> select it as runtime `rocm-{}`", dir.display(), a.version);
@@ -309,7 +309,7 @@ fn cmd_rocm(cfg: &Config, json: bool, cmd: RocmCmd) -> anyhow::Result<()> {
 }
 
 fn cmd_runtimes(cfg: &Config, json: bool) -> anyhow::Result<()> {
-    let all = llamactl_core::runtime::discover(cfg);
+    let all = fidim_core::runtime::discover(cfg);
     if json {
         println!("{}", serde_json::to_string_pretty(&all)?);
         return Ok(());
@@ -343,7 +343,7 @@ fn cmd_update(
     rollback: bool,
     tag: Option<String>,
 ) -> anyhow::Result<()> {
-    use llamactl_core::update::{self, PromoteScope};
+    use fidim_core::update::{self, PromoteScope};
 
     if rollback {
         let r = update::rollback(cfg)?;
@@ -361,7 +361,7 @@ fn cmd_update(
         return Ok(());
     }
 
-    let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+    let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
     let check = match &tag {
         Some(t) => update::check_against(cfg, &builds, update::release_by_tag(t)?)?,
         None => update::check(cfg)?,
@@ -453,7 +453,7 @@ fn cmd_update(
             PromoteScope::All
         } else {
             match &previous {
-                Some(p) if !llamactl_core::update::version_number(&p.version).is_none() => {
+                Some(p) if !fidim_core::update::version_number(&p.version).is_none() => {
                     PromoteScope::FromBuild(p.path.clone())
                 }
                 _ => PromoteScope::All,
@@ -470,7 +470,7 @@ fn cmd_update(
             for (id, why) in &r.skipped {
                 println!("  {id:<20} skipped: {why}");
             }
-            println!("nothing was launched — bench a profile when the GPUs are free; `llamactl update --rollback` undoes this.");
+            println!("nothing was launched — bench a profile when the GPUs are free; `fidim update --rollback` undoes this.");
         }
     } else if json {
         if let Some(r) = &report {
@@ -483,7 +483,7 @@ fn cmd_update(
 // ------------------------------------------------------------------ scan ----
 
 fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
-    let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+    let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
     let models = discovery::scan_models(&cfg.model_roots);
     if json {
         println!(
@@ -532,7 +532,7 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
 
 fn cmd_devices(cfg: &Config, build_tag: Option<&str>, json: bool) -> anyhow::Result<()> {
     let platform = WindowsPlatform;
-    let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+    let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
     let build = pick_build(&builds, build_tag)?;
     let devices = launch::enumerate_devices(cfg, &build.server_exe, &platform)?;
     if json {
@@ -603,7 +603,7 @@ fn cmd_profiles(cfg: &Config, json: bool) -> anyhow::Result<()> {
     }
     if profiles.is_empty() {
         println!(
-            "no profiles in {} — `llamactl seed` writes starters from the existing batch files",
+            "no profiles in {} — `fidim seed` writes starters from the existing batch files",
             cfg.profile_dir.display()
         );
         return Ok(());
@@ -792,7 +792,7 @@ fn cmd_launch(
         prepared.context.resolved.iter().map(|r| r.device.stable_key.clone()).collect();
     let free_before: Vec<u64> =
         prepared.context.resolved.iter().map(|r| r.device.free_mib).collect();
-    // Port takeover (check 8 warned): a llamactl server on this port is
+    // Port takeover (check 8 warned): a Llama FIDIM server on this port is
     // stopped first so the new model answers on the same well-known port.
     if let Some(h) = &prepared.context.port_holder {
         if h.profile_id.is_some() {
@@ -935,7 +935,7 @@ fn find_run(cfg: &Config, target: &str) -> anyhow::Result<supervise::AttachedRun
     let runs = supervise::reattach(&cfg.runs_dir);
     runs.into_iter()
         .find(|r| r.state.profile_id == target || r.state.port.to_string() == target)
-        .with_context(|| format!("no run state matches {target:?} (try `llamactl status`)"))
+        .with_context(|| format!("no run state matches {target:?} (try `fidim status`)"))
 }
 
 fn cmd_stop(cfg: &Config, target: &str) -> anyhow::Result<()> {
@@ -1038,7 +1038,7 @@ fn cmd_bench(
         bail!("run for {profile_id} has crashed — relaunch before benchmarking");
     }
     let n = concurrency.unwrap_or(profile.runtime.slots).max(1);
-    let opts = llamactl_core::bench::BenchOptions {
+    let opts = fidim_core::bench::BenchOptions {
         warmups,
         max_tokens: tokens,
         concurrency: n,
@@ -1054,7 +1054,7 @@ fn cmd_bench(
         if run.state.cold_start { "  [COLD-CACHE RUN]" } else { "" }
     );
     let sweep =
-        llamactl_core::bench::run_sweep(&run.state.host, run.state.port, &run.state.alias, &opts)?;
+        fidim_core::bench::run_sweep(&run.state.host, run.state.port, &run.state.alias, &opts)?;
 
     // Measured VRAM from the PDH counters, per profile device.
     let mem = platform.gpu_process_memory(run.state.pid).unwrap_or_default();
@@ -1067,7 +1067,7 @@ fn cmd_bench(
             let luid = adapters
                 .iter()
                 .find(|a| {
-                    llamactl_core::devices::stable_key(&a.pnp_device_id, a.bus_number) == *key
+                    fidim_core::devices::stable_key(&a.pnp_device_id, a.bus_number) == *key
                 })
                 .and_then(|a| a.luid_low);
             (key.clone(), luid)
@@ -1118,7 +1118,7 @@ fn cmd_bench(
         })
     });
     let baseline = serde_json::json!({
-        "measured_at": llamactl_core::bench::iso8601_utc(now),
+        "measured_at": fidim_core::bench::iso8601_utc(now),
         "measured_at_unix": now,
         "build_version": profile.build.version,
         "driver": driver,
@@ -1134,7 +1134,7 @@ fn cmd_bench(
             "per_stream_tok_s": (c.per_stream_tok_s * 10.0).round() / 10.0,
         })),
         "cold_cache": run.state.cold_start,
-        "profile_fingerprint": llamactl_core::bench::profile_fingerprint(&profile),
+        "profile_fingerprint": fidim_core::bench::profile_fingerprint(&profile),
         "bench": { "warmups": warmups, "tokens": tokens },
     });
 
@@ -1171,12 +1171,12 @@ fn cmd_bench(
 // ---------------------------------------------------------------- router ----
 
 fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
-    use llamactl_core::router::{self, RouterMember};
+    use fidim_core::router::{self, RouterMember};
     let mut rc = router::load_config()?;
     match cmd {
         RouterCmd::Show => {
             let profiles = Profile::load_all(&cfg.profile_dir)?;
-            let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+            let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
             let platform = WindowsPlatform;
             let exe = pick_build(&builds, None)?.server_exe.clone();
             let devices = launch::enumerate_devices(cfg, &exe, &platform)?;
@@ -1217,10 +1217,10 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
         }
         RouterCmd::Launch { ready_timeout } => {
             let profiles = Profile::load_all(&cfg.profile_dir)?;
-            let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+            let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
             let build_dir = match &rc.build {
                 Some(b) => b.clone(),
-                None => llamactl_core::update::newest_installed(&builds).context("no installed build")?.path,
+                None => fidim_core::update::newest_installed(&builds).context("no installed build")?.path,
             };
             let platform = WindowsPlatform;
             let devices = launch::enumerate_devices(cfg, &build_dir.join("bin").join("llama-server.exe"), &platform)?;
@@ -1258,13 +1258,13 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
 // ------------------------------------------------------------------ live ----
 
 fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
-    use llamactl_core::live;
+    use fidim_core::live;
     let platform = WindowsPlatform;
     let util = platform.gpu_utilization().unwrap_or_default();
     let mut rows = Vec::new();
     for r in supervise::reattach(&cfg.runs_dir).into_iter().filter(|r| r.alive) {
-        let samples: Vec<live::LiveSample> = if r.state.profile_id == llamactl_core::router::ROUTER_ID {
-            llamactl_core::router::models(&r.state.host, r.state.port)
+        let samples: Vec<live::LiveSample> = if r.state.profile_id == fidim_core::router::ROUTER_ID {
+            fidim_core::router::models(&r.state.host, r.state.port)
                 .unwrap_or_default()
                 .iter()
                 .filter(|m| m.status == "loaded")

@@ -1,4 +1,4 @@
-//! Tauri command layer: thin wrappers over llamactl-core. The GUI runs the
+//! Tauri command layer: thin wrappers over fidim-core. The GUI runs the
 //! SAME check objects and launch path as the CLI — the editor and the
 //! launcher can never disagree (spec V-2).
 
@@ -7,14 +7,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use llamactl_core::config::Config;
-use llamactl_core::devices::Device;
-use llamactl_core::launch::{self, PrepareInputs};
-use llamactl_core::platform::{Platform, WindowsPlatform};
-use llamactl_core::profile::{self, Profile};
-use llamactl_core::supervise;
-use llamactl_core::update::{self, PromoteScope};
-use llamactl_core::{bench, discovery, export, preflight};
+use fidim_core::config::Config;
+use fidim_core::devices::Device;
+use fidim_core::launch::{self, PrepareInputs};
+use fidim_core::platform::{Platform, WindowsPlatform};
+use fidim_core::profile::{self, Profile};
+use fidim_core::supervise;
+use fidim_core::update::{self, PromoteScope};
+use fidim_core::{bench, discovery, export, preflight};
 use tauri::Emitter;
 
 /// Cached slow inputs for live pre-flight (device enumeration ~2-4s, build
@@ -65,12 +65,12 @@ fn cached_devices(
             }
         }
     }
-    let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+    let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
     // Newest by release NUMBER — a string compare ranks b9817 above b10771.
     let build = builds
         .iter()
         .filter(|b| b.version.is_some())
-        .max_by_key(|b| b.version.as_deref().and_then(llamactl_core::update::version_number).unwrap_or(0))
+        .max_by_key(|b| b.version.as_deref().and_then(fidim_core::update::version_number).unwrap_or(0))
         .or(builds.first())
         .ok_or("no builds found under configured build_roots")?;
     let devices = launch::enumerate_devices(cfg, &build.server_exe, &WindowsPlatform)
@@ -124,7 +124,7 @@ async fn scan(state: tauri::State<'_, AppState>, refresh: Option<bool>) -> Resul
             }
         }
         let cfg = cfg()?;
-        let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+        let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
         let models = discovery::scan_models(&cfg.model_roots);
         let v = serde_json::json!({ "builds": builds, "models": models });
         cache.lock().unwrap().scan = Some((Instant::now(), v.clone()));
@@ -138,7 +138,7 @@ async fn scan(state: tauri::State<'_, AppState>, refresh: Option<bool>) -> Resul
 async fn creator_defaults(model_path: String) -> Result<serde_json::Value, String> {
     blocking(move || {
         let cfg = cfg()?;
-        let d = llamactl_core::hf::creator_defaults(&cfg, &PathBuf::from(model_path)).map_err(|e| e.to_string())?;
+        let d = fidim_core::hf::creator_defaults(&cfg, &PathBuf::from(model_path)).map_err(|e| e.to_string())?;
         serde_json::to_value(d).map_err(|e| e.to_string())
     })
     .await
@@ -228,7 +228,7 @@ fn live_check_blocking(
             .map_err(|e| e.to_string())?;
     let results = preflight::run_all(&prepared.context);
     // Trace what the editor's check saw, so a PASS here that a real launch
-    // contradicts can be diagnosed from ~/.llamactl/ui.log.
+    // contradicts can be diagnosed from ~/.fidim/ui.log.
     {
         let dev: Vec<String> = prepared
             .context
@@ -316,7 +316,7 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         prepared.context.resolved.iter().map(|r| r.device.stable_key.clone()).collect();
     let free_before: Vec<u64> =
         prepared.context.resolved.iter().map(|r| r.device.free_mib).collect();
-    // Port takeover (check 8 warned): stop the llamactl server on this port first.
+    // Port takeover (check 8 warned): stop the Llama FIDIM server on this port first.
     let mut replaced: Option<String> = None;
     if let Some(h) = &prepared.context.port_holder {
         if h.profile_id.is_some() {
@@ -518,7 +518,7 @@ fn do_bench(id: &str, concurrency: Option<u32>, tokens: u32) -> Result<serde_jso
             adapters
                 .iter()
                 .find(|a| {
-                    llamactl_core::devices::stable_key(&a.pnp_device_id, a.bus_number) == *key
+                    fidim_core::devices::stable_key(&a.pnp_device_id, a.bus_number) == *key
                 })
                 .and_then(|a| a.luid_low)
                 .and_then(|l| mem.iter().find(|m| m.luid_low == l))
@@ -538,7 +538,7 @@ fn do_bench(id: &str, concurrency: Option<u32>, tokens: u32) -> Result<serde_jso
         .iter()
         .find(|a| {
             run.state.device_keys.iter().any(|k| {
-                llamactl_core::devices::stable_key(&a.pnp_device_id, a.bus_number) == *k
+                fidim_core::devices::stable_key(&a.pnp_device_id, a.bus_number) == *k
             })
         })
         .map(|a| a.driver_version.clone());
@@ -718,7 +718,7 @@ fn save_config(state: tauri::State<'_, AppState>, config: Config) -> Result<(), 
     Ok(())
 }
 
-/// Append a line from the web view to `~/.llamactl/ui.log` — the only way
+/// Append a line from the web view to `~/.fidim/ui.log` — the only way
 /// a failure inside the GUI becomes visible outside it.
 #[tauri::command]
 fn ui_log(line: String) -> Result<(), String> {
@@ -739,7 +739,7 @@ fn ui_log(line: String) -> Result<(), String> {
 #[tauri::command]
 fn list_runtimes() -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
-    serde_json::to_value(llamactl_core::runtime::discover(&cfg)).map_err(|e| e.to_string())
+    serde_json::to_value(fidim_core::runtime::discover(&cfg)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -752,24 +752,24 @@ fn update_history() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 fn router_get() -> Result<serde_json::Value, String> {
-    let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
+    let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
     serde_json::to_value(rc).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn router_save(rc: llamactl_core::router::RouterConfig) -> Result<(), String> {
-    llamactl_core::router::save_config(&rc).map_err(|e| e.to_string())
+fn router_save(rc: fidim_core::router::RouterConfig) -> Result<(), String> {
+    fidim_core::router::save_config(&rc).map_err(|e| e.to_string())
 }
 
 /// Render the preset file for a (possibly unsaved) router config.
 #[tauri::command]
-async fn router_ini(state: tauri::State<'_, AppState>, rc: llamactl_core::router::RouterConfig) -> Result<serde_json::Value, String> {
+async fn router_ini(state: tauri::State<'_, AppState>, rc: fidim_core::router::RouterConfig) -> Result<serde_json::Value, String> {
     let cache = state.cache.clone();
     blocking(move || {
         let cfg = cfg()?;
         let profiles = Profile::load_all(&cfg.profile_dir).map_err(|e| e.to_string())?;
         let devices = cached_devices(&cache, &cfg, false)?;
-        let r = llamactl_core::router::render_ini(&rc, &profiles, &devices).map_err(|e| e.to_string())?;
+        let r = fidim_core::router::render_ini(&rc, &profiles, &devices).map_err(|e| e.to_string())?;
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
     .await
@@ -779,16 +779,16 @@ async fn router_ini(state: tauri::State<'_, AppState>, rc: llamactl_core::router
 async fn router_launch() -> Result<serde_json::Value, String> {
     blocking(move || {
         let cfg = cfg()?;
-        let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
+        let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
         let profiles = Profile::load_all(&cfg.profile_dir).map_err(|e| e.to_string())?;
-        let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
+        let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
         let build_dir = match &rc.build {
             Some(b) => b.clone(),
             None => update::newest_installed(&builds).ok_or("no installed build")?.path,
         };
         let devices = launch::enumerate_devices(&cfg, &build_dir.join("bin").join("llama-server.exe"), &WindowsPlatform)
             .map_err(|e| e.to_string())?;
-        let r = llamactl_core::router::launch(&cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(180))
+        let r = fidim_core::router::launch(&cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(180))
             .map_err(|e| e.to_string())?;
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
@@ -798,7 +798,7 @@ async fn router_launch() -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn router_status() -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
-    let run = supervise::reattach(&cfg.runs_dir).into_iter().find(|r| r.state.profile_id == llamactl_core::router::ROUTER_ID);
+    let run = supervise::reattach(&cfg.runs_dir).into_iter().find(|r| r.state.profile_id == fidim_core::router::ROUTER_ID);
     Ok(match run {
         Some(r) => serde_json::json!({ "alive": r.alive, "state": r.state }),
         None => serde_json::json!({ "alive": false }),
@@ -808,8 +808,8 @@ fn router_status() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn router_models() -> Result<serde_json::Value, String> {
     blocking(move || {
-        let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
-        let ms = llamactl_core::router::models(&rc.host, rc.port).map_err(|e| e.to_string())?;
+        let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
+        let ms = fidim_core::router::models(&rc.host, rc.port).map_err(|e| e.to_string())?;
         serde_json::to_value(ms).map_err(|e| e.to_string())
     })
     .await
@@ -818,8 +818,8 @@ async fn router_models() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn router_load(id: String) -> Result<(), String> {
     blocking(move || {
-        let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
-        llamactl_core::router::load_model(&rc.host, rc.port, &id).map_err(|e| e.to_string())
+        let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
+        fidim_core::router::load_model(&rc.host, rc.port, &id).map_err(|e| e.to_string())
     })
     .await
 }
@@ -827,8 +827,8 @@ async fn router_load(id: String) -> Result<(), String> {
 #[tauri::command]
 async fn router_unload(id: String) -> Result<(), String> {
     blocking(move || {
-        let rc = llamactl_core::router::load_config().map_err(|e| e.to_string())?;
-        llamactl_core::router::unload_model(&rc.host, rc.port, &id).map_err(|e| e.to_string())
+        let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
+        fidim_core::router::unload_model(&rc.host, rc.port, &id).map_err(|e| e.to_string())
     })
     .await
 }
@@ -858,14 +858,14 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
             .map(|r| {
                 let mut samples = Vec::new();
                 if r.alive {
-                    if r.state.profile_id == llamactl_core::router::ROUTER_ID {
-                        if let Ok(ms) = llamactl_core::router::models(&r.state.host, r.state.port) {
+                    if r.state.profile_id == fidim_core::router::ROUTER_ID {
+                        if let Ok(ms) = fidim_core::router::models(&r.state.host, r.state.port) {
                             for m in ms.iter().filter(|m| m.status == "loaded") {
-                                samples.push(llamactl_core::live::sample(&r.state.host, r.state.port, Some(&m.id)));
+                                samples.push(fidim_core::live::sample(&r.state.host, r.state.port, Some(&m.id)));
                             }
                         }
                     } else {
-                        samples.push(llamactl_core::live::sample(&r.state.host, r.state.port, None));
+                        samples.push(fidim_core::live::sample(&r.state.host, r.state.port, None));
                     }
                 }
                 let mem = platform.gpu_process_memory(r.state.pid).unwrap_or_default();
@@ -897,29 +897,38 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
 #[tauri::command]
 async fn rocm_families() -> Result<serde_json::Value, String> {
     blocking(|| {
-        let f = llamactl_core::rocm::families().map_err(|e| e.to_string())?;
+        let f = fidim_core::rocm::families().map_err(|e| e.to_string())?;
         serde_json::to_value(f).map_err(|e| e.to_string())
     })
     .await
 }
 
 #[tauri::command]
-async fn rocm_available(family: String) -> Result<serde_json::Value, String> {
+async fn rocm_available(state: tauri::State<'_, AppState>, family: String) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
     blocking(move || {
-        let (runtimes, problems) = llamactl_core::rocm::available(&family).map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({ "runtimes": runtimes, "problems": problems }))
+        let cfg = cfg()?;
+        // Empty = guess from the cards, else RDNA4.
+        let family = if family.trim().is_empty() {
+            let names: Vec<String> = cached_devices(&cache, &cfg, false).unwrap_or_default().into_iter().map(|d| d.name).collect();
+            fidim_core::rocm::guess_family(&names).unwrap_or_else(|| "gfx120X-all".to_string())
+        } else {
+            family
+        };
+        let (runtimes, problems) = fidim_core::rocm::available(&family).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "family": family, "runtimes": runtimes, "problems": problems }))
     })
     .await
 }
 
 #[tauri::command]
-async fn rocm_install(app: tauri::AppHandle, runtime: llamactl_core::rocm::AvailableRuntime) -> Result<serde_json::Value, String> {
+async fn rocm_install(app: tauri::AppHandle, runtime: fidim_core::rocm::AvailableRuntime) -> Result<serde_json::Value, String> {
     blocking(move || {
         let cfg = cfg()?;
         let mut progress = |line: String| {
             let _ = app.emit("update-progress", line);
         };
-        let dir = llamactl_core::rocm::install(&cfg, &runtime, &mut progress).map_err(|e| e.to_string())?;
+        let dir = fidim_core::rocm::install(&cfg, &runtime, &mut progress).map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "dir": dir, "name": format!("rocm-{}", runtime.version) }))
     })
     .await
@@ -929,7 +938,7 @@ async fn rocm_install(app: tauri::AppHandle, runtime: llamactl_core::rocm::Avail
 async fn rocm_remove(version: String) -> Result<(), String> {
     blocking(move || {
         let cfg = cfg()?;
-        llamactl_core::rocm::remove(&cfg, &version).map_err(|e| e.to_string())
+        fidim_core::rocm::remove(&cfg, &version).map_err(|e| e.to_string())
     })
     .await
 }
@@ -980,5 +989,5 @@ pub fn run() {
             rocm_remove,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running llamactl UI");
+        .expect("error while running Llama FIDIM UI");
 }

@@ -32,7 +32,8 @@
   const views = groups.flatMap((g) => g.views);
   let active = $state("running");
   let alive = $state(0);
-  // Any uncaught error in the web view goes to ~/.llamactl/ui.log; a thrown
+  let setup = $state(null); // { models, builds } from the boot scan; drives the first-run banner
+  // Any uncaught error in the web view goes to ~/.fidim/ui.log; a thrown
   // template expression otherwise just leaves the view half-updated.
   window.addEventListener("error", (e) => log(`uncaught: ${e.message} @ ${e.filename}:${e.lineno} ${e.error?.stack ?? ""}`));
   window.addEventListener("unhandledrejection", (e) => log(`unhandled rejection: ${e.reason?.stack ?? String(e.reason)}`));
@@ -45,7 +46,7 @@
   const counter = setInterval(count, 5000);
   onDestroy(() => clearInterval(counter));
 
-  // Boot diagnostics: one line in ~/.llamactl/ui.log saying what the GUI can
+  // Boot diagnostics: one line in ~/.fidim/ui.log saying what the GUI can
   // see, so an empty picker can be diagnosed without a debugger.
   (async () => {
     const t = performance.now();
@@ -59,6 +60,7 @@
     }
     const n = (x, k) => (x?.error ? `ERR(${x.error})` : k ? (x?.[k]?.length ?? 0) : (x?.length ?? 0));
     log(`boot: builds=${n(r.scan, "builds")} models=${n(r.scan, "models")} devices=${n(r.devices)} runtimes=${n(r.runtimes)} in ${Math.round(performance.now() - t)}ms`);
+    setup = { models: r.scan?.models?.length ?? 0, builds: r.scan?.builds?.length ?? 0 };
     // Also run the editor's live check on one saved profile at boot; the
     // command logs its inputs, so a check/launch disagreement is diagnosable.
     try {
@@ -76,7 +78,7 @@
 
 <div class="shell">
   <nav class="nav">
-    <div class="brand">llama<em>ctl</em><span class="dot" class:off={!inTauri} title={inTauri ? "connected to the Rust core" : "browser preview: mock data"}></span></div>
+    <div class="brand">Llama <em>FIDIM</em><span class="dot" class:off={!inTauri} title={inTauri ? "connected to the Rust core" : "browser preview: mock data"}></span></div>
     {#each groups as g}
       <div class="group">{g.label}</div>
       {#each g.views as v}
@@ -88,10 +90,22 @@
     {/each}
     <div class="spacer"></div>
     <div class="foot">
-      {inTauri ? "connected" : "MOCK DATA\nbrowser preview"}
+      {inTauri ? "Fine, I'll do it myself." : "MOCK DATA\nbrowser preview"}
     </div>
   </nav>
   <main class="view">
+    {#if setup && (!setup.models || !setup.builds) && active !== "settings" && active !== "updates"}
+      <div class="card notice" style="border-color: var(--accent-line);">
+        <span class="chip accent">first run</span>
+        <span>
+          {#if !setup.models && !setup.builds}No models or llama.cpp builds found yet.
+          {:else if !setup.models}No models found yet.
+          {:else}No llama.cpp build found yet.{/if}
+          {#if !setup.models}Add a model folder in <button class="link" onclick={() => (active = "settings")}>Settings</button>.{/if}
+          {#if !setup.builds}Install a build from <button class="link" onclick={() => (active = "updates")}>Updates</button>.{/if}
+        </span>
+      </div>
+    {/if}
     {#key active}
       <ActiveComponent />
     {/key}

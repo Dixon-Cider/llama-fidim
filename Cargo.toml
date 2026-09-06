@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/llamactl-core", "crates/llamactl-cli", "ui/src-tauri"]
+members = ["crates/fidim-core", "crates/fidim-cli", "ui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/Dixon-Cider/llamactl"
+repository = "https://github.com/Dixon-Cider/llama-fidim"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
