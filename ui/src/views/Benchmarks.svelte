@@ -26,7 +26,7 @@
     try {
       const r = await api("bench_profile", { id: selected, concurrency: null, tokens: 256 });
       message = r.cold
-        ? "Cold-cache run recorded to history but NOT saved as the baseline (R-08) — relaunch and re-bench for a warm number."
+        ? "Cold-cache run recorded, but not saved as the baseline. Run it again warm."
         : r.saved
           ? "Baseline saved to the profile."
           : "Sweep recorded.";
@@ -38,10 +38,9 @@
   }
 </script>
 
-<h1>Benchmarks <span class="sub">sweeps against a running server; results stored per profile revision</span></h1>
+<h1>Benchmarks <span class="sub">Throughput sweeps against a running server.</span></h1>
 <p class="lede">
-  Warm up twice, measure serial then N-concurrent decode. "Decode agg" matches the old batch-file
-  sweep tables (sum of per-stream rates); "wall agg" is what a caller actually experiences.
+  Two warm-ups, then serial and N-concurrent decode. Decode agg is the sum of per-stream rates; wall agg is what a caller sees.
 </p>
 
 <div class="toolbar">
@@ -52,7 +51,7 @@
     {running ? "Sweeping…" : "Run sweep"}
   </button>
   {#if !liveRunIds.includes(selected)}
-    <span class="chip plain">server not running — launch it first</span>
+    <span class="chip plain">server not running</span>
   {/if}
   {#if message}<span class="muted">{message}</span>{/if}
 </div>

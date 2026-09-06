@@ -34,7 +34,7 @@
   onDestroy(() => clearInterval(poll));
 </script>
 
-<h1>Logs <span class="sub">live tail per server, plus logs from stopped and crashed runs</span></h1>
+<h1>Logs <span class="sub">Live tail of each server's log.</span></h1>
 
 <div class="toolbar">
   <select style="width: 220px;" bind:value={selected} onchange={tail}>

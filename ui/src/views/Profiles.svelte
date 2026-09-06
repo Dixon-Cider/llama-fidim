@@ -390,7 +390,7 @@
       await api("save_profile", { p: normalized(draft) });
       const r = await api("launch_profile", { id: draft.id, overrideBlocks });
       if (r.blocked) {
-        toastMsg("Launch blocked by pre-flight — see the check list; use Override to accept the named risks", true);
+        toastMsg("Blocked by pre-flight. See the list below, or Override to accept the named risks.", true);
         check = { ...check, results: r.results };
       } else {
         const place = (r.placement ?? [])
@@ -426,7 +426,7 @@
 </script>
 <h1>
   Profiles
-  <span class="sub">A saved launch: model, build, GPU placement and every server flag. The editor runs the same pre-flight as launch, so what passes here is what launches.</span>
+  <span class="sub">A saved launch: model, build, GPU placement and server flags. Pre-flight here is the same check launch runs.</span>
 </h1>
 {#if loadErrors.length}
   <div class="card">
@@ -508,7 +508,7 @@
 
       <!-- identity -->
       <section class="card">
-        <div class="sec">Identity <span class="faint">what the CLI, the router and clients call it</span></div>
+        <div class="sec">Identity <span class="faint">names the CLI, the router and clients use</span></div>
         <div class="formgrid">
           <label class="field" title="Profile identifier: the file name under the profile directory and what the CLI uses (llamactl launch <id>). Letters, digits, dashes."><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
           <label class="field" style="grid-column: span 2;" title="Free-text display name."><span class="k">name</span><input bind:value={draft.name} /></label>
@@ -574,12 +574,12 @@
               {#if draft.build.path && !selectedBuild}<option value={draft.build.path}>{draft.build.path} (not in scan)</option>{/if}
             </select>
           </label>
-          <label class="field" style="grid-column: span 3;" title="ROCm runtime DLL folder prepended to PATH for this server. Config default is the HIP SDK.">
+          <label class="field" style="grid-column: span 3;" title="ROCm runtime this server runs against; its DLL folders go first on PATH. Newest first; install more from the Updates tab.">
             <span class="k">ROCm runtime</span>
             <select bind:value={draft.rocm_runtime} onchange={scheduleCheck}>
               <option value={null}>config default ({runtimes.find((r) => r.is_default)?.name ?? "default"}{runtimes.find((r) => r.is_default)?.version ? ` · ${runtimes.find((r) => r.is_default).version}` : ""})</option>
               {#each runtimes.filter((r) => !r.is_default) as r}
-                <option value={r.name} disabled={!r.available}>{r.name}{r.version ? ` · ${r.version}` : ""}{r.available ? "" : " (missing)"}</option>
+                <option value={r.name} disabled={!r.available}>{r.name}{r.version ? ` · ${r.version}` : ""}{r.is_latest ? " (latest)" : ""}{r.available ? "" : " (missing)"}</option>
               {/each}
             </select>
           </label>
@@ -588,7 +588,7 @@
 
       <!-- devices -->
       <section class="card">
-        <div class="sec">GPU placement <span class="faint">one card holds the whole model; two cards span it by layer</span></div>
+        <div class="sec">GPU placement <span class="faint">one card, or a layer split across two</span></div>
         <div class="devrows">
           {#each devices.filter((d) => !d.integrated) as dev}
             {@const entry = draft.devices.find((x) => x.key === dev.stable_key)}
@@ -647,13 +647,13 @@
 
       <!-- context & offload -->
       <section class="card">
-        <div class="sec">Context and offload <span class="faint">what the server allocates at start</span></div>
+        <div class="sec">Context and offload <span class="faint">allocated when the server starts</span></div>
         <div class="formgrid">
-          <Range bind:value={draft.runtime.ctx_total} label="context length" title="Total tokens of context the server allocates (split across slots). VRAM is nearly flat with context on Gemma 4's sliding-window layers; on dense models it grows linearly." min={512} max={ctxMax} step={256}
+          <Range bind:value={draft.runtime.ctx_total} label="context length" title="Total tokens of context, split across slots. On sliding-window models VRAM barely grows with context; on dense models it grows linearly." min={512} max={ctxMax} step={256}
             hint={header ? `model supports up to ${fmtInt(ctxMax)} tokens` : "no model header — default cap"} format={fmtInt} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.runtime.n_gpu_layers} label="GPU offload (layers)" title="How many transformer layers live on the GPU. Anything at or above the model's layer count = everything on GPU (fastest). Lower it only when the model does not fit." min={0} max={layerMax} step={1}
             hint={header ? `${layerMax} layers; ≥ ${layerMax} = all` : "99 = all"} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.slots} label="max concurrent requests (slots)" title="-np: parallel request slots. Context divides evenly across them. Measured knee on the 26B-A4B: 6 slots." min={1} max={16} step={1}
+          <Range bind:value={draft.runtime.slots} label="max concurrent requests (slots)" title="-np: parallel request slots. Context divides evenly across them." min={1} max={16} step={1}
             hint={`per-slot context = ${fmtInt(Math.floor(draft.runtime.ctx_total / Math.max(1, draft.runtime.slots)))}`} onchange={scheduleCheck} span={3} />
           <label class="field" style="grid-column: span 3; justify-content: end;" title="One shared KV pool across slots instead of a fixed share per slot. Experimental.">
             <span class="k">unified KV cache</span>
@@ -667,7 +667,7 @@
         <div class="sec">
           Speculative decoding
           {#if mtpBuiltIn}<span class="chip pass">model supports MTP</span>{/if}
-          <span class="faint">drafts several tokens per step and verifies them in one pass; free speed when the draft is right</span>
+          <span class="faint">guess several tokens per step, verify them in one pass</span>
           <span style="margin-left: auto;"><button class="btn small" onclick={applySpecDefaults} disabled={draft.speculative.mode === "off"} title="engine defaults: 3 max, 0 min, 0.0 probability">Engine defaults</button></span>
         </div>
         <div class="formgrid">
@@ -728,7 +728,7 @@
           </div>
         {/if}
         <div class="formgrid">
-          <label class="field" style="grid-column: span 3;" title="Sets enable_thinking in the chat template. Off is what fixed the agentic loops on Gemma; on gives reasoning traces."><span class="k">thinking</span>
+          <label class="field" style="grid-column: span 3;" title="Sets enable_thinking in the chat template. Off avoids the agentic loops some models fall into with thinking on; on gives reasoning traces."><span class="k">thinking</span>
             <select bind:value={draft.chat.enable_thinking} onchange={scheduleCheck}>
               <option value={null}>model default</option>
               <option value={true}>on</option>
@@ -759,22 +759,22 @@
         <div class="formgrid">
           <Range bind:value={draft.runtime.batch_logical} label="evaluation batch size (-b)" title="-b: logical batch, the per-iteration token budget shared by prefill and decode." min={64} max={8192} step={64}
             hint="shared per-iteration budget" format={fmtInt} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.batch_physical} label="physical batch size (-ub)" title="-ub: micro-batch actually pushed through the GPU; sizes the compute buffer. 256 measured best on the R9700 at long context." min={32} max={2048} step={32}
-            hint="sizes the compute buffer; 256 = R9700 sweet spot" format={fmtInt} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.batch_physical} label="physical batch size (-ub)" title="-ub: micro-batch pushed through the GPU; sizes the compute buffer. Smaller is usually better at long context." min={32} max={2048} step={32}
+            hint="sizes the compute buffer" format={fmtInt} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse (min chunk)" title="--cache-reuse: reuse KV cache for a prompt that shares a prefix with a previous one, in chunks of at least this many tokens. 0 = off." min={0} max={2048} step={32} nullable placeholder={256}
             hint="--cache-reuse" onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.runtime.threads} label="CPU thread pool size" title="-t: CPU threads for layers not offloaded and for tokenisation. Irrelevant when everything is on the GPU." min={1} max={32} step={1} nullable placeholder={8}
             hint="only matters for layers left on CPU" onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.keep_alive_seconds} label="keep model resident (keep-alive, seconds)" min={0} max={30} step={1} nullable placeholder={keepAliveDefault}
             hint={`config default ${keepAliveDefault} s · 0 = off`} onchange={scheduleCheck} span={3}
-            title="Workaround, off by default: the eviction root cause is the PCIe Link State Power Management power setting (pre-flight check 12). Only if that cannot be Off: a 1-token request this often keeps the GPU busy so Windows never powers the adapter down. 5 s measured sufficient; ~70 ms of GPU time per ping." />
+            title="Off by default. VRAM eviction on idle comes from the PCIe Link State Power Management power setting (pre-flight check 12). If it cannot be Off, a 1-token request this often keeps the GPU awake; about 70 ms of GPU time per ping." />
           <div style="grid-column: span 3;"></div>
-          <label class="field" style="grid-column: span 2;" title="Fused attention kernel: less VRAM, faster prefill. Must be on for V-cache quantisation. 'auto' lets llama.cpp decide."><span class="k">flash attention</span>
+          <label class="field" style="grid-column: span 2;" title="Fused attention kernel: less VRAM, faster prefill. Required for V-cache quantisation. auto lets llama.cpp decide."><span class="k">flash attention</span>
             <select bind:value={draft.runtime.flash_attn} onchange={scheduleCheck}>
               <option value="on">on</option><option value="off">off</option><option value="auto">auto</option>
             </select>
           </label>
-          <label class="field" title="Storage type of the attention key cache. q8_0 is visually lossless and halves KV VRAM; q4_0 quarters it with some quality cost."><span class="k">K cache quant</span>
+          <label class="field" title="Storage type of the attention key cache. q8_0 halves KV VRAM at no visible cost; q4_0 quarters it with some quality cost."><span class="k">K cache quant</span>
             <select bind:value={draft.runtime.kv_type_k} onchange={scheduleCheck}>
               {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
             </select>
@@ -796,14 +796,14 @@
           </label>
         </div>
         <div class="faint small" style="margin-top: 10px;">
-          KV quantisation is where the VRAM is on this architecture (q8_0 ≈ f16 quality); flash attention must be on for V-cache quant.
+          KV quantisation is the big VRAM lever (q8_0 is as good as f16 in practice); flash attention must be on for V-cache quant.
         </div>
       </section>
 
       <!-- notes -->
       <section class="card">
-        <div class="sec">Notes <span class="faint">why this profile exists, what was measured, what to remember</span></div>
-        <textarea rows="3" bind:value={draft.notes} placeholder="Knee is at 6 slots; 6→8 buys +2.4% aggregate for −23% per-stream."></textarea>
+        <div class="sec">Notes <span class="faint">free text, saved with the profile</span></div>
+        <textarea rows="3" bind:value={draft.notes} placeholder="What was measured, what to remember."></textarea>
       </section>
 
       {#if check?.findings?.length}
@@ -822,7 +822,7 @@
       <section class="card">
         <div class="sec">
           Pre-flight
-          <span class="faint">the same checks launch runs, re-run on every edit</span>
+          <span class="faint">re-run on every edit</span>
           {#if checking}<span class="chip plain live" style="margin-left: auto;">re-checking</span>{/if}
           {#if check?.error}<span class="chip block">{check.error}</span>{/if}
         </div>

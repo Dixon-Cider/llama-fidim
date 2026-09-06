@@ -442,8 +442,11 @@ pub fn prepare_with_inputs(
         baseline.and_then(|b| b.get("sdk")).and_then(|v| v.as_str()).map(String::from);
 
     let mut plan = compose(profile, &resolved);
-    // One or more dirs joined with `;` — everything downstream just prepends it.
-    plan.path_prepend = runtime.path_prepend();
+    // Shims an older install copied into the build folder would shadow the
+    // chosen runtime; retire them, then prepend the runtime's own shim dir
+    // and its DLL dirs (joined with `;`).
+    crate::update::retire_build_shims(&plan.exe);
+    plan.path_prepend = crate::runtime::prepend_for(&runtime, &plan.exe);
 
     let context = LaunchContext {
         profile: profile.clone(),

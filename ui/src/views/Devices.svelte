@@ -29,7 +29,7 @@
 
 <h1>
   Devices
-  <span class="sub">Enumerated fresh from <span class="mono">llama-server --list-devices</span>, the index space every profile launches against. Profiles bind to the stable key; the index is resolved at launch and never trusted from disk.</span>
+  <span class="sub">Fresh from <span class="mono">llama-server --list-devices</span>. Profiles bind to the stable key; the index is resolved at every launch.</span>
 </h1>
 
 <div class="toolbar">
@@ -69,18 +69,18 @@
   {/each}
 </div>
 <p class="faint small" style="margin: 10px 0 0;">
-  ~ marks an index correlated by bus order between identically named cards; it is verified at launch by per-process residency.
-  A display on a compute card costs VRAM to the compositor and can pre-empt compute.
+  ~ means the index was matched by bus order between identically named cards; launch verifies it by per-process residency.
+  A display on a compute card costs VRAM and can pre-empt compute.
 </p>
 
-<h2>ROCm runtimes <span class="sub">DLL search paths a profile can launch against, discovered from the HIP SDK, ComfyUI, LM Studio and your config</span></h2>
+<h2>ROCm runtimes <span class="sub">DLL folders a profile can launch with: HIP SDK installs, versions installed from the Updates tab, LM Studio's, and any you add in Settings. Newest first.</span></h2>
 <div class="card flush" style="overflow-x: auto;">
   <table class="grid">
     <thead><tr><th>Name</th><th>Source</th><th>Version</th><th>State</th><th>Directories</th></tr></thead>
     <tbody>
       {#each runtimes as r}
         <tr>
-          <td class="mono">{r.name}{#if r.is_default} <span class="chip accent">default</span>{/if}</td>
+          <td class="mono">{r.name}{#if r.is_default} <span class="chip accent">default</span>{/if}{#if r.is_latest} <span class="chip pass">latest</span>{/if}</td>
           <td>{r.source}</td>
           <td class="mono">{r.version ?? "—"}</td>
           <td>{#if r.available}<span class="chip pass">available</span>{:else}<span class="chip block">missing</span>{/if}</td>

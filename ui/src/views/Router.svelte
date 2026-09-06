@@ -90,11 +90,11 @@
   const base = (p) => String(p ?? "").split(/[\\/]/).pop();
 </script>
 
-<h1>Router <span class="sub">one OpenAI-compatible port for every model — the request's <span class="mono">model</span> field picks the profile</span></h1>
+<h1>Router <span class="sub">One port for every model. The request's <span class="mono">model</span> field picks the profile.</span></h1>
 <p class="lede">
-  llama-server's router mode: one process on the port, a child instance per model loaded on demand from a preset
-  file llamactl writes from your profiles. Clients keep one base URL and switch models by name. Up to
-  <span class="mono">models-max</span> instances stay loaded at once; the next load evicts the least recently used.
+  llama-server's router mode. One process owns the port and starts a child per model from a preset file
+  written from your profiles. Clients keep one base URL and pick a model by name. Past
+  <span class="mono">models-max</span> loaded instances, the least recently used is evicted.
 </p>
 
 {#if error}<div class="card"><span class="chip block">error</span> <span class="mono">{error}</span></div>{/if}
@@ -130,15 +130,15 @@
       <label class="field" title="ROCm runtime DLL search path for the router process (inherited by every instance).">
         <span class="k">ROCm runtime</span>
         <select bind:value={rc.rocm_runtime}>
-          <option value={null}>config default</option>
-          {#each runtimes.filter((r) => !r.is_default) as r}<option value={r.name} disabled={!r.available}>{r.name}</option>{/each}
+          <option value={null}>default ({runtimes.find((r) => r.is_default)?.name ?? "default"}{runtimes.find((r) => r.is_default)?.version ? ` · ${runtimes.find((r) => r.is_default).version}` : ""})</option>
+          {#each runtimes.filter((r) => !r.is_default) as r}<option value={r.name} disabled={!r.available}>{r.name}{r.version ? ` · ${r.version}` : ""}{r.is_latest ? " (latest)" : ""}{r.available ? "" : " (missing)"}</option>{/each}
         </select>
       </label>
     </div>
   </div>
 
   <div class="card">
-    <div class="sec">Members <span class="faint" style="font-weight: 400;">— profiles served by this router; the model id is the profile's alias</span></div>
+    <div class="sec">Members <span class="faint">profiles this router serves; the model id is the profile's alias</span></div>
     <table class="grid">
       <thead><tr><th></th><th>Profile</th><th>Model id</th><th>Model</th><th>GPU</th><th>Load on startup</th></tr></thead>
       <tbody>
@@ -155,8 +155,8 @@
       </tbody>
     </table>
     <div class="faint small" style=" margin-top: 6px;">
-      Each member's own port, alias and visibility pin are replaced by the router's; GPU placement becomes
-      <span class="mono">device = ROCmN</span>. Per-model VRAM is not pre-checked at load time — size <span class="mono">models loaded at once</span> for your cards.
+      The router replaces each member's port and visibility pin; GPU placement becomes
+      <span class="mono">device = ROCmN</span>. VRAM is not checked per load, so keep <span class="mono">models loaded at once</span> honest for your cards.
     </div>
   </div>
 
@@ -200,7 +200,7 @@
   {/if}
 
   <div class="card">
-    <div class="sec">Preset file preview <span class="faint mono">written to ~/.llamactl/router.ini on launch</span></div>
+    <div class="sec">Preset file <span class="faint">written to ~/.llamactl/router.ini on launch</span></div>
     <pre class="logbox" style="max-height: 320px;">{ini}</pre>
   </div>
 {/if}

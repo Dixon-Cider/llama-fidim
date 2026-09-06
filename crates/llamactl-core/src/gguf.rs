@@ -601,7 +601,9 @@ mod tests {
     /// strongest fixture is the actual inventory.
     #[test]
     fn parses_real_models_when_present() {
-        let root = std::path::Path::new("E:/models");
+        // Point LLAMACTL_TEST_MODELS at a folder of GGUF files to run this.
+        let Some(root_s) = std::env::var_os("LLAMACTL_TEST_MODELS") else { return };
+        let root = std::path::Path::new(&root_s);
         if !root.exists() {
             return;
         }

@@ -1,6 +1,6 @@
 <script>
   // Number + slider pair. Every bounded numeric setting uses this so the
-  // user always sees where a value sits in its range (LM Studio-style).
+  // user always sees where a value sits in its range.
   //
   // `nullable`: the value may be null = "use the engine default"; a checkbox
   // gates the control and `placeholder` shows what the default is.

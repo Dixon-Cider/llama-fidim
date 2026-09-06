@@ -56,6 +56,54 @@ pub struct Release {
     pub published_at: String,
     pub html_url: String,
     pub assets: Vec<Asset>,
+    /// Release title (upstream uses the tag) and body; the body's first
+    /// line is the commit subject the tag was cut from.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// One line of the changelog between the installed build and the latest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReleaseNote {
+    pub tag: String,
+    pub title: String,
+    pub published_at: String,
+    pub html_url: String,
+}
+
+/// The commit subject out of an upstream release body:
+/// `<details open>\n\nserver : fix x (#123)\n\n* details…`.
+pub fn subject_from_body(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('<') && !l.starts_with('*') && !l.starts_with('-') && !l.starts_with('#'))
+        .map(|l| l.to_string())
+}
+
+/// Releases with `since < b<n> <= until`, newest first, from a release-list
+/// JSON. `complete` is false when the installed tag is older than the list
+/// covers (the changelog is then a tail, not the whole story).
+pub fn release_notes(list_json: &str, since: Option<u32>, until: Option<u32>) -> (Vec<ReleaseNote>, bool) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(list_json) else { return (vec![], false) };
+    let Some(arr) = v.as_array() else { return (vec![], false) };
+    let mut notes: Vec<(u32, ReleaseNote)> = Vec::new();
+    let mut saw_since = since.is_none();
+    for item in arr {
+        let Ok(r) = parse_release(&item.to_string()) else { continue };
+        let Some(n) = version_number(&r.tag) else { continue };
+        if Some(n) == since {
+            saw_since = true;
+        }
+        if since.is_some_and(|s| n <= s) || until.is_some_and(|u| n > u) {
+            continue;
+        }
+        let title = subject_from_body(&r.body).unwrap_or_else(|| r.name.clone());
+        notes.push((n, ReleaseNote { tag: r.tag, title, published_at: r.published_at, html_url: r.html_url }));
+    }
+    notes.sort_by(|a, b| b.0.cmp(&a.0));
+    (notes.into_iter().map(|(_, n)| n).collect(), saw_since)
 }
 
 fn agent() -> ureq::Agent {
@@ -102,6 +150,8 @@ pub fn parse_release(json: &str) -> Result<Release> {
         published_at: v["published_at"].as_str().unwrap_or("").to_string(),
         html_url: v["html_url"].as_str().unwrap_or("").to_string(),
         assets,
+        name: v["name"].as_str().unwrap_or("").to_string(),
+        body: v["body"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -190,6 +240,12 @@ pub struct UpdateCheck {
     /// The assets a prebuilt install would download, or why it can't.
     pub assets: Vec<Asset>,
     pub asset_error: Option<String>,
+    /// What changed between the newest installed build and the latest.
+    #[serde(default)]
+    pub changes: Vec<ReleaseNote>,
+    /// False when the installed build is older than the fetched list covers.
+    #[serde(default)]
+    pub changes_complete: bool,
 }
 
 pub fn newest_installed(builds: &[Build]) -> Option<InstalledRef> {
@@ -205,8 +261,15 @@ pub fn newest_installed(builds: &[Build]) -> Option<InstalledRef> {
 
 pub fn check(cfg: &Config) -> Result<UpdateCheck> {
     let builds = discovery::scan_builds(&cfg.build_roots, cfg.rocm_bin.as_deref());
-    let latest = latest_release()?;
-    check_against(cfg, &builds, latest)
+    // One list serves both the latest pick and the changelog.
+    let json = get_json(&format!("{RELEASES_API}?per_page=100"))?;
+    let latest = pick_latest_binary_release(&json)?;
+    let mut c = check_against(cfg, &builds, latest)?;
+    let since = c.newest_installed.as_ref().and_then(|n| version_number(&n.version));
+    let (notes, complete) = release_notes(&json, since, version_number(&c.latest.tag));
+    c.changes = notes;
+    c.changes_complete = complete;
+    Ok(c)
 }
 
 pub fn check_against(cfg: &Config, builds: &[Build], latest: Release) -> Result<UpdateCheck> {
@@ -235,6 +298,8 @@ pub fn check_against(cfg: &Config, builds: &[Build], latest: Release) -> Result<
         already_installed,
         assets,
         asset_error,
+        changes: vec![],
+        changes_complete: true,
     })
 }
 
@@ -345,22 +410,24 @@ fn write_manifest(dir: &Path, m: &Manifest) -> Result<()> {
 }
 
 fn download(asset: &Asset, to: &Path, progress: &mut dyn FnMut(String)) -> Result<()> {
+    download_url(&asset.url, &asset.name, to, progress).map(|_| ())
+}
+
+/// Stream `url` to `to` with progress every 16 MB; returns bytes written.
+pub fn download_url(url: &str, name: &str, to: &Path, progress: &mut dyn FnMut(String)) -> Result<u64> {
     let resp = agent()
-        .get(&asset.url)
+        .get(url)
         .set("User-Agent", USER_AGENT)
         .call()
-        .map_err(|e| upd(format!("download {}: {e}", asset.name)))?;
-    let total = resp
-        .header("Content-Length")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(asset.size);
+        .map_err(|e| upd(format!("download {name}: {e}")))?;
+    let total = resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     let mut reader = resp.into_reader();
     let mut file = File::create(to).map_err(|e| Error::io(to, e))?;
     let mut buf = vec![0u8; 1 << 20];
     let mut done: u64 = 0;
     let mut last_report: u64 = 0;
     loop {
-        let n = reader.read(&mut buf).map_err(|e| upd(format!("download {}: {e}", asset.name)))?;
+        let n = reader.read(&mut buf).map_err(|e| upd(format!("download {name}: {e}")))?;
         if n == 0 {
             break;
         }
@@ -368,15 +435,38 @@ fn download(asset: &Asset, to: &Path, progress: &mut dyn FnMut(String)) -> Resul
         done += n as u64;
         if done - last_report >= 16 << 20 {
             last_report = done;
-            progress(format!("{}: {} / {} MB", asset.name, done >> 20, total >> 20));
+            if total > 0 {
+                progress(format!("{name}: {} / {} MB", done >> 20, total >> 20));
+            } else {
+                progress(format!("{name}: {} MB", done >> 20));
+            }
         }
     }
     file.flush().map_err(|e| Error::io(to, e))?;
     if total > 0 && done != total {
-        return Err(upd(format!("download {}: got {done} of {total} bytes", asset.name)));
+        return Err(upd(format!("download {name}: got {done} of {total} bytes")));
     }
-    progress(format!("{}: {} MB complete", asset.name, done >> 20));
-    Ok(())
+    progress(format!("{name}: {} MB complete", done >> 20));
+    Ok(done)
+}
+
+/// Shims that older versions of this tool copied into a build's `bin`
+/// shadow every runtime (the exe folder wins DLL resolution). Rename them
+/// aside; `runtime::shim_dir` provides per-runtime shims instead. A file
+/// that is in use cannot be renamed on some systems; that is left alone.
+pub fn retire_build_shims(exe: &Path) {
+    let Some(bin) = exe.parent() else { return };
+    let Some(dir) = bin.parent() else { return };
+    let Ok(text) = std::fs::read_to_string(dir.join(MANIFEST_NAME)) else { return };
+    let Ok(m) = serde_json::from_str::<Manifest>(&text) else { return };
+    for a in &m.assets {
+        let Some(rest) = a.strip_prefix("shim:") else { continue };
+        let name = rest.split(" <-").next().unwrap_or(rest).trim();
+        let p = bin.join(name);
+        if p.is_file() {
+            let _ = std::fs::rename(&p, bin.join(format!("{name}.retired")));
+        }
+    }
 }
 
 /// Extract every file entry of a zip into `bin/`, flattening nothing: upstream
@@ -458,12 +548,9 @@ pub fn install_prebuilt(
     let exe = bin.join("llama-server.exe");
     if exe.is_file() {
         progress(format!("{} already installed at {} — verifying only", release.tag, dir.display()));
-        let mut shims = Vec::new();
-        for s in shim_renamed_rocm_dlls(&bin, cfg.rocm_bin.as_deref())? {
-            progress(format!("shimmed renamed ROCm library: {s}"));
-            shims.push(format!("shim:{s}"));
-        }
-        let verify = verify_build(&exe, cfg.rocm_bin.as_deref());
+        retire_build_shims(&exe);
+        let shims: Vec<String> = Vec::new();
+        let verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
         // Refresh the manifest: a re-verify after a runtime change (or a
         // shim added by a newer tool) is the record that matters.
         let manifest_path = dir.join(MANIFEST_NAME);
@@ -510,10 +597,6 @@ pub fn install_prebuilt(
         if !exe.is_file() {
             return Err(upd("archives extracted but bin/llama-server.exe is missing — upstream layout changed"));
         }
-        for s in shim_renamed_rocm_dlls(&bin, cfg.rocm_bin.as_deref())? {
-            progress(format!("shimmed renamed ROCm library: {s}"));
-            names.push(format!("shim:{s}"));
-        }
         Ok(names)
     })();
     let _ = std::fs::remove_dir_all(&tmp);
@@ -526,7 +609,7 @@ pub fn install_prebuilt(
     };
 
     progress("verifying: --version and --list-devices (no model load)".into());
-    let verify = verify_build(&exe, cfg.rocm_bin.as_deref());
+    let verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
     write_manifest(
         &dir,
         &Manifest {
@@ -548,10 +631,20 @@ pub fn build_from_source(
     tag: &str,
     progress: &mut dyn FnMut(String),
 ) -> Result<InstallReport> {
+    // Script beside the running exe (installed layout) or in the repo
+    // (target/release), unless config names one.
     let script = cfg
         .source_build_script
         .clone()
-        .ok_or_else(|| upd("config.source_build_script is not set (path to build-from-tag.bat)"))?;
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?;
+            let here = exe.parent()?;
+            [here.join("scripts"), here.join("..").join("..").join("scripts")]
+                .into_iter()
+                .map(|d| d.join("build-from-tag.bat"))
+                .find(|p| p.is_file())
+        })
+        .ok_or_else(|| upd("no build script: set source_build_script in Settings (scripts\\build-from-tag.bat)"))?;
     let src = cfg
         .llama_cpp_source
         .clone()
@@ -561,7 +654,7 @@ pub fn build_from_source(
     let exe = dir.join("bin").join("llama-server.exe");
     if exe.is_file() {
         progress(format!("{tag} already built at {} — verifying only", dir.display()));
-        let verify = verify_build(&exe, cfg.rocm_bin.as_deref());
+        let verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
         return Ok(InstallReport { tag: tag.into(), dir, source: "source".into(), skipped_existing: true, verify });
     }
     progress(format!("running {} {} {} {}", script.display(), src.display(), tag, dir.display()));
@@ -605,7 +698,7 @@ pub fn build_from_source(
         return Err(upd(format!("script succeeded but {} is missing", exe.display())));
     }
     progress("verifying: --version and --list-devices (no model load)".into());
-    let verify = verify_build(&exe, cfg.rocm_bin.as_deref());
+    let verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
     write_manifest(
         &dir,
         &Manifest {
@@ -838,7 +931,9 @@ mod tests {
     fn version_numbers_compare_and_behind_counts() {
         assert_eq!(version_number("b10769"), Some(10769));
         assert_eq!(version_number("v0.3.0"), None);
-        let cfg = Config::default_for_machine();
+        // First-run defaults have no roots; the install dir needs one.
+        let mut cfg = Config::default_for_machine();
+        cfg.build_roots = vec![PathBuf::from(r"C:")];
         let builds = vec![Build {
             path: PathBuf::from(r"C:\b\build-hip-vision"),
             tag: "build-hip-vision".into(),
@@ -856,7 +951,8 @@ mod tests {
 
     #[test]
     fn no_installed_build_means_update_available() {
-        let cfg = Config::default_for_machine();
+        let mut cfg = Config::default_for_machine();
+        cfg.build_roots = vec![PathBuf::from(r"C:")];
         let c = check_against(&cfg, &[], parse_release(RELEASE_JSON).unwrap()).unwrap();
         assert!(c.newest_installed.is_none());
         assert!(c.update_available);

@@ -892,6 +892,48 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
     .await
 }
 
+// ------------------------------------------------------------ rocm runtimes ----
+
+#[tauri::command]
+async fn rocm_families() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let f = llamactl_core::rocm::families().map_err(|e| e.to_string())?;
+        serde_json::to_value(f).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn rocm_available(family: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let (runtimes, problems) = llamactl_core::rocm::available(&family).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "runtimes": runtimes, "problems": problems }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn rocm_install(app: tauri::AppHandle, runtime: llamactl_core::rocm::AvailableRuntime) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let mut progress = |line: String| {
+            let _ = app.emit("update-progress", line);
+        };
+        let dir = llamactl_core::rocm::install(&cfg, &runtime, &mut progress).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "dir": dir, "name": format!("rocm-{}", runtime.version) }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn rocm_remove(version: String) -> Result<(), String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        llamactl_core::rocm::remove(&cfg, &version).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
@@ -932,6 +974,10 @@ pub fn run() {
             router_load,
             router_unload,
             live,
+            rocm_families,
+            rocm_available,
+            rocm_install,
+            rocm_remove,
         ])
         .run(tauri::generate_context!())
         .expect("error while running llamactl UI");
