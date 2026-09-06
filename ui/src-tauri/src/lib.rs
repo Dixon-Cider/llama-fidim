@@ -868,14 +868,22 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                         samples.push(fidim_core::live::sample(&r.state.host, r.state.port, None));
                     }
                 }
-                let mem = platform.gpu_process_memory(r.state.pid).unwrap_or_default();
-                let resident: Vec<serde_json::Value> = mem
-                    .iter()
-                    .map(|m| serde_json::json!({ "card": card_of(m.luid_low), "dedicated_bytes": m.dedicated_bytes, "committed_bytes": m.committed_bytes }))
-                    .collect();
-                let busy: f64 = util.iter().filter(|u| u.pid == r.state.pid).map(|u| u.percent).sum();
+                // The router's model instances are child processes; their
+                // VRAM and GPU time belong to the router run.
+                let mut pids = vec![r.state.pid];
+                if r.alive {
+                    pids.extend(fidim_core::platform::process_descendants(r.state.pid));
+                }
+                let mut resident: Vec<serde_json::Value> = Vec::new();
+                for pid in &pids {
+                    for m in platform.gpu_process_memory(*pid).unwrap_or_default() {
+                        resident.push(serde_json::json!({ "pid": pid, "card": card_of(m.luid_low), "dedicated_bytes": m.dedicated_bytes, "committed_bytes": m.committed_bytes }));
+                    }
+                }
+                let busy: f64 = util.iter().filter(|u| pids.contains(&u.pid)).map(|u| u.percent).sum();
                 serde_json::json!({
                     "run": r,
+                    "pids": pids,
                     "samples": samples,
                     "resident": resident,
                     "gpu_busy_percent": if busy <= 0.0 { 0.0 } else { busy.min(100.0) },

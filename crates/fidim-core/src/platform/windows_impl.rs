@@ -9,6 +9,41 @@ use crate::{Error, Result};
 
 pub struct WindowsPlatform;
 
+/// Every process below `root` in the parent tree (children, grandchildren...),
+/// from one Toolhelp snapshot. The router's model instances are its
+/// children, and their VRAM and GPU time belong to the router run.
+pub fn process_descendants(root: u32) -> Vec<u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    let mut pairs: Vec<(u32, u32)> = Vec::new(); // (pid, parent)
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return vec![] };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                pairs.push((e.th32ProcessID, e.th32ParentProcessID));
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    let mut out = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(p) = frontier.pop() {
+        for &(pid, parent) in &pairs {
+            if parent == p && pid != p && !out.contains(&pid) {
+                out.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    out
+}
+
 /// DEVPKEY_Gpu_Luid — {60B193CB-5276-4D0F-96FC-F173ABAD3EC6}, 2.
 /// Not exported by the windows crate; value observed working on the target
 /// machine (returns the adapter LUID the PDH GPU counters key on).

@@ -19,6 +19,8 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SlotView {
     pub id: u64,
+    /// Task the slot is (or last was) working on; changes per request.
+    pub id_task: i64,
     pub n_ctx: u64,
     pub is_processing: bool,
     /// `idle`, `prefill`, `decode`.
@@ -116,6 +118,7 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
             let loop_hint = generated_full.as_deref().and_then(|g| detect_loop(g, 3));
             SlotView {
                 id: g("id"),
+                id_task: s.get("id_task").and_then(|x| x.as_i64()).unwrap_or(-1),
                 n_ctx,
                 is_processing,
                 phase: phase.into(),
@@ -222,6 +225,7 @@ mod tests {
         let s = parse_slots(SLOTS).unwrap();
         assert_eq!(s.len(), 3);
         assert_eq!(s[0].phase, "prefill");
+        assert_eq!(s[0].id_task, 1847);
         assert!((s[0].prefill_fraction - 1956.0 / 2468.0).abs() < 1e-9);
         assert_eq!(s[1].phase, "decode");
         assert_eq!(s[1].n_decoded, 22);

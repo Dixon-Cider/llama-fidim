@@ -9,7 +9,7 @@ use crate::Result;
 #[cfg(windows)]
 mod windows_impl;
 #[cfg(windows)]
-pub use windows_impl::WindowsPlatform;
+pub use windows_impl::{process_descendants, WindowsPlatform};
 
 /// System memory state (R-05).
 ///
