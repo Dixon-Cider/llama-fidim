@@ -429,14 +429,14 @@
 {#if loadErrors.length}
   <div class="card">
     {#each loadErrors as [name, msg]}
-      <div><span class="chip block">{name} failed</span> <span class="mono" style="font-size: 11.5px;">{msg}</span></div>
+      <div><span class="chip block">{name} failed</span> <span class="mono">{msg}</span></div>
     {/each}
-    <div class="faint" style="font-size: 11px; margin-top: 4px;">Check the roots on the Settings tab, then Rescan.</div>
+    <div class="faint small" style=" margin-top: 4px;">Check the roots on the Settings tab, then Rescan.</div>
   </div>
 {:else if !loading && (!models.length || !builds.length || !devices.length)}
   <div class="card">
     <span class="chip warn">nothing to pick from</span>
-    <span style="font-size: 12px;">
+    <span >
       {models.length} models · {builds.length} builds · {devices.length} GPUs —
       set the model and build roots on the <b>Settings</b> tab (scanning {models.length ? "" : "found no GGUF files"}{!builds.length ? (models.length ? "" : "; ") + "found no bin\\llama-server.exe" : ""}).
     </span>
@@ -451,7 +451,7 @@
       <button class="btn" onclick={duplicate} disabled={!draft}>Duplicate</button>
       <button class="btn" onclick={rescan} disabled={busy === "scan"} title="rescan build and model roots">{busy === "scan" ? "…" : "Rescan"}</button>
     </div>
-    <div class="card" style="padding: 6px;">
+    <div class="card" style="padding: 8px;">
       {#each profiles as row}
         <button
           class="btn"
@@ -460,12 +460,12 @@
         >
           <div style="display: flex; justify-content: space-between; align-items: baseline;">
             <span>{row.profile.id}</span>
-            <span class="mono faint" style="font-size: 10px;">:{row.profile.server.port}</span>
+            <span class="mono faint">:{row.profile.server.port}</span>
           </div>
-          <div class="faint" style="font-size: 10.5px; font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+          <div class="faint small" style="font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
             {base(row.profile.model.path)}
           </div>
-          <div class="faint" style="font-size: 10.5px; font-weight: 400;">
+          <div class="faint small" style="font-weight: 400;">
             {row.profile.build.version ?? "?"} · {row.profile.devices.length} device{row.profile.devices.length === 1 ? "" : "s"}{row.profile.split_mode ? ` · ${row.profile.split_mode} split` : ""}
             {#if row.profile.baseline}
               · {row.profile.baseline.serial_tok_s} tok/s
@@ -504,13 +504,13 @@
             </select>
           </label>
           {#if header}
-            <div class="mono faint" style="grid-column: 1 / -1; font-size: 10.5px;">
+            <div class="path" style="grid-column: 1 / -1; color: var(--ink-muted);">
               {header.model_name ?? base(draft.model.path)} · {header.architecture} · {header.size_label ?? ""} · {header.block_count} layers · trained context {fmtInt(header.context_length ?? 0)}
               {#if header.source_repo} · <span title="from GGUF general.base_model">{header.source_repo}</span>{/if}
               <br /><span style="opacity: .7; word-break: break-all;">{draft.model.path}</span>
             </div>
           {:else if draft.model.path}
-            <div class="mono faint" style="grid-column: 1 / -1; font-size: 10.5px; word-break: break-all;">{draft.model.path} <span class="chip warn">not in scan</span></div>
+            <div class="path" style="grid-column: 1 / -1;">{draft.model.path} <span class="chip warn">not in scan</span></div>
           {/if}
           <label class="field" style="grid-column: span 2;">
             <span class="k">vision projector (mmproj)</span>
@@ -533,7 +533,7 @@
             </select>
           </label>
           {#if draft.model.draft}
-            <div class="faint" style="font-size: 11px; align-self: end;">used by the Speculative decoding section below</div>
+            <div class="faint small" style=" align-self: end;">used by the Speculative decoding section below</div>
           {/if}
         </div>
 
@@ -562,7 +562,7 @@
 
       <!-- devices -->
       <div class="card">
-        <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">
+        <div class="sec">
           GPU
           <span class="faint" style="font-weight: 400;">— one card loads the whole model there; two cards span it (layer split)</span>
         </div>
@@ -570,8 +570,8 @@
           {@const entry = draft.devices.find((x) => x.key === dev.stable_key)}
           <div style="display: flex; gap: 10px; align-items: center; padding: 5px 0;">
             <input type="checkbox" style="width: auto;" checked={!!entry} onchange={() => toggleDevice(dev)} />
-            <span style="flex: 1;">{dev.name} <span class="mono faint" style="font-size: 10.5px;">{dev.stable_key.split(":").pop()}</span></span>
-            <span class="faint mono" style="font-size: 10.5px;">{dev.backend}{dev.hip_index} · {(dev.free_mib / 1024).toFixed(1)} / {(dev.total_mib / 1024).toFixed(1)} GiB free{dev.display ? " · display attached" : ""}</span>
+            <span style="flex: 1;">{dev.name} <span class="path">{dev.stable_key.split(":").pop()}</span></span>
+            <span class="path">{dev.backend}{dev.hip_index} · {(dev.free_mib / 1024).toFixed(1)} / {(dev.total_mib / 1024).toFixed(1)} GiB free{dev.display ? " · display attached" : ""}</span>
             {#if entry && draft.devices.length > 1}
               <label class="field" style="width: 90px;">
                 <span class="k">fraction</span>
@@ -614,7 +614,7 @@
 
       <!-- context & offload -->
       <div class="card">
-        <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Context and offload</div>
+        <div class="sec">Context and offload</div>
         <div class="formgrid">
           <Range bind:value={draft.runtime.ctx_total} label="context length" title="Total tokens of context the server allocates (split across slots). VRAM is nearly flat with context on Gemma 4's sliding-window layers; on dense models it grows linearly." min={512} max={ctxMax} step={256}
             hint={header ? `model supports up to ${fmtInt(ctxMax)} tokens` : "no model header — default cap"} format={fmtInt} onchange={scheduleCheck} span={3} />
@@ -631,7 +631,7 @@
 
       <!-- advanced -->
       <div class="card">
-        <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 8px;">Advanced</div>
+        <div class="sec">Advanced</div>
         <div class="formgrid">
           <Range bind:value={draft.keep_alive_seconds} label="keep model resident (keep-alive, seconds)" min={0} max={30} step={1} nullable placeholder={keepAliveDefault}
             hint={`config default ${keepAliveDefault} s · 0 = off`} onchange={scheduleCheck} span={3}
@@ -667,7 +667,7 @@
               oninput={(e) => { draft.runtime.extra_flags = e.target.value; scheduleCheck(); }} placeholder="--spec-type mtp --draft-max 3" />
           </label>
         </div>
-        <div class="faint" style="font-size: 11px; margin-top: 6px;">
+        <div class="faint small" style=" margin-top: 6px;">
           KV quantisation is where the VRAM is on this architecture (q8_0 ≈ f16 quality); flash attention must be on for V-cache quant.
         </div>
       </div>
@@ -675,9 +675,9 @@
       <!-- speculative decoding -->
       <div class="card">
         <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
-          <span style="font-weight: 700; font-size: 12.5px;">Speculative decoding</span>
+          <span class="sec-title">Speculative decoding</span>
           {#if mtpBuiltIn}<span class="chip pass">model supports MTP</span>{/if}
-          <span class="faint" style="font-size: 11px;">drafts several tokens per step and verifies them in one pass — free speed when the draft is right</span>
+          <span class="faint small" style="">drafts several tokens per step and verifies them in one pass — free speed when the draft is right</span>
           <div style="flex: 1;"></div>
           <button class="btn" onclick={applySpecDefaults} disabled={draft.speculative.mode === "off"} title="engine defaults: 3 max, 0 min, 0.0 probability">Apply creator defaults</button>
         </div>
@@ -701,15 +701,15 @@
           {/if}
         </div>
         {#if draft.speculative.mode === "mtp" && !mtpBuiltIn && !draft.model.draft?.path}
-          <div class="chip block" style="margin-top: 6px;">MTP needs either a model with a built-in head or an MTP sidecar chosen above</div>
+          <div class="chip block nodot" style="margin-top: 8px; white-space: normal;">MTP needs either a model with a built-in head or an MTP sidecar chosen above</div>
         {/if}
       </div>
 
       <!-- inference -->
       <div class="card">
         <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
-          <span style="font-weight: 700; font-size: 12.5px;">Inference</span>
-          <span class="faint" style="font-size: 11px;">unchecked = the engine's own default</span>
+          <span class="sec-title">Inference</span>
+          <span class="faint small" style="">unchecked = the engine's own default</span>
           <div class="grow" style="flex: 1;"></div>
           <button class="btn" onclick={fetchCreator} disabled={creatorBusy || !draft.model.path} title="look up generation_config.json on Hugging Face">
             {creatorBusy ? "Fetching…" : embedded ? "Re-check on Hugging Face" : "Creator defaults"}
@@ -719,7 +719,7 @@
           {/if}
         </div>
         {#if creatorShown || creator?.error}
-          <div class="mono" style="font-size: 11px; margin-bottom: 10px; padding: 8px 10px; background: var(--ground-inset); border-radius: 4px;">
+          <div class="mono" style="margin-bottom: 12px; padding: 10px 12px; background: var(--ground-inset); border-radius: 6px; line-height: 1.7;">
             {#if creator?.error}
               <span class="chip block">hugging face</span> {creator.error}<br />
             {/if}
@@ -764,7 +764,7 @@
           {#each check.findings as f}
             <div style="display: flex; gap: 8px; align-items: baseline; padding: 3px 0;">
               <span class="chip {f.severity === 'error' ? 'block' : 'warn'}">{f.severity}</span>
-              <span style="font-size: 12px;">{f.message}</span>
+              <span >{f.message}</span>
             </div>
           {/each}
         </div>
@@ -773,8 +773,8 @@
       <!-- live pre-flight -->
       <div class="card">
         <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
-          <span style="font-weight: 700; font-size: 12.5px;">Pre-flight</span>
-          {#if checking}<span class="faint mono" style="font-size: 10.5px;">re-checking…</span>{/if}
+          <span class="sec-title">Pre-flight</span>
+          {#if checking}<span class="path">re-checking…</span>{/if}
           {#if check?.error}<span class="chip block">{check.error}</span>{/if}
         </div>
         {#if check?.results}
@@ -791,10 +791,10 @@
             {/each}
           </div>
           {#if check.command_line}
-            <div class="mono faint" style="font-size: 10.5px; margin-top: 8px; word-break: break-all;">
+            <div class="path" style="margin-top: 10px;">
               {check.command_line}
             </div>
-            <div class="mono faint" style="font-size: 10.5px; word-break: break-all;">
+            <div class="path">
               env: {(check.env ?? []).map(([k, v]) => `${k}=${v}`).join("  ")}
             </div>
           {/if}
@@ -821,10 +821,10 @@
 
       {#if draft.baseline}
         <div class="card">
-          <div style="font-weight: 700; font-size: 12.5px; margin-bottom: 6px;">
-            Last baseline <span class="faint mono" style="font-weight: 400; font-size: 10.5px;">{draft.baseline.measured_at} · driver {draft.baseline.driver} · {draft.baseline.sdk}</span>
+          <div class="sec">
+            Last baseline <span class="faint mono">{draft.baseline.measured_at} · driver {draft.baseline.driver} · {draft.baseline.sdk}</span>
           </div>
-          <div class="mono" style="font-size: 12px;">
+          <div class="mono" >
             serial {draft.baseline.serial_tok_s} tok/s
             {#if draft.baseline.concurrent}
               · n={draft.baseline.concurrent.n}: {draft.baseline.concurrent.decode_aggregate_tok_s ?? draft.baseline.concurrent.aggregate_tok_s} tok/s decode-agg,

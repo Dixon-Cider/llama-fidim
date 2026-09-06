@@ -112,7 +112,7 @@
           </td></tr>
       </tbody>
     </table>
-    <p class="faint" style="font-size: 11px; margin: 8px 0 0;">
+    <p class="faint small" style=" margin: 8px 0 0;">
       Prebuilt = upstream's CPU zip merged with its ROCm zip (built against a newer ROCm than this box runs;
       rocBLAS resolves from PATH). Whether the HIP backend loads is verified with --list-devices, never assumed.
       If it doesn't, "Build from source" compiles the same tag with the local toolchain.
@@ -123,7 +123,7 @@
 {#if installing || log.length}
   <div class="card">
     <div class="logbox" style="max-height: 220px; overflow: auto;">
-      {#each log as line}<div class="mono" style="font-size: 11px;">{line}</div>{/each}
+      {#each log as line}<div class="mono">{line}</div>{/each}
       {#if installing && !log.length}<div class="faint">starting…</div>{/if}
     </div>
   </div>
@@ -149,7 +149,7 @@
         </tbody>
       </table>
     {/if}
-    {#if install.verify.detail}<pre class="mono faint" style="white-space: pre-wrap; font-size: 11px;">{install.verify.detail}</pre>{/if}
+    {#if install.verify.detail}<pre class="path" style="white-space: pre-wrap;">{install.verify.detail}</pre>{/if}
     <div class="toolbar" style="margin-top: 10px;">
       <button class="btn primary" onclick={() => doPromote(false)} disabled={!install.verify.hip_ok || !check?.newest_installed}>
         Promote profiles on {check?.newest_installed?.version ?? "previous build"}
@@ -158,7 +158,7 @@
         Promote all unpinned profiles
       </button>
     </div>
-    <p class="faint" style="font-size: 11px;">
+    <p class="faint small" style="">
       Profiles with <span class="mono">"build_pinned": true</span> are never moved (use it for the MTP drafter profile).
     </p>
   </div>
@@ -177,7 +177,7 @@
         {/each}
       </tbody>
     </table>
-    <p class="muted" style="font-size: 12px;">Nothing was launched. Bench when the GPUs are free; Rollback undoes this batch.</p>
+    <p class="muted">Nothing was launched. Bench when the GPUs are free; Rollback undoes this batch.</p>
   </div>
 {/if}
 
