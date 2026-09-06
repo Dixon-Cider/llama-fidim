@@ -96,6 +96,23 @@
     if (x.phase === "decode") return x.n_decoded / Math.max(1, x.n_decoded + Math.max(0, x.n_remain));
     return 0;
   }
+
+  // Slot drawers: which (model, slot) text panels are open.
+  let open = $state({});
+  const slotKey = (k, id) => `${k}#${id}`;
+  function toggleSlot(k, id) {
+    const sk = slotKey(k, id);
+    open = { ...open, [sk]: !open[sk] };
+  }
+  const trimFrag = (f) => (f.length > 48 ? f.slice(0, 48) + "…" : f).replace(/\n/g, "⏎");
+  // Keep a text pane pinned to its end as new tokens arrive.
+  function stick(node) {
+    const toEnd = () => { node.scrollTop = node.scrollHeight; };
+    const o = new MutationObserver(toEnd);
+    o.observe(node, { childList: true, characterData: true, subtree: true });
+    toEnd();
+    return { destroy() { o.disconnect(); } };
+  }
 </script>
 
 <h1>
@@ -167,6 +184,7 @@
         <div class="ident">
           <div class="model-name">{s.model ?? r.state.alias}</div>
           <span class="chip {phaseChip(s.phase)}">{s.phase}</span>
+          {#if s.slots.some((x) => x.loop_hint)}<span class="chip block live" title="a slot is repeating the same fragment back-to-back; click it to see the text">looping</span>{/if}
           <div class="slot-count"><b class="num">{busySlots}</b><span class="faint"> of {s.slots.length} slots busy</span></div>
           {#if s.error}<div class="err">{s.error}</div>{/if}
         </div>
@@ -207,7 +225,7 @@
         <div class="slots">
           {#each s.slots as x}
             {@const prog = slotProgress(x)}
-            <div class="slot {x.phase}" title={slotTitle(x)}>
+            <button type="button" class="slot {x.phase}" class:loop={!!x.loop_hint} class:open={!!open[slotKey(k, x.id)]} title="{slotTitle(x)} · click for prompt and generated text" onclick={() => toggleSlot(k, x.id)}>
               <div class="fill" style="width: {Math.round(100 * prog)}%;"></div>
               <span class="n">{x.id}</span>
               <span class="p">
@@ -216,14 +234,41 @@
                 {:else}idle{/if}
               </span>
               <span class="what">
-                {#if x.phase === "prefill"}prefill
+                {#if x.loop_hint}loop ×{x.loop_hint.repeats}
+                {:else if x.phase === "prefill"}prefill
                 {:else if x.phase === "decode"}decoding
                 {:else}&nbsp;{/if}
               </span>
               <div class="ctx" style="width: {Math.round(100 * x.ctx_fraction)}%;" title="context used"></div>
-            </div>
+            </button>
           {/each}
         </div>
+
+        {#each s.slots.filter((x) => open[slotKey(k, x.id)]) as x (x.id)}
+          <div class="drawer" class:loop={!!x.loop_hint}>
+            <div class="dhead">
+              <span class="mono" style="font-weight: 700;">slot {x.id}</span>
+              <span class="chip {phaseChip(x.phase)}">{x.phase}</span>
+              {#if x.loop_hint}<span class="chip block live">looping × {x.loop_hint.repeats} <span style="text-transform: none; letter-spacing: 0; font-weight: 500;">“{trimFrag(x.loop_hint.fragment)}”</span></span>{/if}
+              {#if x.generated != null}<span class="faint small">{x.generated_chars.toLocaleString()} chars generated · prompt {x.prompt_chars.toLocaleString()} chars{#if x.prompt_chars > 4000 || x.generated_chars > 4000} · showing the last 4,000 of each{/if}</span>{/if}
+              <button class="btn small" style="margin-left: auto;" onclick={() => toggleSlot(k, x.id)}>Close</button>
+            </div>
+            {#if x.prompt == null && x.generated == null}
+              <div class="faint small">This server does not expose slot text. Turn on <b>trace tokens</b> in the profile's Advanced section and reload it. For the router, turn it on for any member and relaunch the router.</div>
+            {:else}
+              <div class="panes">
+                <div class="pane">
+                  <div class="pl">last prompt received</div>
+                  <pre use:stick>{x.prompt ?? ""}</pre>
+                </div>
+                <div class="pane">
+                  <div class="pl">generated {x.is_processing ? "so far" : "in the last request"}</div>
+                  <pre use:stick>{x.generated ?? ""}</pre>
+                </div>
+              </div>
+            {/if}
+          </div>
+        {/each}
       </div>
     {:else}
       {#if r.alive}<div class="empty small">No loaded models to sample</div>{/if}
@@ -285,11 +330,31 @@
 
   .slots { grid-area: slots; display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
   .slot {
-    position: relative; height: 54px; border-radius: 6px; overflow: hidden;
+    position: relative; height: 54px; border-radius: 6px; overflow: hidden; cursor: pointer;
+    appearance: none; text-align: left; color: inherit; font: inherit; width: 100%;
     background: var(--ground-inset); border: 1px solid var(--rule-strong);
     display: grid; grid-template-columns: auto 1fr; grid-template-rows: 1fr auto; align-items: center; padding: 6px 10px 8px;
     font-family: var(--mono); font-variant-numeric: tabular-nums;
   }
+  .slot:hover { border-color: var(--ink-faint); }
+  .slot.open { box-shadow: 0 0 0 2px var(--accent-soft); border-color: var(--accent); }
+  .slot.loop { border-color: var(--block); }
+  .slot.loop .what { color: var(--block); font-weight: 600; }
+  .slot.loop .fill { background: var(--block-bg); box-shadow: inset -1px 0 0 var(--block); }
+
+  .drawer { grid-column: 1 / -1; border: 1px solid var(--rule-strong); border-radius: 6px; background: var(--ground-inset); padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 10px; }
+  .drawer.loop { border-color: rgba(232, 125, 110, 0.5); }
+  .dhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .panes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .pane { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+  .pane .pl { font-size: 11.5px; font-weight: 600; color: var(--ink-muted); }
+  .pane pre {
+    margin: 0; height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    background: #0b0f13; border: 1px solid var(--rule); border-radius: 5px; padding: 10px 12px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.55; color: var(--ink-muted);
+  }
+  .drawer.loop .pane:last-child pre { border-color: rgba(232, 125, 110, 0.5); color: var(--ink); }
+  @media (max-width: 1100px) { .panes { grid-template-columns: 1fr; } }
   .slot .fill { position: absolute; inset: 0 auto 0 0; transition: width .3s ease; }
   .slot.prefill .fill { background: var(--warn-bg); box-shadow: inset -1px 0 0 var(--warn); }
   .slot.decode .fill { background: var(--accent-soft); box-shadow: inset -1px 0 0 var(--accent); }

@@ -32,6 +32,56 @@ pub struct SlotView {
     pub prefill_fraction: f64,
     /// Tokens in the slot's context / n_ctx, 0..1.
     pub ctx_fraction: f64,
+    /// Tail of the prompt text the slot last received. Present only when
+    /// the server runs with `LLAMA_SERVER_SLOTS_DEBUG=1` (the profile's
+    /// "trace tokens" switch); the server then detokenizes it per poll.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    pub prompt_chars: usize,
+    /// Tail of the text generated so far (or the last completed generation
+    /// while idle). Same gate as `prompt`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated: Option<String>,
+    pub generated_chars: usize,
+    /// A fragment that repeats back-to-back at the end of `generated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_hint: Option<LoopHint>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LoopHint {
+    pub fragment: String,
+    pub repeats: usize,
+}
+
+/// Keep the last `n` chars of `s` (char-safe).
+fn tail(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    if count <= n { s.to_string() } else { s.chars().skip(count - n).collect() }
+}
+
+/// Endless-loop detector for a generation: the tail of `text` is the same
+/// block repeated `repeats` times back-to-back. Period is searched from 6
+/// up to 400 chars over the last 3000 chars; the smallest period that
+/// repeats at least `min_repeats` times wins, so "the the the the" and a
+/// whole repeated paragraph are both caught. Whitespace-only blocks are
+/// ignored (a model printing blank lines is a different failure).
+pub fn detect_loop(text: &str, min_repeats: usize) -> Option<LoopHint> {
+    let chars: Vec<char> = tail(text, 3000).chars().collect();
+    let n = chars.len();
+    for period in 6..=400usize {
+        if period * min_repeats > n { break; }
+        let block = &chars[n - period..];
+        if block.iter().all(|c| c.is_whitespace()) { continue; }
+        let mut repeats = 1;
+        while (repeats + 1) * period <= n && chars[n - (repeats + 1) * period..n - repeats * period] == *block {
+            repeats += 1;
+        }
+        if repeats >= min_repeats {
+            return Some(LoopHint { fragment: block.iter().collect(), repeats });
+        }
+    }
+    None
 }
 
 /// Parse the `/slots` array. Unknown shapes degrade to idle slots rather
@@ -60,6 +110,10 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
                 "decode"
             };
             let prefill_fraction = if n_prompt == 0 { 0.0 } else { (processed as f64 / n_prompt as f64).min(1.0) };
+            let text = |k: &str| s.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            let prompt_full = text("prompt");
+            let generated_full = text("generated");
+            let loop_hint = generated_full.as_deref().and_then(|g| detect_loop(g, 3));
             SlotView {
                 id: g("id"),
                 n_ctx,
@@ -72,6 +126,11 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
                 n_remain,
                 prefill_fraction: if phase == "decode" { 1.0 } else { prefill_fraction },
                 ctx_fraction: if n_ctx == 0 { 0.0 } else { (n_prompt as f64 / n_ctx as f64).min(1.0) },
+                prompt_chars: prompt_full.as_deref().map(|t| t.chars().count()).unwrap_or(0),
+                prompt: prompt_full.as_deref().map(|t| tail(t, 4000)),
+                generated_chars: generated_full.as_deref().map(|t| t.chars().count()).unwrap_or(0),
+                generated: generated_full.as_deref().map(|t| tail(t, 4000)),
+                loop_hint,
             }
         })
         .collect())
@@ -170,6 +229,34 @@ mod tests {
         assert_eq!(s[1].prefill_fraction, 1.0);
         assert_eq!(s[2].phase, "idle");
         assert_eq!(s[2].n_ctx, 32768);
+    }
+
+    #[test]
+    fn slot_text_and_loop_detection() {
+        let j = r#"[{"id":0,"n_ctx":8192,"is_processing":true,"n_prompt_tokens":10,"n_prompt_tokens_processed":10,"next_token":[{"n_remain":-1,"n_decoded":40}],"prompt":"<|turn>user\nhello","generated":"I will help. I will help. I will help. I will help. "}]"#;
+        let s = parse_slots(j).unwrap();
+        assert_eq!(s[0].prompt.as_deref(), Some("<|turn>user\nhello"));
+        assert_eq!(s[0].generated_chars, 52);
+        let hint = s[0].loop_hint.clone().expect("loop");
+        assert_eq!(hint.fragment, "I will help. ");
+        assert_eq!(hint.repeats, 4);
+        // Without slots debug the keys are absent: no text, no hint.
+        let plain = parse_slots(SLOTS).unwrap();
+        assert!(plain[1].prompt.is_none() && plain[1].generated.is_none() && plain[1].loop_hint.is_none());
+    }
+
+    #[test]
+    fn loop_detector_ignores_normal_prose_and_blank_runs() {
+        assert!(detect_loop("The quick brown fox jumps over the lazy dog and keeps going.", 3).is_none());
+        assert!(detect_loop("text\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", 3).is_none());
+        // Two repeats is not yet a loop; three is.
+        assert!(detect_loop("abcdefgh abcdefgh ", 3).is_none());
+        assert_eq!(detect_loop("abcdefgh abcdefgh abcdefgh ", 3).unwrap().repeats, 3);
+        // A repeated paragraph is caught with the paragraph as the fragment.
+        let para = "Step 1: open the file. Step 2: read it. Step 3: close it.\n";
+        let h = detect_loop(&para.repeat(5), 3).unwrap();
+        assert_eq!(h.fragment, para);
+        assert_eq!(h.repeats, 5);
     }
 
     #[test]
