@@ -382,6 +382,22 @@ fn slots_show_prefill_then_monotonic_decode() {
     assert_eq!(idle.n_prompt_tokens, 9);
     // The last answer stays readable, all of it committed.
     assert_eq!((idle.generated.as_deref(), idle.committed_chars), (Some("abc"), Some(3)));
+    // Block/step progress for the canvas view, and every step for its replay.
+    let d = idle.diffusion.as_ref().expect("diffusion progress");
+    assert_eq!((d.block, d.step, d.total, d.steps_done, d.canvas), (1, 0, 4, 3, 256));
+    let (code, body) = get(port, "/frames");
+    assert_eq!(code, 200, "{body}");
+    let f: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(f["id_task"], 1);
+    assert_eq!(f["canvas"], 256);
+    assert_eq!(f["dropped"], 0);
+    let steps: Vec<(u64, u64, &str)> = f["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| (x["b"].as_u64().unwrap(), x["s"].as_u64().unwrap(), x["x"].as_str().unwrap()))
+        .collect();
+    assert_eq!(steps, [(0, 0, "a"), (0, 1, "ab"), (1, 0, "c")]);
     assert_eq!(srv.stop(), 0);
 }
 

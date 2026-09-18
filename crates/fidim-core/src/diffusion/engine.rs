@@ -760,6 +760,9 @@ impl Worker<'_> {
             let mut live = self.shared.live();
             live.committed.clear();
             live.draft.clear();
+            live.frames.clear();
+            live.frames_bytes = 0;
+            live.frames_dropped = 0;
         }
         let sent = match self.child.as_mut() {
             Some(c) => c.send_line(&path.to_string_lossy()),
@@ -784,8 +787,9 @@ impl Worker<'_> {
                                 p.block = block;
                                 p.step = step;
                                 p.total = total;
+                                p.steps_done += 1;
                             }
-                            self.shared.live().draft = text;
+                            self.shared.live().push_frame(block, step, total, text);
                         }
                         Line::Commit { block, text } => {
                             // A block with no F frame means its step-0 decode
@@ -850,6 +854,7 @@ impl Worker<'_> {
         p.step = 0;
         p.total = 0;
         p.n_blocks = n_blocks;
+        p.steps_done = 0;
     }
 
     fn fail(&mut self, job: &Job, f: EngineFailure) -> Flow<Outcome> {
@@ -901,6 +906,9 @@ impl Worker<'_> {
             m.n_decode_total += s.steps as u64;
             m.blocks_total += s.blocks as u64;
             m.last_predicted_tps = if s.wall_ms > 0.0 { s.predicted_n as f64 / (s.wall_ms / 1000.0) } else { 0.0 };
+            let canvas_tokens = s.canvas as u64 * s.steps as u64;
+            m.canvas_tokens_total += canvas_tokens;
+            m.last_canvas_tps = if s.wall_ms > 0.0 { canvas_tokens as f64 / (s.wall_ms / 1000.0) } else { 0.0 };
         }
         self.shared.progress().n_prompt = s.prompt_n;
         // READY without MAXTOK: the first STATS says what the budget is.

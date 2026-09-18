@@ -104,6 +104,42 @@ pub struct LiveText {
     pub committed: String,
     /// The block being denoised, as of its latest step; empty between blocks.
     pub draft: String,
+    /// Every step of the job, for the GUI's replay (`/frames`); the oldest
+    /// are dropped past `FRAMES_MAX_BYTES` of text.
+    pub frames: std::collections::VecDeque<FrameRec>,
+    pub frames_bytes: usize,
+    pub frames_dropped: u64,
+}
+
+/// One denoise step as the replay shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameRec {
+    pub block: u32,
+    pub step: u32,
+    pub total: u32,
+    pub text: String,
+}
+
+/// Replay history cap: a long reply (hundreds of blocks) keeps its latest
+/// steps only.
+pub const FRAMES_MAX_BYTES: usize = 8 << 20;
+
+impl LiveText {
+    /// Record one step: the draft for /slots and a replay frame.
+    pub fn push_frame(&mut self, block: u32, step: u32, total: u32, text: String) {
+        self.frames_bytes += text.len();
+        self.frames.push_back(FrameRec { block, step, total, text: text.clone() });
+        while self.frames_bytes > FRAMES_MAX_BYTES {
+            match self.frames.pop_front() {
+                Some(f) => {
+                    self.frames_bytes -= f.text.len();
+                    self.frames_dropped += 1;
+                }
+                None => break,
+            }
+        }
+        self.draft = text;
+    }
 }
 
 /// Where the current (or last) job is, for /slots and the stream comments.
@@ -118,6 +154,9 @@ pub struct Progress {
     pub n_blocks: u32,
     /// Prompt tokens of the last finished job (the helper cannot tokenize).
     pub n_prompt: u64,
+    /// Denoise steps so far in this attempt, over all blocks (each one
+    /// re-predicts the whole canvas: Studio's "canvas tok/s").
+    pub steps_done: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -129,6 +168,11 @@ pub struct Metrics {
     pub n_decode_total: u64,
     pub last_predicted_tps: f64,
     pub blocks_total: u64,
+    /// Canvas tokens predicted, over every step: canvas x steps.
+    pub canvas_tokens_total: u64,
+    /// The last job's canvas x steps / wall: what Unsloth Studio shows as
+    /// its headline "Speed".
+    pub last_canvas_tps: f64,
 }
 
 /// State shared by the engine worker and the HTTP threads. The read-only
@@ -184,6 +228,7 @@ impl Shared {
                 total: 0,
                 n_blocks: 0,
                 n_prompt: 0,
+                steps_done: 0,
             }),
             live: Mutex::new(LiveText::default()),
             metrics: Mutex::new(Metrics::default()),

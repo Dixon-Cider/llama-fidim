@@ -36,8 +36,17 @@ const KEEPALIVE: Duration = Duration::from_secs(2);
 const HEADER_DELAY: Duration = Duration::from_secs(5);
 
 /// Paths the shim serves (llama-server's aliases included).
-const ROUTES: &[&str] =
-    &["/health", "/v1/health", "/v1/models", "/models", "/v1/chat/completions", "/chat/completions", "/slots", "/metrics"];
+const ROUTES: &[&str] = &[
+    "/health",
+    "/v1/health",
+    "/v1/models",
+    "/models",
+    "/v1/chat/completions",
+    "/chat/completions",
+    "/slots",
+    "/metrics",
+    "/frames",
+];
 
 /// What every connection thread needs.
 pub struct Ctx {
@@ -391,6 +400,7 @@ fn route(s: &mut TcpStream, req: &Request, ctx: &Ctx) {
         ("POST", "/v1/chat/completions" | "/chat/completions") => chat(s, req, ctx),
         ("GET", "/slots") => slots(s, ctx),
         ("GET", "/metrics") => metrics(s, ctx),
+        ("GET", "/frames") => frames(s, ctx),
         (_, p) if ROUTES.contains(&p) => {
             let allow = if p.ends_with("completions") { "POST" } else { "GET" };
             let e = ApiError::new(405, "invalid_request_error", format!("{} is not allowed on {p}", req.method));
@@ -491,7 +501,29 @@ fn slots(s: &mut TcpStream, ctx: &Ctx) {
         "prompt": live.prompt,
         "generated": format!("{}{}", live.committed, live.draft),
         "generated_committed_chars": live.committed.chars().count(),
+        // Where the denoise is, for FIDIM's canvas view.
+        "diffusion": {
+            "block": p.block,
+            "n_blocks": p.n_blocks,
+            "step": p.step,
+            "total": p.total,
+            "steps_done": p.steps_done,
+            "canvas": ctx.info.canvas,
+            "state": p.state,
+        },
     }]);
+    let _ = write_json(s, 200, &body, &[]);
+}
+
+/// Every denoise step of the current (or last) job, for the GUI's replay:
+/// `{id_task, canvas, dropped, frames: [{b, s, t, x}]}`.
+fn frames(s: &mut TcpStream, ctx: &Ctx) {
+    let id_task = ctx.shared.progress().id_task;
+    let live = ctx.shared.live();
+    let frames: Vec<Value> =
+        live.frames.iter().map(|f| json!({ "b": f.block, "s": f.step, "t": f.total, "x": f.text })).collect();
+    let body = json!({ "id_task": id_task, "canvas": ctx.info.canvas, "dropped": live.frames_dropped, "frames": frames });
+    drop(live);
     let _ = write_json(s, 200, &body, &[]);
 }
 
@@ -504,6 +536,8 @@ fn metrics(s: &mut TcpStream, ctx: &Ctx) {
         ("tokens_predicted_seconds_total", m.predicted_seconds_total),
         ("n_decode_total", m.n_decode_total as f64),
         ("predicted_tokens_seconds", m.last_predicted_tps),
+        ("diffusion_canvas_tokens_total", m.canvas_tokens_total as f64),
+        ("diffusion_canvas_tokens_seconds", m.last_canvas_tps),
         ("requests_processing", u8::from(sh.processing.load(Ordering::SeqCst)) as f64),
         ("requests_deferred", sh.queued.load(Ordering::SeqCst) as f64),
         ("diffusion_restarts_total", sh.restarts.load(Ordering::SeqCst) as f64),

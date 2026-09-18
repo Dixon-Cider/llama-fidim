@@ -984,6 +984,26 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
     .await
 }
 
+/// One server's slots and metrics, for a view that follows it faster than
+/// the whole-app `live` poll (the diffusion canvas refreshes ~5x a second).
+#[tauri::command]
+async fn live_one(host: String, port: u16) -> Result<serde_json::Value, String> {
+    blocking(move || serde_json::to_value(fidim_core::live::sample(&host, port, None)).map_err(|e| e.to_string())).await
+}
+
+/// A diffusion server's steps of its current (or last) reply, for replay.
+#[tauri::command]
+async fn dg_frames(host: String, port: u16) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        match fidim_core::supervise::http_get(&host, port, "/frames", std::time::Duration::from_secs(5)) {
+            Ok((200, body)) => serde_json::from_str(&body).map_err(|e| format!("/frames: {e}")),
+            Ok((code, _)) => Err(format!("/frames HTTP {code} (a diffusion server from an older Llama FIDIM?)")),
+            Err(e) => Err(format!("/frames: {e}")),
+        }
+    })
+    .await
+}
+
 // ------------------------------------------------------------ rocm runtimes ----
 
 #[tauri::command]
@@ -1047,6 +1067,8 @@ pub fn run() {
             save_profile,
             delete_profile,
             live_check,
+            live_one,
+            dg_frames,
             launch_profile,
             status,
             slots,

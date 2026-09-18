@@ -54,6 +54,23 @@ pub struct SlotView {
     /// draft, rewritten every denoise step. None for llama-server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed_chars: Option<usize>,
+    /// DiffusionGemma: where the denoise is. None for llama-server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diffusion: Option<DiffusionProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+pub struct DiffusionProgress {
+    pub block: u32,
+    pub n_blocks: u32,
+    pub step: u32,
+    pub total: u32,
+    /// Steps so far in the request, over every block.
+    pub steps_done: u32,
+    pub canvas: u32,
+    /// `loading`, `idle`, `prefill` or `denoise`.
+    #[serde(default)]
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -147,6 +164,7 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
                 generated: generated_full.as_deref().map(|t| tail(t, 4000)),
                 loop_hint,
                 committed_chars,
+                diffusion: s.get("diffusion").and_then(|d| serde_json::from_value(d.clone()).ok()),
             }
         })
         .collect())
