@@ -77,8 +77,9 @@ welcome, and a report that includes your card, driver version and the
 **From a release.** Download `llama-fidim-vX.Y.Z-win-x64.zip` from the
 [releases page](https://github.com/Dixon-Cider/llama-fidim/releases),
 extract it anywhere, and run `llama-fidim.exe`. The `fidim.exe` beside it is
-the CLI; add the folder to your PATH if you want it in every shell. A
-`.sha256` file sits next to each zip.
+the CLI; add the folder to your PATH if you want it in every shell.
+`fidim-dg.exe` is the DiffusionGemma server the app starts; keep it in the
+same folder. A `.sha256` file sits next to each zip.
 
 **From source.** Build and install from the repo:
 
@@ -119,11 +120,43 @@ fidim live                 slots, throughput and GPU busy, once
 fidim bench <id>           serial + concurrent sweep, saved as baseline
 fidim stop <id|port>       clean stop
 fidim export <id>          a standalone .bat or .ps1 that runs without the tool
+                           (a diffusion profile's still needs fidim-dg.exe)
 fidim router ...           configure, launch and manage the one-port router
 fidim update [--install]   llama.cpp releases, changelog, install, promote, roll back
+fidim update --channel unsloth [--install]
+                           Unsloth builds, which carry the DiffusionGemma runner
 fidim rocm list|install    ROCm runtimes from AMD's channels
 fidim runtimes             every runtime a profile can name
 ```
+
+## DiffusionGemma (experimental)
+
+DiffusionGemma GGUFs do not load in llama-server. The model writes a reply
+by denoising whole blocks of tokens instead of predicting one token at a
+time, and only Unsloth's llama.cpp builds ship a runner for it. Llama FIDIM
+starts that runner from an ordinary profile, behind a small OpenAI-compatible
+server of its own (`fidim-dg.exe`), so clients connect to it like any other
+model.
+
+- **Install the engine** with `fidim update --channel unsloth --install`, or
+  **Check Unsloth** on the Updates tab. The build installs beside your
+  others with its own ROCm, and only diffusion profiles are ever moved onto
+  it. A copy that Unsloth Studio keeps is never touched.
+- **Pick a DiffusionGemma GGUF** in the profile editor. The profile switches
+  to the diffusion engine and selects the Unsloth build.
+- **One card, never the iGPU.** The runner aborts every prompt when it can
+  see more than one device, so pre-flight blocks anything else. Prefer an
+  empty card: the runner sizes its context to the VRAM it believes is
+  free, and Windows hides other processes' allocations from it.
+- **The context budget is set by VRAM.** The runner's attention scores grow
+  with the square of the budget, so a 32 GB card fits about 12K tokens,
+  prompt and reply together. Left on auto, the runner picks the largest
+  budget that fits when it loads.
+- **Thinking is always on.** The reasoning arrives as `reasoning_content`.
+- **Tool calls come back as raw text** in the reply; they are not parsed
+  into `tool_calls` yet.
+- **Standalone only:** no router membership, no keep-alive, no benchmarks.
+- **Agents that require a 64K context will refuse it.**
 
 ## Why some things are the way they are
 
@@ -155,8 +188,9 @@ These came from real failures on real hardware and are deliberate:
 
 ```
 crates/fidim-core   discovery, GGUF headers, devices, VRAM estimate, pre-flight,
-                    launch, supervision, router, live view, updates, ROCm runtimes
-crates/fidim-cli    the fidim binary
+                    launch, supervision, router, live view, updates, ROCm runtimes,
+                    the DiffusionGemma server
+crates/fidim-cli    the fidim and fidim-dg binaries
 ui/                 Tauri 2 + Svelte 5 desktop app
 scripts/            install.ps1, build-from-tag.bat (source builds)
 fixtures/           captured --list-devices / hipInfo / WMI output used by tests
