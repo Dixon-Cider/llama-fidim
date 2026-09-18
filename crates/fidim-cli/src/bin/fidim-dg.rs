@@ -13,7 +13,7 @@ use fidim_core::diffusion::{self, ServeConfig};
 #[derive(Parser)]
 #[command(
     name = "fidim-dg",
-    version,
+    version = fidim_core::build_info::LONG,
     about = "Serve a DiffusionGemma GGUF over an OpenAI-compatible API (started by Llama FIDIM)",
     after_help = "Environment: NGL (GPU layers, default 0) and MAXTOK (context budget, 0 = auto) \
                   are read here for the device guard and passed on to the runner, like the rest of \

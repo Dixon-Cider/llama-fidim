@@ -1,8 +1,9 @@
 name: release
 
-# Tag a commit `vX.Y.Z` and this builds the CLI and the desktop app on a
-# clean Windows runner, zips them with the license and README, and attaches
-# the zip to a GitHub release for that tag.
+# Tag a commit `vX.Y.Z` (scripts/release.ps1 does) and this builds the CLI
+# and the desktop app on a clean Windows runner, zips them with the license,
+# README and changelog, and attaches the zip to a GitHub release for that
+# tag, with the version's CHANGELOG.md section as the notes.
 on:
   push:
     tags: ["v*"]
@@ -11,11 +12,40 @@ on:
 permissions:
   contents: write
 
+env:
+  # The binaries name the commit they were built from; a CI checkout has
+  # no local changes.
+  FIDIM_BUILD_ID: ${{ github.sha }}
+  FIDIM_BUILD_MODIFIED: "0"
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # History and tags, so a build that is not a release says how many
+          # commits past the last one it is.
+          fetch-depth: 0
+      - name: Check the tag against the version and the changelog
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $v = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          if ("v$v" -ne $tag) { throw "tag $tag does not match the workspace version $v; cut releases with scripts\release.ps1" }
+          # The release notes: this version's CHANGELOG.md section.
+          $notes = @(); $found = $false
+          foreach ($l in Get-Content CHANGELOG.md) {
+            if ($l -match '^## \[') {
+              if ($found) { break }
+              $found = $l -match ('^## \[' + [regex]::Escape($v) + '\]')
+              continue
+            }
+            if ($found -and $l -notmatch '^\[[^\]]+\]: ') { $notes += $l }
+          }
+          if (-not $found) { throw "CHANGELOG.md has no section for $v" }
+          Set-Content release-notes.md (($notes -join "`n").Trim()) -Encoding utf8
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: pnpm/action-setup@v4
@@ -46,7 +76,7 @@ jobs:
           if ($tag -notmatch '^v') { $tag = "dev-" + "${{ github.sha }}".Substring(0, 7) }
           $name = "llama-fidim-$tag-win-x64"
           New-Item -ItemType Directory -Force $name | Out-Null
-          Copy-Item target\release\fidim.exe, target\release\fidim-dg.exe, target\release\llama-fidim.exe, LICENSE, README.md $name\
+          Copy-Item target\release\fidim.exe, target\release\fidim-dg.exe, target\release\llama-fidim.exe, LICENSE, README.md, CHANGELOG.md $name\
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           # LF and no BOM, so `sha256sum -c` matches the file name on any OS.
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
@@ -77,4 +107,5 @@ jobs:
           files: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
+          body_path: release-notes.md
           generate_release_notes: true

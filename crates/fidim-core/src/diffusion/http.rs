@@ -428,6 +428,7 @@ fn health(s: &mut TcpStream, ctx: &Ctx) {
         "restarts": sh.restarts.load(Ordering::SeqCst),
         "queued": sh.queued.load(Ordering::SeqCst),
         "build_tag": ctx.cfg.build_tag,
+        "version": crate::build_info::LONG,
     });
     let _ = write_json(s, 200, &body, &[]);
 }

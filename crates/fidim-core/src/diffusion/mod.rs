@@ -376,6 +376,9 @@ pub fn remove_request_files(prefix: &Path) {
 
 /// Run the helper to completion; the return value is the process exit code.
 pub fn serve(mut cfg: ServeConfig) -> i32 {
+    // First, so every run's log says which helper it was, even one that
+    // fails to start.
+    dglog!("fidim-dg {}", crate::build_info::LONG);
     // Bind before anything else: FIDIM's stop/reattach identify the helper by
     // the port it listens on, and a second FIDIM launch must see it taken.
     let listener = match TcpListener::bind((cfg.host.as_str(), cfg.port)) {

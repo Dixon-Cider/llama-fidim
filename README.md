@@ -33,8 +33,9 @@ welcome, and a report that includes your card, driver version and the
   it across two by layer with the fraction you choose. Devices are bound by
   a stable hardware key, never by an index that changes when a driver
   updates.
-- **Pre-flight before every launch.** Twelve checks run as you edit and
-  again at launch: the build runs, the files exist, the estimated VRAM fits
+- **Pre-flight before every launch.** Twelve checks (fifteen when a
+  DiffusionGemma model or run is involved) run as you edit and again at
+  launch: the build runs, the files exist, the estimated VRAM fits
   in the free VRAM of each card, the port is free, the alias is unique, the
   driver matches what you benchmarked on, and a few Windows-specific traps
   (a display on a compute card, the PCIe power setting that evicts VRAM on
@@ -86,13 +87,19 @@ same folder. A `.sha256` file sits next to each zip.
 ```
 git clone https://github.com/Dixon-Cider/llama-fidim
 cd llama-fidim
-powershell -File scripts\install.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
 The script checks for the build tools, builds the CLI and the GUI, installs
 both under `%LOCALAPPDATA%\Programs\LlamaFIDIM`, and creates a Start Menu
 entry. Add `-AddToPath` to make `fidim` available in every shell. Re-run it
 after pulling changes.
+
+**Which version you have.** `fidim --version` and the bottom of the app's
+sidebar name the release and the commit a build came from, like
+`0.2.0 (4f2a1c9 2026-09-20)`; a build from source past a release reads
+`0.2.0+3`, three commits later. [CHANGELOG.md](CHANGELOG.md) lists what
+each release changed.
 
 ## First run
 
@@ -173,8 +180,9 @@ model.
   memory, and the runner holds about 4 GiB more after a 10K-token prompt. A
   profile env entry overrides it.
 - **Thinking is always on.** The reasoning arrives as `reasoning_content`.
-- **Tool calls come back as raw text** in the reply; they are not parsed
-  into `tool_calls` yet.
+- **Tool calls.** When a request offers tools, the model's Gemma 4 tool
+  calls come back as OpenAI `tool_calls`, streamed or not; a call that does
+  not parse stays in the reply as text.
 - **Standalone only:** no router membership, no keep-alive, no benchmarks.
 - **Agents that require a 64K context will refuse it** unless the runner is
   a patched build with flash attention, which reports 65,536.
@@ -213,7 +221,8 @@ crates/fidim-core   discovery, GGUF headers, devices, VRAM estimate, pre-flight,
                     the DiffusionGemma server
 crates/fidim-cli    the fidim and fidim-dg binaries
 ui/                 Tauri 2 + Svelte 5 desktop app
-scripts/            install.ps1, build-from-tag.bat (source builds)
+scripts/            install.ps1, build-from-tag.bat (source builds),
+                    release.ps1 (sets the version, dates CHANGELOG.md, tags)
 fixtures/           captured --list-devices / hipInfo / WMI output used by tests
 ```
 

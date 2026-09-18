@@ -83,6 +83,19 @@
     } catch (e) { log(`boot live_check failed: ${String(e)}`); }
   })();
   const ActiveComponent = $derived(views.find((v) => v.id === active).component);
+
+  // Which build this is, under the tagline: v0.2.0+3 is three commits past
+  // the 0.2.0 release, +? an unknown distance from it; the tooltip has the
+  // full `fidim --version` text.
+  let version = $state(null);
+  api("app_version").then((v) => (version = v)).catch(() => {});
+  const versionLabel = $derived(
+    version
+      ? "v" + version.version +
+        (!version.commit ? "" : version.commits_ahead == null ? "+?" : version.commits_ahead ? "+" + version.commits_ahead : "") +
+        (version.commit ? " · " + version.commit : "") + (version.modified ? " · modified" : "")
+      : ""
+  );
 </script>
 
 <div class="shell">
@@ -101,6 +114,7 @@
     <div class="spacer"></div>
     <div class="foot">
       {inTauri ? "Fine, I'll do it myself." : "MOCK DATA\nbrowser preview"}
+      {#if versionLabel}<div class="ver" title={"Llama FIDIM " + version.long}>{versionLabel}</div>{/if}
     </div>
   </nav>
   <main class="view">

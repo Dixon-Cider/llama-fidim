@@ -47,6 +47,27 @@ if (-not $NoBuild) {
 }
 
 if (-not $NoBuild) {
+  # The binaries name the commit they were built from (fidim --version, the
+  # sidebar). Tell the build which checkout and commit it is and whether the
+  # tree has uncommitted changes, so an installed copy never passes for a
+  # commit it does not match. Only for these builds: a caller's shell (run
+  # with `& install.ps1`) must not keep the values.
+  $saved = @{}
+  foreach ($k in 'FIDIM_BUILD_ID', 'FIDIM_BUILD_MODIFIED') { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
+  if (Get-Command git -ErrorAction SilentlyContinue) {
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+      $head = & git -C $repo rev-parse HEAD 2>$null
+      $gitOk = ($LASTEXITCODE -eq 0)
+      if ($gitOk) { $changes = & git -C $repo status --porcelain --untracked-files=no 2>$null; $gitOk = ($LASTEXITCODE -eq 0) }
+    } finally { $ErrorActionPreference = $eap }
+    if ($gitOk) {
+      $env:FIDIM_BUILD_ID = "$repo@$head"
+      $env:FIDIM_BUILD_MODIFIED = if ($changes) { '1' } else { '0' }
+      if ($changes) { Write-Host "== building uncommitted changes: the version will read <commit>-modified" -ForegroundColor Yellow }
+    }
+  }
+
   Write-Host "== building CLI" -ForegroundColor Cyan
   Push-Location $repo
   try {
@@ -60,7 +81,10 @@ if (-not $NoBuild) {
       & pnpm tauri build --no-bundle
       if ($LASTEXITCODE -ne 0) { throw "tauri build failed ($LASTEXITCODE)" }
     } finally { Pop-Location }
-  } finally { Pop-Location }
+  } finally {
+    Pop-Location
+    foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') }
+  }
 }
 
 # fidim-dg.exe is the DiffusionGemma server; without it every diffusion

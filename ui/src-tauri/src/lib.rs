@@ -802,6 +802,12 @@ fn save_config(state: tauri::State<'_, AppState>, config: Config) -> Result<(), 
     Ok(())
 }
 
+/// This build's version and commit, for the sidebar.
+#[tauri::command]
+fn app_version() -> serde_json::Value {
+    fidim_core::build_info::json()
+}
+
 /// Append a line from the web view to `~/.fidim/ui.log` — the only way
 /// a failure inside the GUI becomes visible outside it.
 #[tauri::command]
@@ -1091,6 +1097,7 @@ pub fn run() {
             get_config,
             save_config,
             ui_log,
+            app_version,
             router_get,
             router_save,
             router_ini,

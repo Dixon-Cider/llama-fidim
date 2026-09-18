@@ -13,7 +13,7 @@ use fidim_core::supervise::{self, Health};
 use fidim_core::{export, gguf};
 
 #[derive(Parser)]
-#[command(name = "fidim", version, about = "llama.cpp build/config manager")]
+#[command(name = "fidim", version = fidim_core::build_info::LONG, about = "llama.cpp build/config manager")]
 struct Cli {
     /// Emit JSON instead of tables.
     #[arg(long, global = true)]
