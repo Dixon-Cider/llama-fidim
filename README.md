@@ -143,20 +143,33 @@ model.
   others with its own ROCm, and only diffusion profiles are ever moved onto
   it. A copy that Unsloth Studio keeps is never touched.
 - **Pick a DiffusionGemma GGUF** in the profile editor. The profile switches
-  to the diffusion engine and selects the Unsloth build.
+  to the diffusion engine and selects the newest runner build.
 - **One card, never the iGPU.** The runner aborts every prompt when it can
   see more than one device, so pre-flight blocks anything else. Prefer an
   empty card: the runner sizes its context to the VRAM it believes is
   free, and Windows hides other processes' allocations from it.
-- **The context budget is set by VRAM.** The runner's attention scores grow
-  with the square of the budget, so a 32 GB card fits about 12K tokens,
-  prompt and reply together. Left on auto, the runner picks the largest
-  budget that fits when it loads.
+- **The context budget is set by VRAM.** With flash attention off, the
+  runner's attention scores grow with the square of the budget, so a 32 GB
+  card fits about 12K tokens, prompt and reply together. Left on auto, the
+  runner picks the largest budget that fits when it loads.
+- **Patched runner builds.** A build whose `fidim-build.json` carries a
+  `patch` block is shown with its patch name, and FIDIM sizes and checks it
+  by the features the block declares. With the prompt-KV and flash-attention
+  changes proposed upstream (`dg-pkv-f16`, `dg-swa-ring`, `dg-fa-pad`,
+  `dg-fa-turn-sizing`), flash attention runs on the GPU and the runner sizes
+  by its per-request working set: 65,536 tokens on a 32 GB card. Promotion
+  never moves a diffusion profile onto a build that lacks its patch's
+  features.
+- **Freed memory is released.** Every diffusion run gets
+  `GPU_RESOURCE_CACHE_SIZE=0`: otherwise the HIP runtime keeps freed device
+  memory, and the runner holds about 4 GiB more after a 10K-token prompt. A
+  profile env entry overrides it.
 - **Thinking is always on.** The reasoning arrives as `reasoning_content`.
 - **Tool calls come back as raw text** in the reply; they are not parsed
   into `tool_calls` yet.
 - **Standalone only:** no router membership, no keep-alive, no benchmarks.
-- **Agents that require a 64K context will refuse it.**
+- **Agents that require a 64K context will refuse it** unless the runner is
+  a patched build with flash attention, which reports 65,536.
 
 ## Why some things are the way they are
 
