@@ -555,7 +555,8 @@ fn cmd_update_unsloth(
             println!("installed       : none");
         }
         for i in &c.installed {
-            println!("installed       : {} ({}) at {}", i.tag, i.version, i.path.display());
+            let patch = i.patch.as_deref().map(|n| format!("  [patch: {n}]")).unwrap_or_default();
+            println!("installed       : {} ({}) at {}{patch}", i.tag, i.version, i.path.display());
         }
     }
     if !install && !promote {
@@ -651,7 +652,12 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
             discovery::Channel::Unsloth => "  [unsloth]",
         };
         let dg = if b.runner_exe.is_some() { " +dg" } else { "" };
-        println!("  {:<22} {:<7} {:<11} {}{channel}{dg}{err}", b.tag, ver, commit, b.path.display());
+        let patch = b
+            .patch
+            .as_ref()
+            .map(|p| format!("  [patch: {}]", p.label()))
+            .unwrap_or_default();
+        println!("  {:<22} {:<7} {:<11} {}{channel}{dg}{patch}{err}", b.tag, ver, commit, b.path.display());
     }
     println!("\nMODELS ({})", models.len());
     for m in &models {

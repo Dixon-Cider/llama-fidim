@@ -348,14 +348,20 @@ pub fn serve(mut cfg: ServeConfig) -> i32 {
             return EXIT_SETUP;
         }
     };
+    // FA and the HIP runtime cache decide how the runner sizes its context
+    // and what it holds after a request: log what the run actually got.
+    let env_or = |k: &str| std::env::var(k).unwrap_or_else(|_| "unset".into());
     dglog!(
-        "serving '{}' on {}:{}; runner {}; NGL={} MAXTOK={} expect-bus={} canvas={} layers={}",
+        "serving '{}' on {}:{}; runner {}; NGL={} MAXTOK={} FA={} GPU_RESOURCE_CACHE_SIZE={} expect-bus={} canvas={} \
+         layers={}",
         cfg.alias,
         cfg.host,
         cfg.port,
         cfg.runner.display(),
         cfg.ngl,
         cfg.maxtok_env,
+        env_or("FA"),
+        env_or("GPU_RESOURCE_CACHE_SIZE"),
         cfg.expect_bus.map(|b| format!("{b:02x}")).unwrap_or_else(|| "any".into()),
         info.canvas,
         info.block_count,

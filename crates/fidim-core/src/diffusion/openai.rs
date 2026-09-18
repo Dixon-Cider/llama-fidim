@@ -59,7 +59,7 @@ pub fn exceed_context(needed: u32, budget: u32, canvas: u32) -> ApiError {
         "exceed_context_size_error",
         format!(
             "request ({n_prompt} tokens) exceeds the available context size ({n_ctx} tokens); \
-             DiffusionGemma's context is bounded by this card's VRAM"
+             DiffusionGemma's context is bounded by this card's VRAM and the runner's ceiling"
         ),
     );
     e.extra.insert("n_prompt_tokens".into(), n_prompt.into());
@@ -73,7 +73,7 @@ pub fn failure_error(f: &EngineFailure) -> ApiError {
         EngineFailure::Parse(m) => ApiError::invalid(format!("the chat template rejected this request: {m}")),
         EngineFailure::EmptyPrompt => ApiError::invalid("the chat template produced an empty prompt"),
         EngineFailure::BadReqFile => ApiError::server("the engine could not read its request file"),
-        EngineFailure::Gen => ApiError::server("diffusion prefill failed on block 0 (see log)"),
+        EngineFailure::Gen => ApiError::server("diffusion prefill or a denoise step failed on block 0 (see log)"),
         EngineFailure::StepFailed => ApiError::server("a denoise step failed (see log)"),
         // 400, not 5xx: a client that retries the same conversation hits
         // the same wall; one that compacts it succeeds.

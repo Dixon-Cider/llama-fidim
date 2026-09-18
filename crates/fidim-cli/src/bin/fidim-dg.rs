@@ -16,7 +16,9 @@ use fidim_core::diffusion::{self, ServeConfig};
     version,
     about = "Serve a DiffusionGemma GGUF over an OpenAI-compatible API (started by Llama FIDIM)",
     after_help = "Environment: NGL (GPU layers, default 0) and MAXTOK (context budget, 0 = auto) \
-                  are read here for the device guard and passed on to the runner."
+                  are read here for the device guard and passed on to the runner, like the rest of \
+                  the environment (FA, GPU_RESOURCE_CACHE_SIZE, ...). Keys that add devices or fake \
+                  memory, and a patched runner's DG_* test hooks, are stripped."
 )]
 struct Args {
     /// llama-diffusion-gemma-visual-server.exe

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::devices;
-use crate::discovery::{self, Build, Channel, RUNNER_EXE};
+use crate::discovery::{self, Build, BuildPatch, Channel, RUNNER_EXE};
 use crate::launch::run_capture;
 use crate::profile::{Engine, Profile};
 use crate::{Error, Result};
@@ -336,6 +336,9 @@ pub struct InstalledRef {
     pub tag: String,
     pub version: String,
     pub path: PathBuf,
+    /// The build's `patch.name`: a patched build shares its base's version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -370,7 +373,12 @@ pub fn newest_installed(builds: &[Build]) -> Option<InstalledRef> {
             Some((version_number(v)?, b, v))
         })
         .max_by_key(|(n, _, _)| *n)
-        .map(|(_, b, v)| InstalledRef { tag: b.tag.clone(), version: v.to_string(), path: b.path.clone() })
+        .map(|(_, b, v)| InstalledRef {
+            tag: b.tag.clone(),
+            version: v.to_string(),
+            path: b.path.clone(),
+            patch: b.patch.as_ref().map(|x| x.label().to_string()),
+        })
 }
 
 pub fn check(cfg: &Config) -> Result<UpdateCheck> {
@@ -543,6 +551,11 @@ pub struct Manifest {
     pub asset_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gfx_target: Option<String>,
+    /// Set only on a build assembled outside FIDIM's installers (see
+    /// `discovery::BuildPatch`). Kept through every re-verify rewrite; a
+    /// malformed block reads as none.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "discovery::lenient_patch")]
+    pub patch: Option<BuildPatch>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -723,6 +736,7 @@ pub fn install_prebuilt(
                 release_tag: None,
                 asset_sha256: None,
                 gfx_target: None,
+                patch: None,
             });
         let new_shims: Vec<String> = shims.into_iter().filter(|s| !m.assets.contains(s)).collect();
         m.assets.extend(new_shims);
@@ -783,6 +797,7 @@ pub fn install_prebuilt(
             release_tag: None,
             asset_sha256: None,
             gfx_target: None,
+            patch: None,
         },
     )?;
     Ok(InstallReport { tag: release.tag.clone(), dir, source: "prebuilt".into(), skipped_existing: false, verify })
@@ -877,6 +892,7 @@ pub fn build_from_source(
             release_tag: None,
             asset_sha256: None,
             gfx_target: None,
+            patch: None,
         },
     )?;
     Ok(InstallReport { tag: tag.into(), dir, source: "source".into(), skipped_existing: false, verify })
@@ -1056,6 +1072,7 @@ fn stage_unsloth(zip: &Path, tmp: &Path, final_dir: &Path, meta: &UnslothMeta) -
             release_tag: Some(meta.tag.clone()),
             asset_sha256: meta.sha256.clone(),
             gfx_target: Some(meta.gfx.clone()),
+            patch: None,
         },
     )?;
     if let Some(parent) = final_dir.parent() {
@@ -1116,6 +1133,7 @@ pub fn install_unsloth(
             release_tag: Some(release.tag.clone()),
             asset_sha256: None,
             gfx_target: None,
+            patch: None,
         });
         m.verify = verify.clone();
         write_manifest(&dir, &m)?;
@@ -1234,7 +1252,7 @@ pub fn check_unsloth_against(cfg: &Config, builds: &[Build], latest: Release, gf
         .map(|b| {
             let n = b.release_tag.as_deref().and_then(unsloth_tag_parts).map_or(0, |(n, _)| n);
             let version = b.version.clone().or_else(|| b.release_tag.clone()).unwrap_or_else(|| "?".into());
-            (n, InstalledRef { tag: b.tag.clone(), version, path: b.path.clone() })
+            (n, InstalledRef { tag: b.tag.clone(), version, path: b.path.clone(), patch: b.patch.as_ref().map(|x| x.label().to_string()) })
         })
         .collect();
     installed.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1330,14 +1348,19 @@ pub struct PromoteTarget {
     pub channel: Channel,
     pub has_llama_server: bool,
     pub has_runner: bool,
+    /// The runner features the target's manifest `patch` declares (none
+    /// for an unpatched build).
+    pub features: Vec<String>,
 }
 
 pub fn promote_target(dir: &Path) -> PromoteTarget {
     let bin = dir.join("bin");
+    let meta = discovery::read_build_meta(dir);
     PromoteTarget {
-        channel: discovery::read_build_meta(dir).channel,
+        channel: meta.channel,
         has_llama_server: bin.join("llama-server.exe").is_file(),
         has_runner: bin.join(RUNNER_EXE).is_file(),
+        features: meta.patch.map(|p| p.features).unwrap_or_default(),
     }
 }
 
@@ -1367,6 +1390,22 @@ pub fn promote_skip_reason(p: &Profile, to_dir: &Path, t: &PromoteTarget, scope:
             Some("Unsloth fork build: pick it in the editor if wanted".into())
         }
         Engine::DiffusionGemma if !t.has_runner => Some("target build has no diffusion runner".into()),
+        // A patched runner's profile (FA on, a context only the patch can
+        // hold) would break on a runner without those features: never swap
+        // it onto one by promotion.
+        Engine::DiffusionGemma => {
+            let patch = discovery::read_build_meta(&p.build.path).patch?;
+            let missing: Vec<&str> =
+                patch.features.iter().filter(|f| !t.features.contains(f)).map(String::as_str).collect();
+            (!missing.is_empty()).then(|| {
+                format!(
+                    "on a patched runner build ({}) whose features the target lacks ({}); pick the new build in \
+                     the editor if wanted",
+                    patch.label(),
+                    missing.join(", ")
+                )
+            })
+        }
         _ => None,
     }
 }
@@ -1512,6 +1551,7 @@ mod tests {
             channel: discovery::Channel::Upstream,
             bundled_runtime: false,
             release_tag: None,
+            patch: None,
             runner_exe: None,
         }];
         let c = check_against(&cfg, &builds, parse_release(RELEASE_JSON).unwrap()).unwrap();
@@ -1711,6 +1751,7 @@ mod tests {
             channel,
             bundled_runtime: channel == Channel::Unsloth,
             release_tag: (channel == Channel::Unsloth).then(|| tag.trim_end_matches("-unsloth").to_string()),
+            patch: None,
             runner_exe: None,
         }
     }
@@ -1754,9 +1795,9 @@ mod tests {
 
         let unsloth_dir = Path::new(r"C:\b\b11027-mix-3e83366-unsloth");
         let upstream_dir = Path::new(r"C:\b\b10819-rocm");
-        let fork = PromoteTarget { channel: Channel::Unsloth, has_llama_server: true, has_runner: true };
-        let plain = PromoteTarget { channel: Channel::Upstream, has_llama_server: true, has_runner: false };
-        let upstream_with_runner = PromoteTarget { channel: Channel::Upstream, has_llama_server: true, has_runner: true };
+        let fork = PromoteTarget { channel: Channel::Unsloth, has_llama_server: true, has_runner: true, features: vec![] };
+        let plain = PromoteTarget { channel: Channel::Upstream, has_llama_server: true, has_runner: false, features: vec![] };
+        let upstream_with_runner = PromoteTarget { channel: Channel::Upstream, has_llama_server: true, has_runner: true, features: vec![] };
         let all = PromoteScope::All;
 
         let llama = test_profile("dd", None, r"C:\b\b9817-src");
@@ -1772,7 +1813,7 @@ mod tests {
         assert_eq!(skip(&dg, upstream_dir, &upstream_with_runner, &all), None, "the runner decides, not the channel");
         assert_eq!(skip(&odd, unsloth_dir, &fork, &all).as_deref(), Some("unknown engine"));
         assert_eq!(skip(&odd, upstream_dir, &plain, &all).as_deref(), Some("unknown engine"));
-        let runner_only = PromoteTarget { channel: Channel::Upstream, has_llama_server: false, has_runner: true };
+        let runner_only = PromoteTarget { channel: Channel::Upstream, has_llama_server: false, has_runner: true, features: vec![] };
         assert_eq!(skip(&llama, upstream_dir, &runner_only, &all).as_deref(), Some("target build has no llama-server.exe"));
 
         let mut pinned = dg.clone();
@@ -1798,6 +1839,42 @@ mod tests {
         std::fs::write(root.join(MANIFEST_NAME), r#"{"tag":"t","source":"unsloth-prebuilt","installed_at_unix":1,"assets":[],"verify":{"version":null,"commit":null,"devices":[],"hip_ok":false,"detail":""},"channel":"unsloth","bundled_runtime":true}"#).unwrap();
         let t = promote_target(&root);
         assert_eq!((t.channel, t.has_llama_server, t.has_runner), (Channel::Unsloth, true, true));
+        assert!(t.features.is_empty());
+        std::fs::remove_dir_all(root).ok();
+
+        // A diffusion profile on a patched runner build never moves onto an
+        // unpatched one by promotion; onto another patched build it may.
+        let root = std::env::temp_dir().join(format!("fidim-promote-patched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let patched_dir = root.join("b11027-mix-3e83366-unsloth-dgpatch");
+        std::fs::create_dir_all(patched_dir.join("bin")).unwrap();
+        std::fs::write(patched_dir.join("bin").join("llama-server.exe"), b"").unwrap();
+        std::fs::write(patched_dir.join("bin").join(RUNNER_EXE), b"").unwrap();
+        std::fs::write(
+            patched_dir.join(MANIFEST_NAME),
+            r#"{"tag":"t","source":"unsloth-local-patch","installed_at_unix":1,"assets":[],"verify":{"version":null,"commit":null,"devices":[],"hip_ok":false,"detail":""},"channel":"unsloth","bundled_runtime":true,"patch":{"name":"dgpatch","features":["dg-fa-pad","dg-fa-turn-sizing"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(promote_target(&patched_dir).features, ["dg-fa-pad", "dg-fa-turn-sizing"]);
+        let mut on_patch = dg.clone();
+        on_patch.build.path = patched_dir.clone();
+        assert_eq!(
+            skip(&on_patch, unsloth_dir, &fork, &all).as_deref(),
+            Some(
+                "on a patched runner build (dgpatch) whose features the target lacks (dg-fa-pad, \
+                 dg-fa-turn-sizing); pick the new build in the editor if wanted"
+            )
+        );
+        // A patch block that lacks one of them is not enough either...
+        let partial = PromoteTarget { features: vec!["dg-fa-pad".into()], ..fork.clone() };
+        assert!(skip(&on_patch, Path::new(r"C:\b\other-dgpatch"), &partial, &all).unwrap().contains("(dg-fa-turn-sizing)"));
+        // ...one that carries them all (or more) is.
+        let superset = PromoteTarget {
+            features: vec!["dg-fa-pad".into(), "dg-fa-turn-sizing".into(), "dg-swa-ring".into()],
+            ..fork.clone()
+        };
+        assert_eq!(skip(&on_patch, Path::new(r"C:\b\other-dgpatch"), &superset, &all), None);
+        assert_eq!(skip(&dg, &patched_dir, &promote_target(&patched_dir), &all), None, "moving onto a patch is fine");
         std::fs::remove_dir_all(root).ok();
     }
 

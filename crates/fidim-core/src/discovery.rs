@@ -26,6 +26,61 @@ pub enum Channel {
 /// The DiffusionGemma runner, beside `llama-server.exe` in a build's `bin`.
 pub const RUNNER_EXE: &str = "llama-diffusion-gemma-visual-server.exe";
 
+/// Runner features a patched build declares in its manifest (`patch.features`).
+/// The estimator and the checks branch on these, never on `patch.name`.
+pub mod dg_feature {
+    /// The prompt-KV store is F16 with flash attention on or off (stock: F32
+    /// unless FA is on).
+    pub const PKV_F16: &str = "dg-pkv-f16";
+    /// Sliding-window layers keep a ring of `n_swa-1 + n_ubatch` store rows;
+    /// only full-attention layers keep every prompt position.
+    pub const SWA_RING: &str = "dg-swa-ring";
+    /// FA=1 runs the 512-dim heads on the GPU: K/V are padded to the kernel's
+    /// 256-key stride (stock: those layers fall back to the CPU).
+    pub const FA_PAD: &str = "dg-fa-pad";
+    /// Under FA the auto-sizer gates on `llama_diffusion_fa_turn_bytes`
+    /// instead of the N² score tensor, up to min(n_ctx_train, 65536).
+    pub const FA_TURN_SIZING: &str = "dg-fa-turn-sizing";
+    /// A failed denoise step ends block 0 with `ERR gen` instead of
+    /// committing a stale canvas.
+    pub const STEP_FAIL_ERR: &str = "dg-step-fail-err";
+}
+
+/// A build FIDIM did not download as-is: the manifest's `patch` block, set by
+/// whoever assembled it (e.g. the DiffusionGemma memory/context patch over
+/// Unsloth's source). Every field is optional so an older or hand-written
+/// block still parses.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildPatch {
+    /// Short label the UI appends to the build, e.g. `dgpatch`.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// See `dg_feature`.
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_sha256: Option<String>,
+}
+
+impl BuildPatch {
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+    /// What the UI and CLI call it: the name, or `patched` when it has none.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() { "patched" } else { &self.name }
+    }
+}
+
+/// serde `deserialize_with` for a manifest's `patch`: a malformed block reads
+/// as no patch instead of failing the whole manifest.
+pub fn lenient_patch<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<BuildPatch>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
+}
+
 /// What FIDIM's install manifest says about a build directory.
 #[derive(Debug, Clone, Default)]
 pub struct BuildMeta {
@@ -35,6 +90,14 @@ pub struct BuildMeta {
     /// ROCm versions.
     pub bundled_runtime: bool,
     pub release_tag: Option<String>,
+    pub patch: Option<BuildPatch>,
+}
+
+impl BuildMeta {
+    /// Whether the build's patch declares this `dg_feature`.
+    pub fn has_feature(&self, feature: &str) -> bool {
+        self.patch.as_ref().is_some_and(|p| p.has(feature))
+    }
 }
 
 /// Only the manifest fields discovery needs, all optional, so manifests from
@@ -47,6 +110,10 @@ struct ManifestLite {
     bundled_runtime: bool,
     #[serde(default)]
     release_tag: Option<String>,
+    /// Kept loose: a malformed `patch` must not turn the whole build into a
+    /// plain upstream one; it just reads as unpatched.
+    #[serde(default, deserialize_with = "lenient_patch")]
+    patch: Option<BuildPatch>,
 }
 
 /// Read a build's channel metadata. No manifest, or one that does not parse,
@@ -60,6 +127,7 @@ pub fn read_build_meta(dir: &Path) -> BuildMeta {
             channel: m.channel.unwrap_or_default(),
             bundled_runtime: m.bundled_runtime,
             release_tag: m.release_tag,
+            patch: m.patch,
         },
         Err(_) => BuildMeta::default(),
     }
@@ -82,6 +150,9 @@ pub struct Build {
     pub bundled_runtime: bool,
     /// The release this build was installed from, e.g. `b11027-mix-3e83366`.
     pub release_tag: Option<String>,
+    /// From the manifest only. A patched build shares its base's version,
+    /// commit and release tag; this is what tells them apart.
+    pub patch: Option<BuildPatch>,
     /// `bin/<RUNNER_EXE>` when present: this build can run diffusion profiles.
     pub runner_exe: Option<PathBuf>,
 }
@@ -127,6 +198,7 @@ fn probe_build(dir: &Path, exe: &Path, rocm_bin: Option<&Path>) -> Build {
         channel: meta.channel,
         bundled_runtime: meta.bundled_runtime,
         release_tag: meta.release_tag,
+        patch: meta.patch,
         runner_exe: runner.is_file().then_some(runner),
     };
     // A bundled build is probed exactly as it launches: with nothing on PATH.
@@ -502,6 +574,60 @@ mod tests {
         let v = serde_json::to_value(find("b11027-mix-3e83366-unsloth")).unwrap();
         assert_eq!(v["channel"], "unsloth");
         assert_eq!(v["bundled_runtime"], true);
+        assert_eq!(v["patch"], serde_json::Value::Null);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A locally patched build keeps its base's channel and release tag; its
+    /// `patch` block is what tells them apart, and a malformed one only drops
+    /// the patch, never the channel.
+    #[test]
+    fn patched_build_meta() {
+        let root = std::env::temp_dir().join(format!("fidim-disc-patch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("b11027-mix-3e83366-unsloth-dgpatch");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let manifest = |patch: &str| {
+            format!(
+                r#"{{"tag":"b11027-mix-3e83366","source":"unsloth-local-patch","installed_at_unix":1,"assets":[],
+                    "verify":{{"version":"b11027","commit":null,"devices":[],"hip_ok":true,"detail":""}},
+                    "channel":"unsloth","bundled_runtime":true,"release_tag":"b11027-mix-3e83366"{patch}}}"#
+            )
+        };
+        std::fs::write(
+            dir.join(crate::update::MANIFEST_NAME),
+            manifest(r#","patch":{"name":"dgpatch","base_commit":"f6b9ea743","features":["dg-pkv-f16","dg-swa-ring","dg-fa-pad","dg-fa-turn-sizing"]}"#),
+        )
+        .unwrap();
+        let m = read_build_meta(&dir);
+        assert_eq!(m.channel, Channel::Unsloth);
+        assert!(m.bundled_runtime);
+        let patch = m.patch.as_ref().unwrap();
+        assert_eq!(patch.name, "dgpatch");
+        assert_eq!(patch.base_commit.as_deref(), Some("f6b9ea743"));
+        assert!(m.has_feature(dg_feature::FA_PAD) && m.has_feature(dg_feature::SWA_RING));
+        assert!(!m.has_feature(dg_feature::STEP_FAIL_ERR));
+
+        // The full manifest round-trips the block (re-verify rewrites it).
+        let full: crate::update::Manifest =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(crate::update::MANIFEST_NAME)).unwrap()).unwrap();
+        assert_eq!(full.patch.as_ref(), Some(patch));
+        let back = serde_json::to_string(&full).unwrap();
+        assert!(back.contains(r#""patch":{"name":"dgpatch""#), "{back}");
+
+        std::fs::write(dir.join(crate::update::MANIFEST_NAME), manifest(r#","patch":{"features":"not a list"}"#)).unwrap();
+        let m = read_build_meta(&dir);
+        assert_eq!(m.channel, Channel::Unsloth, "a bad patch block must not demote the build");
+        assert!(m.patch.is_none());
+        // ...nor make the full manifest unreadable (re-verify, shim retirement).
+        let full: crate::update::Manifest =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(crate::update::MANIFEST_NAME)).unwrap()).unwrap();
+        assert!(full.patch.is_none());
+        assert_eq!(full.release_tag.as_deref(), Some("b11027-mix-3e83366"));
+        // An unnamed patch still counts, under a label.
+        assert_eq!(BuildPatch { features: vec![dg_feature::FA_PAD.into()], ..Default::default() }.label(), "patched");
+        std::fs::write(dir.join(crate::update::MANIFEST_NAME), manifest("")).unwrap();
+        assert!(read_build_meta(&dir).patch.is_none());
         std::fs::remove_dir_all(root).ok();
     }
 

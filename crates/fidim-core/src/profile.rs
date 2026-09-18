@@ -322,10 +322,28 @@ pub const DG_OWNED_ENV: &[&str] = &[
     "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
 ];
 
+/// Test hooks of the patched DiffusionGemma runner (a local build of
+/// Unsloth's source): they corrupt the prompt-KV store, change its layout
+/// under the sizing model, or stop the runner. The helper strips them from
+/// the runner's environment; validate warns when a profile sets one.
+/// (DG_POOL_TRIM is a real, default-off memory option and passes through.)
+pub const DG_TEST_HOOK_ENV: &[&str] =
+    &["DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_RING_POISON", "DG_DUMP_LOGITS", "DG_EXIT_AFTER_DUMP"];
+
 /// Windows env names are case-insensitive (and so is Rust's `Command` env
 /// there), so `hip_visible_devices` overrides `HIP_VISIBLE_DEVICES`.
 pub fn env_has_key(env: &BTreeMap<String, String>, key: &str) -> bool {
     env.keys().any(|k| k.eq_ignore_ascii_case(key))
+}
+
+/// The HIP runtime's resource cache, which keeps freed device memory. FIDIM
+/// sends 0 to the DiffusionGemma runner unless the profile env sets the key.
+pub const DG_RUNTIME_CACHE_KEY: &str = "GPU_RESOURCE_CACHE_SIZE";
+
+/// Whether a diffusion run has the HIP runtime cache off: FIDIM's default,
+/// or the profile env setting the key to 0 itself.
+pub fn dg_runtime_cache_off(env: &BTreeMap<String, String>) -> bool {
+    env.iter().find(|(k, _)| k.eq_ignore_ascii_case(DG_RUNTIME_CACHE_KEY)).is_none_or(|(_, v)| v.trim() == "0")
 }
 
 impl Profile {
@@ -728,14 +746,36 @@ fn validate_diffusion(p: &Profile, out: &mut Vec<Finding>) {
                 .into(),
         ));
     }
-    if dg.flash_attn {
+    // diffusion.flash_attn is judged at pre-flight (check 15), which knows
+    // whether the build's runner pads keys for it; validate cannot see the build.
+    let hooks: Vec<&str> = p
+        .env
+        .keys()
+        .filter(|k| DG_TEST_HOOK_ENV.iter().any(|h| k.eq_ignore_ascii_case(h)))
+        .map(String::as_str)
+        .collect();
+    if !hooks.is_empty() {
         out.push(finding(
             warn,
-            "dg-flash-attn",
-            "diffusion.flash_attn is on: DiffusionGemma's 512-dim attention heads fall back to the CPU on \
-             HIP, which is slower; leave it off unless measured"
-                .into(),
+            "dg-test-hook-env",
+            format!(
+                "env sets {}: the runner's test hooks are never passed to it (they corrupt the prompt-KV store, \
+                 change its layout or stop the runner)",
+                hooks.join(", ")
+            ),
         ));
+    }
+    if let Some((k, v)) = p.env.iter().find(|(k, _)| k.eq_ignore_ascii_case(DG_RUNTIME_CACHE_KEY)) {
+        if v.trim() != "0" {
+            out.push(finding(
+                warn,
+                "dg-resource-cache-env",
+                format!(
+                    "env sets {k}={v}: the HIP runtime keeps freed device memory, so the runner holds more \
+                     after long prompts than FIDIM's default of 0 (measured +3.9 GiB after 10K tokens)"
+                ),
+            ));
+        }
     }
     if !dg.hipblaslt_safeguard {
         out.push(finding(
@@ -770,8 +810,8 @@ fn validate_diffusion(p: &Profile, out: &mut Vec<Finding>) {
             "dg-context",
             format!(
                 "runtime.ctx_total {ctx} is the diffusion context budget (MAXTOK, 0 = auto-size): expected a \
-                 multiple of 256 between 2048 and 65536; the runner's scores buffer grows with N², so large \
-                 budgets do not fit"
+                 multiple of 256 between 2048 and 65536; with flash attention off the runner's scores buffer \
+                 grows with N², so large budgets do not fit"
             ),
         ));
     }
@@ -1116,9 +1156,25 @@ mod tests {
         p.keep_alive_seconds = Some(0);
         assert!(validate(&p).is_empty());
 
+        // Flash attention is judged at pre-flight, which knows the build.
         let mut p = diffusion_profile();
         p.diffusion.as_mut().unwrap().flash_attn = true;
-        only_warning(&p, "dg-flash-attn");
+        assert!(validate(&p).is_empty());
+
+        // The runner's test hooks never reach it; setting one is a mistake.
+        let mut p = diffusion_profile();
+        p.env.insert("dg_pkv_type".into(), "f32".into());
+        only_warning(&p, "dg-test-hook-env");
+
+        // FIDIM turns the HIP runtime cache off; a profile that turns it on is told the cost.
+        let mut p = diffusion_profile();
+        p.env.insert("GPU_RESOURCE_CACHE_SIZE".into(), "0".into());
+        assert!(validate(&p).is_empty());
+        assert!(dg_runtime_cache_off(&p.env));
+        p.env.insert("GPU_RESOURCE_CACHE_SIZE".into(), "1024".into());
+        only_warning(&p, "dg-resource-cache-env");
+        assert!(!dg_runtime_cache_off(&p.env));
+        assert!(dg_runtime_cache_off(&BTreeMap::new()));
 
         let mut p = diffusion_profile();
         p.diffusion.as_mut().unwrap().hipblaslt_safeguard = false;

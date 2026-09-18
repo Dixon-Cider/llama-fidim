@@ -50,6 +50,12 @@ const TAIL_LINES: usize = 40;
 const SCRUBBED_ENV: &[&str] =
     &["GGML_BACKEND_PATH", "GGML_CUDA_DEVICES", "GGML_CUDA_ENABLE_UNIFIED_MEMORY", "DG_FREE_VRAM_MB"];
 
+/// Every env key the runner must not inherit: the device/memory overrides
+/// above and a patched runner's test hooks (`profile::DG_TEST_HOOK_ENV`).
+fn runner_env_removals() -> impl Iterator<Item = &'static str> {
+    SCRUBBED_ENV.iter().chain(crate::profile::DG_TEST_HOOK_ENV).copied()
+}
+
 // -------------------------------------------------------------- interfaces ----
 
 pub trait Spawner: Send {
@@ -968,7 +974,7 @@ impl Spawner for RealSpawner {
     ) -> io::Result<Box<dyn EngineChild>> {
         let mut cmd = Command::new(&self.runner);
         cmd.arg(&self.model).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        for k in SCRUBBED_ENV {
+        for k in runner_env_removals() {
             cmd.env_remove(k);
         }
         if let Some(m) = maxtok_override {
@@ -2168,5 +2174,16 @@ mod tests {
         assert_eq!(child.kill_and_wait(Duration::from_secs(5)), Some(3));
         drop(child);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runner_env_removals_cover_overrides_and_test_hooks() {
+        let keys: Vec<&str> = runner_env_removals().collect();
+        for k in ["GGML_CUDA_DEVICES", "DG_FREE_VRAM_MB", "DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_EXIT_AFTER_DUMP"] {
+            assert!(keys.contains(&k), "{k} must not reach the runner: {keys:?}");
+        }
+        for k in ["DG_POOL_TRIM", "GPU_RESOURCE_CACHE_SIZE", "FA", "MAXTOK"] {
+            assert!(!keys.contains(&k), "{k} is a real runner setting: {keys:?}");
+        }
     }
 }

@@ -208,6 +208,17 @@ pub struct DiffusionPaths {
     pub full_offload: bool,
 }
 
+/// The helper's `--build-tag`: the release tag (else the profile's recorded
+/// version), plus `+<patch>` for a patched build, which shares its base's
+/// release tag, so /health and the run log tell them apart.
+pub fn dg_build_tag(meta: &discovery::BuildMeta, version: Option<&str>) -> Option<String> {
+    let tag = meta.release_tag.as_deref().or(version)?;
+    Some(match &meta.patch {
+        Some(p) => format!("{tag}+{}", p.label()),
+        None => tag.to_string(),
+    })
+}
+
 /// The DiffusionGemma runner inside the profile's build.
 pub fn runner_exe(p: &Profile) -> PathBuf {
     p.build.path.join("bin").join(discovery::RUNNER_EXE)
@@ -279,6 +290,12 @@ pub fn compose_diffusion(p: &Profile, resolved: &[ResolvedDevice], d: &Diffusion
                 env.push((k.into(), "0".into()));
             }
         }
+    }
+    // The HIP runtime otherwise keeps freed device memory cached: the runner
+    // held 3.9 GiB more after a 10K-token prompt, at no measured speed gain.
+    // The profile env may still set it (its value wins, see above).
+    if !env_has_key(&p.env, crate::profile::DG_RUNTIME_CACHE_KEY) {
+        env.push((crate::profile::DG_RUNTIME_CACHE_KEY.into(), "0".into()));
     }
 
     LaunchPlan { exe: d.helper_exe.clone(), args, env, path_prepend: None, visibility_env }
@@ -533,6 +550,7 @@ pub fn prepare_with_inputs(
                 profile.runtime.n_gpu_layers,
                 profile.runtime.ctx_total,
                 profile.diffusion_effective().flash_attn,
+                estimate::DgRunner::from_build(&meta, crate::profile::dg_runtime_cache_off(&profile.env)),
                 &r.profile_key,
                 r.device.free_mib,
             );
@@ -608,7 +626,7 @@ pub fn prepare_with_inputs(
             runner_exe: runner.clone(),
             req_prefix: req_prefix(&cfg.runs_dir, profile),
             expect_bus: resolved.first().and_then(|r| r.device.bus_number),
-            build_tag: meta.release_tag.clone().or_else(|| profile.build.version.clone()),
+            build_tag: dg_build_tag(&meta, profile.build.version.as_deref()),
             full_offload: sizing.as_ref().is_some_and(|s| s.full_offload),
         };
         let mut plan = compose_diffusion(profile, &resolved, &paths);
@@ -628,6 +646,7 @@ pub fn prepare_with_inputs(
             req_fallback_error: crate::diffusion::protocol::check_req_prefix(&req_fallback).err(),
             req_fallback,
             sizing,
+            runner: estimate::DgRunner::from_build(&meta, crate::profile::dg_runtime_cache_off(&profile.env)),
         };
         (plan, Some(pre))
     } else {
@@ -1044,6 +1063,7 @@ mod tests {
                 ("DG_FREE_RAM_MB", "0"),
                 ("ROCBLAS_USE_HIPBLASLT", "0"),
                 ("ROCBLAS_USE_HIPBLASLT_BATCHED", "0"),
+                ("GPU_RESOURCE_CACHE_SIZE", "0"),
             ]
         );
         // enable_thinking=false cannot reach the runner (validate warns).
@@ -1071,9 +1091,29 @@ mod tests {
         let plan = compose_diffusion(&p, &resolved_single(), &d);
         assert!(plan.env.contains(&("FA".into(), "1".into())));
         assert!(!plan.env.iter().any(|(k, _)| k.starts_with("ROCBLAS")));
+        // The runtime cache goes off with or without the safeguard...
+        assert!(plan.env.contains(&("GPU_RESOURCE_CACHE_SIZE".into(), "0".into())));
+        // ...unless the profile env sets it, whatever its case.
+        let mut p2 = p.clone();
+        p2.env.insert("gpu_resource_cache_size".into(), "256".into());
+        let plan2 = compose_diffusion(&p2, &resolved_single(), &d);
+        let cache: Vec<&(String, String)> =
+            plan2.env.iter().filter(|(k, _)| k.eq_ignore_ascii_case("GPU_RESOURCE_CACHE_SIZE")).collect();
+        assert_eq!(cache, [&("gpu_resource_cache_size".to_string(), "256".to_string())]);
         let cmd = plan.command_line();
         assert!(cmd.contains("--default-max-tokens 2048") && !cmd.contains("--seed") && !cmd.contains("--expect-bus"), "{cmd}");
         assert_eq!(runner_exe(&p), PathBuf::from("C:/fidim/b11027-mix-3e83366-unsloth/bin/llama-diffusion-gemma-visual-server.exe"));
+
+        // --build-tag names a patch, which shares its base's release tag.
+        let mut meta = discovery::BuildMeta { release_tag: Some("b11027-mix-3e83366".into()), ..Default::default() };
+        assert_eq!(dg_build_tag(&meta, Some("b11027")).as_deref(), Some("b11027-mix-3e83366"));
+        meta.patch = Some(discovery::BuildPatch { name: "dgpatch".into(), ..Default::default() });
+        assert_eq!(dg_build_tag(&meta, None).as_deref(), Some("b11027-mix-3e83366+dgpatch"));
+        meta.patch = Some(discovery::BuildPatch::default());
+        assert_eq!(dg_build_tag(&meta, None).as_deref(), Some("b11027-mix-3e83366+patched"));
+        let bare = discovery::BuildMeta::default();
+        assert_eq!(dg_build_tag(&bare, Some("b11027")).as_deref(), Some("b11027"));
+        assert_eq!(dg_build_tag(&bare, None), None);
         assert_eq!(req_prefix(Path::new("C:/r"), &p), PathBuf::from("C:/r/dg-dg-26b-9760"));
     }
 

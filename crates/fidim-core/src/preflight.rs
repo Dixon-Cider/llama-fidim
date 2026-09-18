@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::devices::Device;
-use crate::estimate::{DiffusionSizing, VramEstimate};
+use crate::estimate::{DgRunner, DiffusionSizing, VramEstimate};
 use crate::gguf::GgufHeader;
 use crate::platform::SystemCommit;
 use crate::profile::{Engine, Profile};
@@ -104,6 +104,9 @@ pub struct DiffusionPreflight {
     pub req_fallback: PathBuf,
     pub req_fallback_error: Option<String>,
     pub sizing: Option<DiffusionSizing>,
+    /// What the build's runner does (its manifest `patch` features) and
+    /// whether the HIP runtime cache is off for this launch.
+    pub runner: DgRunner,
 }
 
 /// A live run on one of this launch's cards (check 14).
@@ -416,9 +419,14 @@ fn check_vram(ctx: &LaunchContext) -> CheckResult {
     // A diffusion profile at auto (ctx_total = 0) lets the runner size its
     // context budget to the VRAM it sees at load, so the load fits by
     // construction. The estimate's kv term there is the working set of a
-    // full-budget prompt, which the runner keeps after the request but never
-    // budgets for: report it, and Block only when the load itself does not fit.
-    let auto_sized = ctx.profile.engine.is_diffusion() && ctx.profile.runtime.ctx_total == 0;
+    // full-budget prompt, which the stock runner keeps after the request but
+    // never budgets for: report it, and Block only when the load itself does
+    // not fit. A patched runner under FA budgets that working set itself and
+    // degrades an explicit budget that does not fit, so the same holds for
+    // explicit budgets there.
+    let fa_sized = ctx.profile.engine.is_diffusion()
+        && ctx.diffusion.as_ref().and_then(|d| d.sizing.as_ref()).is_some_and(|s| s.fa_sized);
+    let auto_sized = ctx.profile.engine.is_diffusion() && (ctx.profile.runtime.ctx_total == 0 || fa_sized);
     let mut worst: Option<(f64, f64, String)> = None;
     for (d, r) in est.per_device.iter().zip(&ctx.resolved) {
         let free_bytes = r.device.free_mib as f64 * 1024.0 * 1024.0;
@@ -442,6 +450,15 @@ fn check_vram(ctx: &LaunchContext) -> CheckResult {
         Some((_, load, msg)) if auto_sized && load > 1.0 => Outcome::Block(format!(
             "{msg} — the weights and buffers alone exceed free VRAM, so no context budget fits and the runner \
              fails to load"
+        )),
+        Some((r, _, msg)) if fa_sized && r > 1.0 => Outcome::Warn(format!(
+            "{msg} — the load fits, and the runner checks a full-budget prompt's working set against the card \
+             when it sets MAXTOK, but not its fixed buffers; a lower explicit context budget (MAXTOK) leaves \
+             headroom"
+        )),
+        Some((r, _, msg)) if fa_sized && r > 0.90 => Outcome::Note(format!(
+            "{msg} — the runner checks this budget's working set against the card at load and lowers MAXTOK when \
+             it does not fit; the figure is the working set of a full-budget prompt, kept after the request"
         )),
         Some((r, _, msg)) if auto_sized && r > 1.0 => Outcome::Warn(format!(
             "{msg} — the load fits (the runner sizes MAXTOK to the card at load), but the working set of a \
@@ -738,7 +755,15 @@ fn check_card_sharing(ctx: &LaunchContext) -> CheckResult {
             diffusion_runs.push(&c.profile_id);
         }
     }
-    let outcome = if ctx.profile.engine.is_diffusion() && ctx.profile.runtime.ctx_total == 0 {
+    // The runner also auto-sizes when it ignores an explicit budget (above
+    // the FA ceiling) or refuses it (its gate): the WDDM caveat applies then.
+    let runner_sizes = ctx.profile.runtime.ctx_total == 0
+        || ctx
+            .diffusion
+            .as_ref()
+            .and_then(|d| d.sizing.as_ref())
+            .is_some_and(|s| s.explicit_capped || s.explicit_fits == Some(false));
+    let outcome = if ctx.profile.engine.is_diffusion() && runner_sizes {
         Outcome::Warn(format!(
             "card also hosts {}; the runner auto-sizes its context to the VRAM it believes is free, and WDDM \
              hides other processes' allocations, so it will oversubscribe. Pick an empty card",
@@ -749,12 +774,7 @@ fn check_card_sharing(ctx: &LaunchContext) -> CheckResult {
             .diffusion
             .as_ref()
             .and_then(|d| d.sizing.as_ref())
-            .map(|s| {
-                format!(
-                    " (up to {:.1} GiB)",
-                    (s.pkv_bytes_per_token * s.max_prompt_tokens as u64) as f64 / GIB_F
-                )
-            })
+            .map(|s| format!(" (up to {:.1} GiB)", s.request_bytes as f64 / GIB_F))
             .unwrap_or_default();
         Outcome::Warn(format!(
             "card also hosts {}; this profile allocates its prompt-KV store{store} per request, after load; \
@@ -779,21 +799,40 @@ fn check_card_sharing(ctx: &LaunchContext) -> CheckResult {
 /// Check 15: what context budget (MAXTOK) the runner will end up with.
 fn check_diffusion_context(ctx: &LaunchContext) -> CheckResult {
     let sizing = ctx.diffusion.as_ref().and_then(|d| d.sizing.as_ref());
+    let runner = ctx.diffusion.as_ref().map(|d| d.runner).unwrap_or(DgRunner::STOCK);
+    let flash_attn = ctx.profile.diffusion_effective().flash_attn;
+    let fa_cpu = (flash_attn && !runner.fa_pad).then(|| {
+        "diffusion.flash_attn is on, but this build's runner does not pad keys for flash attention: \
+         DiffusionGemma's 512-dim heads fall back to the CPU, which is slower. Turn it off, or pick a patched \
+         runner build"
+            .to_string()
+    });
     let outcome = match sizing {
-        None => Outcome::Note(
-            "context budget not predicted (model header unreadable or no device resolved); the runner decides \
-             at load"
-                .into(),
-        ),
+        None => match fa_cpu {
+            Some(w) => Outcome::Warn(w),
+            None => Outcome::Note(
+                "context budget not predicted (model header unreadable or no device resolved); the runner \
+                 decides at load"
+                    .into(),
+            ),
+        },
         Some(s) => {
             let ctx_total = ctx.profile.runtime.ctx_total;
-            let mut warns = Vec::new();
+            let mut warns: Vec<String> = fa_cpu.into_iter().collect();
+            if s.explicit_capped {
+                warns.push(format!(
+                    "explicit budget {ctx_total} is above the runner's flash-attention ceiling {} (training \
+                     context, and the pad kernel's 65,536-row grid limit); it auto-sizes instead (≈ {})",
+                    s.ctx_ceiling,
+                    s.predicted_auto_maxtok.map(|p| p.to_string()).unwrap_or_else(|| "its floor".into())
+                ));
+            }
             match s.predicted_auto_maxtok {
-                Some(p) if ctx_total > p as u64 => warns.push(format!(
+                Some(p) if s.explicit_fits == Some(false) => warns.push(format!(
                     "explicit budget {ctx_total} is above what fits (auto MAXTOK predicted ≈ {p}); the runner \
                      will degrade it at load"
                 )),
-                None if ctx_total > 0 => warns.push(format!(
+                None if ctx_total > 0 && !s.explicit_capped && s.explicit_fits != Some(true) => warns.push(format!(
                     "explicit budget {ctx_total}: no context fits the VRAM left after the weights; the runner \
                      will degrade it at load, down to its floor, or fail to load"
                 )),
@@ -810,18 +849,30 @@ fn check_diffusion_context(ctx: &LaunchContext) -> CheckResult {
                         .into(),
                 );
             }
+            let sized_by = if s.fa_sized { " (flash attention: sized by the per-request working set)" } else { "" };
             if !warns.is_empty() {
                 Outcome::Warn(warns.join("; "))
+            } else if runner.fa_turn_sizing && !flash_attn {
+                Outcome::Note(format!(
+                    "{}; this build's runner runs flash attention on the GPU: diffusion.flash_attn sizes the \
+                     context by the per-request working set instead of the N² scores buffer, up to {} tokens",
+                    if ctx_total > 0 {
+                        format!("explicit MAXTOK {ctx_total}")
+                    } else {
+                        format!("auto MAXTOK predicted ≈ {}", s.predicted_auto_maxtok.unwrap_or(s.maxtok_used))
+                    },
+                    s.ctx_ceiling
+                ))
             } else if ctx_total > 0 {
                 Outcome::Note(format!(
-                    "explicit MAXTOK {ctx_total} (largest prompt ≈ {} tokens); auto would pick ≈ {}",
+                    "explicit MAXTOK {ctx_total} (largest prompt ≈ {} tokens); auto would pick ≈ {}{sized_by}",
                     s.max_prompt_tokens,
                     s.predicted_auto_maxtok.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
                 ))
             } else {
                 let p = s.predicted_auto_maxtok.unwrap_or(s.maxtok_used);
                 Outcome::Note(format!(
-                    "auto MAXTOK predicted ≈ {p} (largest prompt ≈ {} tokens); the runner decides at load",
+                    "auto MAXTOK predicted ≈ {p} (largest prompt ≈ {} tokens){sized_by}; the runner decides at load",
                     p.saturating_sub(s.canvas)
                 ))
             }
@@ -1167,8 +1218,18 @@ mod tests {
             maxtok_used,
             max_prompt_tokens: maxtok_used - 256,
             pkv_bytes_per_token: 450_560,
+            request_bytes: 5 << 30,
+            fa_sized: false,
+            ctx_ceiling: 65536,
+            explicit_fits: None,
+            explicit_capped: false,
             full_offload,
         }
+    }
+
+    /// The patched runner as its manifest declares it.
+    fn patched_runner() -> DgRunner {
+        DgRunner { pkv_f16: true, swa_ring: true, fa_pad: true, fa_turn_sizing: true, runtime_cache_off: true }
     }
 
     /// dg-26b as the editor creates it: one card (bus08), auto context, the
@@ -1189,6 +1250,7 @@ mod tests {
             req_fallback: "C:/Users/u/AppData/Local/Temp/fidim-dg-9760".into(),
             req_fallback_error: None,
             sizing: Some(sizing(Some(12288), 12288, true)),
+            runner: DgRunner::STOCK,
         });
         ctx
     }
@@ -1290,18 +1352,80 @@ mod tests {
         ctx.co_resident[0].engine = Engine::LlamaServer;
         assert_eq!(run_all(&ctx).len(), 12);
 
-        // Check 15: an explicit budget above the prediction, and partial offload.
+        // Check 15: an explicit budget the runner's gate refuses, one it
+        // takes although it is no auto candidate, and partial offload.
         let mut ctx = healthy_diffusion_ctx();
         ctx.profile.runtime.ctx_total = 16384;
-        ctx.diffusion.as_mut().unwrap().sizing = Some(sizing(Some(12288), 16384, true));
+        ctx.diffusion.as_mut().unwrap().sizing =
+            Some(DiffusionSizing { explicit_fits: Some(false), ..sizing(Some(12288), 16384, true) });
         match outcome_of(&run_all(&ctx), "diffusion-context") {
             Outcome::Warn(m) => assert!(m.contains("above what fits"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.profile.runtime.ctx_total = 14000;
+        ctx.diffusion.as_mut().unwrap().sizing =
+            Some(DiffusionSizing { explicit_fits: Some(true), ..sizing(Some(12288), 14000, true) });
+        match outcome_of(&run_all(&ctx), "diffusion-context") {
+            Outcome::Note(m) => assert!(m.contains("explicit MAXTOK 14000"), "{m}"),
             o => panic!("{o:?}"),
         }
         let mut ctx = healthy_diffusion_ctx();
         ctx.diffusion.as_mut().unwrap().sizing = Some(sizing(Some(12288), 12288, false));
         match outcome_of(&run_all(&ctx), "diffusion-context") {
             Outcome::Warn(m) => assert!(m.contains("partial offload"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+
+        // Check 15 and flash attention: the stock runner puts the 512-dim
+        // heads on the CPU; a patched one runs them and sizes by its working
+        // set, up to a ceiling above which an explicit budget is ignored.
+        let fa_on = |ctx: &mut LaunchContext| {
+            ctx.profile.diffusion = Some(crate::profile::DiffusionCfg { flash_attn: true, ..Default::default() });
+        };
+        let mut ctx = healthy_diffusion_ctx();
+        fa_on(&mut ctx);
+        match outcome_of(&run_all(&ctx), "diffusion-context") {
+            Outcome::Warn(m) => assert!(m.contains("does not pad keys") && m.contains("CPU"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        // ...also when the context could not be predicted.
+        ctx.diffusion.as_mut().unwrap().sizing = None;
+        assert!(matches!(outcome_of(&run_all(&ctx), "diffusion-context"), Outcome::Warn(m) if m.contains("does not pad keys")));
+        // Check 14: a budget the runner ignores is auto-sized, WDDM caveat and all.
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.profile.runtime.ctx_total = 70_000;
+        ctx.diffusion.as_mut().unwrap().sizing =
+            Some(DiffusionSizing { fa_sized: true, explicit_capped: true, ..sizing(Some(65536), 65536, true) });
+        ctx.co_resident = vec![CoResident {
+            profile_id: "daily-driver".into(),
+            device_key: ctx.resolved[0].device.stable_key.clone(),
+            engine: Engine::LlamaServer,
+        }];
+        match outcome_of(&run_all(&ctx), "diffusion-card-sharing") {
+            Outcome::Warn(m) => assert!(m.contains("WDDM"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.diffusion.as_mut().unwrap().runner = patched_runner();
+        match outcome_of(&run_all(&ctx), "diffusion-context") {
+            Outcome::Note(m) => assert!(m.contains("runs flash attention on the GPU") && m.contains("65536"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        let mut ctx = healthy_diffusion_ctx();
+        fa_on(&mut ctx);
+        let d = ctx.diffusion.as_mut().unwrap();
+        d.runner = patched_runner();
+        d.sizing = Some(DiffusionSizing { fa_sized: true, ..sizing(Some(65536), 65536, true) });
+        match outcome_of(&run_all(&ctx), "diffusion-context") {
+            Outcome::Note(m) => assert!(m.contains("65536") && m.contains("per-request working set"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        ctx.profile.runtime.ctx_total = 70_000;
+        ctx.diffusion.as_mut().unwrap().sizing =
+            Some(DiffusionSizing { fa_sized: true, explicit_capped: true, ..sizing(Some(65536), 65536, true) });
+        match outcome_of(&run_all(&ctx), "diffusion-context") {
+            Outcome::Warn(m) => assert!(m.contains("flash-attention ceiling 65536") && m.contains("auto-sizes"), "{m}"),
             o => panic!("{o:?}"),
         }
 
@@ -1391,6 +1515,16 @@ mod tests {
         }
         ctx.profile.runtime.ctx_total = 8192;
         assert!(matches!(outcome_of(&run_all(&ctx), "vram-fits"), Outcome::Block(_)));
+        // A patched runner under FA budgets the working set itself, explicit
+        // budgets included: a Warn, not a Block.
+        ctx.diffusion.as_mut().unwrap().sizing =
+            Some(DiffusionSizing { fa_sized: true, explicit_fits: Some(true), ..sizing(Some(65536), 8192, true) });
+        match outcome_of(&run_all(&ctx), "vram-fits") {
+            Outcome::Warn(m) => assert!(m.contains("fixed buffers"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        with_estimate(&mut ctx, free * 105 / 100, 0);
+        assert!(matches!(outcome_of(&run_all(&ctx), "vram-fits"), Outcome::Block(_)), "the load itself still Blocks");
         // The load alone over the card Blocks at auto too.
         let mut ctx = healthy_diffusion_ctx();
         with_estimate(&mut ctx, free * 105 / 100, 0);
