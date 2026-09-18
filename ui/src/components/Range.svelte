@@ -4,6 +4,8 @@
   //
   // `nullable`: the value may be null = "use the engine default"; a checkbox
   // gates the control and `placeholder` shows what the default is.
+  // `offLabel` names that null state where "engine default" would mislead
+  // (e.g. a budget the engine sizes itself at load: "auto").
   let {
     value = $bindable(),
     label,
@@ -13,6 +15,7 @@
     hint = "",
     nullable = false,
     placeholder = null,
+    offLabel = "engine default",
     format = (v) => v,
     onchange = () => {},
     span = 2,
@@ -46,7 +49,7 @@
   <span class="k" style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
     <span style="display: flex; gap: 6px; align-items: center;">
       {#if nullable}
-        <input type="checkbox" style="width: auto; margin: 0;" checked={!disabled} onchange={toggle} title="off = engine default" />
+        <input type="checkbox" style="width: auto; margin: 0;" checked={!disabled} onchange={toggle} title="off = {offLabel}" />
       {/if}
       {label}
     </span>
@@ -63,9 +66,9 @@
         style="--pct: {pct}%;"
       />
       <span class="scale">
-        <span class="end" class:hide={!disabled && nearMin}>{format(min)}</span>
+        <span class="end" class:hide={disabled || nearMin}>{format(min)}</span>
         <span class="end" class:hide={!disabled && nearMax}>{format(max)}</span>
-        <span class="cur" class:off={disabled} style="left: calc({pct}% + {thumbShift}px);">{disabled ? "engine default" : format(value)}</span>
+        <span class="cur" class:off={disabled} style="left: calc({pct}% + {thumbShift}px);">{disabled ? offLabel : format(value)}</span>
       </span>
     </span>
     <input

@@ -118,7 +118,7 @@
     {/if}
     {#key active}
       <div in:fly={arrive()}>
-        <ActiveComponent />
+        <ActiveComponent go={(id) => (active = id)} />
       </div>
     {/key}
   </main>

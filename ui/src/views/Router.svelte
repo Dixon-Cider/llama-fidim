@@ -36,6 +36,22 @@
   const poll = setInterval(() => { if (status?.alive) refreshModels(); }, 5000);
   onDestroy(() => clearInterval(poll));
 
+  // What the router runs when no build is chosen: the newest UPSTREAM build
+  // by number, as core's newest_installed picks it.
+  const newestUpstream = $derived(
+    builds
+      .filter((b) => (b.channel ?? "upstream") === "upstream")
+      .map((b) => b.version)
+      .sort((a, b) => (Number(b.replace(/^b/, "")) || 0) - (Number(a.replace(/^b/, "")) || 0))[0],
+  );
+
+  // Only llama-server profiles can be members (core's router::check_member
+  // refuses the rest). One that is already in router.json stays listed so
+  // it can be removed.
+  const isServerProfile = (p) => (p.engine ?? "llama-server") === "llama-server";
+  const listed = $derived(profiles.filter((p) => isServerProfile(p) || isMember(p.id)));
+  const hiddenCount = $derived(profiles.length - listed.length);
+
   function isMember(id) { return rc?.members?.some((m) => m.profile_id === id) ?? false; }
   function member(id) { return rc?.members?.find((m) => m.profile_id === id); }
   function toggle(id) {
@@ -126,7 +142,7 @@
       <label class="field" style="grid-column: span 2;" title="llama-server build that runs the router and its child instances. Needs router mode (b10819+).">
         <span class="k">build</span>
         <select bind:value={rc.build}>
-          <option value={null}>newest ({builds.map((b) => b.version).sort().reverse()[0] ?? "?"})</option>
+          <option value={null}>newest ({newestUpstream ?? "?"})</option>
           {#each builds as b}<option value={b.path}>{b.tag} · {b.version}</option>{/each}
         </select>
       </label>
@@ -145,10 +161,10 @@
     <table class="grid">
       <thead><tr><th></th><th>Profile</th><th>Model id</th><th>Model</th><th>GPU</th><th>Load on startup</th></tr></thead>
       <tbody>
-        {#each profiles as p}
+        {#each listed as p}
           <tr>
             <td><input type="checkbox" style="width: auto;" checked={isMember(p.id)} onchange={() => toggle(p.id)} /></td>
-            <td class="mono">{p.id}</td>
+            <td class="mono">{p.id}{#if !isServerProfile(p)} <span class="chip block" title="The router runs llama-server children only; this profile's engine cannot be a member. Uncheck it to render the preset again.">standalone only</span>{/if}</td>
             <td class="mono">{p.server.alias || p.id}</td>
             <td class="faint">{base(p.model.path)}</td>
             <td class="path">{p.devices.map((d) => d.key.split(":").pop()).join(", ")}</td>
@@ -160,6 +176,9 @@
     <div class="faint small" style=" margin-top: 6px;">
       The router replaces each member's port and visibility pin; GPU placement becomes
       <span class="mono">device = ROCmN</span>. VRAM is not checked per load, so keep <span class="mono">models loaded at once</span> honest for your cards.
+    </div>
+    <div class="faint small" style="margin-top: 4px;">
+      Diffusion profiles run standalone only{hiddenCount ? `; ${hiddenCount === 1 ? "one is" : `${hiddenCount} are`} not listed here` : ""}.
     </div>
   </div>
 

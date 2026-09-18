@@ -5,8 +5,12 @@
   import { flip } from "svelte/animate";
   import { arrive, leave, flipParams, toastFly, stagger, LAYOUT } from "../motion.js";
 
+  // App passes `go(viewId)` so a missing build can link straight to Updates.
+  let { go = () => {} } = $props();
+
   let profiles = $state([]);
   let devices = $state([]);
+  let occupancy = $state({}); // stable_key -> ids of live runs on that card
   let runtimes = $state([]);
   let builds = $state([]);
   let models = $state([]);
@@ -58,6 +62,7 @@
     ]);
     profiles = p;
     devices = d.map((r) => r.device);
+    occupancy = Object.fromEntries(d.map((r) => [r.device?.stable_key, r.occupied_by ?? []]));
     runtimes = r;
     builds = s.builds ?? [];
     models = (s.models ?? []).slice().sort((a, b) => a.path.localeCompare(b.path));
@@ -89,6 +94,91 @@
   const layerMax = $derived(header?.block_count ?? 99);
   const selectedBuild = $derived(builds.find((b) => samePath(b.path, draft?.build?.path)));
 
+  // ---- engine ----------------------------------------------------------------
+  // A profile carries `engine` only when it is not llama-server; the model's
+  // header decides which one it needs (discovery sets Model.engine).
+  const isDiffusion = $derived(draft?.engine === "diffusion-gemma");
+  const modelEngine = $derived(selectedModel?.engine ?? "llama-server");
+  const engineMismatch = $derived(!!selectedModel && modelEngine !== (draft?.engine ?? "llama-server"));
+  const DG_DEFAULTS = { hipblaslt_safeguard: true, default_max_tokens: 2048 };
+  const canvas = $derived(header?.diffusion_canvas_length ?? 256);
+  const dgSizing = $derived(check?.diffusion?.sizing ?? null);
+  const runnerBuilds = $derived(builds.filter((b) => b.runner_exe));
+  // Env keys FIDIM composes for every diffusion run (profile::DG_OWNED_ENV):
+  // validate refuses them, and the editor has no env field to clear them.
+  const DG_OWNED_ENV = ["HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", "NGL", "MAXTOK", "FA", "DG_FREE_VRAM_MB", "DG_FREE_RAM_MB", "GGML_BACKEND_PATH", "GGML_CUDA_DEVICES", "GGML_CUDA_ENABLE_UNIFIED_MEMORY"];
+  // With the safeguard on, a ROCBLAS_USE_HIPBLASLT* entry in the env would
+  // override its value (validate warns the same way).
+  const dgEnvConflicts = $derived.by(() => {
+    if (!isDiffusion) return [];
+    const upper = (k) => String(k).toUpperCase();
+    return Object.keys(draft?.env ?? {}).filter((k) => DG_OWNED_ENV.includes(upper(k)) ||
+      (draft?.diffusion?.hipblaslt_safeguard !== false && upper(k).startsWith("ROCBLAS_USE_HIPBLASLT")));
+  });
+  function dropEnvConflicts() {
+    for (const k of [...dgEnvConflicts]) delete draft.env[k];
+    scheduleCheck();
+  }
+
+  const buildNum = (b) => Number(/^b(\d+)/.exec(String(b?.release_tag ?? b?.version ?? ""))?.[1] ?? 0);
+  // Newest upstream build by release NUMBER (a string sort ranks b9817 above
+  // b10771). A fork build reports a higher number but is picked per profile,
+  // never by default.
+  function newestUpstreamBuild() {
+    const newestOf = (list) => list.filter((b) => b.version).sort((a, b) => buildNum(b) - buildNum(a))[0];
+    return newestOf(builds.filter((b) => (b.channel ?? "upstream") === "upstream")) ?? newestOf(builds);
+  }
+  function newestRunnerBuild() {
+    const runs = runnerBuilds.filter((b) => !b.version_error);
+    return (runs.length ? runs : runnerBuilds).slice().sort((a, b) => buildNum(b) - buildNum(a))[0];
+  }
+
+  function enterDiffusion() {
+    draft.engine = "diffusion-gemma";
+    draft.diffusion ??= { ...DG_DEFAULTS };
+    draft.diffusion.seed ??= null;
+    draft.diffusion.flash_attn ??= false;
+    // One card: an empty one if any (the runner sizes its context to the
+    // whole card and cannot see other processes' VRAM), else the first.
+    const discrete = devices.filter((d) => !d.integrated);
+    const pick = discrete.find((d) => !occupancy[d.stable_key]?.length) ?? discrete[0];
+    draft.devices = pick ? [{ key: pick.stable_key, split_fraction: null, resolved_index_last_launch: null }] : [];
+    draft.split_mode = null;
+    draft.main_device = 0;
+    // Kept as an "off" object so the (hidden) speculative card never reads
+    // null; normalized() drops it from the saved diffusion profile.
+    draft.speculative = { mode: "off", n_max: null, n_min: null, p_min: null };
+    draft.model.mmproj = null;
+    draft.model.draft = null;
+    draft.runtime.slots = 1;
+    draft.runtime.n_gpu_layers = 99;
+    draft.runtime.ctx_total = 0;
+    draft.keep_alive_seconds = null;
+    // What validate reports as ignored lives on cards hidden for this
+    // engine; clear it so no finding is left that cannot be fixed here.
+    for (const k of Object.keys(draft.sampling ?? {})) draft.sampling[k] = null;
+    if (draft.chat) draft.chat.enable_thinking = null;
+    draft.runtime.extra_flags = [];
+    draft.runtime.cache_reuse = null;
+    // A runtime still applies to a runner build without its own ROCm.
+    if (selectedBuild?.bundled_runtime) draft.rocm_runtime = null;
+    if (!selectedBuild?.runner_exe) {
+      const b = newestRunnerBuild();
+      if (b) onBuildPick(b.path);
+    }
+  }
+
+  function leaveDiffusion(h) {
+    delete draft.engine;
+    delete draft.diffusion;
+    if (!draft.runtime.ctx_total) draft.runtime.ctx_total = Math.min(32768, h?.context_length ?? 262144);
+    // A fork build is chosen per profile, never inherited by a llama-server one.
+    if (selectedBuild && (selectedBuild.channel ?? "upstream") !== "upstream") {
+      const b = newestUpstreamBuild();
+      if (b && (b.channel ?? "upstream") === "upstream") onBuildPick(b.path);
+    }
+  }
+
   function samePath(a, b) {
     if (!a || !b) return false;
     return String(a).replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase() ===
@@ -115,14 +205,31 @@
     draft.model.mmproj = m?.mmproj_candidates?.[0] ?? null;
     draft.model.draft = null;
     const h = m?.header;
-    if (h?.context_length && draft.runtime.ctx_total > h.context_length) draft.runtime.ctx_total = h.context_length;
-    if (h?.block_count && draft.runtime.n_gpu_layers > h.block_count) draft.runtime.n_gpu_layers = h.block_count;
+    // The header decides the engine; switching resets what the other one
+    // cannot use.
+    const engine = m?.engine ?? "llama-server";
+    if (engine !== (draft.engine ?? "llama-server")) {
+      if (engine === "diffusion-gemma") enterDiffusion();
+      else leaveDiffusion(h);
+    }
+    if (engine === "diffusion-gemma") {
+      // MAXTOK is capped far below the trained context, and NGL must reach
+      // block_count + 1 (the output layer) for a full offload: no clamps.
+      draft.model.mmproj = null;
+    } else {
+      if (h?.context_length && draft.runtime.ctx_total > h.context_length) draft.runtime.ctx_total = h.context_length;
+      if (h?.block_count && draft.runtime.n_gpu_layers > h.block_count) draft.runtime.n_gpu_layers = h.block_count;
+    }
     creator = null;
     scheduleCheck();
   }
   function onBuildPick(path) {
+    const b = builds.find((x) => samePath(x.path, path));
     draft.build.path = path;
-    draft.build.version = builds.find((b) => samePath(b.path, path))?.version ?? null;
+    draft.build.version = b?.version ?? null;
+    // A bundled build runs on its own ROCm and replaces the runtime picker,
+    // so a runtime left set would be a hidden setting that does nothing.
+    if (isDiffusion && b?.bundled_runtime) draft.rocm_runtime = null;
     scheduleCheck();
   }
   function onDraftPick(path) {
@@ -140,7 +247,7 @@
       draft = row ? withDefaults(JSON.parse(JSON.stringify(row.profile))) : null;
       check = null;
       creator = null;
-      log(`select ${id}: model=${base(draft?.model?.path)} build=${draft?.build?.version} ctx=${draft?.runtime?.ctx_total} slots=${draft?.runtime?.slots} kv=${draft?.runtime?.kv_type_k} spec=${draft?.speculative?.mode} port=${draft?.server?.port}`);
+      log(`select ${id}: engine=${draft?.engine ?? "llama-server"} model=${base(draft?.model?.path)} build=${draft?.build?.version} ctx=${draft?.runtime?.ctx_total} slots=${draft?.runtime?.slots} kv=${draft?.runtime?.kv_type_k} spec=${draft?.speculative?.mode} port=${draft?.server?.port}`);
       scheduleCheck();
     } catch (e) {
       log(`select ${id} FAILED: ${e?.stack ?? String(e)}`);
@@ -169,6 +276,14 @@
       };
     }
     p.speculative.n_max ??= null; p.speculative.n_min ??= null; p.speculative.p_min ??= null;
+    // Serde fills an absent diffusion section with these same defaults.
+    if (p.engine === "diffusion-gemma") {
+      p.diffusion ??= {};
+      p.diffusion.hipblaslt_safeguard ??= DG_DEFAULTS.hipblaslt_safeguard;
+      p.diffusion.default_max_tokens ??= DG_DEFAULTS.default_max_tokens;
+      p.diffusion.flash_attn ??= false;
+      p.diffusion.seed ??= null;
+    }
     return p;
   }
 
@@ -202,7 +317,7 @@
 
   function newProfile() {
     const first = devices.find((d) => !d.integrated);
-    const newest = builds.filter((b) => b.version).sort((a, b) => (b.version > a.version ? 1 : -1))[0];
+    const newest = newestUpstreamBuild();
     draft = withDefaults({
       schema: 1, id: "new-profile", name: "New profile",
       build: { path: newest?.path ?? "", version: newest?.version ?? null },
@@ -292,10 +407,40 @@
     if (copy.chat.enable_thinking === null) delete copy.chat.enable_thinking;
     if (!copy.model.mmproj) copy.model.mmproj = null;
     if (copy.model.draft && !copy.model.draft.path) copy.model.draft = null;
+    if ((copy.engine ?? "llama-server") === "llama-server") {
+      // Absent means llama-server, so these profiles save byte-identically.
+      // Never send `engine: null`: it does not parse.
+      delete copy.engine;
+      delete copy.diffusion;
+    } else if (copy.engine === "diffusion-gemma") {
+      copy.devices = copy.devices.slice(0, 1);
+      copy.split_mode = null;
+      // e.g. a profile promoted onto a bundled build keeps its old runtime,
+      // and the picker that could clear it is hidden for that build.
+      if (builds.find((b) => samePath(b.path, copy.build?.path))?.bundled_runtime) copy.rocm_runtime = null;
+      r.slots = 1;
+      delete copy.speculative;
+      delete copy.keep_alive_seconds;
+      const dg = (copy.diffusion ??= { ...DG_DEFAULTS });
+      dg.default_max_tokens = Math.round(Number(dg.default_max_tokens)) || 0;
+      dg.seed = numOrNull(dg.seed);
+      if (dg.seed === null || !Number.isFinite(dg.seed)) delete dg.seed;
+      else dg.seed = Math.round(dg.seed);
+      if (!dg.flash_attn) delete dg.flash_attn;
+    }
     return copy;
   }
 
   function toggleDevice(dev) {
+    if (isDiffusion) {
+      // Radio: a second visible device makes the runner abort every prompt,
+      // and the bundle has no kernels for the iGPU.
+      if (dev.integrated || (draft.devices.length === 1 && draft.devices[0].key === dev.stable_key)) return;
+      draft.devices = [{ key: dev.stable_key, split_fraction: null, resolved_index_last_launch: null }];
+      draft.split_mode = null;
+      scheduleCheck();
+      return;
+    }
     const i = draft.devices.findIndex((d) => d.key === dev.stable_key);
     if (i >= 0) draft.devices.splice(i, 1);
     else draft.devices.push({ key: dev.stable_key, split_fraction: null, resolved_index_last_launch: null });
@@ -492,6 +637,8 @@
           <div class="r3">
             <span class="mono">{p.build.version ?? "?"}</span>
             <span>{p.devices.length} GPU{p.devices.length === 1 ? "" : "s"}{p.split_mode ? `, ${p.split_mode} split` : ""}</span>
+            {#if p.engine === "diffusion-gemma"}<span class="chip note" title="Runs on the DiffusionGemma engine (fidim-dg.exe and Unsloth's runner), not llama-server.">diffusion</span>
+            {:else if p.engine && p.engine !== "llama-server"}<span class="chip block" title="This file names an engine this version of Llama FIDIM does not know. Fix the engine field by hand; the editor will not save it.">unknown engine</span>{/if}
             {#if p.baseline}<span class="tok num">{p.baseline.serial_tok_s} tok/s</span>{/if}
             {#if row.findings.length}<span class="chip warn">{row.findings.length}</span>{/if}
           </div>
@@ -568,11 +715,19 @@
               <span>trained context {fmtInt(header.context_length ?? 0)}</span>
               {#if header.source_repo}<span title="from GGUF general.base_model">{header.source_repo}</span>{/if}
               {#if mtpBuiltIn}<span class="chip pass">MTP built in</span>{/if}
+              {#if isDiffusion}<span class="chip note" title="A diffusion LM: each reply is denoised in whole blocks of this many tokens, by Unsloth's DiffusionGemma runner behind fidim-dg.exe.">diffusion · canvas {canvas}</span>{/if}
               <span class="path" style="flex-basis: 100%;">{draft.model.path}</span>
             </div>
           {:else if draft.model.path}
             <div class="facts" style="grid-column: 1 / -1;"><span class="chip warn">not in scan</span><span class="path">{draft.model.path}</span></div>
           {/if}
+          {#if engineMismatch}
+            <div class="notice" style="grid-column: 1 / -1;" title="The engine is set when a model is picked. This profile names one engine but its model needs the other; pre-flight blocks the launch until they agree.">
+              <span class="chip block">needs {modelEngine}</span>
+              <span>this profile runs {draft.engine ?? "llama-server"}. <button class="link" onclick={() => onModelPick(draft.model.path)}>Switch the engine</button> to match the model.</span>
+            </div>
+          {/if}
+          {#if !isDiffusion}
           <label class="field" style="grid-column: span 3;" title="Multimodal projector paired with the weights; lets the server read images.">
             <span class="k">vision projector (mmproj)</span>
             <select bind:value={draft.model.mmproj} onchange={scheduleCheck}>
@@ -603,16 +758,26 @@
               {/if}
             </select>
           </label>
-          <label class="field" style="grid-column: span 3;" title="Which llama.cpp build launches this profile. Updates installs new builds side by side and can promote profiles to them.">
+          {/if}
+          <label class="field" style="grid-column: span 3;" title={isDiffusion
+            ? "Which build supplies the DiffusionGemma runner (llama-diffusion-gemma-visual-server.exe). Only Unsloth's builds carry it today; install one from the Updates tab."
+            : "Which llama.cpp build launches this profile. Updates installs new builds side by side and can promote profiles to them."}>
             <span class="k">llama.cpp build</span>
             <select value={selectedBuild?.path ?? ""} onchange={(e) => onBuildPick(e.target.value)}>
               <option value="" disabled>choose a build…</option>
               {#each builds as b}
-                <option value={b.path} disabled={!!b.version_error}>{b.tag} · {b.version ?? "broken"}{b.version_error ? " (does not run)" : ""}</option>
+                {@const noRunner = isDiffusion && !b.runner_exe}
+                <option value={b.path} disabled={!!b.version_error || noRunner}>{b.tag} · {b.version ?? "broken"}{b.version_error ? " (does not run)" : ""}{noRunner ? " (no diffusion runner)" : ""}</option>
               {/each}
               {#if draft.build.path && !selectedBuild}<option value={draft.build.path}>{draft.build.path} (not in scan)</option>{/if}
             </select>
           </label>
+          {#if selectedBuild?.bundled_runtime}
+            <label class="field" style="grid-column: span 3;" title="This build ships its own ROCm DLLs and runs with nothing added to PATH, so the runtime picker does not apply to it.">
+              <span class="k">ROCm runtime</span>
+              <select disabled><option>bundled with this build</option></select>
+            </label>
+          {:else}
           <label class="field" style="grid-column: span 3;" title="ROCm runtime this server runs against; its DLL folders go first on PATH. Newest first; install more from the Updates tab.">
             <span class="k">ROCm runtime</span>
             <select bind:value={draft.rocm_runtime} onchange={scheduleCheck}>
@@ -622,28 +787,43 @@
               {/each}
             </select>
           </label>
+          {/if}
+          {#if isDiffusion && !runnerBuilds.length}
+            <div class="notice" style="grid-column: 1 / -1;">
+              <span class="chip block">no runner</span>
+              <span>No installed build carries the DiffusionGemma runner. Save this profile, then <button class="link" onclick={() => go("updates")} title="Opens the Updates tab; unsaved edits here are dropped when you leave this tab.">install an Unsloth build from Updates</button>.</span>
+            </div>
+          {/if}
         </div>
       </section>
 
       <!-- devices -->
       <section class="card">
-        <div class="sec">GPU placement <span class="faint">one card, or a layer split across two</span></div>
+        <div class="sec">GPU placement <span class="faint">{isDiffusion ? "exactly one card for the diffusion engine" : "one card, or a layer split across two"}</span></div>
         <div class="devrows">
           {#each devices.filter((d) => !d.integrated) as dev}
-            {@const entry = draft.devices.find((x) => x.key === dev.stable_key)}
+            {@const entry = isDiffusion
+              ? (draft.devices[0]?.key === dev.stable_key ? draft.devices[0] : undefined)
+              : draft.devices.find((x) => x.key === dev.stable_key)}
             {@const used = dev.total_mib - dev.free_mib}
+            {@const users = occupancy[dev.stable_key] ?? []}
             <label class="devrow" class:on={!!entry}>
-              <input type="checkbox" checked={!!entry} onchange={() => toggleDevice(dev)} />
+              {#if isDiffusion}
+                <input type="radio" name="dg-device" checked={!!entry} onchange={() => toggleDevice(dev)} title="The diffusion runner gets this one card; picking another moves it." />
+              {:else}
+                <input type="checkbox" checked={!!entry} onchange={() => toggleDevice(dev)} />
+              {/if}
               <span class="dname">
                 <b>{dev.name.replace(/^AMD /, "")}</b>
                 <span class="mono faint">{dev.stable_key.split(":").pop()} · {dev.backend}{dev.hip_index}</span>
                 {#if dev.display}<span class="chip warn">display attached</span>{/if}
+                {#if isDiffusion && users.length}<span class="chip warn" title="The runner sizes its context to the VRAM it believes is free, and Windows hides other processes' allocations from it, so sharing a card can push either model into shared memory. Pick an empty card when you can.">in use: {users.join(", ")}</span>{/if}
               </span>
               <span class="dmeter">
                 <span class="meter"><span class="fill {used / dev.total_mib > 0.9 ? 'block' : used / dev.total_mib > 0.7 ? 'warn' : 'pass'}" style="width: {Math.round(100 * used / Math.max(1, dev.total_mib))}%;"></span></span>
                 <span class="mono faint num">{(dev.free_mib / 1024).toFixed(1)} of {(dev.total_mib / 1024).toFixed(0)} GiB free</span>
               </span>
-              {#if entry && draft.devices.length > 1}
+              {#if entry && !isDiffusion && draft.devices.length > 1}
                 <span class="frac" title="Share of the layers placed on this card. Blank = split evenly.">
                   <span class="k">fraction</span>
                   <input type="number" step="0.05" min="0" max="1" placeholder="auto" bind:value={entry.split_fraction} oninput={scheduleCheck} />
@@ -652,7 +832,9 @@
             </label>
           {/each}
         </div>
-        {#if draft.devices.length > 1}
+        {#if isDiffusion}
+          <div class="faint small" style="margin-top: 8px;">One card only: more than one visible device makes the runner abort every prompt. The iGPU is never used.</div>
+        {:else if draft.devices.length > 1}
           <div class="formgrid" style="margin-top: 14px;">
             <label class="field" style="grid-column: span 2;" title="layer: whole layers per card (supported, no cross-GPU collectives). row: split each tensor across cards (experimental on this stack)."><span class="k">split mode</span>
               <select bind:value={draft.split_mode} onchange={scheduleCheck}>
@@ -688,6 +870,17 @@
       <section class="card">
         <div class="sec">Context and offload <span class="faint">allocated when the server starts</span></div>
         <div class="formgrid">
+          {#if isDiffusion}
+            {@const predicted = dgSizing?.predicted_auto_maxtok ?? null}
+            <Range bind:value={() => draft.runtime.ctx_total || null, (v) => (draft.runtime.ctx_total = v ?? 0)}
+              label="context budget (MAXTOK)" min={2048} max={65536} step={256} nullable offLabel="auto"
+              placeholder={predicted ?? 12288} format={fmtInt} onchange={scheduleCheck} span={3}
+              hint={`auto = largest that fits VRAM at load${predicted ? ` (≈ ${fmtInt(predicted)})` : ""}; one reply uses ceil(max_tokens/${canvas}) blocks`}
+              title={`Prompt plus reply, in tokens (the runner's MAXTOK). Off = auto: the runner picks the largest budget that fits the card's VRAM when it loads; its scores buffer grows with the square of the budget, so a 32 GB card lands near 12K. A reply is denoised in whole ${canvas}-token blocks, so ceil(max_tokens/${canvas}) blocks of this budget go to the answer and the rest bounds the prompt.`} />
+            <Range bind:value={draft.runtime.n_gpu_layers} label="GPU offload (layers, NGL)" min={0} max={layerMax + 1} step={1}
+              hint={header ? `≥ ${layerMax + 1} = all, incl. the output layer; runner default is 0 = CPU` : "runner default is 0 = CPU; FIDIM always sends NGL"} onchange={scheduleCheck} span={3}
+              title={`Layers on the GPU, sent to the runner as NGL. Full offload needs the ${header ? layerMax : "model's"} blocks plus the output layer${header ? ` (${layerMax + 1})` : ""}; below that the runner is slow and sizes its context against system RAM. The runner's own default is 0 = CPU only, so Llama FIDIM always sends NGL.`} />
+          {:else}
           <Range bind:value={draft.runtime.ctx_total} label="context length" title="Total tokens of context, split across slots. On sliding-window models VRAM barely grows with context; on dense models it grows linearly." min={512} max={ctxMax} step={256}
             hint={header ? `model supports up to ${fmtInt(ctxMax)} tokens` : "no model header — default cap"} format={fmtInt} onchange={scheduleCheck} span={3} />
           <Range bind:value={draft.runtime.n_gpu_layers} label="GPU offload (layers)" title="How many transformer layers live on the GPU. Anything at or above the model's layer count = everything on GPU (fastest). Lower it only when the model does not fit." min={0} max={layerMax} step={1}
@@ -698,9 +891,55 @@
             <span class="k">unified KV cache</span>
             <span><input type="checkbox" bind:checked={draft.runtime.kv_unified} onchange={scheduleCheck} /> one shared KV pool across slots</span>
           </label>
+          {/if}
         </div>
       </section>
 
+      {#if isDiffusion && draft.diffusion}
+        {@const maxTok = Number(draft.diffusion.default_max_tokens) || 0}
+        <!-- diffusion -->
+        <section class="card">
+          <div class="sec">Diffusion <span class="faint">settings of the DiffusionGemma runner; sampling, speculative decoding and batching do not apply</span></div>
+          <div class="formgrid">
+            <Range bind:value={draft.diffusion.default_max_tokens} label="default reply budget (max_tokens)" min={256} max={8192} step={256}
+              hint={`= ${Math.ceil(maxTok / canvas)} blocks; a client's max_tokens overrides; the thought channel uses blocks too`}
+              format={fmtInt} onchange={scheduleCheck} span={3}
+              title={`Reply budget when a request sends no max_tokens. The runner denoises whole ${canvas}-token blocks, so this is spent in ceil(max_tokens/${canvas}) blocks, and the model's thinking comes out of the same budget. Bigger budgets leave less of the context for the prompt.`} />
+            <label class="field" style="grid-column: span 3;" title="Seed for requests that do not send one. Empty = a random seed per request; a fixed seed makes replies to the same prompt repeat.">
+              <span class="k">seed</span>
+              <input type="number" step="1" placeholder="random per request" value={draft.diffusion.seed ?? ""}
+                oninput={(e) => { draft.diffusion.seed = e.target.value === "" ? null : e.target.value; scheduleCheck(); }} />
+            </label>
+            <label class="field" style="grid-column: span 3;" title="Sets ROCBLAS_USE_HIPBLASLT=0 and ROCBLAS_USE_HIPBLASLT_BATCHED=0 for the runner. Without it the first denoise step intermittently fails with 'MUL_MAT failed / ROCm error: invalid argument'. Measured no speed cost; leave it on.">
+              <span class="k">hipBLASLt safeguard</span>
+              <span>
+                <input type="checkbox" bind:checked={draft.diffusion.hipblaslt_safeguard} onchange={scheduleCheck} /> keep rocBLAS off hipBLASLt
+                {#if !draft.diffusion.hipblaslt_safeguard}<span class="chip warn">intermittent MUL_MAT failures</span>{/if}
+              </span>
+            </label>
+            <label class="field" style="grid-column: span 3;" title="Sends FA=1 to the runner. DiffusionGemma's 512-dim attention heads have no flash-attention kernel on HIP and fall back to the CPU, which is slower. Separate from llama-server's flash attention setting; leave it off unless you have measured otherwise.">
+              <span class="k">flash attention</span>
+              <span>
+                <input type="checkbox" bind:checked={draft.diffusion.flash_attn} onchange={scheduleCheck} /> FA=1
+                {#if draft.diffusion.flash_attn}<span class="chip warn">512-dim heads fall back to CPU on HIP</span>{/if}
+              </span>
+            </label>
+          </div>
+          {#if dgEnvConflicts.length}
+            <div class="notice" style="margin-top: 12px;" title="Llama FIDIM sets these itself for every diffusion run (card pinning, NGL, MAXTOK, FA, memory sizing, the hipBLASLt safeguard); a profile env entry would override them.">
+              <span class="chip block">env conflict</span>
+              <span>the profile env sets <span class="mono">{dgEnvConflicts.join(", ")}</span>.</span>
+              <button class="btn small" onclick={dropEnvConflicts}>Remove from env</button>
+            </div>
+          {/if}
+          <div class="faint small" style="margin-top: 10px;">
+            The model always thinks; its reasoning arrives as <span class="mono">reasoning_content</span>. Tool calls come back as raw text in the reply.
+            Diffusion profiles run standalone: no keep-alive, no router membership, no benchmarks.
+          </div>
+        </section>
+      {/if}
+
+      {#if !isDiffusion}
       <!-- speculative decoding -->
       <section class="card">
         <div class="sec">
@@ -838,6 +1077,7 @@
           KV quantisation is the big VRAM lever (q8_0 is as good as f16 in practice); flash attention must be on for V-cache quant.
         </div>
       </section>
+      {/if}
 
       <!-- notes -->
       <section class="card">

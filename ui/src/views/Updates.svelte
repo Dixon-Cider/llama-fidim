@@ -24,6 +24,18 @@
   let rocmBusy = $state("");
   let rocmError = $state("");
 
+  // Unsloth fork builds (the DiffusionGemma engine)
+  let dg = $state(null);         // unsloth_check result
+  let dgChecking = $state(false);
+  let dgInstalling = $state(false);
+  let dgInstall = $state(null);  // InstallReport of the last fork install this session
+  let dgPromote = $state(null);  // PromoteReport
+  let dgError = $state("");
+  let dgGfx = $state("");        // "" = automatic (config family, else a guess from the cards)
+  // Which section's action the shared progress log belongs to, so it
+  // renders under the button that started it.
+  let logOwner = $state("upstream");
+
   onEvent("update-progress", (line) => {
     log = [...log.slice(-400), line];
   }).then((u) => (unlisten = u));
@@ -49,7 +61,7 @@
   }
 
   async function doInstall(source) {
-    installing = true; error = ""; log = []; install = null; promote = null;
+    installing = true; error = ""; log = []; logOwner = "upstream"; install = null; promote = null;
     try {
       install = await api("update_install", { tag: check?.latest?.tag ?? null, source });
       await doCheck();
@@ -90,7 +102,7 @@
     availBusy = false;
   }
   async function installRocm(rt) {
-    rocmBusy = rt.version; rocmError = ""; log = [];
+    rocmBusy = rt.version; rocmError = ""; log = []; logOwner = "rocm";
     try {
       await api("rocm_install", { runtime: rt });
       await loadRuntimes();
@@ -111,6 +123,33 @@
     } catch (e) { rocmError = String(e); }
     rocmBusy = "";
   }
+  // Not run on load: the unauthenticated GitHub API allows 60 calls an hour,
+  // shared with the upstream check.
+  async function dgCheck() {
+    dgChecking = true; dgError = ""; dgPromote = null;
+    try {
+      dg = await api("unsloth_check", { tag: null, gfx: dgGfx || null });
+    } catch (e) { dgError = String(e); }
+    dgChecking = false;
+  }
+
+  async function dgDoInstall() {
+    dgInstalling = true; dgError = ""; log = []; logOwner = "unsloth"; dgInstall = null; dgPromote = null;
+    try {
+      dgInstall = await api("unsloth_install", { tag: dg?.latest?.tag ?? null, gfx: dg?.gfx ?? (dgGfx || null) });
+      await dgCheck();
+    } catch (e) { dgError = String(e); }
+    dgInstalling = false;
+  }
+
+  async function dgDoPromote() {
+    dgError = "";
+    try {
+      dgPromote = await api("unsloth_promote", { toPath: dgInstall.dir, toVersion: dgInstall.verify.version });
+      await loadHistory();
+    } catch (e) { dgError = String(e); }
+  }
+
   async function setFamily(f) {
     try {
       const c = { ...cfg, rocm_family: f || null };
@@ -213,17 +252,21 @@
   {/if}
 {/if}
 
-{#if installing || rocmBusy || log.length}
-  <div class="card" transition:slide={leave}>
-    {#if (installing || rocmBusy) && progress != null}
-      <div class="meter" style="margin-bottom: 10px;"><div class="fill" style="width: {progress}%;"></div></div>
-    {/if}
-    <div class="logbox" style="max-height: 220px; overflow: auto;">
-      {#each log as line}<div class="mono">{line}</div>{/each}
-      {#if (installing || rocmBusy) && !log.length}<div class="faint">starting…</div>{/if}
+{#snippet logCard(show, busy)}
+  {#if show}
+    <div class="card" transition:slide={leave}>
+      {#if busy && progress != null}
+        <div class="meter" style="margin-bottom: 10px;"><div class="fill" style="width: {progress}%;"></div></div>
+      {/if}
+      <div class="logbox" style="max-height: 220px; overflow: auto;">
+        {#each log as line}<div class="mono">{line}</div>{/each}
+        {#if busy && !log.length}<div class="faint">starting…</div>{/if}
+      </div>
     </div>
-  </div>
-{/if}
+  {/if}
+{/snippet}
+
+{@render logCard(logOwner !== "unsloth" && !!(installing || rocmBusy || log.length), !!(installing || rocmBusy))}
 
 {#if install}
   <div class="card">
@@ -305,6 +348,124 @@
     </tbody>
   </table>
 </div>
+
+<h2>DiffusionGemma engine <span class="sub">Unsloth's llama.cpp builds, which carry the DiffusionGemma runner. Each brings its own ROCm and runs with nothing added to PATH.</span></h2>
+
+<div class="card">
+  <div class="sec">
+    Unsloth builds
+    <span class="faint">unslothai/llama.cpp releases, one zip per GPU target</span>
+    {#if dgError}<span class="chip block shake">{dgError}</span>{/if}
+    <span style="margin-left: auto; display: flex; gap: 8px; align-items: center;">
+      <label class="field" style="flex-direction: row; align-items: center; gap: 8px;" title="GPU target of the zip. Automatic uses the ROCm family from Settings, else a guess from your cards: Radeon AI PRO R9700 and RX 9000 are gfx120X.">
+        <span class="k">gpu target</span>
+        <select style="width: 200px;" value={dgGfx} onchange={(e) => { dgGfx = e.target.value; dgCheck(); }} disabled={dgChecking || dgInstalling}>
+          <option value="">automatic{dg && !dgGfx ? ` (${dg.gfx})` : ""}</option>
+          {#each dg?.gfx_available ?? [] as g}<option value={g}>{g}</option>{/each}
+        </select>
+      </label>
+      <button class="btn" onclick={dgCheck} disabled={dgChecking || dgInstalling} title="Ask GitHub for the newest Unsloth release. Nothing is downloaded.">
+        {dgChecking ? "Checking…" : "Check Unsloth"}
+      </button>
+      {#if dg}
+        <button class="btn primary" onclick={dgDoInstall} disabled={dgInstalling || !dg.asset}
+          title="Download the zip, check it against GitHub's sha256 digest, unpack it into its own folder, then run --version and --list-devices on it. No model is loaded.">
+          {dgInstalling ? "Installing…" : dg.already_installed ? "Re-verify" : "Install"}
+        </button>
+      {/if}
+    </span>
+  </div>
+  {#if dg}
+    <table class="grid">
+      <tbody>
+        <tr><th>Latest release</th>
+          <td class="mono">{dg.latest.tag}</td>
+          <td class="faint">{day(dg.latest.published_at)}</td>
+          <td>{#if dg.already_installed}<span class="chip pass">installed</span>{/if}</td></tr>
+        <tr><th title="The upstream llama.cpp release this build was cut from.">Upstream base</th>
+          <td class="mono" colspan="3">{dg.upstream_tag ?? "?"}</td></tr>
+        <tr><th>GPU target</th>
+          <td class="mono" colspan="3">{dg.gfx}</td></tr>
+        <tr><th>Asset</th>
+          <td colspan="3" class="path">
+            {#if dg.asset}
+              {dg.asset.name} ({(dg.asset.size / 1048576).toFixed(0)} MB)
+              {#if dg.asset.digest}<span class="mono faint" title="Checked against the download before anything is unpacked: {dg.asset.digest}">{dg.asset.digest.slice(0, 19)}…</span>
+              {:else}<span class="chip warn" title="The download cannot be checked against a published hash.">no digest published</span>{/if}
+            {:else}<span class="chip block">{dg.asset_error}</span>{/if}
+          </td></tr>
+        <tr><th>Install target</th>
+          <td class="path" colspan="3">{dg.install_dir}</td></tr>
+        <tr><th>Installed</th>
+          <td colspan="3">
+            {#each dg.installed as b}
+              <div><span class="mono">{b.tag}</span> <span class="faint mono">{b.version}</span>
+                <span class="chip accent" title="Runs on the ROCm DLLs inside the build, never a runtime from the list below.">bundled ROCm</span></div>
+            {:else}<span class="faint">none yet</span>{/each}
+          </td></tr>
+      </tbody>
+    </table>
+  {:else}
+    <div class="empty">Check Unsloth to see the newest build for your GPU</div>
+  {/if}
+  <p class="faint small" style="margin: 10px 0 0;">
+    Installed into Llama FIDIM's build folder; Unsloth Studio's own copy is never touched.
+    Only diffusion profiles move onto these builds. llama-server profiles stay on upstream builds.
+  </p>
+</div>
+
+{@render logCard(logOwner === "unsloth" && !!(dgInstalling || log.length), dgInstalling)}
+
+{#if dgInstall}
+  <div class="card">
+    <h2 style="margin-top: 0;">
+      {dgInstall.tag} <span class="chip plain">unsloth</span>
+      {#if dgInstall.verify.hip_ok}<span class="chip pass">HIP backend loaded</span>
+      {:else}<span class="chip block">HIP backend did not load</span>{/if}
+      {#if dgInstall.verify.runner_present}<span class="chip pass">runner present</span>
+      {:else}<span class="chip block">runner missing</span>{/if}
+      {#if dgInstall.skipped_existing}<span class="chip plain">already present, verified only</span>{/if}
+    </h2>
+    <div class="path">{dgInstall.dir}</div>
+    <div class="mono">bundled llama-server reports {dgInstall.verify.version ?? "?"} {dgInstall.verify.commit ? `(${dgInstall.verify.commit})` : ""}</div>
+    {#if dgInstall.verify.devices.length}
+      <table class="grid" style="margin-top: 6px;">
+        <thead><tr><th title="Indices as this build's own ROCm enumerates them.">Index</th><th>Name</th><th>VRAM</th></tr></thead>
+        <tbody>
+          {#each dgInstall.verify.devices as d}
+            <tr><td class="mono">{d.backend}{d.index}</td><td>{d.name}</td><td class="num">{(d.total_mib / 1024).toFixed(1)} GiB</td></tr>
+          {/each}
+        </tbody>
+      </table>
+    {/if}
+    {#if dgInstall.verify.detail}<pre class="path" style="white-space: pre-wrap;">{dgInstall.verify.detail}</pre>{/if}
+    {#if dgInstall.verify.hip_ok && dgInstall.verify.runner_present}
+      <div class="toolbar" style="margin-top: 10px;">
+        <button class="btn primary" onclick={dgDoPromote}
+          title="Re-point every unpinned diffusion profile at this build. llama-server profiles are never moved here. Roll back most recent undoes it.">
+          Move diffusion profiles onto it
+        </button>
+      </div>
+    {/if}
+  </div>
+{/if}
+
+{#if dgPromote}
+  <div class="card">
+    <h2 style="margin-top: 0;">Moved {dgPromote.batch.entries.length} diffusion profile(s)</h2>
+    <table class="grid">
+      <tbody>
+        {#each dgPromote.batch.entries as e}
+          <tr><td class="mono">{e.profile_id}</td><td class="mono faint">{e.from.version ?? "?"} → {e.to.version ?? "?"}</td></tr>
+        {/each}
+        {#each dgPromote.skipped as [id, why]}
+          <tr><td class="mono">{id}</td><td class="faint">skipped: {why}</td></tr>
+        {/each}
+      </tbody>
+    </table>
+    <p class="muted">Nothing was launched. Rollback undoes this batch.</p>
+  </div>
+{/if}
 
 <h2>ROCm runtimes <span class="sub">AMD's Windows ROCm, one folder per version next to the builds. Profiles pick one by name; the default applies when a profile names none.</span></h2>
 

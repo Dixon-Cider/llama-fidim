@@ -117,7 +117,7 @@ const MOCK_SPLIT_PROFILE = {
 
 function mockCheckResults(p) {
   const multi = (p?.devices?.length ?? 1) > 1;
-  return [
+  const results = [
     { id: "build-runs", spec_number: 1, title: "Build binary exists and runs", outcome: "pass" },
     { id: "files-exist", spec_number: 2, title: "Model and paired mmproj / draft files exist", outcome: "pass" },
     { id: "devices-resolve", spec_number: 3, title: "Every target device resolves from its stable key", outcome: "pass" },
@@ -132,10 +132,99 @@ function mockCheckResults(p) {
       outcome: { warn: "target device(s) driving a display: AMD Radeon AI PRO R9700 (1920x1080@59) — desktop compositing has consumed 2.68 GB and preempted compute in the past" },
     },
     { id: "versions-match", spec_number: 11, title: "Driver and SDK match the profile's baselines", outcome: "pass" },
+    { id: "pcie-aspm-off", spec_number: 12, title: "PCIe link-state power management is Off", outcome: "pass" },
   ].map((r) => (multi && r.id === "visibility-pinned" ? r : r));
+  if (!p) return results;
+  // Checks 13-15 as core's run_all appends them: 13 whenever the profile or
+  // its model is diffusion, 14 when a diffusion run shares the card, 15 for
+  // diffusion profiles.
+  const dg = p.engine === "diffusion-gemma";
+  const model = MOCK_MODELS.find((m) => m.path === p.model?.path);
+  const modelDg = model?.engine === "diffusion-gemma";
+  if (dg) {
+    const build = MOCK_BUILDS.find((b) => b.path === p.build?.path);
+    if (!build?.runner_exe) {
+      results[0].outcome = { outcome: "block", message: `build ${build?.tag ?? p.build?.path} has no llama-diffusion-gemma-visual-server.exe; install one with \`fidim update --channel unsloth --install\` (or the Updates tab)` };
+    }
+    if ((p.devices?.length ?? 0) !== 1) {
+      results[4].outcome = { outcome: "block", message: `the diffusion engine needs exactly one device; ${p.devices?.length ?? 0} resolved` };
+    }
+  }
+  if (dg || modelDg) {
+    const outcome = !dg && modelDg
+      ? { outcome: "block", message: `llama-server cannot load ${model.header.architecture}; pick this model again in the editor so it switches to the diffusion engine` }
+      : dg && model && !modelDg ? { outcome: "block", message: 'the diffusion runner exits with "not a diffusion model"' } : "pass";
+    results.push({ id: "engine-matches-model", spec_number: 13, title: "Engine can load this model", outcome });
+  }
+  if (dg) {
+    const others = (p.devices ?? []).flatMap((d) => MOCK_DEVICES.find((m) => m.device.stable_key === d.key)?.occupied_by ?? []);
+    if (others.length) {
+      results.push({
+        id: "diffusion-card-sharing", spec_number: 14, title: "Card is not shared with a diffusion run",
+        outcome: { outcome: "warn", message: p.runtime?.ctx_total
+          ? `card also hosts ${others.join(", ")}; this profile allocates its prompt-KV store (up to 5.0 GiB) per request, after load; sharing can push either model into shared memory`
+          : `card also hosts ${others.join(", ")}; the runner auto-sizes its context to the VRAM it believes is free, and WDDM hides other processes' allocations, so it will oversubscribe. Pick an empty card` },
+      });
+    }
+    const s = mockDiffusion(p).sizing;
+    const ctx = p.runtime?.ctx_total ?? 0;
+    const warns = [];
+    if (ctx > s.predicted_auto_maxtok) warns.push(`explicit budget ${ctx} is above what fits (auto MAXTOK predicted ≈ ${s.predicted_auto_maxtok}); the runner will degrade it at load`);
+    if (!s.full_offload) warns.push("NGL < block_count+1: partial offload is slow and the context is sized against system RAM");
+    results.push({
+      id: "diffusion-context", spec_number: 15, title: "Diffusion context budget",
+      outcome: warns.length ? { outcome: "warn", message: warns.join("; ") }
+        : ctx ? { outcome: "note", message: `explicit MAXTOK ${ctx} (largest prompt ≈ ${s.max_prompt_tokens} tokens); auto would pick ≈ ${s.predicted_auto_maxtok}` }
+        : { outcome: "note", message: `auto MAXTOK predicted ≈ ${s.predicted_auto_maxtok} (largest prompt ≈ ${s.predicted_auto_maxtok - s.canvas} tokens); the runner decides at load` },
+    });
+  }
+  return results;
+}
+
+// live_check's `diffusion` block (preflight::DiffusionPreflight) for the
+// mock DiffusionGemma 26B-A4B header on a 32 GB card.
+function mockDiffusion(p) {
+  const build = MOCK_BUILDS.find((b) => b.path === p?.build?.path);
+  const ctx = p?.runtime?.ctx_total ?? 0;
+  const predicted = 12288;
+  const used = ctx > 0 ? ctx : predicted;
+  return {
+    helper_exe: "C:\\Users\\me\\AppData\\Local\\Programs\\LlamaFIDIM\\fidim-dg.exe",
+    helper_dir: "C:\\Users\\me\\AppData\\Local\\Programs\\LlamaFIDIM",
+    runner_exe: `${p?.build?.path ?? ""}\\bin\\llama-diffusion-gemma-visual-server.exe`,
+    runner_present: !!build?.runner_exe,
+    vulkan_backend: false,
+    sizing: {
+      canvas: 256, predicted_auto_maxtok: predicted, maxtok_used: used, max_prompt_tokens: used - 256,
+      pkv_bytes_per_token: 450560, full_offload: (p?.runtime?.n_gpu_layers ?? 0) >= 31,
+    },
+  };
+}
+
+// A subset of profile::validate_diffusion, so the Findings card shows.
+function mockFindings(p) {
+  if (p?.engine !== "diffusion-gemma") return [];
+  const f = [];
+  const dg = p.diffusion ?? {};
+  const ctx = p.runtime?.ctx_total ?? 0;
+  if ((p.devices?.length ?? 0) !== 1) f.push({ severity: "error", code: "dg-single-device", message: `the diffusion engine needs exactly one device (profile lists ${p.devices?.length ?? 0})` });
+  if (!dg.default_max_tokens) f.push({ severity: "error", code: "dg-max-tokens", message: "diffusion.default_max_tokens must be at least 1" });
+  if (dg.flash_attn) f.push({ severity: "warning", code: "dg-flash-attn", message: "diffusion.flash_attn is on: DiffusionGemma's 512-dim attention heads fall back to the CPU on HIP, which is slower; leave it off unless measured" });
+  if (dg.hipblaslt_safeguard === false) f.push({ severity: "warning", code: "dg-safeguard-off", message: "diffusion.hipblaslt_safeguard is off: the first denoise step intermittently fails with 'MUL_MAT failed / ROCm error: invalid argument' when rocBLAS routes through hipBLASLt" });
+  if (ctx !== 0 && (ctx < 2048 || ctx % 256 !== 0 || ctx > 65536)) f.push({ severity: "warning", code: "dg-context", message: `runtime.ctx_total ${ctx} is the diffusion context budget (MAXTOK, 0 = auto-size): expected a multiple of 256 between 2048 and 65536` });
+  return f;
 }
 
 function mockEstimate(p) {
+  if (p?.engine === "diffusion-gemma") {
+    const s = mockDiffusion(p).sizing;
+    const w = 15.65 * 2 ** 30, kv = s.pkv_bytes_per_token * s.max_prompt_tokens, c = 1.93 * 2 ** 30, o = 0.4 * 2 ** 30;
+    return {
+      per_device: [{ key: p.devices?.[0]?.key ?? "?", fraction: 1.0, weights_bytes: w, kv_bytes: kv, compute_bytes: c, overhead_bytes: o, total_bytes: w + kv + c + o }],
+      total_bytes: w + kv + c + o,
+      assumptions: ["prompt-KV store is allocated lazily per request (inferred)", "sc_embT buffer inferred", "auto-size cannot see other processes' VRAM (WDDM)"],
+    };
+  }
   const n = p?.devices?.length ?? 1;
   const per = n === 2
     ? [
@@ -159,6 +248,69 @@ const MOCK_RUN = {
   alive: true, health: "healthy", crashed: false,
 };
 
+// An upstream build plus an Unsloth fork build (bundled ROCm, carries the
+// DiffusionGemma runner). The fork reports the higher upstream number: every
+// "newest build" default must still land on the upstream one.
+const MOCK_BUILDS = [
+  {
+    path: "C:\\llama.cpp\\b10819-rocm", tag: "b10819-rocm",
+    server_exe: "C:\\llama.cpp\\b10819-rocm\\bin\\llama-server.exe",
+    version: "b10819", commit: "8d2c5a1f0", version_error: null,
+    channel: "upstream", bundled_runtime: false, release_tag: null, runner_exe: null,
+  },
+  {
+    path: "C:\\llama.cpp\\b11027-mix-3e83366-unsloth", tag: "b11027-mix-3e83366-unsloth",
+    server_exe: "C:\\llama.cpp\\b11027-mix-3e83366-unsloth\\bin\\llama-server.exe",
+    version: "b11027", commit: "f6b9ea743", version_error: null,
+    channel: "unsloth", bundled_runtime: true, release_tag: "b11027-mix-3e83366",
+    runner_exe: "C:\\llama.cpp\\b11027-mix-3e83366-unsloth\\bin\\llama-diffusion-gemma-visual-server.exe",
+  },
+];
+
+// A llama-server model and a DiffusionGemma model; discovery sets `engine`
+// from the header and the editor switches the profile's engine on it.
+const MOCK_MODELS = [
+  {
+    path: MOCK_PROFILE.model.path, file_size: 17.0e9, modified_unix: 1785000000, header_error: null,
+    engine: "llama-server", mmproj_candidates: [], draft_candidates: [MOCK_PROFILE.model.draft.path],
+    header: {
+      architecture: "gemma4", model_name: "Gemma 4 26B A4B It", size_label: "26B-A4B", file_type: 15,
+      block_count: 30, context_length: 262144, embedding_length: 2816, head_count: 16,
+    },
+  },
+  {
+    path: "D:\\models\\unsloth\\diffusiongemma-26B-A4B-it-GGUF\\diffusiongemma-26B-A4B-it-Q4_K_M.gguf",
+    file_size: 16806810208, modified_unix: 1789000000, header_error: null,
+    engine: "diffusion-gemma", mmproj_candidates: [], draft_candidates: [],
+    header: {
+      architecture: "diffusion-gemma", model_name: "DiffusionGemma 26B A4B It", size_label: "26B-A4B", file_type: 15,
+      block_count: 30, context_length: 262144, embedding_length: 2816, head_count: 16,
+      diffusion_canvas_length: 256, attention_causal: false, vocab_size: 262144,
+    },
+  },
+];
+
+const MOCK_DG_PROFILE = {
+  schema: 1, engine: "diffusion-gemma", id: "dg-26b", name: "DiffusionGemma 26B-A4B",
+  build: { path: MOCK_BUILDS[1].path, version: "b11027" },
+  model: { path: MOCK_MODELS[1].path, mmproj: null, draft: null },
+  devices: [{ key: "pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus08", split_fraction: null, resolved_index_last_launch: null }],
+  split_mode: null, main_device: 0,
+  server: { port: 9760, alias: "diffusiongemma", host: "127.0.0.1" },
+  runtime: {
+    n_gpu_layers: 99, ctx_total: 0, slots: 1, kv_type_k: "f16", kv_type_v: "f16",
+    flash_attn: "on", batch_logical: 2048, batch_physical: 512, cont_batching: true,
+    kv_unified: false, cache_reuse: null,
+  },
+  sampling: {}, chat: {}, env: {},
+  diffusion: { hipblaslt_safeguard: true, default_max_tokens: 2048 },
+};
+
+// The mock's newest Unsloth release is not installed until unsloth_install runs.
+const MOCK_UNSLOTH_TAG = "b11031-mix-3e83366";
+const MOCK_UNSLOTH_GFX = ["gfx103X", "gfx110X", "gfx1150", "gfx1151", "gfx120X", "gfx908", "gfx90a"];
+let mockUnslothInstalled = false;
+
 const MOCK_LOG_LINES = [
   "0.00.339 I   - ROCm0   : AMD Radeon AI PRO R9700 (32624 MiB, 32472 MiB free)",
   "0.00.640 I   - ROCm1   : AMD Radeon AI PRO R9700 (32624 MiB, 32472 MiB free)",
@@ -177,9 +329,35 @@ async function mock(cmd, args) {
       return [
         { profile: MOCK_PROFILE, findings: [] },
         { profile: MOCK_SPLIT_PROFILE, findings: [] },
+        { profile: MOCK_DG_PROFILE, findings: [] },
       ];
     case "live_check": {
       const p = args.p;
+      if (p?.engine === "diffusion-gemma") {
+        const dev = MOCK_DEVICES.find((m) => m.device.stable_key === p.devices?.[0]?.key)?.device ?? MOCK_DEVICES[2].device;
+        const idx = dev.hip_index;
+        const d = mockDiffusion(p);
+        const dg = p.diffusion ?? {};
+        const env = [...Object.entries(p.env ?? {}),
+          ["HIP_VISIBLE_DEVICES", String(idx)], ["CUDA_VISIBLE_DEVICES", String(idx)],
+          ["NGL", String(p.runtime?.n_gpu_layers ?? 0)], ["MAXTOK", String(p.runtime?.ctx_total ?? 0)], ["FA", dg.flash_attn ? "1" : "0"]];
+        if (d.sizing.full_offload) env.push(["DG_FREE_RAM_MB", "0"]);
+        if (dg.hipblaslt_safeguard !== false) env.push(["ROCBLAS_USE_HIPBLASLT", "0"], ["ROCBLAS_USE_HIPBLASLT_BATCHED", "0"]);
+        return {
+          findings: mockFindings(p),
+          results: mockCheckResults(p),
+          estimate: mockEstimate(p),
+          resolved: (p.devices ?? []).map((x) => ({
+            profile_key: x.key,
+            device: MOCK_DEVICES.find((m) => m.device.stable_key === x.key)?.device ?? MOCK_DEVICES[2].device,
+            fraction: 1.0, rebound: false,
+          })),
+          command_line: `"${d.helper_exe}" --runner "${d.runner_exe}" --model "${p.model?.path}" --host ${p.server?.host ?? "127.0.0.1"} --port ${p.server?.port} --alias ${p.server?.alias} --req-prefix "C:\\Users\\me\\.fidim\\runs\\dg-${p.id}-${p.server?.port}" --default-max-tokens ${dg.default_max_tokens ?? 2048}${dg.seed != null ? ` --seed ${dg.seed}` : ""} --expect-bus ${dev.bus_number} --build-tag ${MOCK_BUILDS.find((b) => b.path === p.build?.path)?.tag ?? "?"}`,
+          env,
+          commit: { limit_bytes: 95.4e9, charge_bytes: 48.7e9 },
+          diffusion: d,
+        };
+      }
       return {
         findings: [],
         results: mockCheckResults(p),
@@ -193,6 +371,7 @@ async function mock(cmd, args) {
         command_line: '"llama-server.exe" -m model.gguf -ngl 99 -c ' + (p?.runtime?.ctx_total ?? 0) + " -np " + (p?.runtime?.slots ?? 1) + " --port " + (p?.server?.port ?? 0),
         env: [["HIP_VISIBLE_DEVICES", (p?.devices?.length ?? 1) > 1 ? "0,2" : "2"], ["GPU_MAX_HW_QUEUES", "1"]],
         commit: { limit_bytes: 95.4e9, charge_bytes: 48.7e9 },
+        diffusion: null,
       };
     }
     case "status":
@@ -254,6 +433,40 @@ async function mock(cmd, args) {
       return { latest: { tag: "b10819", published_at: "2026-09-05" }, update_available: false, behind: 0, already_installed: true, newest_installed: { version: "b10819", path: "C:\\llama.cpp\\b10819-rocm" }, install_dir: "C:\\llama.cpp\\b10819-rocm", assets: [{ name: "llama-b10819-bin-win-cpu-x64.zip", size: 21e6 }], asset_error: null };
     case "update_history":
       return [];
+    case "unsloth_check": {
+      const tag = args.tag ?? MOCK_UNSLOTH_TAG;
+      const gfx = args.gfx || "gfx120X";
+      const name = `app-${tag}-windows-x64-rocm-${gfx}.zip`;
+      const known = MOCK_UNSLOTH_GFX.includes(gfx);
+      const dir = `C:\\llama.cpp\\${tag}-unsloth`;
+      const installed = MOCK_BUILDS.filter((b) => b.channel === "unsloth").map((b) => ({ tag: b.tag, version: b.version, path: b.path }));
+      if (mockUnslothInstalled) installed.unshift({ tag: `${tag}-unsloth`, version: "b11031", path: dir });
+      return {
+        latest: { tag, published_at: "2026-09-18T21:04:11Z", html_url: `https://github.com/unslothai/llama.cpp/releases/tag/${tag}`, assets: [], name: `llama.cpp prebuilt ${tag}`, body: "" },
+        upstream_tag: "b11031", gfx, gfx_available: MOCK_UNSLOTH_GFX,
+        asset: known ? { name, url: "", size: 494370803, digest: "sha256:09135ea01882040460a1eda0f301ca28effd270fdf661c3697d29119e2234011" } : null,
+        asset_error: known ? null : `release ${tag} has no ${name}; its Windows ROCm zips are: ${MOCK_UNSLOTH_GFX.map((g) => `app-${tag}-windows-x64-rocm-${g}.zip`).join(", ")}`,
+        install_dir: dir, already_installed: mockUnslothInstalled, installed,
+      };
+    }
+    case "unsloth_install": {
+      await new Promise((r) => setTimeout(r, 1500));
+      const tag = args.tag ?? MOCK_UNSLOTH_TAG;
+      const skipped = mockUnslothInstalled;
+      mockUnslothInstalled = true;
+      return {
+        tag, dir: `C:\\llama.cpp\\${tag}-unsloth`, source: "unsloth-prebuilt", skipped_existing: skipped,
+        verify: {
+          version: "b11031", commit: "a41c7e2d0", hip_ok: true, detail: "", runner_present: true,
+          devices: MOCK_DEVICES.map((d) => ({ index: d.device.hip_index, backend: "ROCm", name: d.device.name, total_mib: d.device.total_mib })),
+        },
+      };
+    }
+    case "unsloth_promote":
+      return {
+        batch: { at_unix: Math.floor(Date.now() / 1000), entries: [{ profile_id: "dg-26b", from: { path: MOCK_BUILDS[1].path, version: "b11027" }, to: { path: args.toPath, version: args.toVersion } }] },
+        skipped: [["worker-pool", "Unsloth fork build: pick it in the editor if wanted"], ["qwen-split", "Unsloth fork build: pick it in the editor if wanted"]],
+      };
     case "rocm_families":
       return ["gfx103X-all", "gfx110X-all", "gfx1151", "gfx120X-all"];
     case "rocm_available":
@@ -274,7 +487,7 @@ async function mock(cmd, args) {
     case "export_profile":
       return { path: "C:\\Users\\me\\.fidim\\profiles\\worker-pool.bat", text: "@echo off\r\nset \"HIP_VISIBLE_DEVICES=2\"\r\n\"llama-server.exe\" -m ..." };
     case "scan":
-      return { builds: [], models: [] };
+      return { builds: MOCK_BUILDS, models: MOCK_MODELS, drafts: [MOCK_PROFILE.model.draft.path], mmproj: [] };
     default:
       throw new Error("unmocked command: " + cmd);
   }
