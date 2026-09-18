@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use super::engine::{EngineEvent, EngineMsg, Job};
 use super::openai::{
     self, chat_chunk, chat_completion, delta_json, exceed_context, failure_error, finish_reason, shape_final,
-    timings, usage_chunk, ApiError, ChatPlan, RespMeta, StreamShaper,
+    timings, usage_chunk, ApiError, ChatPlan, RespMeta, StreamShaper, extract_tool_calls, tool_calls_json,
 };
 use super::protocol::Stats;
 use super::{dglog, lock, unix_now, ModelInfo, ServeConfig, Shared};
@@ -761,8 +761,15 @@ fn plain_chat(s: &mut TcpStream, ctx: &Ctx, plan: &ChatPlan, q: Enqueued, t_enq:
             }
             Ok(EngineEvent::Done) => {
                 let (reasoning, content, hit) = shape_final(&text, plan.raw_reasoning, &plan.stop);
-                let finish = finish_reason(toolong_after, sum.stats.as_ref(), ctx.info.canvas, plan.n_blocks, hit);
-                let v = chat_completion(&new_meta(ctx), &content, &reasoning, finish, sum.stats.as_ref(), sum.seed);
+                // The model writes tool calls as Gemma 4 text; clients expect OpenAI tool_calls.
+                let (content, calls) =
+                    if plan.req.tools.is_some() { extract_tool_calls(&content) } else { (content, Vec::new()) };
+                let finish = if calls.is_empty() {
+                    finish_reason(toolong_after, sum.stats.as_ref(), ctx.info.canvas, plan.n_blocks, hit)
+                } else {
+                    "tool_calls"
+                };
+                let v = chat_completion(&new_meta(ctx), &content, &reasoning, &calls, finish, sum.stats.as_ref(), sum.seed);
                 let _ = write_json(s, 200, &v, &[]);
                 sum.status = 200;
                 sum.finish = finish;
@@ -785,7 +792,7 @@ fn plain_chat(s: &mut TcpStream, ctx: &Ctx, plan: &ChatPlan, q: Enqueued, t_enq:
 
 fn stream_chat(s: &mut TcpStream, ctx: &Ctx, plan: &ChatPlan, q: Enqueued, t_enq: Instant) -> Summary {
     let mut sum = Summary::new(plan);
-    let mut shaper = StreamShaper::new(plan.raw_reasoning, plan.stop.clone());
+    let mut shaper = StreamShaper::new(plan.raw_reasoning, plan.stop.clone(), plan.req.tools.is_some());
     let mut first = None;
 
     // Hold the headers back until there is something to stream (or the
@@ -917,11 +924,19 @@ fn stream_body(
                 return stream_error(sse, &e);
             }
             EngineEvent::Done => {
-                for d in shaper.finish(&text) {
-                    sse.data(&chunk(delta_json(&d)))?;
+                let (deltas, calls) = shaper.finish(&text);
+                for d in &deltas {
+                    sse.data(&chunk(delta_json(d)))?;
+                }
+                if !calls.is_empty() {
+                    sse.data(&chunk(json!({ "tool_calls": tool_calls_json(&meta.id, &calls, true) })))?;
                 }
                 let (_, _, hit) = shape_final(&text, plan.raw_reasoning, &plan.stop);
-                let finish = finish_reason(toolong_after, sum.stats.as_ref(), ctx.info.canvas, plan.n_blocks, hit);
+                let finish = if calls.is_empty() {
+                    finish_reason(toolong_after, sum.stats.as_ref(), ctx.info.canvas, plan.n_blocks, hit)
+                } else {
+                    "tool_calls"
+                };
                 let t = sum.stats.as_ref().map(|st| ("timings", timings(st, sum.seed)));
                 sse.data(&chat_chunk(&meta, json!({}), Some(finish), t).to_string())?;
                 if plan.include_usage {

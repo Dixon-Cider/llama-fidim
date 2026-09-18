@@ -899,3 +899,44 @@ impl TestServer {
         code
     }
 }
+
+/// A reply that calls a tool comes back as OpenAI tool_calls, streamed or
+/// not, when the request offered tools; as text when it did not.
+#[test]
+fn tool_calls_are_parsed_when_tools_are_offered() {
+    let srv = start_fake(|_| {}, |cx| {
+        cx.ready(12288);
+        cx.serve(|_| "<|channel>thought\nneed weather<channel|><|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>".into());
+    });
+    srv.wait_status("/health", 200);
+    let tools = json!([{"type": "function", "function": {"name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]);
+
+    let (code, body) = post(srv.port(), &chat_body("weather?", json!({"tools": tools.clone()})));
+    assert_eq!(code, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "tool_calls", "{v}");
+    assert!(c["message"]["content"].is_null(), "{v}");
+    assert_eq!(c["message"]["reasoning_content"], "need weather");
+    assert_eq!(c["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+    assert_eq!(c["message"]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+
+    let mut s = connect(srv.port());
+    s.write_all(&post_raw(&chat_body("weather?", json!({"tools": tools, "stream": true})))).unwrap();
+    let (_, raw) = split_response(&read_all(s));
+    let events = sse_data(&dechunk(&raw));
+    let ev: Vec<Value> = events.iter().filter(|e| e.as_str() != "[DONE]").map(|e| serde_json::from_str(e).unwrap()).collect();
+    assert!(!ev.iter().any(|e| e["choices"][0]["delta"]["content"].as_str().is_some_and(|t| t.contains("tool_call"))), "{events:?}");
+    let tc = ev.iter().find(|e| e["choices"][0]["delta"].get("tool_calls").is_some()).expect("a tool_calls delta");
+    assert_eq!(tc["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+    assert_eq!(tc["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(ev.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+
+    // No tools in the request: the text is left alone.
+    let (_, body) = post(srv.port(), &chat_body("weather?", json!({})));
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["choices"][0]["message"]["content"].as_str().unwrap().contains("<|tool_call>call:get_weather"));
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    assert_eq!(srv.stop(), 0);
+}

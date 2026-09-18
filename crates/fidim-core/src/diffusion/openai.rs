@@ -448,13 +448,16 @@ pub enum Delta {
 pub struct StreamShaper {
     raw: bool,
     stop: Vec<String>,
+    /// The request offered tools: content stops streaming at a tool call,
+    /// which `finish` turns into `tool_calls`.
+    tools: bool,
     sent_reasoning: String,
     sent_content: String,
 }
 
 impl StreamShaper {
-    pub fn new(raw_reasoning: bool, stop: Vec<String>) -> Self {
-        StreamShaper { raw: raw_reasoning, stop, sent_reasoning: String::new(), sent_content: String::new() }
+    pub fn new(raw_reasoning: bool, stop: Vec<String>, tools: bool) -> Self {
+        StreamShaper { raw: raw_reasoning, stop, tools, sent_reasoning: String::new(), sent_content: String::new() }
     }
 
     /// Deltas for a new cumulative commit, and whether a stop string was hit
@@ -465,7 +468,17 @@ impl StreamShaper {
             None => (cumulative, false),
         };
         let safe = if hit { cut } else { &cut[..cut.len() - holdback(cut, !self.raw, &self.stop)] };
-        let (r, c) = if self.raw { (String::new(), safe.to_string()) } else { split_thought(safe) };
+        let (r, mut c) = if self.raw { (String::new(), safe.to_string()) } else { split_thought(safe) };
+        if self.tools {
+            // Never stream tool-call syntax as text: stop at a call, or at what may be the start of one.
+            match c.find(TOOL_START) {
+                Some(i) => c.truncate(i),
+                None => {
+                    let hold = holdback_marker(&c, TOOL_START);
+                    c.truncate(c.len() - hold);
+                }
+            }
+        }
         let mut out = Vec::new();
         if let Some(d) = r.strip_prefix(self.sent_reasoning.as_str()).filter(|d| !d.is_empty()) {
             out.push(Delta::Reasoning(d.to_string()));
@@ -484,11 +497,13 @@ impl StreamShaper {
         self.sent_content.clear();
     }
 
-    /// The rest of both channels once the job is done. If a channel diverged
-    /// from what was streamed, the tail after the common prefix is sent: a
-    /// glitch at the seam beats silently dropping the answer.
-    pub fn finish(&mut self, final_text: &str) -> Vec<Delta> {
+    /// The rest of both channels once the job is done, and the tool calls
+    /// when the request offered tools. If a channel diverged from what was
+    /// streamed, the tail after the common prefix is sent: a glitch at the
+    /// seam beats silently dropping the answer.
+    pub fn finish(&mut self, final_text: &str) -> (Vec<Delta>, Vec<ToolCall>) {
         let (r, c, _) = shape_final(final_text, self.raw, &self.stop);
+        let (c, calls) = if self.tools { extract_tool_calls(&c) } else { (c, Vec::new()) };
         let mut out = Vec::new();
         let rest_r = remainder(&self.sent_reasoning, &r);
         if !rest_r.is_empty() {
@@ -500,8 +515,13 @@ impl StreamShaper {
         }
         self.sent_reasoning = r;
         self.sent_content = c;
-        out
+        (out, calls)
     }
+}
+
+/// The longest proper prefix of `marker` that `text` ends with, in bytes.
+fn holdback_marker(text: &str, marker: &str) -> usize {
+    (1..marker.len()).rev().find(|&k| marker.is_char_boundary(k) && text.ends_with(&marker[..k])).unwrap_or(0)
 }
 
 /// `full` minus its longest common prefix with `sent` (char-aligned).
@@ -514,6 +534,193 @@ fn remainder<'a>(sent: &str, full: &'a str) -> &'a str {
         common = i + a.len_utf8();
     }
     &full[common..]
+}
+
+// ----------------------------------------------------------- tool calls ----
+
+/// One tool call the model made, with its arguments as a JSON object string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Where a Gemma 4 tool call starts; the whole call is
+/// `<|tool_call>call:NAME{ARGS}<tool_call|>`.
+const TOOL_START: &str = "<|tool_call>";
+const TOOL_OPEN: &str = "<|tool_call>call:";
+const TOOL_CLOSE: &str = "<tool_call|>";
+/// Gemma 4's string delimiter inside tool-call arguments.
+const G4_QUOTE: &str = "<|\"|>";
+
+/// Gemma 4's argument syntax (llama.cpp common/parsers/gemma4.cpp): strings
+/// between `<|"|>` (no escapes), bare keys up to `:`, JSON numbers, booleans
+/// and null, nested `{}` and `[]`, whitespace after `{ [ , :` and before
+/// `} ]`. Read into JSON.
+struct G4<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl<'a> G4<'a> {
+    fn rest(&self) -> &'a str {
+        &self.s[self.i..]
+    }
+    fn ws(&mut self) {
+        let r = self.rest();
+        self.i += r.len() - r.trim_start().len();
+    }
+    fn eat(&mut self, lit: &str) -> bool {
+        if self.rest().starts_with(lit) {
+            self.i += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+    fn value(&mut self, depth: u32) -> Option<Value> {
+        if depth > 64 {
+            return None;
+        }
+        self.ws();
+        if self.eat(G4_QUOTE) {
+            let end = self.rest().find(G4_QUOTE)?;
+            let v = self.rest()[..end].to_string();
+            self.i += end + G4_QUOTE.len();
+            return Some(Value::String(v));
+        }
+        if self.eat("{") {
+            let mut map = serde_json::Map::new();
+            self.ws();
+            if self.eat("}") {
+                return Some(Value::Object(map));
+            }
+            loop {
+                self.ws();
+                let key = if self.eat(G4_QUOTE) {
+                    let end = self.rest().find(G4_QUOTE)?;
+                    let k = self.rest()[..end].to_string();
+                    self.i += end + G4_QUOTE.len();
+                    k
+                } else {
+                    let end = self.rest().find([':', '}'])?;
+                    let k = self.rest()[..end].trim().to_string();
+                    self.i += end;
+                    k
+                };
+                if key.is_empty() || !self.eat(":") {
+                    return None;
+                }
+                let v = self.value(depth + 1)?;
+                map.insert(key, v);
+                self.ws();
+                if self.eat(",") {
+                    continue;
+                }
+                return self.eat("}").then_some(Value::Object(map));
+            }
+        }
+        if self.eat("[") {
+            let mut arr = Vec::new();
+            self.ws();
+            if self.eat("]") {
+                return Some(Value::Array(arr));
+            }
+            loop {
+                arr.push(self.value(depth + 1)?);
+                self.ws();
+                if self.eat(",") {
+                    continue;
+                }
+                return self.eat("]").then_some(Value::Array(arr));
+            }
+        }
+        for (lit, v) in [("true", Value::Bool(true)), ("false", Value::Bool(false)), ("null", Value::Null)] {
+            if self.eat(lit) {
+                return Some(v);
+            }
+        }
+        let r = self.rest();
+        let n = r.find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))).unwrap_or(r.len());
+        let num: Value = serde_json::from_str(&r[..n]).ok()?;
+        if !num.is_number() {
+            return None;
+        }
+        self.i += n;
+        Some(num)
+    }
+}
+
+/// Parse one `NAME{ARGS}<tool_call|>` after `<|tool_call>call:`: the call and
+/// the bytes it used.
+fn parse_one_call(s: &str) -> Option<(ToolCall, usize)> {
+    let brace = s.find('{')?;
+    let name = s[..brace].trim();
+    if name.is_empty() || name.contains(|c: char| c.is_whitespace() || c == '<') {
+        return None;
+    }
+    let mut p = G4 { s, i: brace };
+    let args = p.value(0)?;
+    if !args.is_object() {
+        return None;
+    }
+    p.ws();
+    if !p.eat(TOOL_CLOSE) {
+        return None;
+    }
+    Some((ToolCall { name: name.to_string(), arguments: args.to_string() }, p.i))
+}
+
+/// The model's Gemma 4 tool calls out of `content`, as llama-server's gemma4
+/// parser would read them: the content without the parsed calls, and the
+/// calls in order. A call that does not parse stays in the content as text.
+pub fn extract_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
+    let mut out = String::new();
+    let mut calls = Vec::new();
+    let mut rest = content;
+    while let Some(i) = rest.find(TOOL_OPEN) {
+        let after = &rest[i + TOOL_OPEN.len()..];
+        match parse_one_call(after) {
+            Some((call, used)) => {
+                out.push_str(&rest[..i]);
+                calls.push(call);
+                rest = &after[used..];
+            }
+            None => {
+                out.push_str(&rest[..i + TOOL_OPEN.len()]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    // Whitespace around the calls is the model's formatting, not an answer.
+    if !calls.is_empty() && out.trim().is_empty() {
+        out.clear();
+    }
+    (out, calls)
+}
+
+/// OpenAI's `tool_calls` array. Ids are unique per response: `call_` + the
+/// response id's tail + the index.
+pub fn tool_calls_json(meta_id: &str, calls: &[ToolCall], with_index: bool) -> Value {
+    let tail = &meta_id[meta_id.len().saturating_sub(12)..];
+    Value::Array(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut v = json!({
+                    "id": format!("call_{tail}{i}"),
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                });
+                if with_index {
+                    v["index"] = i.into();
+                }
+                v
+            })
+            .collect(),
+    )
 }
 
 // -------------------------------------------------------------- responses ----
@@ -587,6 +794,7 @@ pub fn chat_completion(
     meta: &RespMeta,
     content: &str,
     reasoning: &str,
+    calls: &[ToolCall],
     finish: &str,
     stats: Option<&Stats>,
     seed: i32,
@@ -594,6 +802,13 @@ pub fn chat_completion(
     let mut message = json!({ "role": "assistant", "content": content });
     if !reasoning.is_empty() {
         message["reasoning_content"] = reasoning.into();
+    }
+    if !calls.is_empty() {
+        // OpenAI: content is null when the turn is only tool calls.
+        if content.is_empty() {
+            message["content"] = Value::Null;
+        }
+        message["tool_calls"] = tool_calls_json(&meta.id, calls, false);
     }
     let mut v = json!({
         "id": meta.id,
@@ -845,7 +1060,7 @@ mod shaping_tests {
 
     #[test]
     fn stream_shaper_golden_three_blocks_with_split_marker() {
-        let mut sh = StreamShaper::new(false, vec![]);
+        let mut sh = StreamShaper::new(false, vec![], false);
         let (d, hit) = sh.on_commit("<|channel>thought\nThe user wants");
         assert!(!hit);
         assert_eq!(d, vec![Delta::Reasoning("The user wants".into())]);
@@ -854,26 +1069,26 @@ mod shaping_tests {
         assert_eq!(d, vec![Delta::Reasoning(" a greeting.".into())]);
         let (d, _) = sh.on_commit("<|channel>thought\nThe user wants a greeting.<channel|>Hello there");
         assert_eq!(d, vec![Delta::Content("Hello there".into())]);
-        let d = sh.finish("<|channel>thought\nThe user wants a greeting.<channel|>Hello there");
+        let d = sh.finish("<|channel>thought\nThe user wants a greeting.<channel|>Hello there").0;
         assert!(d.is_empty());
     }
 
     #[test]
     fn stream_shaper_stop_and_finish() {
-        let mut sh = StreamShaper::new(false, s(&["END"]));
+        let mut sh = StreamShaper::new(false, s(&["END"]), false);
         assert_eq!(sh.on_commit("abc E").0, vec![Delta::Content("abc ".into())]);
         let (d, hit) = sh.on_commit("abc ENDING");
         assert!(hit);
         assert!(d.is_empty(), "nothing past the stop string: {d:?}");
         // Held-back text is released by finish.
-        let mut sh = StreamShaper::new(false, vec![]);
+        let mut sh = StreamShaper::new(false, vec![], false);
         assert_eq!(sh.on_commit("Hi <").0, vec![Delta::Content("Hi ".into())]);
-        assert_eq!(sh.finish("Hi <"), vec![Delta::Content("<".into())]);
+        assert_eq!(sh.finish("Hi <").0, vec![Delta::Content("<".into())]);
         // Raw mode streams markers as content.
-        let mut sh = StreamShaper::new(true, vec![]);
+        let mut sh = StreamShaper::new(true, vec![], false);
         assert_eq!(sh.on_commit("<think>x").0, vec![Delta::Content("<think>x".into())]);
         // reset: a retry starts both channels over.
-        let mut sh = StreamShaper::new(false, vec![]);
+        let mut sh = StreamShaper::new(false, vec![], false);
         sh.on_commit("one");
         sh.reset();
         assert_eq!(sh.on_commit("two").0, vec![Delta::Content("two".into())]);
@@ -934,7 +1149,7 @@ mod shaping_tests {
     #[test]
     fn response_builders() {
         let meta = RespMeta { id: "chatcmpl-x".into(), created: 1, model: "dg".into() };
-        let v = chat_completion(&meta, "", "", "stop", None, 1);
+        let v = chat_completion(&meta, "", "", &[], "stop", None, 1);
         assert_eq!(v["choices"][0]["message"]["content"], "");
         assert!(v["choices"][0]["message"].get("reasoning_content").is_none());
         assert!(v.get("timings").is_none());
@@ -949,5 +1164,112 @@ mod shaping_tests {
         assert_eq!(e.message, "diffusion engine crashed (exit 0xC0000409): GGML_ASSERT(x) failed");
         assert_eq!(failure_error(&EngineFailure::Oom).kind, "exceed_context_size_error");
         assert_eq!(failure_error(&EngineFailure::Watchdog(180)).message, "diffusion engine produced no output for 180 s; restarted");
+    }
+}
+
+#[cfg(test)]
+mod tool_call_tests {
+    use super::*;
+
+    const Q: &str = "<|\"|>";
+
+    fn call(name: &str, args: &str) -> String {
+        format!("<|tool_call>call:{name}{args}<tool_call|>")
+    }
+
+    #[test]
+    fn parses_what_the_model_writes() {
+        // Verbatim from DiffusionGemma 26B-A4B (tests/tool_call_probe.py).
+        let text = format!("{}", call("get_weather", &format!("{{city:{Q}Paris{Q},unit:{Q}celsius{Q}}}")));
+        let (content, calls) = extract_tool_calls(&text);
+        assert_eq!(content, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args, json!({"city": "Paris", "unit": "celsius"}));
+
+        let (_, calls) = extract_tool_calls(&call("terminal", &format!("{{command:{Q}ls -la | head{Q}}}")));
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].arguments).unwrap(), json!({"command": "ls -la | head"}));
+    }
+
+    #[test]
+    fn values_nesting_and_several_calls() {
+        let args = format!(
+            "{{ path: {Q}a, b{Q}, n: -3.5e2, ok: true, off: false, none: null, list: [1, {Q}x{Q}, [ ], {{ }}], \
+             obj: {{ inner: {{k:{Q}v{Q}}} }} }}"
+        );
+        let text = format!("Let me check.\n{}\n{}", call("write_file", &args), call("noop", "{}"));
+        let (content, calls) = extract_tool_calls(&text);
+        assert_eq!(content, "Let me check.\n\n");
+        assert_eq!(calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["write_file", "noop"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].arguments).unwrap(),
+            json!({"path": "a, b", "n": -350.0, "ok": true, "off": false, "none": null,
+                   "list": [1, "x", [], {}], "obj": {"inner": {"k": "v"}}})
+        );
+        assert_eq!(calls[1].arguments, "{}");
+        // A quoted key is accepted too.
+        let (_, calls) = extract_tool_calls(&call("f", &format!("{{{Q}key{Q}:1}}")));
+        assert_eq!(calls[0].arguments, r#"{"key":1}"#);
+    }
+
+    #[test]
+    fn malformed_calls_stay_text() {
+        for bad in [
+            call("f", &format!("{{a:{Q}unterminated}}")),
+            call("f", "{a:1"),
+            call("f", "{:1}"),
+            call("f", "[1,2]"),
+            call("", "{a:1}"),
+            "<|tool_call>call:f{a:1}".to_string(), // no close
+            call("f", "{a:tru}"),
+        ] {
+            let (content, calls) = extract_tool_calls(&bad);
+            assert!(calls.is_empty(), "{bad}");
+            assert_eq!(content, bad);
+        }
+        // A good call after a bad one still parses; the bad one stays.
+        let text = format!("{}{}", call("f", "{a:"), call("g", "{b:2}"));
+        let (content, calls) = extract_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "g");
+        assert!(content.starts_with("<|tool_call>call:f{a:"));
+        // No tool call at all: untouched.
+        assert_eq!(extract_tool_calls("plain text").0, "plain text");
+    }
+
+    #[test]
+    fn stream_holds_tool_calls_back() {
+        let mut sh = StreamShaper::new(false, vec![], true);
+        let (d, _) = sh.on_commit("<|channel>thought\nuse the tool<channel|>Checking.<|tool");
+        assert_eq!(d, vec![Delta::Reasoning("use the tool".into()), Delta::Content("Checking.".into())]);
+        let full = format!("<|channel>thought\nuse the tool<channel|>Checking.{}", call("get_weather", &format!("{{city:{Q}Oslo{Q}}}")));
+        let (d, _) = sh.on_commit(&full);
+        assert!(d.is_empty(), "no call syntax as text: {d:?}");
+        let (d, calls) = sh.finish(&full);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, r#"{"city":"Oslo"}"#);
+        // Without tools offered, the text streams as before.
+        let mut sh = StreamShaper::new(false, vec![], false);
+        let (d, calls) = sh.finish(&call("f", "{a:1}"));
+        assert!(calls.is_empty());
+        assert_eq!(d, vec![Delta::Content(call("f", "{a:1}"))]);
+    }
+
+    #[test]
+    fn response_shapes() {
+        let meta = RespMeta { id: "chatcmpl-0123456789abcdef".into(), created: 1, model: "m".into() };
+        let calls = vec![ToolCall { name: "f".into(), arguments: r#"{"a":1}"#.into() }];
+        let v = chat_completion(&meta, "", "why", &calls, "tool_calls", None, 0);
+        let m = &v["choices"][0]["message"];
+        assert!(m["content"].is_null());
+        assert_eq!(m["reasoning_content"], "why");
+        assert_eq!(m["tool_calls"][0]["id"], "call_456789abcdef0");
+        assert_eq!(m["tool_calls"][0]["type"], "function");
+        assert_eq!(m["tool_calls"][0]["function"], json!({"name": "f", "arguments": "{\"a\":1}"}));
+        assert!(m["tool_calls"][0].get("index").is_none());
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(tool_calls_json(&meta.id, &calls, true)[0]["index"], 0);
     }
 }
