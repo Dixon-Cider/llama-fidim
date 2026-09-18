@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-  Build Llama FIDIM and install it where a shortcut can point: the CLI and the
-  GUI go to %LOCALAPPDATA%\Programs\LlamaFIDIM, a Start Menu shortcut is
+  Build Llama FIDIM and install it where a shortcut can point: the CLI, the
+  GUI and the DiffusionGemma server (fidim-dg.exe) go to
+  %LOCALAPPDATA%\Programs\LlamaFIDIM, a Start Menu shortcut is
   created, and optionally the folder is added to the user PATH.
 
   Re-run after `git pull` / code changes to update the installed copies.
@@ -62,7 +63,9 @@ if (-not $NoBuild) {
   } finally { Pop-Location }
 }
 
-foreach ($exe in 'fidim.exe', 'llama-fidim.exe') {
+# fidim-dg.exe is the DiffusionGemma server; without it every diffusion
+# launch blocks at pre-flight, so -NoBuild must not install a set without it.
+foreach ($exe in 'fidim.exe', 'fidim-dg.exe', 'llama-fidim.exe') {
   if (-not (Test-Path (Join-Path $release $exe))) { throw "missing $release\$exe - build first" }
 }
 
@@ -85,8 +88,25 @@ New-Item -ItemType Directory -Force $dest | Out-Null
 # The installed GUI may be running too.
 Get-Process llama-fidim -ErrorAction SilentlyContinue |
   Where-Object { $_.Path -like "$dest*" } | Stop-Process -Force
+# A running fidim-dg.exe is a live diffusion server holding a model in VRAM:
+# never stop it. Windows lets a running image be renamed but not replaced, so
+# move it aside; it keeps serving (same pid, same image name, so `fidim stop`
+# still finds it) and the next install deletes the old copy once it exits.
+# Done before the keep-alive helpers are stopped: if the rename fails, the
+# script throws with every llama-server run still kept alive.
+$dg = Join-Path $dest 'fidim-dg.exe'
+Get-ChildItem $dest -Filter 'fidim-dg.exe.old-*' -ErrorAction SilentlyContinue |
+  Remove-Item -Force -ErrorAction SilentlyContinue
+if (Get-Process fidim-dg -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $dg }) {
+  $aside = 'fidim-dg.exe.old-' + (Get-Date -Format yyyyMMddHHmmss)
+  try { Rename-Item $dg $aside -ErrorAction Stop }
+  catch {
+    throw "a running diffusion server holds $dg and it could not be renamed aside: $($_.Exception.Message). Stop the diffusion profile (fidim stop <id>) and run the installer again."
+  }
+  Write-Host "== moved the running fidim-dg.exe aside as $aside (its server keeps running)"
+}
 # Keep-alive helpers hold fidim.exe open; stop them, remember which runs
-# had one, and restart them from the new binary afterwards. (Stop-Process,
+# had one, and restart them afterwards, even when a copy fails. (Stop-Process,
 # never Git-Bash taskkill: MSYS mangles /PID into a path.)
 $helpers = Get-CimInstance Win32_Process -Filter "Name='fidim.exe'" |
   Where-Object { $_.CommandLine -like '*keepalive*' }
@@ -98,22 +118,28 @@ foreach ($h in $helpers) {
   Stop-Process -Id $h.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Milliseconds 500
-foreach ($exe in 'fidim.exe', 'llama-fidim.exe') {
-  Copy-Item (Join-Path $release $exe) (Join-Path $dest $exe) -Force
-}
-foreach ($r in $restart) {
-  $p = Start-Process -FilePath (Join-Path $dest 'fidim.exe') -WindowStyle Hidden -PassThru `
-    -ArgumentList @('keepalive', '--host', '127.0.0.1', '--port', $r.port, '--interval', $r.interval, '--server-pid', $r.serverPid)
-  # Point the run state at the new helper pid so `stop` still kills it.
-  Get-ChildItem "$env:USERPROFILE\.fidim\runs\*-$($r.port).json" -ErrorAction SilentlyContinue | ForEach-Object {
-    $j = Get-Content $_.FullName -Raw | ConvertFrom-Json
-    if ("$($j.pid)" -eq $r.serverPid) {
-      $j | Add-Member -NotePropertyName keepalive_pid -NotePropertyValue $p.Id -Force
-      # No BOM: the tool reads these with serde_json.
-      [IO.File]::WriteAllText($_.FullName, ($j | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
-    }
+try {
+  foreach ($exe in 'fidim.exe', 'fidim-dg.exe', 'llama-fidim.exe') {
+    try { Copy-Item (Join-Path $release $exe) (Join-Path $dest $exe) -Force -ErrorAction Stop }
+    catch { throw "could not copy $exe into ${dest}: $($_.Exception.Message). A running copy may hold it open." }
   }
-  Write-Host ("== restarted keep-alive for port {0} (pid {1})" -f $r.port, $p.Id)
+} finally {
+  # From whichever fidim.exe is in place now (the new one, or the old one
+  # when its copy failed).
+  foreach ($r in $restart) {
+    $p = Start-Process -FilePath (Join-Path $dest 'fidim.exe') -WindowStyle Hidden -PassThru `
+      -ArgumentList @('keepalive', '--host', '127.0.0.1', '--port', $r.port, '--interval', $r.interval, '--server-pid', $r.serverPid)
+    # Point the run state at the new helper pid so `stop` still kills it.
+    Get-ChildItem "$env:USERPROFILE\.fidim\runs\*-$($r.port).json" -ErrorAction SilentlyContinue | ForEach-Object {
+      $j = Get-Content $_.FullName -Raw | ConvertFrom-Json
+      if ("$($j.pid)" -eq $r.serverPid) {
+        $j | Add-Member -NotePropertyName keepalive_pid -NotePropertyValue $p.Id -Force
+        # No BOM: the tool reads these with serde_json.
+        [IO.File]::WriteAllText($_.FullName, ($j | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+      }
+    }
+    Write-Host ("== restarted keep-alive for port {0} (pid {1})" -f $r.port, $p.Id)
+  }
 }
 
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
@@ -142,4 +168,5 @@ Write-Host ""
 Write-Host "installed: $ver"
 Write-Host "  GUI : $dest\llama-fidim.exe"
 Write-Host "  CLI : $dest\fidim.exe"
+Write-Host "  DG  : $dest\fidim-dg.exe (the DiffusionGemma server the app starts)"
 Write-Host "  to pin: Start Menu -> right-click 'Llama FIDIM' -> Pin to taskbar"

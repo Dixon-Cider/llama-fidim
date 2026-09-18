@@ -46,7 +46,7 @@ jobs:
           if ($tag -notmatch '^v') { $tag = "dev-" + "${{ github.sha }}".Substring(0, 7) }
           $name = "llama-fidim-$tag-win-x64"
           New-Item -ItemType Directory -Force $name | Out-Null
-          Copy-Item target\release\fidim.exe, target\release\llama-fidim.exe, LICENSE, README.md $name\
+          Copy-Item target\release\fidim.exe, target\release\fidim-dg.exe, target\release\llama-fidim.exe, LICENSE, README.md $name\
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           # LF and no BOM, so `sha256sum -c` matches the file name on any OS.
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
@@ -58,6 +58,10 @@ jobs:
         run: |
           & target\release\fidim.exe --version
           & target\release\fidim.exe runtimes
+          # The DiffusionGemma server only parses its arguments here; it
+          # needs no GPU or model to print help.
+          & target\release\fidim-dg.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "fidim-dg.exe --help exited $LASTEXITCODE" }
 
       - uses: actions/upload-artifact@v4
         with:
