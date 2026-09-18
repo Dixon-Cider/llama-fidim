@@ -121,11 +121,27 @@
   const sparkLine = (pts) => pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
   const sparkArea = (pts) => (pts.length ? `M0,${SH} L${sparkLine(pts)} L${SW},${SH} Z` : "");
 
+  // DiffusionGemma slots mark how much of `generated` is committed; the rest
+  // is the current block's draft, rewritten every denoise step.
+  const isDiffusion = (x) => x.committed_chars != null;
+  function draftChars(x) {
+    if (!isDiffusion(x)) return 0;
+    const shown = [...(x.generated ?? "")].length;
+    return Math.min(shown, Math.max(0, x.generated_chars - x.committed_chars));
+  }
+  // generated is a tail; the draft is its last draftChars(x) chars.
+  function splitDraft(x) {
+    const chars = [...(x.generated ?? "")];
+    const n = draftChars(x);
+    return [chars.slice(0, chars.length - n).join(""), chars.slice(chars.length - n).join("")];
+  }
   function slotTitle(x) {
     if (!x.is_processing) return `slot ${x.id}: idle · ${Math.round(100 * x.ctx_fraction)}% of ${x.n_ctx.toLocaleString()} ctx used`;
     const p = x.phase === "prefill"
       ? `prefill ${x.n_prompt_tokens_processed.toLocaleString()} / ${x.n_prompt_tokens.toLocaleString()} prompt tokens`
-      : `decode ${x.n_decoded.toLocaleString()} generated, ${Math.max(0, x.n_remain).toLocaleString()} remaining`;
+      : isDiffusion(x)
+        ? `denoise: ${x.n_decoded.toLocaleString()} of ${(x.n_decoded + Math.max(0, x.n_remain)).toLocaleString()} canvas tokens`
+        : `decode ${x.n_decoded.toLocaleString()} generated, ${Math.max(0, x.n_remain).toLocaleString()} remaining`;
     return `slot ${x.id}: ${p} · ${Math.round(100 * x.ctx_fraction)}% of ${x.n_ctx.toLocaleString()} ctx used`;
   }
   function slotProgress(x) {
@@ -283,7 +299,7 @@
               <span class="what">
                 {#if x.loop_hint}loop ×{x.loop_hint.repeats}
                 {:else if x.phase === "prefill"}prefill
-                {:else if x.phase === "decode"}decoding
+                {:else if x.phase === "decode"}{isDiffusion(x) ? "denoising" : "decoding"}
                 {:else}&nbsp;{/if}
               </span>
               <div class="ctx" style="width: {Math.round(100 * x.ctx_fraction)}%;" title="context used"></div>
@@ -298,6 +314,7 @@
               <span class="chip {phaseChip(x.phase)}">{x.phase}</span>
               {#if x.loop_hint}<span class="chip block live">looping × {x.loop_hint.repeats} <span style="text-transform: none; letter-spacing: 0; font-weight: 500;">“{trimFrag(x.loop_hint.fragment)}”</span></span>{/if}
               {#if x.generated != null}<span class="faint small">{x.generated_chars.toLocaleString()} chars generated · prompt {x.prompt_chars.toLocaleString()} chars{#if x.prompt_chars > 4000 || x.generated_chars > 4000} · showing the last 4,000 of each{/if}</span>{/if}
+              {#if draftChars(x) > 0}<span class="chip plain" title="DiffusionGemma writes a whole block at once: each denoise step rewrites the block's draft (dimmed) until it settles and is committed.">draft {draftChars(x).toLocaleString()} chars</span>{/if}
               <button class="btn small" style="margin-left: auto;" onclick={() => toggleSlot(k, x.id)}>Close</button>
             </div>
             {#if x.prompt == null && x.generated == null}
@@ -309,8 +326,13 @@
                   <pre use:stick>{x.prompt ?? ""}</pre>
                 </div>
                 <div class="pane">
-                  <div class="pl">generated {x.is_processing ? "so far" : "in the last request"}</div>
-                  <pre use:stick>{x.generated ?? ""}</pre>
+                  <div class="pl">generated {x.is_processing ? "so far" : "in the last request"}{isDiffusion(x) && x.is_processing ? " · committed, then the current block's draft" : ""}</div>
+                  {#if isDiffusion(x)}
+                    {@const parts = splitDraft(x)}
+                    <pre use:stick>{parts[0]}<span class="draft">{parts[1]}</span></pre>
+                  {:else}
+                    <pre use:stick>{x.generated ?? ""}</pre>
+                  {/if}
                 </div>
               </div>
             {/if}
@@ -401,6 +423,7 @@
     font-family: var(--mono); font-size: 12px; line-height: 1.55; color: var(--ink-muted);
   }
   .drawer.loop .pane:last-child pre { border-color: rgba(232, 125, 110, 0.5); color: var(--ink); }
+  .pane pre .draft { opacity: 0.55; font-style: italic; }
   @media (max-width: 1100px) { .panes { grid-template-columns: 1fr; } }
   .slot { transition: border-color var(--t-layout), background-color var(--t-layout), box-shadow var(--t-fast); }
   .slot .fill { position: absolute; inset: 0 auto 0 0; transition: width .3s ease, background-color var(--t-layout); }

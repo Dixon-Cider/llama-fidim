@@ -435,8 +435,23 @@ async function mock(cmd, args) {
         resident: [{ card: MOCK_DEVICES[0].device.stable_key, dedicated_bytes: 26.2e9, committed_bytes: 26.2e9 }, { card: MOCK_DEVICES[2].device.stable_key, dedicated_bytes: 13.1e9, committed_bytes: 13.1e9 }],
         gpu_busy_percent: 67,
       };
+      // A standalone DiffusionGemma run (fidim-dg): committed blocks, then the
+      // current block's draft sharpening step by step.
+      const dgSample = (() => {
+            // fidim-dg: committed blocks, then the current block's draft sharpening step by step.
+            const committed = "<|channel>thought\nThe user wants a haiku about GPUs. Five, seven, five.<channel|>";
+            const drafts = ["Sil sil  hum hum warm", "Silicon hums warm\nthous thous cores cores", "Silicon hums warm\nthousand small cores think as one\nthe fan", "Silicon hums warm\nthousand small cores think as one\nthe fan sings them home"];
+            const d = drafts[tick % drafts.length];
+            return { model: null, sampled_unix_ms: t, phase: "decode", slots: [slot(0, "decode", { prompt: "[user]\nWrite a haiku about GPUs.", prompt_chars: 33, generated: committed + d, generated_chars: committed.length + d.length, committed_chars: committed.length, loop_hint: null, n_decoded: 256 + 64 * (1 + tick % 4), n_remain: 512 - 64 * (1 + tick % 4) })], metrics: metrics(33, 512, 0), error: null };
+          })();
+      const runDiffusion = {
+        run: { state: { profile_id: "dg-26b", pid: 32400, port: 9760, host: "127.0.0.1", alias: "diffusiongemma", started_unix: Math.floor(t / 1000) - 600, log_path: "", command_line: "", visibility_env: "1", device_keys: [MOCK_DEVICES[2].device.stable_key], free_mib_before: [], cold_start: false }, alive: true, health: "healthy", crashed: false },
+        samples: [dgSample],
+        resident: [{ card: MOCK_DEVICES[2].device.stable_key, dedicated_bytes: 19.7e9, committed_bytes: 19.7e9 }],
+        gpu_busy_percent: 88,
+      };
       const runCrashed = { run: { ...MOCK_RUN, alive: false, health: "dead", crashed: true }, samples: [], resident: [], gpu_busy_percent: 0 };
-      return { runs: [runRouter, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
+      return { runs: [runRouter, runDiffusion, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
     }
     case "get_config":
       return { path: "C:\\Users\\me\\.fidim\\config.json", config: { build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models"], rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.fidim\\profiles", runs_dir: "C:\\Users\\me\\.fidim\\runs", keep_alive_seconds: 0, runtimes: [] } };
