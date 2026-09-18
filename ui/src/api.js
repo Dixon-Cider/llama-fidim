@@ -10,6 +10,50 @@ if (inTauri) {
   invoke = mod.invoke;
 }
 
+
+// A DiffusionGemma run for the browser preview: a haiku block that resolves
+// out of noise over 16 steps (one step per 200 ms), after a committed
+// thought. mockDgFrames() is the same reply as the helper's /frames.
+const DG_THOUGHT = "<|channel>thought\nThe user wants a haiku about GPUs. Five, seven, five syllables.<channel|>";
+const DG_ANSWER = "Silicon hums warm,\nthousand small cores think as one,\nthe fan sings them home.";
+const DG_STEPS = 16;
+function dgNoisy(text, step, total) {
+  const junk = [",", ",", " ", "\n", "*", ":", "the", "the", "."];
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const settled = ((i * 7919) % 97) / 97 < (step + 1) / total;
+    out += settled || text[i] === "\n" ? text[i] : junk[(i * 31 + step * 7) % junk.length];
+  }
+  return out;
+}
+function mockDgFrames() {
+  const frames = [];
+  for (let st = 0; st < DG_STEPS; st++) frames.push({ b: 0, s: st, t: 48, x: dgNoisy(DG_THOUGHT, st, DG_STEPS) });
+  for (let st = 0; st < DG_STEPS; st++) frames.push({ b: 1, s: st, t: 48, x: dgNoisy(DG_ANSWER, st, DG_STEPS) });
+  return { id_task: 12, canvas: 256, dropped: 0, frames };
+}
+function mockDiffusionSample(t) {
+  const step = Math.floor(t / 200) % (DG_STEPS + 4);   // a short pause between replies
+  const st = Math.min(step, DG_STEPS - 1);
+  const draft = step < DG_STEPS ? dgNoisy(DG_ANSWER, st, DG_STEPS) : "";
+  const processing = step < DG_STEPS;
+  const generated = DG_THOUGHT + (processing ? draft : DG_ANSWER);
+  return {
+    model: null, sampled_unix_ms: t, phase: processing ? "decode" : "idle",
+    slots: [{
+      id: 0, id_task: 12, n_ctx: 65536, is_processing: processing, phase: processing ? "decode" : "idle",
+      n_prompt_tokens: 18, n_prompt_tokens_processed: 18, n_prompt_tokens_cache: 0,
+      n_decoded: processing ? 256 + Math.round(256 * (st + 1) / 48) : 0, n_remain: processing ? 256 - Math.round(256 * (st + 1) / 48) : 0,
+      prefill_fraction: 1, ctx_fraction: 0.01,
+      prompt: "[user]\nWrite a haiku about GPUs.", prompt_chars: 33,
+      generated, generated_chars: generated.length, committed_chars: DG_THOUGHT.length + (processing ? 0 : DG_ANSWER.length), loop_hint: null,
+      diffusion: { block: processing ? 1 : 1, n_blocks: 2, step: st, total: 48, steps_done: DG_STEPS + st + 1, canvas: 256, state: processing ? "denoise" : "idle" },
+    }],
+    metrics: { tokens_predicted_total: 512, prompt_tokens_total: 18, requests_processing: processing ? 1 : 0, requests_deferred: 0, predicted_tokens_seconds: 38.4, diffusion_canvas_tokens_seconds: 1114 },
+    error: null,
+  };
+}
+
 export async function api(cmd, args = {}) {
   if (!invoke) return mock(cmd, args);
   try {
@@ -419,6 +463,10 @@ async function mock(cmd, args) {
     case "launch_profile":
       await new Promise((r) => setTimeout(r, 2000));
       return { blocked: false, results: mockCheckResults(null), state: MOCK_RUN.state, cold_start: false, placement: [{ key: MOCK_RUN.state.device_keys[0], expected_bytes: 20.7e9, dedicated_bytes: 21.3e9, committed_bytes: 19.3e9 }] };
+    case "live_one":
+      return mockDiffusionSample(Date.now());
+    case "dg_frames":
+      return mockDgFrames();
     case "live": {
       const t = Date.now();
       const tick = Math.floor(t / 1000);
@@ -437,13 +485,7 @@ async function mock(cmd, args) {
       };
       // A standalone DiffusionGemma run (fidim-dg): committed blocks, then the
       // current block's draft sharpening step by step.
-      const dgSample = (() => {
-            // fidim-dg: committed blocks, then the current block's draft sharpening step by step.
-            const committed = "<|channel>thought\nThe user wants a haiku about GPUs. Five, seven, five.<channel|>";
-            const drafts = ["Sil sil  hum hum warm", "Silicon hums warm\nthous thous cores cores", "Silicon hums warm\nthousand small cores think as one\nthe fan", "Silicon hums warm\nthousand small cores think as one\nthe fan sings them home"];
-            const d = drafts[tick % drafts.length];
-            return { model: null, sampled_unix_ms: t, phase: "decode", slots: [slot(0, "decode", { prompt: "[user]\nWrite a haiku about GPUs.", prompt_chars: 33, generated: committed + d, generated_chars: committed.length + d.length, committed_chars: committed.length, loop_hint: null, n_decoded: 256 + 64 * (1 + tick % 4), n_remain: 512 - 64 * (1 + tick % 4) })], metrics: metrics(33, 512, 0), error: null };
-          })();
+      const dgSample = mockDiffusionSample(t);
       const runDiffusion = {
         run: { state: { profile_id: "dg-26b", pid: 32400, port: 9760, host: "127.0.0.1", alias: "diffusiongemma", started_unix: Math.floor(t / 1000) - 600, log_path: "", command_line: "", visibility_env: "1", device_keys: [MOCK_DEVICES[2].device.stable_key], free_mib_before: [], cold_start: false }, alive: true, health: "healthy", crashed: false },
         samples: [dgSample],

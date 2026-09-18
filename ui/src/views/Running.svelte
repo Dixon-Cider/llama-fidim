@@ -6,6 +6,7 @@
   import { arrive, leave, flipParams, stagger, LAYOUT } from "../motion.js";
   import CountUp from "../components/CountUp.svelte";
   import Skeleton from "../components/Skeleton.svelte";
+  import DiffusionCanvas from "../components/DiffusionCanvas.svelte";
 
   let data = $state({ runs: [], cards: [] });
   let loaded = $state(false);   // first poll landed: skeletons give way to content
@@ -26,7 +27,7 @@
   let now = $state(Math.floor(Date.now() / 1000));
   // Per (run, model) history of counter samples for rates and sparklines.
   const hist = new Map();
-  let rates = $state({});   // key -> { decode, prompt, accept }
+  let rates = $state({});   // key -> { decode, prompt, accept, canvas }
   let spark = $state({});   // key -> [decode tok/s ...] last 60
 
   const GIB = 1024 * 1024 * 1024;
@@ -46,18 +47,23 @@
           const m = s.metrics ?? {};
           const prev = hist.get(k);
           const slots = new Map();
-          let gen = 0, prompt = 0;
+          let gen = 0, prompt = 0, canvas = 0;
           for (const x of s.slots) {
-            slots.set(x.id, { task: x.id_task, dec: x.n_decoded, proc: x.n_prompt_tokens_processed });
+            // DiffusionGemma: every denoise step predicts the whole canvas
+            // (Unsloth Studio's "Speed" counts those tokens).
+            const steps = x.diffusion?.steps_done ?? 0, cv = x.diffusion?.canvas ?? 0;
+            slots.set(x.id, { task: x.id_task, dec: x.n_decoded, proc: x.n_prompt_tokens_processed, steps });
             const ps = prev?.slots?.get(x.id);
             if (ps && ps.task === x.id_task) {
               if (x.n_decoded > ps.dec) gen += x.n_decoded - ps.dec;
               if (x.n_prompt_tokens_processed > ps.proc) prompt += x.n_prompt_tokens_processed - ps.proc;
+              if (steps > ps.steps) canvas += (steps - ps.steps) * cv;
             } else if (ps && x.is_processing) {
               // A new request started since the last poll: what it has
               // done so far is this interval's work.
               gen += x.n_decoded;
               prompt += x.n_prompt_tokens_processed;
+              canvas += steps * cv;
             }
           }
           const cur = { t: s.sampled_unix_ms, slots, dn: m.spec_decode_num_draft_tokens_total ?? 0, da: m.spec_decode_num_accepted_tokens_total ?? 0 };
@@ -67,8 +73,10 @@
             const promptRate = prompt / dt;
             const dd = cur.dn - prev.dn;
             const accept = dd > 0 ? (cur.da - prev.da) / dd : null;
-            rates = { ...rates, [k]: { decode, prompt: promptRate, accept } };
-            spark = { ...spark, [k]: [...(spark[k] ?? []), decode].slice(-60) };
+            const canvasRate = canvas / dt;
+            const dg = s.slots.some((x) => x.diffusion);
+            rates = { ...rates, [k]: { decode, prompt: promptRate, accept, canvas: canvasRate } };
+            spark = { ...spark, [k]: [...(spark[k] ?? []), dg ? canvasRate : decode].slice(-60) };
           }
           hist.set(k, cur);
         }
@@ -243,6 +251,7 @@
       {@const pts = sparkPts(spark[k])}
       {@const busySlots = s.slots.filter((x) => x.is_processing).length}
       {@const hasDraft = (m.spec_decode_num_draft_tokens_total ?? 0) > 0}
+      {@const dg = s.slots.some((x) => x.diffusion)}
       <div class="model" class:active={s.phase !== "idle"} in:fly={arrive(stagger(si, 40))} out:slide={leave} animate:flip={flipParams}>
         <div class="ident">
           <div class="model-name">{s.model ?? r.state.alias}</div>
@@ -253,6 +262,22 @@
         </div>
 
         <div class="stats">
+          {#if dg}
+            <!-- Diffusion: text delivered (compare with autoregressive decode) vs.
+                 canvas tokens predicted per step (Unsloth Studio's "Speed"). -->
+            <div class="stat" class:dim={!m.predicted_tokens_seconds} title="Answer tokens delivered per second over the last reply, prefill included. Compare this with an autoregressive model's decode speed.">
+              <span class="v">{fmt1(m.predicted_tokens_seconds)}<small>tok/s</small></span>
+              <span class="l">output, last reply</span>
+            </div>
+            <div class="stat" class:dim={!rt?.canvas} title="Canvas tokens predicted per second right now: every denoise step re-predicts the whole 256-token block. This is how Unsloth Studio counts its Speed.">
+              <span class="v">{fmt0(rt?.canvas)}<small>tok/s</small></span>
+              <span class="l">canvas, now</span>
+            </div>
+            <div class="stat" class:dim={!m.diffusion_canvas_tokens_seconds} title="Unsloth Studio's headline Speed for the last reply: 256 × denoise steps ÷ time.">
+              <span class="v">{fmt0(m.diffusion_canvas_tokens_seconds)}<small>tok/s</small></span>
+              <span class="l">canvas, last reply</span>
+            </div>
+          {:else}
           <div class="stat" class:dim={!rt?.decode}>
             <span class="v">{fmt1(rt?.decode)}<small>tok/s</small></span>
             <span class="l">decode, now</span>
@@ -261,6 +286,7 @@
             <span class="v">{fmt0(rt?.prompt)}<small>tok/s</small></span>
             <span class="l">prefill, now</span>
           </div>
+          {/if}
           <div class="stat" class:dim={!(m.requests_processing || m.requests_deferred)}>
             <span class="v">{m.requests_processing ?? 0}<small>+ {m.requests_deferred ?? 0} queued</small></span>
             <span class="l">requests in flight</span>
@@ -273,7 +299,7 @@
           {/if}
         </div>
 
-        <div class="spark" aria-label="decode tok/s, last 60 seconds">
+        <div class="spark" aria-label="{dg ? "canvas" : "decode"} tok/s, last 60 seconds">
           <svg viewBox="0 0 {SW} {SH}" preserveAspectRatio="none">
             <line x1="0" y1={SH - 3} x2={SW} y2={SH - 3} class="base" />
             {#if pts.length > 1}
@@ -282,7 +308,7 @@
               <circle cx={pts[pts.length - 1][0]} cy={pts[pts.length - 1][1]} r="2.5" class="end" />
             {/if}
           </svg>
-          <span class="l">decode tok/s · last 60 s{#if pts.length > 1} · peak {fmt1(Math.max(...spark[k]))}{/if}</span>
+          <span class="l">{dg ? "canvas" : "decode"} tok/s · last 60 s{pts.length > 1 ? ` · peak ${dg ? fmt0(Math.max(...spark[k])) : fmt1(Math.max(...spark[k]))}` : ""}</span>
         </div>
 
         <div class="slots">
@@ -317,6 +343,9 @@
               {#if draftChars(x) > 0}<span class="chip plain" title="DiffusionGemma writes a whole block at once: each denoise step rewrites the block's draft (dimmed) until it settles and is committed.">draft {draftChars(x).toLocaleString()} chars</span>{/if}
               <button class="btn small" style="margin-left: auto;" onclick={() => toggleSlot(k, x.id)}>Close</button>
             </div>
+            {#if x.diffusion}
+              <DiffusionCanvas host={r.state.host} port={r.state.port} slot={x} />
+            {/if}
             {#if x.prompt == null && x.generated == null}
               <div class="faint small">This server does not expose slot text. Turn on <b>trace tokens</b> in the profile's Advanced section and reload it. For the router, turn it on for any member and relaunch the router.</div>
             {:else}
