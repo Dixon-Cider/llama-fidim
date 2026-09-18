@@ -358,12 +358,19 @@ fn slots_show_prefill_then_monotonic_decode() {
     assert_eq!(s0.n_decoded, 0);
     assert_eq!(s0.n_ctx, 12288);
     assert_eq!(s0.id_task, 1);
+    assert!(s0.prompt.as_deref().is_some_and(|p| p.contains("[user]\nhi")), "{s0:?}");
+    assert_eq!(s0.generated.as_deref(), Some(""));
     let mut seen = vec![0u64];
-    for want in [64u64, 128, 320] {
+    // (n_decoded, generated text, committed chars) after each gate: the
+    // draft is live text, the loop detector only ever sees committed text.
+    for (want, text, committed) in [(64u64, "a", Some(0)), (128, "ab", None), (320, "abc", Some(2))] {
         gate.open();
-        let s = wait_for(&|s| s.n_decoded == want);
+        let s = wait_for(&|s| s.n_decoded == want && s.generated.as_deref() == Some(text));
         assert_eq!(s.phase, "decode");
         assert_eq!(s.n_remain, 512 - want as i64);
+        if committed.is_some() {
+            assert_eq!(s.committed_chars, committed, "{s:?}");
+        }
         seen.push(s.n_decoded);
     }
     gate.open();
@@ -373,6 +380,8 @@ fn slots_show_prefill_then_monotonic_decode() {
     let idle = wait_for(&|s| !s.is_processing);
     assert_eq!(idle.phase, "idle");
     assert_eq!(idle.n_prompt_tokens, 9);
+    // The last answer stays readable, all of it committed.
+    assert_eq!((idle.generated.as_deref(), idle.committed_chars), (Some("abc"), Some(3)));
     assert_eq!(srv.stop(), 0);
 }
 

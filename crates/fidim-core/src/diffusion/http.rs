@@ -464,9 +464,14 @@ pub(crate) fn n_decoded(p: &super::Progress, canvas: u32) -> u64 {
     p.block as u64 * canvas + within.min(canvas)
 }
 
-/// One slot in llama-server's shape (live.rs parses it).
+/// One slot in llama-server's shape (live.rs parses it), with the text
+/// llama-server shows under LLAMA_SERVER_SLOTS_DEBUG: the conversation as
+/// `prompt`, the committed answer plus the current block's draft as
+/// `generated`. `generated_committed_chars` marks where the draft starts, so
+/// the loop detector skips it (an early draft is often repetitive noise).
 fn slots(s: &mut TcpStream, ctx: &Ctx) {
     let p = ctx.shared.progress().clone();
+    let live = ctx.shared.live().clone();
     let processing = ctx.shared.processing.load(Ordering::SeqCst);
     let decoded = if processing { n_decoded(&p, ctx.info.canvas) } else { 0 };
     let remain = p.n_blocks as i64 * ctx.info.canvas as i64 - decoded as i64;
@@ -483,6 +488,9 @@ fn slots(s: &mut TcpStream, ctx: &Ctx) {
             "n_decoded": decoded,
             "n_remain": remain.max(0),
         }],
+        "prompt": live.prompt,
+        "generated": format!("{}{}", live.committed, live.draft),
+        "generated_committed_chars": live.committed.chars().count(),
     }]);
     let _ = write_json(s, 200, &body, &[]);
 }

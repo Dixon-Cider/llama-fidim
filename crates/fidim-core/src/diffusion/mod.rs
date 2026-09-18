@@ -93,6 +93,19 @@ impl ModelInfo {
     }
 }
 
+/// Text for FIDIM's live view (`/slots` `prompt` and `generated`): the
+/// request's conversation, the answer committed so far and the current
+/// block's latest draft. Kept after the job, like llama-server's last
+/// generation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LiveText {
+    pub prompt: String,
+    /// The cumulative answer of the last accepted `C` line.
+    pub committed: String,
+    /// The block being denoised, as of its latest step; empty between blocks.
+    pub draft: String,
+}
+
 /// Where the current (or last) job is, for /slots and the stream comments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Progress {
@@ -142,6 +155,7 @@ pub struct Shared {
     /// Jobs the engine has taken off its queue (run or skipped).
     pub(crate) served: AtomicU64,
     pub(crate) progress: Mutex<Progress>,
+    pub(crate) live: Mutex<LiveText>,
     pub(crate) metrics: Mutex<Metrics>,
     pub(crate) rng: Mutex<XorShift64>,
 }
@@ -171,6 +185,7 @@ impl Shared {
                 n_blocks: 0,
                 n_prompt: 0,
             }),
+            live: Mutex::new(LiveText::default()),
             metrics: Mutex::new(Metrics::default()),
             rng: Mutex::new(XorShift64::seeded()),
         }
@@ -178,6 +193,9 @@ impl Shared {
 
     pub(crate) fn progress(&self) -> MutexGuard<'_, Progress> {
         lock(&self.progress)
+    }
+    pub(crate) fn live(&self) -> MutexGuard<'_, LiveText> {
+        lock(&self.live)
     }
     pub(crate) fn metrics(&self) -> MutexGuard<'_, Metrics> {
         lock(&self.metrics)

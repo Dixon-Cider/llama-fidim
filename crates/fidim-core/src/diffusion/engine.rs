@@ -716,6 +716,8 @@ impl Worker<'_> {
         // Progress first: a /slots poll that sees is_processing must also
         // see this job's id_task.
         self.set_prefill(run.id_task, job.req.n_blocks);
+        *self.shared.live() =
+            super::LiveText { prompt: super::protocol::render_messages(&job.req.messages), ..Default::default() };
         self.shared.processing.store(true, Ordering::SeqCst);
         let _ = job.events.send(EngineEvent::Started { id_task: run.id_task, seed: run.seed });
         let result = loop {
@@ -753,6 +755,12 @@ impl Worker<'_> {
         self.live_req = Some(path.clone());
         let mark = self.facts.len();
         self.set_prefill(run.id_task, job.req.n_blocks);
+        {
+            // A retry starts the answer over.
+            let mut live = self.shared.live();
+            live.committed.clear();
+            live.draft.clear();
+        }
         let sent = match self.child.as_mut() {
             Some(c) => c.send_line(&path.to_string_lossy()),
             None => Err(io::ErrorKind::BrokenPipe.into()),
@@ -768,13 +776,16 @@ impl Worker<'_> {
                 Next::Line(l) => {
                     last_output = Instant::now();
                     match l {
-                        Line::Frame { block, step, total } => {
+                        Line::Frame { block, step, total, text } => {
                             st.frames += 1;
-                            let mut p = self.shared.progress();
-                            p.state = "denoise";
-                            p.block = block;
-                            p.step = step;
-                            p.total = total;
+                            {
+                                let mut p = self.shared.progress();
+                                p.state = "denoise";
+                                p.block = block;
+                                p.step = step;
+                                p.total = total;
+                            }
+                            self.shared.live().draft = text;
                         }
                         Line::Commit { block, text } => {
                             // A block with no F frame means its step-0 decode
@@ -786,6 +797,11 @@ impl Worker<'_> {
                                 }
                                 st.stale = true;
                             } else {
+                                {
+                                    let mut live = self.shared.live();
+                                    live.committed.clone_from(&text);
+                                    live.draft.clear();
+                                }
                                 let _ = job.events.send(EngineEvent::Commit { block, text });
                                 st.commit_sent = true;
                             }

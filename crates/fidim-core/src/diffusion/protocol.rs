@@ -24,9 +24,12 @@ pub enum Line {
     /// `READY <n_vocab> <maxtok>`; builds before the auto-sizer print only
     /// `READY <n_vocab>`.
     Ready { n_vocab: u32, maxtok: Option<u32> },
-    /// `F <block> <step> <total> <json>`: one denoise step. The canvas text
-    /// is discarded in v1 (no frame streaming).
-    Frame { block: u32, step: u32, total: u32 },
+    /// `F <block> <step> <total> <json>`: one denoise step and the block's
+    /// whole draft after it (every position can still change). With
+    /// DG_FRAME_SPECIAL=1 a patched runner keeps special tokens and stops at
+    /// end-of-turn, so the draft reads like a commit; a stock runner strips
+    /// them. Only FIDIM's live view shows it.
+    Frame { block: u32, step: u32, total: u32, text: String },
     /// `C <block> <json>`: the CUMULATIVE committed answer after `block`.
     Commit { block: u32, text: String },
     Stats(Stats),
@@ -109,6 +112,8 @@ fn parse_text(s: &str) -> Option<Line> {
             block: p[1].parse().ok()?,
             step: p[2].parse().ok()?,
             total: p[3].parse().ok()?,
+            // A garbled payload still counts as a step (stale-canvas detection).
+            text: serde_json::from_str::<String>(p[4]).unwrap_or_default(),
         });
     }
     if s.starts_with("C ") {
@@ -187,6 +192,31 @@ fn parse_err(rest: &str) -> ErrLine {
 }
 
 // ------------------------------------------------------------ request file ----
+
+/// A request's conversation as plain text for FIDIM's live view (the helper
+/// cannot run the chat template): each message's role in brackets, then its
+/// text (string content, or the text parts of an array). Tool calls and
+/// images are left out.
+pub fn render_messages(messages: &Value) -> String {
+    let mut out = String::new();
+    for m in messages.as_array().into_iter().flatten() {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
+        let text = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("[{role}]\n{text}"));
+    }
+    out
+}
 
 /// The runner's request file (VS:297-311): `{seed, n_blocks, messages,
 /// tools?}`. The runner applies the GGUF's chat template itself.
@@ -322,12 +352,27 @@ mod tests {
     }
 
     #[test]
+    fn messages_render_as_plain_text() {
+        let m = serde_json::json!([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": [{"type": "text", "text": "Look:"}, {"type": "image_url", "image_url": {"url": "x"}}, {"type": "text", "text": "what is it?"}]},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "1"}]},
+        ]);
+        assert_eq!(render_messages(&m), "[system]\nBe brief.\n\n[user]\nLook:\nwhat is it?\n\n[assistant]\n");
+        assert_eq!(render_messages(&serde_json::json!("not a list")), "");
+    }
+
+    #[test]
     fn frames_and_commits() {
-        // The frame payload (escaped newline, raw UTF-8) is discarded but
-        // must not break the header fields.
+        // The frame payload (escaped newline, raw UTF-8) is the block's draft.
         let f = "F 1 7 48 \"line one\\nzwei \u{00fc}ber \u{1f600} x y\"\n";
-        assert_eq!(parse_line(f.as_bytes()), Line::Frame { block: 1, step: 7, total: 48 });
+        assert_eq!(
+            parse_line(f.as_bytes()),
+            Line::Frame { block: 1, step: 7, total: 48, text: "line one\nzwei \u{00fc}ber \u{1f600} x y".into() }
+        );
         assert_eq!(parse_line(b"F 1 7 48"), Line::Other);
+        // A payload that is not a JSON string still counts as a step.
+        assert_eq!(parse_line(b"F 0 3 9 not-json"), Line::Frame { block: 0, step: 3, total: 9, text: String::new() });
 
         let c = "C 2 \"<|channel>thought\\nhm<channel|>Gr\u{00fc}\u{00df} Gott \\\"x\\\"\"\r\n";
         assert_eq!(

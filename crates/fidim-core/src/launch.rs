@@ -297,6 +297,11 @@ pub fn compose_diffusion(p: &Profile, resolved: &[ResolvedDevice], d: &Diffusion
     if !env_has_key(&p.env, crate::profile::DG_RUNTIME_CACHE_KEY) {
         env.push((crate::profile::DG_RUNTIME_CACHE_KEY.into(), "0".into()));
     }
+    // Step drafts that keep the thinking markers, for the live view. A stock
+    // runner ignores the key.
+    if !env_has_key(&p.env, "DG_FRAME_SPECIAL") {
+        env.push(("DG_FRAME_SPECIAL".into(), "1".into()));
+    }
 
     LaunchPlan { exe: d.helper_exe.clone(), args, env, path_prepend: None, visibility_env }
 }
@@ -1064,6 +1069,7 @@ mod tests {
                 ("ROCBLAS_USE_HIPBLASLT", "0"),
                 ("ROCBLAS_USE_HIPBLASLT_BATCHED", "0"),
                 ("GPU_RESOURCE_CACHE_SIZE", "0"),
+                ("DG_FRAME_SPECIAL", "1"),
             ]
         );
         // enable_thinking=false cannot reach the runner (validate warns).

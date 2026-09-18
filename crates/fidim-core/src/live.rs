@@ -45,9 +45,15 @@ pub struct SlotView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generated: Option<String>,
     pub generated_chars: usize,
-    /// A fragment that repeats back-to-back at the end of `generated`.
+    /// A fragment that repeats back-to-back at the end of `generated` (of
+    /// its committed part, when the server marks one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loop_hint: Option<LoopHint>,
+    /// DiffusionGemma: how much of `generated` (from its start, in chars of
+    /// the untrimmed text) is committed; the rest is the current block's
+    /// draft, rewritten every denoise step. None for llama-server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_chars: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -115,7 +121,13 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
             let text = |k: &str| s.get(k).and_then(|x| x.as_str()).map(str::to_string);
             let prompt_full = text("prompt");
             let generated_full = text("generated");
-            let loop_hint = generated_full.as_deref().and_then(|g| detect_loop(g, 3));
+            let committed_chars =
+                s.get("generated_committed_chars").and_then(|x| x.as_u64()).map(|n| n as usize);
+            // A draft is not output yet: an early one is often repetitive noise.
+            let loop_hint = match (generated_full.as_deref(), committed_chars) {
+                (Some(g), Some(n)) => detect_loop(&g.chars().take(n).collect::<String>(), 3),
+                (g, _) => g.and_then(|g| detect_loop(g, 3)),
+            };
             SlotView {
                 id: g("id"),
                 id_task: s.get("id_task").and_then(|x| x.as_i64()).unwrap_or(-1),
@@ -134,6 +146,7 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
                 generated_chars: generated_full.as_deref().map(|t| t.chars().count()).unwrap_or(0),
                 generated: generated_full.as_deref().map(|t| tail(t, 4000)),
                 loop_hint,
+                committed_chars,
             }
         })
         .collect())
