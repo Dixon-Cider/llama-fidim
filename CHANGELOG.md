@@ -13,6 +13,8 @@ build with uncommitted changes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-18
+
 ### Added
 
 - **DiffusionGemma engine (experimental).** A profile whose model is a
@@ -91,5 +93,6 @@ First public release.
   and roll back; benchmarks stored per profile; the `fidim` CLI for nearly
   all of it.
 
-[Unreleased]: https://github.com/Dixon-Cider/llama-fidim/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Dixon-Cider/llama-fidim/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Dixon-Cider/llama-fidim/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Dixon-Cider/llama-fidim/releases/tag/v0.1.0
