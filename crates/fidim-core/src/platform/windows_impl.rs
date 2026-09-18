@@ -10,8 +10,9 @@ use crate::{Error, Result};
 pub struct WindowsPlatform;
 
 /// Every process below `root` in the parent tree (children, grandchildren...),
-/// from one Toolhelp snapshot. The router's model instances are its
-/// children, and their VRAM and GPU time belong to the router run.
+/// from one Toolhelp snapshot, minus children of a reused pid (see
+/// `descendants_in`). The router's model instances are its children, and
+/// their VRAM and GPU time belong to the router run.
 pub fn process_descendants(root: u32) -> Vec<u32> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -31,17 +32,22 @@ pub fn process_descendants(root: u32) -> Vec<u32> {
         }
         let _ = CloseHandle(snap);
     }
-    let mut out = Vec::new();
-    let mut frontier = vec![root];
-    while let Some(p) = frontier.pop() {
-        for &(pid, parent) in &pairs {
-            if parent == p && pid != p && !out.contains(&pid) {
-                out.push(pid);
-                frontier.push(pid);
-            }
-        }
+    crate::platform::descendants_in(root, &pairs, &creation_time)
+}
+
+/// When `pid` started, in FILETIME ticks; None when it cannot be opened.
+fn creation_time(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, BOOL, FILETIME};
+    use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, BOOL::from(false), pid).ok()?;
+        let (mut created, mut exited, mut kernel, mut user) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let got = GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user);
+        let _ = CloseHandle(h);
+        got.ok()?;
+        Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
     }
-    out
 }
 
 /// DEVPKEY_Gpu_Luid — {60B193CB-5276-4D0F-96FC-F173ABAD3EC6}, 2.
@@ -149,6 +155,10 @@ mod tests {
             Some(0x1B592)
         );
         assert_eq!(parse_luid_low("pid_1_nope"), None);
+        assert_eq!(instance_pid("pid_3864_luid_0x00000000_0x0001B592_phys_0"), Some(3864));
+        // The prefix wildcard's false match must not read as the same pid.
+        assert_ne!(instance_pid("pid_38640_luid_0x00000000_0x0001B592_phys_0"), Some(3864));
+        assert_eq!(instance_pid("_Total"), None);
     }
 
     /// Live probe: the current process holds no GPU memory, which must be an
@@ -333,6 +343,11 @@ fn pdh_counter_by_luid(pid: u32, counter_name: &str) -> Result<Vec<(u64, u64)>> 
             );
             for item in items {
                 let name = item.szName.to_string().unwrap_or_default();
+                // `pid_1234*` also matches pid_12345's instances; a helper
+                // whose pid prefixes its runner's would count the runner twice.
+                if instance_pid(&name) != Some(pid) {
+                    continue;
+                }
                 if let Some(luid_low) = parse_luid_low(&name) {
                     let bytes = item.FmtValue.Anonymous.largeValue.max(0) as u64;
                     out.push((luid_low, bytes));
@@ -399,8 +414,7 @@ fn pdh_gpu_utilization() -> Result<Vec<super::GpuEngineUtil>> {
             );
             for item in items {
                 let name = item.szName.to_string().unwrap_or_default();
-                let pid = name.strip_prefix("pid_").and_then(|r| r.split('_').next()).and_then(|p| p.parse::<u32>().ok());
-                if let (Some(pid), Some(luid)) = (pid, parse_luid_low(&name)) {
+                if let (Some(pid), Some(luid)) = (instance_pid(&name), parse_luid_low(&name)) {
                     let v = item.FmtValue.Anonymous.doubleValue;
                     if v.is_finite() && v > 0.0 {
                         *acc.entry((pid, luid)).or_insert(0.0) += v;
@@ -414,6 +428,11 @@ fn pdh_gpu_utilization() -> Result<Vec<super::GpuEngineUtil>> {
         .into_iter()
         .map(|((pid, luid_low), percent)| super::GpuEngineUtil { pid, luid_low, percent: percent.clamp(0.0, 100.0) })
         .collect())
+}
+
+/// `pid_3864_luid_0x00000000_0x0001B592_phys_0` → 3864.
+fn instance_pid(instance: &str) -> Option<u32> {
+    instance.strip_prefix("pid_").and_then(|r| r.split('_').next()).and_then(|p| p.parse::<u32>().ok())
 }
 
 /// `pid_3864_luid_0x00000000_0x0001B592_phys_0` → 0x1B592.

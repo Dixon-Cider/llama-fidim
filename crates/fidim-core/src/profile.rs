@@ -15,6 +15,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub schema: u32,
+    /// Which server runs this profile. Omitted when llama-server, so every
+    /// existing profile file re-saves byte-identically.
+    #[serde(default, skip_serializing_if = "Engine::is_llama_server")]
+    pub engine: Engine,
     pub id: String,
     pub name: String,
     pub build: BuildRef,
@@ -43,6 +47,11 @@ pub struct Profile {
     /// Speculative decoding. None = off (or legacy `model.draft.enabled`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speculative: Option<Speculative>,
+    /// DiffusionGemma-only settings with no llama-server equivalent. The
+    /// shared ones reuse `runtime`: `ctx_total` is MAXTOK (0 = the runner
+    /// auto-sizes) and `n_gpu_layers` is NGL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diffusion: Option<DiffusionCfg>,
     #[serde(default)]
     pub chat: Chat,
     /// Arbitrary env passthrough — hardware workarounds change without
@@ -57,6 +66,36 @@ pub struct Profile {
     pub notes: String,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The server process a profile launches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Engine {
+    #[default]
+    LlamaServer,
+    /// Unsloth's DiffusionGemma runner behind FIDIM's `fidim-dg.exe` shim.
+    DiffusionGemma,
+    /// A value this build does not know (a typo, or a newer FIDIM). Kept so
+    /// the profile still loads; it never launches and is never re-saved.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Engine {
+    pub fn is_llama_server(&self) -> bool {
+        *self == Engine::LlamaServer
+    }
+    pub fn is_diffusion(&self) -> bool {
+        *self == Engine::DiffusionGemma
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Engine::LlamaServer => "llama-server",
+            Engine::DiffusionGemma => "diffusion-gemma",
+            Engine::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,7 +266,74 @@ impl Speculative {
     }
 }
 
+/// Settings for the DiffusionGemma engine that llama-server has no field for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffusionCfg {
+    /// ROCBLAS_USE_HIPBLASLT(_BATCHED)=0: without it the first denoise step
+    /// intermittently fails with "MUL_MAT failed / ROCm error: invalid
+    /// argument"; measured no speed cost.
+    #[serde(default = "default_true")]
+    pub hipblaslt_safeguard: bool,
+    /// FA=1. Separate from `runtime.flash_attn`, whose default is "on":
+    /// the 512-dim heads fall back to the CPU on HIP, so this defaults off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flash_attn: bool,
+    /// Reply budget when the client sends no max_tokens; the runner spends
+    /// it in whole 256-token canvas blocks.
+    #[serde(default = "default_dg_max_tokens")]
+    pub default_max_tokens: u32,
+    /// Fixed seed for every request; None = a random seed per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+}
+
+fn default_dg_max_tokens() -> u32 { 2048 }
+fn is_false(b: &bool) -> bool { !*b }
+
+impl Default for DiffusionCfg {
+    /// Must equal the serde defaults: a profile with no `diffusion` section
+    /// and one with `"diffusion": {}` have to behave the same.
+    fn default() -> Self {
+        DiffusionCfg {
+            hipblaslt_safeguard: default_true(),
+            flash_attn: false,
+            default_max_tokens: default_dg_max_tokens(),
+            seed: None,
+        }
+    }
+}
+
+/// Env keys FIDIM composes for every diffusion run. A profile.env entry for
+/// any of them could silently add a device (the runner's unified path aborts
+/// every prompt), move the run to another card, or fake free memory, so
+/// validate refuses them.
+pub const DG_OWNED_ENV: &[&str] = &[
+    "HIP_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "GPU_DEVICE_ORDINAL",
+    "NGL",
+    "MAXTOK",
+    "FA",
+    "DG_FREE_VRAM_MB",
+    "DG_FREE_RAM_MB",
+    "GGML_BACKEND_PATH",
+    "GGML_CUDA_DEVICES",
+    "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
+];
+
+/// Windows env names are case-insensitive (and so is Rust's `Command` env
+/// there), so `hip_visible_devices` overrides `HIP_VISIBLE_DEVICES`.
+pub fn env_has_key(env: &BTreeMap<String, String>, key: &str) -> bool {
+    env.keys().any(|k| k.eq_ignore_ascii_case(key))
+}
+
 impl Profile {
+    /// The diffusion settings in effect: the explicit section, else defaults.
+    pub fn diffusion_effective(&self) -> DiffusionCfg {
+        self.diffusion.clone().unwrap_or_default()
+    }
+
     /// The effective speculative config: the explicit section, else the
     /// legacy `model.draft.enabled` translated (MTP sidecar -> `mtp`,
     /// anything else -> `draft`), else off.
@@ -269,6 +375,15 @@ impl Profile {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        // `#[serde(other)]` would write a mistyped engine back as "unknown",
+        // destroying what the user typed. Every save path goes through here,
+        // promote included.
+        if self.engine == Engine::Unknown {
+            return Err(Error::Config(format!(
+                "refusing to save profile `{}`: unknown engine; fix the \"engine\" field by hand",
+                self.id
+            )));
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
@@ -317,6 +432,22 @@ fn finding(severity: Severity, code: &'static str, message: String) -> Finding {
 /// no filesystem or device access — so the profile editor can run it live.
 pub fn validate(p: &Profile) -> Vec<Finding> {
     let mut out = Vec::new();
+
+    if p.engine == Engine::Unknown {
+        out.push(finding(
+            Severity::Error,
+            "engine-unknown",
+            "engine is not one this build knows (expected \"llama-server\" or \"diffusion-gemma\"); \
+             fix the \"engine\" field by hand: the profile cannot launch or be saved until then"
+                .into(),
+        ));
+        return out;
+    }
+    if p.engine.is_diffusion() {
+        validate_diffusion(p, &mut out);
+        validate_server(p, &mut out);
+        return out;
+    }
 
     let spec = p.speculative_effective();
     if !matches!(spec.mode.as_str(), "off" | "mtp" | "draft" | "dflash" | "ngram") {
@@ -454,13 +585,196 @@ pub fn validate(p: &Profile) -> Vec<Finding> {
             out.push(finding(warn, "kv-type-unknown", format!("unrecognised KV cache type {kv:?}")));
         }
     }
+    validate_server(p, &mut out);
+    out
+}
+
+/// Rules for the listening socket, shared by every engine.
+fn validate_server(p: &Profile, out: &mut Vec<Finding>) {
     if p.server.alias.trim().is_empty() {
-        out.push(finding(err, "alias-empty", "server alias must not be empty".into()));
+        out.push(finding(Severity::Error, "alias-empty", "server alias must not be empty".into()));
     }
     if p.server.port < 1024 {
-        out.push(finding(warn, "port-privileged", format!("port {} is in the privileged range", p.server.port)));
+        out.push(finding(
+            Severity::Warning,
+            "port-privileged",
+            format!("port {} is in the privileged range", p.server.port),
+        ));
     }
-    out
+}
+
+/// DiffusionGemma rules. Batch, slot and KV rules do not apply to the
+/// runner; instead a few settings that are harmless for llama-server break
+/// every prompt here, and those are Errors.
+fn validate_diffusion(p: &Profile, out: &mut Vec<Finding>) {
+    let err = Severity::Error;
+    let warn = Severity::Warning;
+    let dg = p.diffusion_effective();
+
+    if p.devices.len() != 1 {
+        out.push(finding(
+            err,
+            "dg-single-device",
+            format!(
+                "the diffusion engine needs exactly one device (profile lists {}): more than one visible \
+                 device takes the runner's unified path, which aborts every prompt",
+                p.devices.len()
+            ),
+        ));
+    }
+    let owned: Vec<&str> = p
+        .env
+        .keys()
+        .filter(|k| DG_OWNED_ENV.iter().any(|o| k.eq_ignore_ascii_case(o)))
+        .map(String::as_str)
+        .collect();
+    if !owned.is_empty() {
+        out.push(finding(
+            err,
+            "dg-env-owned",
+            format!(
+                "env sets {}: Llama FIDIM composes these for every diffusion run (card pinning, NGL, \
+                 MAXTOK, FA, memory sizing), and an override can add a device or move the run to another \
+                 card; remove them from the profile env",
+                owned.join(", ")
+            ),
+        ));
+    }
+    let draft_on = p.model.draft.as_ref().is_some_and(|d| d.enabled);
+    if p.speculative_effective().mode != "off" || draft_on {
+        out.push(finding(
+            err,
+            "dg-speculative",
+            "speculative decoding and draft models do not apply to the diffusion engine; set speculative \
+             to off and disable model.draft"
+                .into(),
+        ));
+    }
+    if !p.model.path.to_string_lossy().is_ascii() {
+        out.push(finding(
+            err,
+            "dg-path-ascii",
+            format!(
+                "model path {} is not ASCII: the diffusion runner opens it through narrow argv/fopen and \
+                 cannot reach it; rename or move the file",
+                p.model.path.display()
+            ),
+        ));
+    }
+    if dg.default_max_tokens == 0 {
+        out.push(finding(err, "dg-max-tokens", "diffusion.default_max_tokens must be at least 1".into()));
+    }
+
+    let mut ignored: Vec<String> = Vec::new();
+    if p.model.mmproj.as_ref().is_some_and(|m| !m.as_os_str().is_empty()) {
+        ignored.push("model.mmproj".into());
+    }
+    let s = &p.sampling;
+    for (name, set) in [
+        ("temperature", s.temperature.is_some()),
+        ("top_p", s.top_p.is_some()),
+        ("top_k", s.top_k.is_some()),
+        ("min_p", s.min_p.is_some()),
+        ("dry_multiplier", s.dry_multiplier.is_some()),
+        ("repeat_penalty", s.repeat_penalty.is_some()),
+        ("presence_penalty", s.presence_penalty.is_some()),
+    ] {
+        if set {
+            ignored.push(format!("sampling.{name}"));
+        }
+    }
+    ignored.extend(s.extra.keys().map(|k| format!("sampling.{k}")));
+    if p.split_mode.is_some() {
+        ignored.push("split_mode".into());
+    }
+    if p.main_device != 0 {
+        ignored.push("main_device".into());
+    }
+    if p.runtime.slots != 1 {
+        ignored.push("runtime.slots".into());
+    }
+    if !p.runtime.extra_flags.is_empty() {
+        ignored.push("runtime.extra_flags".into());
+    }
+    if p.runtime.cache_reuse.is_some() {
+        ignored.push("runtime.cache_reuse".into());
+    }
+    // rocm_runtime is not listed: a build without its own ROCm does run the
+    // diffusion runner on it, and validate cannot see which kind of build
+    // this is (the editor clears it for a bundled one).
+    if !ignored.is_empty() {
+        out.push(finding(
+            warn,
+            "dg-ignored",
+            format!("not used by the diffusion engine: {}", ignored.join(", ")),
+        ));
+    }
+    if p.chat.enable_thinking == Some(false) {
+        out.push(finding(
+            warn,
+            "dg-thinking",
+            "chat.enable_thinking=false cannot be honoured: the runner's request file has no \
+             chat_template_kwargs, so the model always thinks; the thought channel is split into \
+             reasoning_content"
+                .into(),
+        ));
+    }
+    if p.keep_alive_seconds.is_some_and(|s| s > 0) {
+        out.push(finding(
+            warn,
+            "dg-keepalive",
+            "keep_alive_seconds is not used for the diffusion engine: each keep-alive request would run a \
+             whole denoise block"
+                .into(),
+        ));
+    }
+    if dg.flash_attn {
+        out.push(finding(
+            warn,
+            "dg-flash-attn",
+            "diffusion.flash_attn is on: DiffusionGemma's 512-dim attention heads fall back to the CPU on \
+             HIP, which is slower; leave it off unless measured"
+                .into(),
+        ));
+    }
+    if !dg.hipblaslt_safeguard {
+        out.push(finding(
+            warn,
+            "dg-safeguard-off",
+            "diffusion.hipblaslt_safeguard is off: the first denoise step intermittently fails with \
+             'MUL_MAT failed / ROCm error: invalid argument' when rocBLAS routes through hipBLASLt"
+                .into(),
+        ));
+    } else {
+        let overrides: Vec<&str> = p
+            .env
+            .keys()
+            .filter(|k| k.to_ascii_uppercase().starts_with("ROCBLAS_USE_HIPBLASLT"))
+            .map(String::as_str)
+            .collect();
+        if !overrides.is_empty() {
+            out.push(finding(
+                warn,
+                "dg-hipblaslt-env",
+                format!(
+                    "env sets {}: the profile env wins over the hipBLASLt safeguard's value",
+                    overrides.join(", ")
+                ),
+            ));
+        }
+    }
+    let ctx = p.runtime.ctx_total;
+    if ctx != 0 && (ctx < 2048 || ctx % 256 != 0 || ctx > 65536) {
+        out.push(finding(
+            warn,
+            "dg-context",
+            format!(
+                "runtime.ctx_total {ctx} is the diffusion context budget (MAXTOK, 0 = auto-size): expected a \
+                 multiple of 256 between 2048 and 65536; the runner's scores buffer grows with N², so large \
+                 budgets do not fit"
+            ),
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -552,6 +866,358 @@ mod tests {
         let out = serde_json::to_value(&p).unwrap();
         assert_eq!(out["future_field"]["keep"], true);
         assert_eq!(out["split_mode"], "layer");
+    }
+
+    /// A profile exactly as the pre-engine code saved it (every optional
+    /// section present). Loading and saving it again must not change a byte:
+    /// the engine fields stay invisible on llama-server profiles.
+    const LEGACY_SAVED: &str = r#"{
+  "schema": 1,
+  "id": "daily-driver",
+  "name": "Daily driver",
+  "build": {
+    "path": "C:/llama.cpp/b10819-rocm",
+    "version": "b10819"
+  },
+  "model": {
+    "path": "E:/models/qwen.gguf",
+    "mmproj": null,
+    "draft": {
+      "path": "E:/models/MTP/mtp.gguf",
+      "enabled": false
+    }
+  },
+  "devices": [
+    {
+      "key": "pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus03",
+      "split_fraction": null,
+      "resolved_index_last_launch": 0
+    }
+  ],
+  "split_mode": null,
+  "main_device": 0,
+  "rocm_runtime": "default",
+  "keep_alive_seconds": 0,
+  "server": {
+    "port": 1234,
+    "alias": "dd",
+    "host": "127.0.0.1"
+  },
+  "runtime": {
+    "n_gpu_layers": 99,
+    "ctx_total": 262144,
+    "slots": 2,
+    "kv_type_k": "q4_0",
+    "kv_type_v": "q4_0",
+    "flash_attn": "on",
+    "batch_logical": 2048,
+    "batch_physical": 512,
+    "cont_batching": true,
+    "kv_unified": false,
+    "cache_reuse": 256,
+    "threads": 8,
+    "extra_flags": [
+      "--no-mmap"
+    ]
+  },
+  "sampling": {
+    "temperature": 0.6,
+    "top_k": 20,
+    "future_sampler": 1
+  },
+  "speculative": {
+    "mode": "mtp",
+    "n_max": 3
+  },
+  "chat": {
+    "enable_thinking": false
+  },
+  "env": {
+    "GPU_MAX_HW_QUEUES": "1"
+  },
+  "notes": "hand notes",
+  "future_field": {
+    "keep": true
+  }
+}"#;
+
+    #[test]
+    fn engine_serde_legacy_profile_resaves_byte_identically() {
+        let p: Profile = serde_json::from_str(LEGACY_SAVED).unwrap();
+        assert_eq!(p.engine, Engine::LlamaServer);
+        assert!(p.diffusion.is_none());
+        let text = serde_json::to_string_pretty(&p).unwrap();
+        assert_eq!(text, LEGACY_SAVED);
+        assert!(!text.contains("\"engine\"") && !text.contains("\"diffusion\""));
+        // Through the real save path as well.
+        let dir = std::env::temp_dir().join(format!("fidim-prof-legacy-{}", std::process::id()));
+        let path = dir.join("daily-driver.json");
+        p.save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), LEGACY_SAVED);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn diffusion_profile() -> Profile {
+        serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "engine": "diffusion-gemma",
+            "id": "dg-26b",
+            "name": "DiffusionGemma 26B",
+            "build": { "path": "C:/b/b11027-mix-3e83366-unsloth" },
+            "model": { "path": "E:/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf" },
+            "devices": [ { "key": "pci:VEN_1002&DEV_7551&SUBSYS_54131849:bus08" } ],
+            "server": { "port": 2345, "alias": "dg" },
+            "runtime": { "ctx_total": 0 },
+            "diffusion": { "hipblaslt_safeguard": true, "default_max_tokens": 2048 }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn engine_serde_diffusion_round_trips_kebab_case() {
+        let p = diffusion_profile();
+        assert_eq!(p.engine, Engine::DiffusionGemma);
+        assert_eq!(p.diffusion_effective(), DiffusionCfg::default());
+        let text = serde_json::to_string_pretty(&p).unwrap();
+        assert!(text.starts_with("{\n  \"schema\": 1,\n  \"engine\": \"diffusion-gemma\",\n"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["diffusion"], serde_json::json!({ "hipblaslt_safeguard": true, "default_max_tokens": 2048 }));
+        let back: Profile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.engine, Engine::DiffusionGemma);
+        assert_eq!(back.diffusion, p.diffusion);
+        assert_eq!(serde_json::to_string_pretty(&back).unwrap(), text);
+
+        // An empty section means the defaults, same as no section.
+        let mut raw = serde_json::to_value(&p).unwrap();
+        raw["diffusion"] = serde_json::json!({});
+        let empty: Profile = serde_json::from_value(raw).unwrap();
+        assert_eq!(empty.diffusion, Some(DiffusionCfg::default()));
+        let mut none = p.clone();
+        none.diffusion = None;
+        assert_eq!(none.diffusion_effective(), DiffusionCfg::default());
+
+        // Non-default values survive; flash_attn=false and seed=None stay out.
+        let mut q = p.clone();
+        q.diffusion = Some(DiffusionCfg { flash_attn: true, seed: Some(7), ..DiffusionCfg::default() });
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(v["diffusion"]["flash_attn"], true);
+        assert_eq!(v["diffusion"]["seed"], 7);
+    }
+
+    #[test]
+    fn engine_serde_unknown_engine_loads_but_never_saves() {
+        let mut raw = serde_json::to_value(diffusion_profile()).unwrap();
+        raw["engine"] = "difusion-gema".into();
+        let p: Profile = serde_json::from_value(raw).unwrap();
+        assert_eq!(p.engine, Engine::Unknown);
+        assert!(!p.extra.contains_key("engine"));
+
+        let f = validate(&p);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!((f[0].code, f[0].severity), ("engine-unknown", Severity::Error));
+
+        let dir = std::env::temp_dir().join(format!("fidim-prof-unknown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dg-26b.json");
+        std::fs::write(&path, "hand-typed original").unwrap();
+        match p.save(&path) {
+            Err(Error::Config(msg)) => assert!(msg.contains("unknown engine"), "{msg}"),
+            other => panic!("expected a Config error, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hand-typed original");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn engine_serde_missing_ctx_total_still_fails_to_parse() {
+        for engine in ["llama-server", "diffusion-gemma"] {
+            let r = serde_json::from_value::<Profile>(serde_json::json!({
+                "schema": 1, "engine": engine, "id": "x", "name": "x",
+                "build": { "path": "C:/b" }, "model": { "path": "E:/m.gguf" },
+                "devices": [], "server": { "port": 9701, "alias": "x" },
+                "runtime": { "slots": 1 }
+            }));
+            assert!(r.is_err(), "{engine}: a profile without ctx_total must not load");
+        }
+    }
+
+    fn codes(f: &[Finding], severity: Severity) -> Vec<&'static str> {
+        f.iter().filter(|x| x.severity == severity).map(|x| x.code).collect()
+    }
+
+    #[test]
+    fn validate_diffusion_healthy_profile_has_no_findings() {
+        let f = validate(&diffusion_profile());
+        assert!(f.is_empty(), "unexpected findings: {f:?}");
+    }
+
+    #[test]
+    fn validate_diffusion_errors() {
+        let only_error = |p: &Profile, code: &str| {
+            let errs = codes(&validate(p), Severity::Error);
+            assert_eq!(errs, vec![code], "for {code}");
+        };
+
+        let mut p = diffusion_profile();
+        p.devices.push(DeviceRef { key: "pci:X:bus03".into(), split_fraction: None, resolved_index_last_launch: None });
+        only_error(&p, "dg-single-device");
+        let mut p = diffusion_profile();
+        p.devices.clear();
+        only_error(&p, "dg-single-device");
+
+        let mut p = diffusion_profile();
+        p.env.insert("hip_visible_devices".into(), "1".into());
+        only_error(&p, "dg-env-owned");
+        assert!(env_has_key(&p.env, "HIP_VISIBLE_DEVICES"));
+        assert!(!env_has_key(&p.env, "CUDA_VISIBLE_DEVICES"));
+
+        let mut p = diffusion_profile();
+        p.speculative = Some(Speculative { mode: "mtp".into(), ..Speculative::default() });
+        only_error(&p, "dg-speculative");
+        let mut p = diffusion_profile();
+        p.model.draft = Some(DraftRef { path: "E:/models/MTP/x.gguf".into(), enabled: true });
+        only_error(&p, "dg-speculative");
+        let mut p = diffusion_profile();
+        p.speculative = Some(Speculative::default());
+        p.model.draft = Some(DraftRef { path: "E:/models/d.gguf".into(), enabled: false });
+        assert!(codes(&validate(&p), Severity::Error).is_empty(), "off + disabled draft is fine");
+
+        let mut p = diffusion_profile();
+        p.model.path = "E:/modèles/diffusiongemma.gguf".into();
+        only_error(&p, "dg-path-ascii");
+
+        let mut p = diffusion_profile();
+        p.diffusion.as_mut().unwrap().default_max_tokens = 0;
+        only_error(&p, "dg-max-tokens");
+    }
+
+    #[test]
+    fn validate_diffusion_warnings() {
+        let only_warning = |p: &Profile, code: &str| {
+            let f = validate(p);
+            assert!(codes(&f, Severity::Error).is_empty(), "{code}: {f:?}");
+            assert_eq!(codes(&f, Severity::Warning), vec![code], "for {code}");
+        };
+
+        let mut p = diffusion_profile();
+        p.model.mmproj = Some("E:/models/mmproj.gguf".into());
+        only_warning(&p, "dg-ignored");
+        assert!(validate(&p)[0].message.contains("model.mmproj"));
+
+        let mut p = diffusion_profile();
+        p.chat.enable_thinking = Some(false);
+        only_warning(&p, "dg-thinking");
+        p.chat.enable_thinking = Some(true);
+        assert!(validate(&p).is_empty());
+
+        let mut p = diffusion_profile();
+        p.keep_alive_seconds = Some(5);
+        only_warning(&p, "dg-keepalive");
+        p.keep_alive_seconds = Some(0);
+        assert!(validate(&p).is_empty());
+
+        let mut p = diffusion_profile();
+        p.diffusion.as_mut().unwrap().flash_attn = true;
+        only_warning(&p, "dg-flash-attn");
+
+        let mut p = diffusion_profile();
+        p.diffusion.as_mut().unwrap().hipblaslt_safeguard = false;
+        only_warning(&p, "dg-safeguard-off");
+        // With the safeguard off, the env is the user's call: no double warning.
+        p.env.insert("ROCBLAS_USE_HIPBLASLT".into(), "1".into());
+        only_warning(&p, "dg-safeguard-off");
+
+        let mut p = diffusion_profile();
+        p.env.insert("rocblas_use_hipblaslt_batched".into(), "1".into());
+        only_warning(&p, "dg-hipblaslt-env");
+
+        for ctx in [3000u64, 1024, 65536 + 256] {
+            let mut p = diffusion_profile();
+            p.runtime.ctx_total = ctx;
+            only_warning(&p, "dg-context");
+        }
+        for ctx in [0u64, 2048, 12288, 65536] {
+            let mut p = diffusion_profile();
+            p.runtime.ctx_total = ctx;
+            assert!(validate(&p).is_empty(), "ctx_total {ctx}");
+        }
+
+        // Every ignored llama-server knob lands in one finding.
+        let mut p = diffusion_profile();
+        p.sampling.temperature = Some(1.0);
+        p.sampling.extra.insert("xtc_probability".into(), 0.5.into());
+        p.split_mode = Some(SplitMode::Layer);
+        p.main_device = 1;
+        p.runtime.extra_flags = vec!["--no-mmap".into()];
+        p.runtime.cache_reuse = Some(256);
+        let f = validate(&p);
+        let ignored: Vec<&Finding> = f.iter().filter(|x| x.code == "dg-ignored").collect();
+        assert_eq!(ignored.len(), 1, "{f:?}");
+        for part in [
+            "sampling.temperature",
+            "sampling.xtc_probability",
+            "split_mode",
+            "main_device",
+            "runtime.extra_flags",
+            "runtime.cache_reuse",
+        ] {
+            assert!(ignored[0].message.contains(part), "missing {part}: {}", ignored[0].message);
+        }
+
+        // A runtime is used whenever the build does not bundle its own ROCm,
+        // which validate cannot see: never reported as ignored.
+        let mut p = diffusion_profile();
+        p.rocm_runtime = Some("rocm-7.14.0".into());
+        assert!(validate(&p).is_empty(), "{:?}", validate(&p));
+    }
+
+    #[test]
+    fn validate_diffusion_skips_llama_server_batch_slot_and_kv_rules() {
+        let mut p = diffusion_profile();
+        p.runtime.batch_logical = 256;
+        p.runtime.batch_physical = 512;
+        p.runtime.slots = 3;
+        p.runtime.ctx_total = 4096;
+        p.runtime.kv_type_k = "mystery".into();
+        let f = validate(&p);
+        for code in [
+            "batch-physical-exceeds-logical",
+            "batch-coupled-low",
+            "ctx-not-divisible",
+            "per-slot-ctx-small",
+            "kv-type-unknown",
+            "slots-zero",
+        ] {
+            assert!(!f.iter().any(|x| x.code == code), "{code} reported for a diffusion profile: {f:?}");
+        }
+        assert_eq!(codes(&f, Severity::Warning), vec!["dg-ignored"], "slots != 1 is the only note");
+
+        // The shared server rules still apply.
+        p.runtime.slots = 1;
+        p.server.alias = " ".into();
+        p.server.port = 80;
+        assert_eq!(codes(&validate(&p), Severity::Error), vec!["alias-empty"]);
+        assert_eq!(codes(&validate(&p), Severity::Warning), vec!["port-privileged"]);
+    }
+
+    #[test]
+    fn validate_llama_server_results_unchanged_by_explicit_engine() {
+        let mut coupled = base_profile();
+        coupled.runtime.batch_logical = 256;
+        coupled.runtime.batch_physical = 256;
+        coupled.server.port = 80;
+        for p in [base_profile(), coupled] {
+            let implicit: Vec<_> = validate(&p).into_iter().map(|x| (x.code, x.severity, x.message)).collect();
+            let mut explicit = p.clone();
+            explicit.engine = Engine::LlamaServer;
+            let explicit: Vec<_> = validate(&explicit).into_iter().map(|x| (x.code, x.severity, x.message)).collect();
+            assert_eq!(implicit, explicit);
+        }
+        let mut raw = serde_json::to_value(base_profile()).unwrap();
+        raw["engine"] = "llama-server".into();
+        let p: Profile = serde_json::from_value(raw).unwrap();
+        assert_eq!(p.engine, Engine::LlamaServer);
+        assert!(serde_json::to_value(&p).unwrap().get("engine").is_none());
     }
 
     #[test]

@@ -99,12 +99,77 @@ pub trait Platform {
     }
 }
 
+/// A run's process and everything below it. What a run holds on the GPU
+/// is the sum over these: a diffusion run's helper holds nothing itself
+/// (its runner child does), and a router's model instances are its children.
+pub fn run_pids(root: u32) -> Vec<u32> {
+    let mut pids = vec![root];
+    #[cfg(windows)]
+    pids.extend(process_descendants(root));
+    pids
+}
+
+/// Every process below `root`, from (pid, parent pid) pairs and a creation
+/// time lookup. Windows reuses pids and never rewrites a child's parent pid:
+/// once the CLI that launched a server exits, a later process can get its
+/// pid and would "adopt" that server, whose VRAM would then be counted
+/// against the wrong run. A child created before its parent cannot be its
+/// child, so it is skipped; a time that cannot be read is given the benefit
+/// of the doubt.
+pub fn descendants_in(root: u32, pairs: &[(u32, u32)], created: &dyn Fn(u32) -> Option<u64>) -> Vec<u32> {
+    let mut times: std::collections::HashMap<u32, Option<u64>> = std::collections::HashMap::new();
+    let mut time = |pid: u32| *times.entry(pid).or_insert_with(|| created(pid));
+    let mut out = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(p) = frontier.pop() {
+        for &(pid, parent) in pairs {
+            if parent != p || pid == p || pid == root || out.contains(&pid) {
+                continue;
+            }
+            if let (Some(child), Some(parent)) = (time(pid), time(p)) {
+                if child < parent {
+                    continue;
+                }
+            }
+            out.push(pid);
+            frontier.push(pid);
+        }
+    }
+    out
+}
+
+/// Per-adapter GPU memory summed over `pids`, one entry per LUID. An error
+/// for the first pid (the run's own) means the counters are unavailable and
+/// is returned; a descendant that exits mid-query is skipped.
+pub fn sum_gpu_memory(p: &dyn Platform, pids: &[u32]) -> Result<Vec<GpuProcessMem>> {
+    let mut out: Vec<GpuProcessMem> = Vec::new();
+    for (i, pid) in pids.iter().enumerate() {
+        let mem = match p.gpu_process_memory(*pid) {
+            Ok(m) => m,
+            Err(e) if i == 0 => return Err(e),
+            Err(_) => continue,
+        };
+        for m in mem {
+            match out.iter_mut().find(|o| o.luid_low == m.luid_low) {
+                Some(o) => {
+                    o.dedicated_bytes += m.dedicated_bytes;
+                    o.committed_bytes += m.committed_bytes;
+                }
+                None => out.push(m),
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Deterministic fake for tests: scripted responses, no OS access.
 #[derive(Default)]
 pub struct FakePlatform {
     pub adapters: Vec<OsAdapter>,
     pub commit: Option<SystemCommit>,
     pub gpu_mem: Vec<GpuProcessMem>,
+    /// Per-pid answers; a pid not listed gets `gpu_mem`.
+    pub gpu_mem_by_pid: std::collections::HashMap<u32, Vec<GpuProcessMem>>,
 }
 
 impl Platform for FakePlatform {
@@ -121,7 +186,69 @@ impl Platform for FakePlatform {
             pagefile_can_grow: true,
         }))
     }
-    fn gpu_process_memory(&self, _pid: u32) -> Result<Vec<GpuProcessMem>> {
-        Ok(self.gpu_mem.clone())
+    fn gpu_process_memory(&self, pid: u32) -> Result<Vec<GpuProcessMem>> {
+        Ok(self.gpu_mem_by_pid.get(&pid).cloned().unwrap_or_else(|| self.gpu_mem.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem(luid_low: u64, dedicated_bytes: u64, committed_bytes: u64) -> GpuProcessMem {
+        GpuProcessMem { luid_low, dedicated_bytes, committed_bytes }
+    }
+
+    #[test]
+    fn sum_gpu_memory() {
+        let mut p = FakePlatform::default();
+        // The helper holds a sliver; its runner child holds the model.
+        p.gpu_mem_by_pid.insert(10, vec![mem(0x1BAAD, 1 << 20, 2 << 20)]);
+        p.gpu_mem_by_pid.insert(11, vec![mem(0x1BAAD, 16 << 30, 17 << 30), mem(0x14427, 3 << 20, 4 << 20)]);
+        let sum = super::sum_gpu_memory(&p, &[10, 11]).unwrap();
+        assert_eq!(sum.len(), 2);
+        let card = sum.iter().find(|m| m.luid_low == 0x1BAAD).unwrap();
+        assert_eq!(card.dedicated_bytes, (16 << 30) + (1 << 20));
+        assert_eq!(card.committed_bytes, (17 << 30) + (2 << 20));
+        let other = sum.iter().find(|m| m.luid_low == 0x14427).unwrap();
+        assert_eq!((other.dedicated_bytes, other.committed_bytes), (3 << 20, 4 << 20));
+        // The root is always first.
+        assert_eq!(run_pids(std::process::id())[0], std::process::id());
+    }
+
+    #[test]
+    fn descendants_skip_children_of_a_reused_pid() {
+        // CLI pid 100 launched server 200 at t=10 and exited; pid 100 was then
+        // reused by a later server (t=50), which started 300, which started 400.
+        let pairs = [(0, 0), (1, 0), (200, 100), (100, 1), (300, 100), (400, 300)];
+        let t = |pid: u32| match pid {
+            200 => Some(10),
+            100 => Some(50),
+            300 => Some(60),
+            400 => Some(70),
+            _ => None,
+        };
+        assert_eq!(descendants_in(100, &pairs, &t), vec![300, 400]);
+        // A time that cannot be read is trusted.
+        assert_eq!(descendants_in(100, &pairs, &|_| None), vec![200, 300, 400]);
+        // pid 0 names itself as its parent; no loops.
+        assert_eq!(descendants_in(0, &pairs, &|_| None), vec![1, 100, 200, 300, 400]);
+    }
+
+    /// The creation-time filter must keep a real child: it starts after us.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_child_is_a_descendant() {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/d", "/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::launch::hide_console(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let found = process_descendants(std::process::id()).contains(&child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found);
     }
 }

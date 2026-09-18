@@ -13,11 +13,11 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::devices::{self, Device};
 use crate::discovery;
-use crate::estimate::{self, EstimateInput, VramEstimate};
+use crate::estimate::{self, DiffusionSizing, EstimateInput, VramEstimate};
 use crate::gguf;
 use crate::platform::Platform;
-use crate::preflight::{LaunchContext, PortHolder, ResolvedDevice};
-use crate::profile::{Profile, SplitMode};
+use crate::preflight::{CoResident, DiffusionPreflight, LaunchContext, ModelFacts, PortHolder, ResolvedDevice};
+use crate::profile::{env_has_key, Profile, SplitMode};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,6 +193,97 @@ fn format_num(v: f64) -> String {
     }
 }
 
+// ------------------------------------------------------------ diffusion ----
+
+/// The paths and facts `compose_diffusion` needs beyond the profile, found
+/// by the launch path (or given by tests).
+#[derive(Debug, Clone)]
+pub struct DiffusionPaths {
+    pub helper_exe: PathBuf,
+    pub runner_exe: PathBuf,
+    pub req_prefix: PathBuf,
+    /// PCI bus of the chosen card; the helper refuses a runner on another.
+    pub expect_bus: Option<u32>,
+    pub build_tag: Option<String>,
+    pub full_offload: bool,
+}
+
+/// The DiffusionGemma runner inside the profile's build.
+pub fn runner_exe(p: &Profile) -> PathBuf {
+    p.build.path.join("bin").join(discovery::RUNNER_EXE)
+}
+
+/// Where a diffusion run's request files go: `runs_dir/dg-<id>-<port>`, to
+/// which the helper appends `-<task>-<attempt>.req`.
+pub fn req_prefix(runs_dir: &Path, p: &Profile) -> PathBuf {
+    req_prefix_for(runs_dir, &p.id, p.server.port)
+}
+
+/// `req_prefix` from a run state's identity (stop has no profile).
+pub fn req_prefix_for(runs_dir: &Path, profile_id: &str, port: u16) -> PathBuf {
+    runs_dir.join(format!("dg-{profile_id}-{port}"))
+}
+
+/// Compose the `fidim-dg.exe` command for a diffusion profile. Pure. The
+/// runner reads everything but the model path from its environment, so the
+/// env carries the settings: profile.env first, then every key FIDIM owns,
+/// which therefore wins (Windows env names are case-insensitive, and so is
+/// `Command::env` there).
+pub fn compose_diffusion(p: &Profile, resolved: &[ResolvedDevice], d: &DiffusionPaths) -> LaunchPlan {
+    let dg = p.diffusion_effective();
+    let mut args: Vec<String> = vec![
+        "--runner".into(),
+        d.runner_exe.to_string_lossy().into_owned(),
+        "--model".into(),
+        p.model.path.to_string_lossy().into_owned(),
+        "--host".into(),
+        p.server.host.clone(),
+        "--port".into(),
+        p.server.port.to_string(),
+        "--alias".into(),
+        p.server.alias.clone(),
+        "--req-prefix".into(),
+        d.req_prefix.to_string_lossy().into_owned(),
+        "--default-max-tokens".into(),
+        dg.default_max_tokens.to_string(),
+    ];
+    if let Some(seed) = dg.seed {
+        args.extend(["--seed".into(), seed.to_string()]);
+    }
+    if let Some(bus) = d.expect_bus {
+        args.extend(["--expect-bus".into(), bus.to_string()]);
+    }
+    if let Some(tag) = &d.build_tag {
+        args.extend(["--build-tag".into(), tag.clone()]);
+    }
+
+    // One card only (check 5): the runner's unified multi-device path
+    // aborts every prompt. The HIP runtime honours CUDA_VISIBLE_DEVICES as
+    // well, so both carry the same index.
+    let visibility_env = resolved.first().map(|r| r.device.hip_index.to_string()).unwrap_or_default();
+    let mut env: Vec<(String, String)> = p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    env.push(("HIP_VISIBLE_DEVICES".into(), visibility_env.clone()));
+    env.push(("CUDA_VISIBLE_DEVICES".into(), visibility_env.clone()));
+    // Always sent: the runner's own default is 0, a CPU run.
+    env.push(("NGL".into(), p.runtime.n_gpu_layers.to_string()));
+    env.push(("MAXTOK".into(), p.runtime.ctx_total.to_string()));
+    env.push(("FA".into(), if dg.flash_attn { "1" } else { "0" }.into()));
+    // With the whole model on the card, size the context against VRAM only,
+    // so auto MAXTOK does not depend on how much RAM happens to be free.
+    if d.full_offload {
+        env.push(("DG_FREE_RAM_MB".into(), "0".into()));
+    }
+    if dg.hipblaslt_safeguard {
+        for k in ["ROCBLAS_USE_HIPBLASLT", "ROCBLAS_USE_HIPBLASLT_BATCHED"] {
+            if !env_has_key(&p.env, k) {
+                env.push((k.into(), "0".into()));
+            }
+        }
+    }
+
+    LaunchPlan { exe: d.helper_exe.clone(), args, env, path_prepend: None, visibility_env }
+}
+
 // -------------------------------------------------------- context builder ----
 
 /// Everything the launch path measured while assembling a context, kept so
@@ -210,6 +301,12 @@ pub fn enumerate_devices(
     server_exe: &Path,
     platform: &dyn Platform,
 ) -> Result<Vec<Device>> {
+    // A build that bundles its own ROCm enumerates the way it launches: on
+    // its own DLLs with nothing on PATH. The default runtime would mix two
+    // ROCm versions in one process, and a mixed load lists no devices at all.
+    if bundles_runtime(server_exe) {
+        return enumerate_devices_with(cfg, server_exe, platform, None);
+    }
     // Probe with the default runtime (and its shims) so the HIP backend
     // loads the same way a launch would; the bare fallback folder is the
     // last resort.
@@ -219,6 +316,15 @@ pub fn enumerate_devices(
     crate::update::retire_build_shims(server_exe);
     let prepend = crate::runtime::default_prepend(cfg, server_exe).or_else(|| cfg.rocm_bin.clone());
     enumerate_devices_with(cfg, server_exe, platform, prepend.as_deref())
+}
+
+/// Whether the build `<dir>/bin/llama-server.exe` belongs to says, in its
+/// FIDIM manifest, that it ships its own ROCm.
+fn bundles_runtime(server_exe: &Path) -> bool {
+    server_exe
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(|dir| discovery::read_build_meta(dir).bundled_runtime)
 }
 
 /// `enumerate_devices` against a specific runtime search path (a profile's
@@ -310,8 +416,14 @@ impl PrepareInputs {
         let server_exe = profile.build.path.join("bin").join("llama-server.exe");
         // Probe and enumerate with the runtime this profile will launch
         // under, so a backend that only loads against one runtime is judged
-        // against that one.
-        let runtime_path = crate::runtime::path_prepend(cfg, profile.rocm_runtime.as_deref())?;
+        // against that one. A build that bundles its own ROCm runs with
+        // nothing on PATH, and its device indices come from that bundle.
+        let meta = discovery::read_build_meta(&profile.build.path);
+        let runtime_path = if meta.bundled_runtime {
+            None
+        } else {
+            crate::runtime::path_prepend(cfg, profile.rocm_runtime.as_deref())?
+        };
         let build_version_output =
             run_capture(&server_exe, &["--version"], runtime_path.as_deref())
                 .ok()
@@ -347,8 +459,11 @@ pub fn prepare_with_inputs(
     inputs: PrepareInputs,
 ) -> Result<PreparedLaunch> {
     let PrepareInputs { devices_now, build_version_output } = inputs;
+    let diffusion = profile.engine.is_diffusion();
+    let meta = discovery::read_build_meta(&profile.build.path);
 
-    // File existence (check 2).
+    // File existence (check 2). The diffusion runner takes neither a
+    // projector nor a draft, so a stale path there does not matter.
     let mut missing = Vec::new();
     let mut check_file = |p: &Path| {
         if !p.is_file() {
@@ -356,12 +471,14 @@ pub fn prepare_with_inputs(
         }
     };
     check_file(&profile.model.path);
-    if let Some(mm) = &profile.model.mmproj {
-        check_file(mm);
-    }
-    if let Some(d) = &profile.model.draft {
-        if d.enabled {
-            check_file(&d.path);
+    if !diffusion {
+        if let Some(mm) = &profile.model.mmproj {
+            check_file(mm);
+        }
+        if let Some(d) = &profile.model.draft {
+            if d.enabled {
+                check_file(&d.path);
+            }
         }
     }
 
@@ -403,58 +520,125 @@ pub fn prepare_with_inputs(
         }
     }
 
-    // VRAM estimate (check 6).
-    let estimate: Option<VramEstimate> = gguf::read_header(&profile.model.path).ok().map(|h| {
-        let mmproj_bytes = profile
-            .model
-            .mmproj
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let draft_bytes = profile
-            .model
-            .draft
-            .as_ref()
-            .filter(|d| d.enabled)
-            .and_then(|d| std::fs::metadata(&d.path).ok())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        estimate::estimate(&EstimateInput {
-            header: &h,
-            runtime: &profile.runtime,
-            devices: resolved.iter().map(|r| (r.profile_key.clone(), r.fraction)).collect(),
-            split_mode: profile.split_mode,
-            main_index: (profile.main_device as usize).min(resolved.len().saturating_sub(1)),
-            mmproj_bytes,
-            draft_bytes,
-        })
-    });
+    // VRAM estimate (check 6), and what the header says about the engine
+    // the model needs (check 13).
+    let header = gguf::read_header(&profile.model.path).ok();
+    let model_facts = header.as_ref().map(ModelFacts::from_header);
+    let mut sizing: Option<DiffusionSizing> = None;
+    let estimate: Option<VramEstimate> = match &header {
+        None => None,
+        Some(h) if diffusion => resolved.first().and_then(|r| {
+            let (est, s) = estimate::estimate_diffusion(
+                h,
+                profile.runtime.n_gpu_layers,
+                profile.runtime.ctx_total,
+                profile.diffusion_effective().flash_attn,
+                &r.profile_key,
+                r.device.free_mib,
+            );
+            sizing = Some(s);
+            // More than one card blocks at check 5; a per-card figure for
+            // only the first would read as a fit.
+            (resolved.len() == 1).then_some(est)
+        }),
+        Some(h) => Some(llama_server_estimate(profile, &resolved, h)),
+    };
 
     let commit = platform.system_commit()?;
-    let inflight_reserved_bytes = crate::supervise::inflight_reserved_bytes(&cfg.runs_dir);
+    let runs = crate::supervise::reattach(&cfg.runs_dir);
+    let inflight_reserved_bytes = crate::supervise::inflight_of(&runs);
     let port_holder = port_holder(&profile.server.host, profile.server.port, &cfg.runs_dir);
+    // Live runs on this launch's cards. A run on this profile's own port is
+    // left out: launching stops it first to take the port over.
+    let keys: Vec<&str> = resolved.iter().map(|r| r.device.stable_key.as_str()).collect();
+    let co_resident: Vec<CoResident> = runs
+        .iter()
+        .filter(|r| r.alive && r.state.port != profile.server.port)
+        .flat_map(|r| {
+            r.state.device_keys.iter().filter(|k| keys.contains(&k.as_str())).map(move |k| CoResident {
+                profile_id: r.state.profile_id.clone(),
+                device_key: k.clone(),
+                engine: r.state.engine,
+            })
+        })
+        .collect();
 
-    // Driver/SDK now vs baseline (check 11).
+    // Driver/SDK now vs baseline (check 11). A bundled build has no runtime
+    // to resolve: it runs on the DLLs in its own folder.
     let driver_now = resolved.iter().find_map(|r| r.device.driver_version.clone());
-    let runtime = crate::runtime::resolve(cfg, profile.rocm_runtime.as_deref())?;
+    let runtime = if meta.bundled_runtime {
+        None
+    } else {
+        Some(crate::runtime::resolve(cfg, profile.rocm_runtime.as_deref())?)
+    };
     // SDK identity for the baseline fingerprint: hipconfig where the runtime
     // has one (the HIP SDK), else the runtime's name + version.
-    let sdk_now = sdk_version(runtime.dirs.first().map(|p| p.as_path())).or_else(|| {
-        Some(format!("{}{}", runtime.name, runtime.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default()))
-    });
+    let sdk_now = match &runtime {
+        Some(runtime) => sdk_version(runtime.dirs.first().map(|p| p.as_path())).or_else(|| {
+            Some(format!(
+                "{}{}",
+                runtime.name,
+                runtime.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default()
+            ))
+        }),
+        None => Some(format!(
+            "bundled ROCm ({})",
+            meta.release_tag.clone().unwrap_or_else(|| {
+                profile.build.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            })
+        )),
+    };
     let baseline = profile.baseline.as_ref();
     let driver_baseline =
         baseline.and_then(|b| b.get("driver")).and_then(|v| v.as_str()).map(String::from);
     let sdk_baseline =
         baseline.and_then(|b| b.get("sdk")).and_then(|v| v.as_str()).map(String::from);
 
-    let mut plan = compose(profile, &resolved);
-    // Shims an older install copied into the build folder would shadow the
-    // chosen runtime; retire them, then prepend the runtime's own shim dir
-    // and its DLL dirs (joined with `;`).
-    crate::update::retire_build_shims(&plan.exe);
-    plan.path_prepend = crate::runtime::prepend_for(&runtime, &plan.exe);
+    let (plan, diffusion_pre) = if diffusion {
+        let runner = runner_exe(profile);
+        let helper = crate::supervise::helper_exe(crate::supervise::DG_HELPER_EXE);
+        let helper_dir = std::env::current_exe().ok().and_then(|me| me.parent().map(Path::to_path_buf));
+        let paths = DiffusionPaths {
+            // A missing helper blocks at check 1; the plan still names where
+            // it would be.
+            helper_exe: helper.clone().unwrap_or_else(|| match &helper_dir {
+                Some(d) => d.join(crate::supervise::DG_HELPER_EXE),
+                None => PathBuf::from(crate::supervise::DG_HELPER_EXE),
+            }),
+            runner_exe: runner.clone(),
+            req_prefix: req_prefix(&cfg.runs_dir, profile),
+            expect_bus: resolved.first().and_then(|r| r.device.bus_number),
+            build_tag: meta.release_tag.clone().or_else(|| profile.build.version.clone()),
+            full_offload: sizing.as_ref().is_some_and(|s| s.full_offload),
+        };
+        let mut plan = compose_diffusion(profile, &resolved, &paths);
+        // The helper passes its PATH on to the runner, which lives in the build.
+        plan.path_prepend = runtime.as_ref().and_then(|rt| crate::runtime::prepend_for(rt, &runner));
+        // The helper judges these two paths the same way at startup and
+        // exits 7 when neither is usable; check 1 says so before the launch.
+        let req_fallback = crate::diffusion::req_fallback_prefix(profile.server.port);
+        let pre = DiffusionPreflight {
+            helper_exe: helper,
+            helper_dir,
+            runner_present: runner.is_file(),
+            vulkan_backend: profile.build.path.join("bin").join("ggml-vulkan.dll").is_file(),
+            runner_exe: runner,
+            req_prefix_error: crate::diffusion::protocol::check_req_prefix(&paths.req_prefix).err(),
+            req_prefix: paths.req_prefix.clone(),
+            req_fallback_error: crate::diffusion::protocol::check_req_prefix(&req_fallback).err(),
+            req_fallback,
+            sizing,
+        };
+        (plan, Some(pre))
+    } else {
+        let mut plan = compose(profile, &resolved);
+        // Shims an older install copied into the build folder would shadow the
+        // chosen runtime; retire them, then prepend the runtime's own shim dir
+        // and its DLL dirs (joined with `;`).
+        crate::update::retire_build_shims(&plan.exe);
+        plan.path_prepend = runtime.as_ref().and_then(|rt| crate::runtime::prepend_for(rt, &plan.exe));
+        (plan, None)
+    };
 
     let context = LaunchContext {
         profile: profile.clone(),
@@ -474,8 +658,39 @@ pub fn prepare_with_inputs(
         sdk_now,
         sdk_baseline,
         pcie_aspm: pcie_aspm_ac(),
+        model_facts,
+        diffusion: diffusion_pre,
+        co_resident,
     };
     Ok(PreparedLaunch { context, plan, devices_now })
+}
+
+/// The llama-server VRAM estimate for a profile whose devices are resolved.
+fn llama_server_estimate(profile: &Profile, resolved: &[ResolvedDevice], h: &gguf::GgufHeader) -> VramEstimate {
+    let mmproj_bytes = profile
+        .model
+        .mmproj
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let draft_bytes = profile
+        .model
+        .draft
+        .as_ref()
+        .filter(|d| d.enabled)
+        .and_then(|d| std::fs::metadata(&d.path).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    estimate::estimate(&EstimateInput {
+        header: h,
+        runtime: &profile.runtime,
+        devices: resolved.iter().map(|r| (r.profile_key.clone(), r.fraction)).collect(),
+        split_mode: profile.split_mode,
+        main_index: (profile.main_device as usize).min(resolved.len().saturating_sub(1)),
+        mmproj_bytes,
+        draft_bytes,
+    })
 }
 
 /// AC index of "PCI Express > Link State Power Management" on the active
@@ -513,24 +728,49 @@ pub fn port_holder(host: &str, port: u16, runs_dir: &Path) -> Option<PortHolder>
 
 /// PID of the process LISTENING on a TCP port (netstat -ano).
 pub fn listening_pid(port: u16) -> Option<u32> {
+    parse_netstat_listener(&netstat_tcp()?, port)
+}
+
+/// Whether `pid` has a LISTENING socket on `port`. Checks every listener
+/// rather than the first: one process on 127.0.0.1:N and another on [::1]:N
+/// can coexist. False when netstat cannot run.
+pub fn listens_on(port: u16, pid: u32) -> bool {
+    netstat_tcp().is_some_and(|t| parse_netstat_listeners(&t, port).contains(&pid))
+}
+
+fn netstat_tcp() -> Option<String> {
+    // No `-p tcp`: that lists IPv4 sockets only, and a server bound to
+    // "localhost" or "::1" listens on IPv6. Without `-p` both families print
+    // as "TCP" rows (UDP rows are filtered out by the parser).
     let mut cmd = std::process::Command::new("netstat");
-    cmd.args(["-ano", "-p", "tcp"]);
+    cmd.arg("-ano");
     hide_console(&mut cmd);
     let out = cmd.output().ok()?;
-    parse_netstat_listener(&String::from_utf8_lossy(&out.stdout), port)
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// `  TCP    127.0.0.1:1234    0.0.0.0:0    LISTENING    3776` -> 3776.
 pub fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
+    parse_netstat_listeners(text, port).into_iter().next()
+}
+
+/// Every pid listening on `port`, IPv4 or IPv6, in netstat order. A
+/// listener is recognised by its unconnected foreign address, not by the
+/// state column: Windows translates "LISTENING" (ABHÖREN, …), so matching
+/// the English word made every run look dead on a non-English system.
+pub fn parse_netstat_listeners(text: &str, port: u16) -> Vec<u32> {
     let suffix = format!(":{port}");
-    text.lines().find_map(|line| {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() >= 5 && f[0].eq_ignore_ascii_case("TCP") && f[1].ends_with(&suffix) && f[3] == "LISTENING" {
-            f[4].parse().ok()
-        } else {
-            None
-        }
-    })
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let unconnected = f.get(2).is_some_and(|a| *a == "0.0.0.0:0" || *a == "[::]:0");
+            if f.len() >= 5 && f[0].eq_ignore_ascii_case("TCP") && f[1].ends_with(&suffix) && unconnected {
+                f.last()?.parse().ok()
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn process_name(pid: u32) -> Option<String> {
@@ -735,6 +975,108 @@ mod tests {
         assert!(cmd.contains("--some-future-flag"));
     }
 
+    fn diffusion_profile(env: serde_json::Value) -> Profile {
+        serde_json::from_value(serde_json::json!({
+            "schema": 1, "engine": "diffusion-gemma", "id": "dg-26b", "name": "DiffusionGemma",
+            "build": { "path": "C:/fidim/b11027-mix-3e83366-unsloth", "version": "b11027" },
+            "model": { "path": "E:/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf" },
+            "devices": [ { "key": "pci:A:bus08" } ],
+            "server": { "port": 9760, "alias": "diffusiongemma" },
+            "runtime": { "ctx_total": 0, "n_gpu_layers": 99 },
+            "diffusion": { "default_max_tokens": 1024, "seed": 7 },
+            "chat": { "enable_thinking": false },
+            "env": env
+        }))
+        .unwrap()
+    }
+
+    fn diffusion_paths(full_offload: bool) -> DiffusionPaths {
+        DiffusionPaths {
+            helper_exe: "C:/Programs/LlamaFIDIM/fidim-dg.exe".into(),
+            runner_exe: "C:/fidim/b11027-mix-3e83366-unsloth/bin/llama-diffusion-gemma-visual-server.exe".into(),
+            req_prefix: "C:/Users/u/.fidim/runs/dg-dg-26b-9760".into(),
+            expect_bus: Some(8),
+            build_tag: Some("b11027-mix-3e83366".into()),
+            full_offload,
+        }
+    }
+
+    #[test]
+    fn compose_diffusion_golden() {
+        let p = diffusion_profile(serde_json::json!({ "GPU_MAX_HW_QUEUES": "1" }));
+        let plan = compose_diffusion(&p, &resolved_single(), &diffusion_paths(true));
+        assert_eq!(plan.exe, PathBuf::from("C:/Programs/LlamaFIDIM/fidim-dg.exe"));
+        assert_eq!(
+            plan.args,
+            [
+                "--runner",
+                "C:/fidim/b11027-mix-3e83366-unsloth/bin/llama-diffusion-gemma-visual-server.exe",
+                "--model",
+                "E:/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9760",
+                "--alias",
+                "diffusiongemma",
+                "--req-prefix",
+                "C:/Users/u/.fidim/runs/dg-dg-26b-9760",
+                "--default-max-tokens",
+                "1024",
+                "--seed",
+                "7",
+                "--expect-bus",
+                "8",
+                "--build-tag",
+                "b11027-mix-3e83366",
+            ]
+        );
+        let env: Vec<(&str, &str)> = plan.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            env,
+            [
+                ("GPU_MAX_HW_QUEUES", "1"),
+                ("HIP_VISIBLE_DEVICES", "2"),
+                ("CUDA_VISIBLE_DEVICES", "2"),
+                ("NGL", "99"),
+                ("MAXTOK", "0"),
+                ("FA", "0"),
+                ("DG_FREE_RAM_MB", "0"),
+                ("ROCBLAS_USE_HIPBLASLT", "0"),
+                ("ROCBLAS_USE_HIPBLASLT_BATCHED", "0"),
+            ]
+        );
+        // enable_thinking=false cannot reach the runner (validate warns).
+        assert!(!plan.env.iter().any(|(k, _)| k == "LLAMA_ARG_CHAT_TEMPLATE_KWARGS"));
+        assert_eq!(plan.path_prepend, None);
+        assert_eq!(plan.visibility_env, "2");
+
+        // profile.env wins for the hipBLASLt keys, whatever their case.
+        let p = diffusion_profile(serde_json::json!({ "rocblas_use_hipblaslt": "1" }));
+        let plan = compose_diffusion(&p, &resolved_single(), &diffusion_paths(false));
+        let keys: Vec<&str> = plan.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(!keys.contains(&"ROCBLAS_USE_HIPBLASLT"), "{keys:?}");
+        assert!(keys.contains(&"ROCBLAS_USE_HIPBLASLT_BATCHED"), "{keys:?}");
+        // Partial offload: the runner may size against RAM, so no override.
+        assert!(!keys.contains(&"DG_FREE_RAM_MB"), "{keys:?}");
+
+        // Safeguard off, flash attention on, no seed/bus/tag.
+        let mut p = diffusion_profile(serde_json::json!({}));
+        p.diffusion = Some(crate::profile::DiffusionCfg {
+            hipblaslt_safeguard: false,
+            flash_attn: true,
+            ..Default::default()
+        });
+        let d = DiffusionPaths { expect_bus: None, build_tag: None, ..diffusion_paths(true) };
+        let plan = compose_diffusion(&p, &resolved_single(), &d);
+        assert!(plan.env.contains(&("FA".into(), "1".into())));
+        assert!(!plan.env.iter().any(|(k, _)| k.starts_with("ROCBLAS")));
+        let cmd = plan.command_line();
+        assert!(cmd.contains("--default-max-tokens 2048") && !cmd.contains("--seed") && !cmd.contains("--expect-bus"), "{cmd}");
+        assert_eq!(runner_exe(&p), PathBuf::from("C:/fidim/b11027-mix-3e83366-unsloth/bin/llama-diffusion-gemma-visual-server.exe"));
+        assert_eq!(req_prefix(Path::new("C:/r"), &p), PathBuf::from("C:/r/dg-dg-26b-9760"));
+    }
+
     #[test]
     fn port_free_detects_bound_port() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -761,11 +1103,62 @@ mod aspm_tests {
 }
 
 #[cfg(test)]
+mod bundle_tests {
+    #[test]
+    fn bundled_builds_are_recognised_from_the_server_path() {
+        let dir = std::env::temp_dir().join(format!("fidim-bundle-{}", std::process::id()));
+        let build = dir.join("b11027-mix-3e83366-unsloth");
+        let exe = build.join("bin").join("llama-server.exe");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        assert!(!super::bundles_runtime(&exe), "no manifest: an upstream build on the default runtime");
+        std::fs::write(
+            build.join(crate::update::MANIFEST_NAME),
+            r#"{"channel":"unsloth","bundled_runtime":true,"release_tag":"b11027-mix-3e83366"}"#,
+        )
+        .unwrap();
+        assert!(super::bundles_runtime(&exe));
+        assert!(!super::bundles_runtime(std::path::Path::new("llama-server.exe")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
 mod port_tests {
     #[test]
     fn parses_netstat_listener() {
-        let text = "  TCP    0.0.0.0:135    0.0.0.0:0    LISTENING    1234\n  TCP    127.0.0.1:9701    0.0.0.0:0    LISTENING    3776\n  TCP    127.0.0.1:9701    127.0.0.1:5000    ESTABLISHED    3776\n";
+        // `netstat -ano` (no -p): IPv4 and IPv6 TCP rows, then UDP rows.
+        let text = "\nActive Connections\n\n  Proto  Local Address          Foreign Address        State           PID\n\
+            \x20 TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1234\n\
+            \x20 TCP    127.0.0.1:9701         0.0.0.0:0              LISTENING       3776\n\
+            \x20 TCP    127.0.0.1:9701         127.0.0.1:5000         ESTABLISHED     3776\n\
+            \x20 TCP    [::1]:9701             [::]:0                 LISTENING       4100\n\
+            \x20 TCP    [::1]:9701             [::1]:50202            ESTABLISHED     4100\n\
+            \x20 UDP    0.0.0.0:9701           *:*                                    5436\n";
         assert_eq!(super::parse_netstat_listener(text, 9701), Some(3776));
         assert_eq!(super::parse_netstat_listener(text, 9702), None);
+        assert_eq!(super::parse_netstat_listeners(text, 9701), vec![3776, 4100]);
+        assert!(super::parse_netstat_listeners(text, 970).is_empty());
+        // A helper bound to "localhost" listens on IPv6 only.
+        let v6 = "  TCP    [::]:135               [::]:0                 LISTENING       2196\n\
+                  \x20 TCP    [::1]:18766            [::]:0                 LISTENING       4100\n";
+        assert_eq!(super::parse_netstat_listeners(v6, 18766), vec![4100]);
+        // The state column is translated on non-English Windows.
+        let de = "  TCP    127.0.0.1:9701         0.0.0.0:0              ABH\u{00d6}REN         3776\n\
+                  \x20 TCP    127.0.0.1:9701         127.0.0.1:5000         HERGESTELLT     3776\n";
+        assert_eq!(super::parse_netstat_listeners(de, 9701), vec![3776]);
+    }
+
+    /// The real netstat must see an IPv6 listener: a diffusion helper bound
+    /// to "localhost" or "::1" otherwise reads as CRASHED and is never stopped.
+    #[cfg(windows)]
+    #[test]
+    fn listens_on_sees_ipv4_and_ipv6_listeners() {
+        let me = std::process::id();
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(super::listens_on(v4.local_addr().unwrap().port(), me));
+        let Ok(v6) = std::net::TcpListener::bind("[::1]:0") else { return }; // no IPv6 stack
+        let port = v6.local_addr().unwrap().port();
+        assert!(super::listens_on(port, me), "[::1]:{port} is not seen");
+        assert!(!super::listens_on(port, me.wrapping_add(1)));
     }
 }

@@ -169,6 +169,19 @@ pub fn render_section(p: &Profile, resolved: &[ResolvedDevice], load_on_startup:
     lines.join("\n")
 }
 
+/// Only llama-server profiles can be router members: every instance is a
+/// llama-server child of the router.
+pub fn check_member(p: &Profile) -> Result<()> {
+    if p.engine.is_llama_server() {
+        return Ok(());
+    }
+    let what = if p.engine.is_diffusion() { "a diffusion profile" } else { "not a llama-server profile" };
+    Err(Error::Config(format!(
+        "`{}` is {what}; llama-server's router cannot load it — launch it standalone on its own port",
+        p.id
+    )))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RenderedIni {
     pub text: String,
@@ -192,6 +205,7 @@ pub fn render_ini(rc: &RouterConfig, profiles: &[Profile], devices: &[Device]) -
             .iter()
             .find(|p| p.id == m.profile_id)
             .ok_or_else(|| Error::Config(format!("router member `{}` is not a saved profile", m.profile_id)))?;
+        check_member(p)?;
         let resolved = resolve_members(p, devices)?;
         text.push('\n');
         text.push_str(&render_section(p, &resolved, m.load_on_startup));
@@ -409,6 +423,19 @@ mod tests {
     fn unknown_member_is_an_error() {
         let rc = RouterConfig { members: vec![RouterMember { profile_id: "nope".into(), load_on_startup: false }], ..Default::default() };
         assert!(render_ini(&rc, &[profile()], &[]).is_err());
+    }
+
+    #[test]
+    fn diffusion_member_rejected() {
+        let mut dg = profile();
+        dg.engine = crate::profile::Engine::DiffusionGemma;
+        let rc = RouterConfig { members: vec![RouterMember { profile_id: "dd".into(), load_on_startup: false }], ..Default::default() };
+        match render_ini(&rc, &[dg.clone()], &[dev(0, "pci:x:bus03")]) {
+            Err(Error::Config(m)) => assert!(m.contains("standalone"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(check_member(&dg).is_err());
+        assert!(check_member(&profile()).is_ok());
     }
 
     #[test]

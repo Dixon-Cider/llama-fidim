@@ -146,8 +146,44 @@ pub struct GgufHeader {
     pub swa_layer_flags: Option<Vec<bool>>,
     pub expert_count: Option<u64>,
     pub expert_used_count: Option<u64>,
+    /// `diffusion.canvas_length`: tokens denoised per block by a diffusion
+    /// LM. The key is literal, not arch-prefixed; the DiffusionGemma runner
+    /// reads it the same way and refuses a model without it.
+    #[serde(default)]
+    pub diffusion_canvas_length: Option<u64>,
+    /// `<arch>.attention.causal`; false on diffusion LMs.
+    #[serde(default)]
+    pub attention_causal: Option<bool>,
+    /// Length of `tokenizer.ggml.tokens`.
+    #[serde(default)]
+    pub vocab_size: Option<u64>,
     /// All scalar metadata (arrays recorded as skipped).
     pub metadata: BTreeMap<String, Value>,
+}
+
+/// Architectures that are diffusion LMs: llama-server cannot serve them.
+pub const DIFFUSION_ARCHES: &[&str] = &["diffusion-gemma", "dream", "llada", "llada-moe", "rnd1"];
+
+impl GgufHeader {
+    pub fn is_diffusion(&self) -> bool {
+        self.diffusion_canvas_length.is_some()
+            || self.architecture.as_deref().is_some_and(|a| DIFFUSION_ARCHES.contains(&a))
+    }
+
+    /// Whether the DiffusionGemma runner can load this file: it handles only
+    /// its own architecture and exits on a model without the canvas key.
+    pub fn runner_supported(&self) -> bool {
+        self.architecture.as_deref() == Some("diffusion-gemma") && self.diffusion_canvas_length.is_some()
+    }
+
+    /// The engine a profile for this model needs.
+    pub fn engine(&self) -> crate::profile::Engine {
+        if self.is_diffusion() {
+            crate::profile::Engine::DiffusionGemma
+        } else {
+            crate::profile::Engine::LlamaServer
+        }
+    }
 }
 
 pub fn read_header(path: &Path) -> Result<GgufHeader> {
@@ -234,6 +270,13 @@ pub fn read_header(path: &Path) -> Result<GgufHeader> {
             .and_then(|v| v.as_bool_array()),
         expert_count: arch_key("expert_count"),
         expert_used_count: arch_key("expert_used_count"),
+        diffusion_canvas_length: metadata.get("diffusion.canvas_length").and_then(Value::as_u64),
+        attention_causal: arch_val("attention.causal").and_then(|v| v.as_bool()),
+        vocab_size: metadata.get("tokenizer.ggml.tokens").and_then(|v| match v {
+            Value::ArraySkipped { len, .. } => Some(*len),
+            Value::Array(items) => Some(items.len() as u64),
+            _ => None,
+        }),
         architecture: arch,
         metadata,
     })
@@ -471,6 +514,10 @@ mod tests {
                     out.extend_from_slice(&4u32.to_le_bytes());
                     out.extend_from_slice(&x.to_le_bytes());
                 }
+                SynthVal::Bool(b) => {
+                    out.extend_from_slice(&7u32.to_le_bytes());
+                    out.push(if *b { 1 } else { 0 });
+                }
                 SynthVal::Str(s) => {
                     out.extend_from_slice(&8u32.to_le_bytes());
                     out.extend_from_slice(&(s.len() as u64).to_le_bytes());
@@ -516,6 +563,7 @@ mod tests {
 
     enum SynthVal {
         U32(u32),
+        Bool(bool),
         Str(&'static str),
         StrArray(Vec<&'static str>),
         F32Array(Vec<f32>),
@@ -587,6 +635,54 @@ mod tests {
         assert_eq!(h.key_length, Some(512));
         assert_eq!(h.value_length_swa, Some(256));
         assert_eq!(h.swa_layer_flags, Some(vec![true, true, true, false]));
+        std::fs::remove_file(path).ok();
+    }
+
+    /// DiffusionGemma's shape: the canvas key is literal (not arch-prefixed)
+    /// and attention is non-causal.
+    #[test]
+    fn diffusion_header() {
+        let bytes = synth_gguf(&[
+            ("general.architecture", SynthVal::Str("diffusion-gemma")),
+            ("diffusion-gemma.block_count", SynthVal::U32(30)),
+            ("diffusion-gemma.attention.causal", SynthVal::Bool(false)),
+            ("diffusion.canvas_length", SynthVal::U32(256)),
+            ("tokenizer.ggml.tokens", SynthVal::StrArray(vec!["a", "bb", "ccc"])),
+        ]);
+        let path = write_temp("diffusion", &bytes);
+        let h = read_header(&path).unwrap();
+        assert_eq!(h.diffusion_canvas_length, Some(256));
+        assert_eq!(h.attention_causal, Some(false));
+        assert_eq!(h.vocab_size, Some(3));
+        assert!(h.is_diffusion());
+        assert!(h.runner_supported());
+        assert_eq!(h.engine(), crate::profile::Engine::DiffusionGemma);
+        std::fs::remove_file(path).ok();
+
+        // Another diffusion architecture: still not llama-server's, but not
+        // one the DiffusionGemma runner can load either.
+        let bytes = synth_gguf(&[("general.architecture", SynthVal::Str("llada"))]);
+        let path = write_temp("llada", &bytes);
+        let h = read_header(&path).unwrap();
+        assert!(h.is_diffusion());
+        assert!(!h.runner_supported());
+        assert_eq!(h.engine(), crate::profile::Engine::DiffusionGemma);
+        std::fs::remove_file(path).ok();
+
+        let bytes = synth_gguf(&[
+            ("general.architecture", SynthVal::Str("llama")),
+            ("llama.block_count", SynthVal::U32(32)),
+            ("llama.attention.causal", SynthVal::Bool(true)),
+            ("tokenizer.ggml.tokens", SynthVal::StrArray(vec!["a", "b"])),
+        ]);
+        let path = write_temp("llama", &bytes);
+        let h = read_header(&path).unwrap();
+        assert_eq!(h.diffusion_canvas_length, None);
+        assert_eq!(h.attention_causal, Some(true));
+        assert_eq!(h.vocab_size, Some(2));
+        assert!(!h.is_diffusion());
+        assert!(!h.runner_supported());
+        assert_eq!(h.engine(), crate::profile::Engine::LlamaServer);
         std::fs::remove_file(path).ok();
     }
 

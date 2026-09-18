@@ -10,8 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::launch::LaunchPlan;
-use crate::profile::Profile;
+use crate::profile::{Engine, Profile};
 use crate::{Error, Result};
+
+/// The diffusion engine's server: FIDIM's shim, which owns the runner.
+pub const DG_HELPER_EXE: &str = "fidim-dg.exe";
 
 /// State file written next to the logs for every launched server — the
 /// re-attach path reads these back after the tool restarts.
@@ -49,17 +52,23 @@ pub struct RunState {
     /// run, if any. Killed by `stop`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepalive_pid: Option<u32>,
+    /// What `pid` is: llama-server, or the `fidim-dg.exe` helper that owns a
+    /// DiffusionGemma runner. Omitted for llama-server, so state files from
+    /// before this field (and router states) read as llama-server.
+    #[serde(default, skip_serializing_if = "Engine::is_llama_server")]
+    pub engine: Engine,
 }
 
 /// Bytes reserved by runs that are alive but not yet finished loading.
 /// A loading server has claimed its memory without having charged it, so a
 /// concurrent pre-flight that ignores it sees phantom headroom.
 pub fn inflight_reserved_bytes(runs_dir: &Path) -> u64 {
-    reattach(runs_dir)
-        .iter()
-        .filter(|r| r.alive && !r.state.ready)
-        .map(|r| r.state.estimated_bytes)
-        .sum()
+    inflight_of(&reattach(runs_dir))
+}
+
+/// `inflight_reserved_bytes` over runs already re-attached.
+pub fn inflight_of(runs: &[AttachedRun]) -> u64 {
+    runs.iter().filter(|r| r.alive && !r.state.ready).map(|r| r.state.estimated_bytes).sum()
 }
 
 impl RunState {
@@ -177,6 +186,7 @@ pub fn spawn(
         estimated_bytes,
         ready: false,
         keepalive_pid: None,
+        engine: profile.engine,
     };
     state.save(runs_dir)?;
     Ok(state)
@@ -301,7 +311,7 @@ fn dechunk(mut b: &[u8]) -> Vec<u8> {
 /// `fidim launch … | tail` both deadlocked this way. The server's own
 /// stdio is set explicitly to the log file, so it loses nothing.
 #[cfg(windows)]
-fn stop_inheriting_std_handles() {
+pub(crate) fn stop_inheriting_std_handles() {
     use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
     use windows::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -315,6 +325,10 @@ fn stop_inheriting_std_handles() {
         }
     }
 }
+
+/// Handle inheritance is a Windows-only hazard; elsewhere there is nothing to clear.
+#[cfg(not(windows))]
+pub(crate) fn stop_inheriting_std_handles() {}
 
 /// Wait for `/v1/models` to answer 200 (R-07: readiness by HTTP, never by
 /// log-scraping). Large models take minutes to load.
@@ -379,14 +393,21 @@ pub fn probe_health(state: &RunState, deep: bool) -> Health {
         return Health::Dead;
     }
     if deep {
-        let body = format!(
-            r#"{{"model":"{}","prompt":"Hi","max_tokens":1,"stream":false}}"#,
-            state.alias
-        );
-        let ok = matches!(
-            http_post_json(&state.host, state.port, "/v1/completions", &body, Duration::from_secs(60)),
-            Ok((200, _))
-        );
+        let ok = if state.engine.is_diffusion() {
+            // Never generate: the smallest diffusion request is a whole
+            // 256-token denoise block. The helper's /health answers 200 only
+            // while a guarded runner is up, and 503 while it respawns.
+            matches!(http_get(&state.host, state.port, "/health", Duration::from_secs(5)), Ok((200, _)))
+        } else {
+            let body = format!(
+                r#"{{"model":"{}","prompt":"Hi","max_tokens":1,"stream":false}}"#,
+                state.alias
+            );
+            matches!(
+                http_post_json(&state.host, state.port, "/v1/completions", &body, Duration::from_secs(60)),
+                Ok((200, _))
+            )
+        };
         if !ok {
             return Health::RespondingNotGenerating;
         }
@@ -418,21 +439,47 @@ pub fn process_alive_as(pid: u32, image_contains: &str) -> bool {
     process_image(pid).map(|img| img.to_ascii_lowercase().contains(image_contains)).unwrap_or(false)
 }
 
+/// Whether a run's pid is still the server it started, per engine:
+/// - llama-server: the image name, as before.
+/// - diffusion: the exact image `fidim-dg.exe` (a substring would also match
+///   `llama-fidim.exe` and the keep-alive `fidim.exe`) AND that pid is the one
+///   listening on the run's port. The helper binds before anything else, and
+///   a reused pid on another helper listens elsewhere.
+/// - unknown: never ours to kill.
+pub fn run_alive(s: &RunState) -> bool {
+    match s.engine {
+        Engine::LlamaServer => process_alive_as(s.pid, "llama-server"),
+        Engine::DiffusionGemma => {
+            process_image(s.pid).is_some_and(|img| img.eq_ignore_ascii_case(DG_HELPER_EXE))
+                && crate::launch::listens_on(s.port, s.pid)
+        }
+        Engine::Unknown => false,
+    }
+}
+
+/// The keep-alive helper's image: `fidim.exe`, or `llamactl.exe` from before
+/// the rename. Exact, because `llama-fidim.exe` (the GUI) contains "fidim".
+pub(crate) fn is_keepalive_image(img: &str) -> bool {
+    img.eq_ignore_ascii_case("fidim.exe") || img.eq_ignore_ascii_case("llamactl.exe")
+}
+
 /// Stop a server. llama-server has no shutdown endpoint; on Windows a
 /// process-tree terminate is the clean stop (§04 clean-stop requirement).
+/// For a diffusion run the tree is the helper and its runner; the runner's
+/// kill-on-close job is the second line of defence.
 ///
 /// A run whose process is gone (or whose pid now belongs to something
 /// else) is only forgotten: the state file goes, nothing is killed.
 pub fn stop(state: &RunState, runs_dir: &Path) -> Result<()> {
     if let Some(kp) = state.keepalive_pid {
-        if process_alive_as(kp, "fidim") {
+        if process_image(kp).is_some_and(|img| is_keepalive_image(&img)) {
             let mut k = std::process::Command::new("taskkill");
             k.args(["/PID", &kp.to_string(), "/F"]);
             crate::launch::hide_console(&mut k);
             let _ = k.output();
         }
     }
-    if process_alive_as(state.pid, "llama-server") {
+    if run_alive(state) {
         let mut cmd = std::process::Command::new("taskkill");
         cmd.args(["/PID", &state.pid.to_string(), "/T", "/F"]);
         crate::launch::hide_console(&mut cmd);
@@ -445,8 +492,19 @@ pub fn stop(state: &RunState, runs_dir: &Path) -> Result<()> {
             }
         }
     }
+    if state.engine.is_diffusion() {
+        remove_diffusion_requests(state, runs_dir);
+    }
     forget(state, runs_dir);
     Ok(())
+}
+
+/// Request files hold conversations, and a killed helper cannot clean up
+/// the one in flight. Also the helper's %TEMP% fallback, used when the runs
+/// dir path is unusable for the runner (non-ASCII or too long).
+fn remove_diffusion_requests(state: &RunState, runs_dir: &Path) {
+    crate::diffusion::remove_request_files(&crate::launch::req_prefix_for(runs_dir, &state.profile_id, state.port));
+    crate::diffusion::remove_request_files(&crate::diffusion::req_fallback_prefix(state.port));
 }
 
 /// Drop the run state without touching any process.
@@ -481,7 +539,7 @@ pub fn reattach(runs_dir: &Path) -> Vec<AttachedRun> {
         }
         let Ok(text) = std::fs::read_to_string(&p) else { continue };
         let Ok(state) = serde_json::from_str::<RunState>(text.trim_start_matches('\u{feff}')) else { continue };
-        let alive = process_alive_as(state.pid, "llama-server");
+        let alive = run_alive(&state);
         let health = if alive { probe_health(&state, false) } else { Health::Dead };
         out.push(AttachedRun { crashed: !alive, alive, health, state });
     }
@@ -573,6 +631,7 @@ mod tests {
             estimated_bytes: 20 * 1024 * 1024 * 1024,
             ready: true,
             keepalive_pid: None,
+            engine: Engine::LlamaServer,
         };
         state.save(&dir).unwrap();
         let attached = reattach(&dir);
@@ -581,20 +640,104 @@ mod tests {
         assert!(attached[0].crashed, "pid 1234 should not be our live process");
         std::fs::remove_dir_all(dir).ok();
     }
+
+    fn diffusion_state(dir: &Path, pid: u32) -> RunState {
+        RunState {
+            profile_id: "dg-26b".into(),
+            pid,
+            port: 9760,
+            host: "127.0.0.1".into(),
+            alias: "dg".into(),
+            started_unix: 1_700_000_000,
+            log_path: dir.join("dg-26b-9760.log"),
+            command_line: "fidim-dg.exe --runner r.exe".into(),
+            visibility_env: "2".into(),
+            device_keys: vec!["pci:A:bus08".into()],
+            free_mib_before: vec![32472],
+            cold_start: false,
+            estimated_bytes: 0,
+            ready: true,
+            keepalive_pid: None,
+            engine: Engine::DiffusionGemma,
+        }
+    }
+
+    #[test]
+    fn engine_identity() {
+        let dir = std::env::temp_dir().join(format!("fidim-runs-engine-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // A state file from before the field reads as llama-server, and a
+        // llama-server state still saves without the key.
+        let legacy = r#"{"profile_id":"w","pid":1,"port":9701,"host":"127.0.0.1","alias":"w",
+            "started_unix":0,"log_path":"w.log","command_line":"llama-server.exe","visibility_env":"2",
+            "device_keys":[],"free_mib_before":[]}"#;
+        let s: RunState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.engine, Engine::LlamaServer);
+        assert!(!serde_json::to_string(&s).unwrap().contains("engine"));
+
+        // A diffusion state round-trips through its file.
+        let s = diffusion_state(&dir, std::process::id());
+        s.save(&dir).unwrap();
+        let text = std::fs::read_to_string(RunState::state_path(&dir, "dg-26b", 9760)).unwrap();
+        assert!(text.contains(r#""engine": "diffusion-gemma""#), "{text}");
+        let back: RunState = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.engine, Engine::DiffusionGemma);
+
+        // Our own pid is alive but it is the test binary, not fidim-dg.exe:
+        // the run is crashed, never ours to kill.
+        let attached = reattach(&dir);
+        assert_eq!(attached.len(), 1);
+        assert!(attached[0].crashed && !attached[0].alive, "{:?}", attached[0]);
+        assert!(!run_alive(&s));
+        let unknown = RunState { engine: Engine::Unknown, ..s.clone() };
+        assert!(!run_alive(&unknown));
+
+        // No keep-alive for diffusion runs, whatever the interval.
+        let mut ka = s.clone();
+        assert_eq!(spawn_keepalive(&mut ka, &dir, 5).unwrap(), None);
+        assert_eq!(ka.keepalive_pid, None);
+
+        // stop forgets the run (killing nothing: it is not alive) and deletes
+        // its request files, but only its own.
+        let mine = dir.join("dg-dg-26b-9760-3-1.req");
+        let other = dir.join("dg-dg-26b-97601-3-1.req");
+        std::fs::write(&mine, b"{}").unwrap();
+        std::fs::write(&other, b"{}").unwrap();
+        stop(&s, &dir).unwrap();
+        assert!(!mine.exists());
+        assert!(other.exists());
+        assert!(!RunState::state_path(&dir, "dg-26b", 9760).exists());
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The keep-alive kill matches exact images only.
+        assert!(is_keepalive_image("FIDIM.EXE"));
+        assert!(is_keepalive_image("fidim.exe"));
+        assert!(is_keepalive_image("llamactl.exe"));
+        assert!(!is_keepalive_image("llama-fidim.exe"));
+        assert!(!is_keepalive_image("fidim-dg.exe"));
+    }
 }
 
 
 // ---------------------------------------------------------------- keep-alive ----
 
+/// A companion binary shipped with Llama FIDIM: the running executable when
+/// that is `name`, else an existing `name` beside it (install.ps1 and
+/// `target\<profile>` both put the CLI, the GUI and fidim-dg side by side).
+pub fn helper_exe(name: &str) -> Option<PathBuf> {
+    let me = std::env::current_exe().ok()?;
+    if me.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+        return Some(me);
+    }
+    let sibling = me.parent()?.join(name);
+    sibling.is_file().then_some(sibling)
+}
+
 /// The CLI binary that hosts the `keepalive` loop: `fidim.exe` beside the
 /// running executable (the GUI ships next to it), or the executable itself.
 pub fn keepalive_exe() -> Option<std::path::PathBuf> {
-    let me = std::env::current_exe().ok()?;
-    if me.file_name().is_some_and(|n| n.eq_ignore_ascii_case("fidim.exe")) {
-        return Some(me);
-    }
-    let sibling = me.parent()?.join("fidim.exe");
-    sibling.is_file().then_some(sibling)
+    helper_exe("fidim.exe")
 }
 
 /// Arguments for the helper process (kept separate so they are testable).
@@ -617,7 +760,13 @@ pub fn keepalive_args(host: &str, port: u16, interval_s: u32, server_pid: u32) -
 /// down and WDDM evicts every allocation first (measured 2026-09-05: 25.6 GB
 /// gone within 20 s of the monitors switching off; a 1-token request every
 /// 5 s held it for the full test). `interval_s == 0` = disabled.
+///
+/// Never for a diffusion run: its smallest request is a whole 256-token
+/// denoise block, and the helper has no `/completion` to post to.
 pub fn spawn_keepalive(state: &mut RunState, runs_dir: &Path, interval_s: u32) -> Result<Option<u32>> {
+    if state.engine.is_diffusion() {
+        return Ok(None);
+    }
     if interval_s == 0 {
         return Ok(None);
     }

@@ -3,12 +3,67 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::gguf::{self, GgufHeader};
 use crate::{Error, Result};
 
 // ---------------------------------------------------------------- builds ----
+
+/// Where a build came from. Only FIDIM's own manifest sets it: a build is
+/// never classed by the files it contains, because upstream may ship the
+/// diffusion runner too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    /// ggml-org/llama.cpp, or any build FIDIM did not install.
+    #[default]
+    Upstream,
+    /// unslothai/llama.cpp's fork, which carries the DiffusionGemma runner.
+    Unsloth,
+}
+
+/// The DiffusionGemma runner, beside `llama-server.exe` in a build's `bin`.
+pub const RUNNER_EXE: &str = "llama-diffusion-gemma-visual-server.exe";
+
+/// What FIDIM's install manifest says about a build directory.
+#[derive(Debug, Clone, Default)]
+pub struct BuildMeta {
+    pub channel: Channel,
+    /// The build ships its own ROCm DLLs and must run with no PATH prefix:
+    /// a runtime on PATH would supply whatever DLL the bundle lacks and mix
+    /// ROCm versions.
+    pub bundled_runtime: bool,
+    pub release_tag: Option<String>,
+}
+
+/// Only the manifest fields discovery needs, all optional, so manifests from
+/// every FIDIM version parse (older ones lack the channel fields entirely).
+#[derive(Deserialize)]
+struct ManifestLite {
+    #[serde(default)]
+    channel: Option<Channel>,
+    #[serde(default)]
+    bundled_runtime: bool,
+    #[serde(default)]
+    release_tag: Option<String>,
+}
+
+/// Read a build's channel metadata. No manifest, or one that does not parse,
+/// means a plain upstream build with no bundled runtime.
+pub fn read_build_meta(dir: &Path) -> BuildMeta {
+    let Ok(text) = std::fs::read_to_string(crate::update::manifest_path(dir)) else {
+        return BuildMeta::default();
+    };
+    match serde_json::from_str::<ManifestLite>(&text) {
+        Ok(m) => BuildMeta {
+            channel: m.channel.unwrap_or_default(),
+            bundled_runtime: m.bundled_runtime,
+            release_tag: m.release_tag,
+        },
+        Err(_) => BuildMeta::default(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Build {
@@ -22,15 +77,30 @@ pub struct Build {
     pub version: Option<String>,
     pub commit: Option<String>,
     pub version_error: Option<String>,
+    /// From the manifest only (see `Channel`).
+    pub channel: Channel,
+    pub bundled_runtime: bool,
+    /// The release this build was installed from, e.g. `b11027-mix-3e83366`.
+    pub release_tag: Option<String>,
+    /// `bin/<RUNNER_EXE>` when present: this build can run diffusion profiles.
+    pub runner_exe: Option<PathBuf>,
 }
 
 /// Scan each root and its immediate subdirectories for `bin/llama-server.exe`.
+/// Subdirectories named `.…` are skipped: installs stage into `.fidim-tmp-*`
+/// and a half-extracted build must never be offered.
 pub fn scan_builds(roots: &[PathBuf], rocm_bin: Option<&Path>) -> Vec<Build> {
     let mut found = Vec::new();
     for root in roots {
         let mut candidates = vec![root.clone()];
         if let Ok(entries) = std::fs::read_dir(root) {
-            candidates.extend(entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            candidates.extend(
+                entries
+                    .flatten()
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir()),
+            );
         }
         for dir in candidates {
             let exe = dir.join("bin").join("llama-server.exe");
@@ -45,6 +115,8 @@ pub fn scan_builds(roots: &[PathBuf], rocm_bin: Option<&Path>) -> Vec<Build> {
 
 fn probe_build(dir: &Path, exe: &Path, rocm_bin: Option<&Path>) -> Build {
     let tag = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let meta = read_build_meta(dir);
+    let runner = exe.with_file_name(RUNNER_EXE);
     let mut build = Build {
         path: dir.to_path_buf(),
         tag,
@@ -52,7 +124,13 @@ fn probe_build(dir: &Path, exe: &Path, rocm_bin: Option<&Path>) -> Build {
         version: None,
         commit: None,
         version_error: None,
+        channel: meta.channel,
+        bundled_runtime: meta.bundled_runtime,
+        release_tag: meta.release_tag,
+        runner_exe: runner.is_file().then_some(runner),
     };
+    // A bundled build is probed exactly as it launches: with nothing on PATH.
+    let rocm_bin = if build.bundled_runtime { None } else { rocm_bin };
     match run_version(exe, rocm_bin) {
         Ok(text) => match parse_version_output(&text) {
             Some((ver, commit)) => {
@@ -111,6 +189,9 @@ pub struct Model {
     pub modified_unix: Option<u64>,
     pub header: Option<GgufHeader>,
     pub header_error: Option<String>,
+    /// The engine this model needs, from its header (llama-server when the
+    /// header is unreadable). The profile editor switches engine on it.
+    pub engine: crate::profile::Engine,
     /// Paired multimodal projectors found beside the model (R-02).
     pub mmproj_candidates: Vec<PathBuf>,
     /// Paired speculative-decoding draft models (R-02): `MTP/` subdirectory
@@ -274,6 +355,7 @@ fn load_model(path: PathBuf, mmproj: &[PathBuf], drafts: &[PathBuf]) -> Model {
         path,
         file_size,
         modified_unix,
+        engine: header.as_ref().map(|h| h.engine()).unwrap_or_default(),
         header,
         header_error,
         mmproj_candidates: mmproj.to_vec(),
@@ -334,6 +416,137 @@ mod tests {
         assert_eq!(m.mmproj_candidates.len(), 1);
         assert_eq!(m.draft_candidates.len(), 1);
         assert!(m.draft_candidates[0].ends_with("mtp-draft-Q8_0.gguf"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn build_meta_and_dotdirs() {
+        let root = std::env::temp_dir().join(format!("fidim-disc-builds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let make = |name: &str, runner: bool| -> PathBuf {
+            let bin = root.join(name).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            // Not a real executable: the probe fails into version_error,
+            // which is how a scan reports any broken build.
+            std::fs::write(bin.join("llama-server.exe"), b"").unwrap();
+            if runner {
+                std::fs::write(bin.join(RUNNER_EXE), b"").unwrap();
+            }
+            root.join(name)
+        };
+        make(".fidim-tmp-1", true);
+        let unsloth = make("b11027-mix-3e83366-unsloth", true);
+        let upstream = make("b10819-rocm", false);
+        let runner_only = make("hand-built-dg", true);
+
+        // Written the way install_unsloth will write it; the full Manifest
+        // fields around the channel ones must not disturb the lite parse.
+        std::fs::write(
+            unsloth.join(crate::update::MANIFEST_NAME),
+            r#"{"tag":"b11027-mix-3e83366","source":"unsloth-prebuilt","installed_at_unix":1,
+                "assets":["app-b11027-mix-3e83366-windows-x64-rocm-gfx120X.zip"],
+                "verify":{"version":"b11027","commit":null,"devices":[],"hip_ok":true,"detail":"","runner_present":true},
+                "channel":"unsloth","bundled_runtime":true,"release_tag":"b11027-mix-3e83366",
+                "asset_sha256":"00ff","gfx_target":"gfx120X"}"#,
+        )
+        .unwrap();
+        // A manifest from before the channel fields existed, under the
+        // pre-rename file name.
+        std::fs::write(
+            upstream.join("llamactl-build.json"),
+            r#"{"tag":"b10819","source":"prebuilt","installed_at_unix":1,
+                "assets":["shim:hipblas.dll <- libhipblas.dll"],
+                "verify":{"version":"b10819","commit":"abc","devices":[],"hip_ok":true,"detail":""}}"#,
+        )
+        .unwrap();
+
+        let m = read_build_meta(&unsloth);
+        assert_eq!(m.channel, Channel::Unsloth);
+        assert!(m.bundled_runtime);
+        assert_eq!(m.release_tag.as_deref(), Some("b11027-mix-3e83366"));
+        for dir in [upstream.clone(), runner_only.clone(), root.join("missing")] {
+            let m = read_build_meta(&dir);
+            assert_eq!(m.channel, Channel::Upstream, "{dir:?}");
+            assert!(!m.bundled_runtime, "{dir:?}");
+            assert_eq!(m.release_tag, None, "{dir:?}");
+        }
+        let garbled = root.join("garbled");
+        std::fs::create_dir_all(&garbled).unwrap();
+        std::fs::write(garbled.join(crate::update::MANIFEST_NAME), r#"{"channel": 5, "bundled_runtime": true}"#)
+            .unwrap();
+        assert_eq!(read_build_meta(&garbled).channel, Channel::Upstream);
+        assert!(!read_build_meta(&garbled).bundled_runtime);
+
+        let builds = scan_builds(&[root.clone()], None);
+        let tags: Vec<&str> = builds.iter().map(|b| b.tag.as_str()).collect();
+        assert_eq!(tags, vec!["b10819-rocm", "b11027-mix-3e83366-unsloth", "hand-built-dg"], "dot-dir skipped");
+        let find = |t: &str| builds.iter().find(|b| b.tag == t).unwrap();
+
+        let b = find("b11027-mix-3e83366-unsloth");
+        assert_eq!(b.channel, Channel::Unsloth);
+        assert!(b.bundled_runtime);
+        assert_eq!(b.release_tag.as_deref(), Some("b11027-mix-3e83366"));
+        assert_eq!(b.runner_exe.as_deref(), Some(unsloth.join("bin").join(RUNNER_EXE).as_path()));
+        assert!(b.version_error.is_some());
+
+        // The runner alone never makes a build Unsloth: upstream may ship it.
+        let b = find("hand-built-dg");
+        assert_eq!(b.channel, Channel::Upstream);
+        assert!(!b.bundled_runtime);
+        assert!(b.runner_exe.is_some());
+
+        let b = find("b10819-rocm");
+        assert_eq!(b.channel, Channel::Upstream);
+        assert_eq!(b.runner_exe, None);
+
+        let v = serde_json::to_value(find("b11027-mix-3e83366-unsloth")).unwrap();
+        assert_eq!(v["channel"], "unsloth");
+        assert_eq!(v["bundled_runtime"], true);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Minimal GGUF: an architecture and, optionally, the literal
+    /// `diffusion.canvas_length` key.
+    fn tiny_gguf(arch: &str, canvas: Option<u32>) -> Vec<u8> {
+        fn key(out: &mut Vec<u8>, k: &str) {
+            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            out.extend_from_slice(k.as_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&(1 + canvas.is_some() as u64).to_le_bytes());
+        key(&mut out, "general.architecture");
+        out.extend_from_slice(&8u32.to_le_bytes());
+        out.extend_from_slice(&(arch.len() as u64).to_le_bytes());
+        out.extend_from_slice(arch.as_bytes());
+        if let Some(c) = canvas {
+            key(&mut out, "diffusion.canvas_length");
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn model_engine_comes_from_the_header() {
+        use crate::profile::Engine;
+        let dir = std::env::temp_dir().join(format!("fidim-disc-engine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("diffusiongemma-26B-A4B-it-Q4_K_M.gguf"), tiny_gguf("diffusion-gemma", Some(256)))
+            .unwrap();
+        std::fs::write(dir.join("gemma-4-e4b-it-q8_0.gguf"), tiny_gguf("gemma4", None)).unwrap();
+        std::fs::write(dir.join("truncated.gguf"), b"GGUF").unwrap();
+
+        let models = scan_models(&[dir.clone()]);
+        let engine = |stem: &str| models.iter().find(|m| m.path.file_stem().unwrap() == stem).unwrap().engine;
+        assert_eq!(engine("diffusiongemma-26B-A4B-it-Q4_K_M"), Engine::DiffusionGemma);
+        assert_eq!(engine("gemma-4-e4b-it-q8_0"), Engine::LlamaServer);
+        assert_eq!(engine("truncated"), Engine::LlamaServer, "unreadable header = the default engine");
+        let dg = models.iter().find(|m| m.engine == Engine::DiffusionGemma).unwrap();
+        assert_eq!(serde_json::to_value(dg).unwrap()["engine"], "diffusion-gemma");
         std::fs::remove_dir_all(dir).ok();
     }
 }

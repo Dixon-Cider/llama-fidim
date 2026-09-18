@@ -174,6 +174,14 @@ enum Cmd {
         /// Specific release tag (default: latest).
         #[arg(long)]
         tag: Option<String>,
+        /// `upstream` (ggml-org/llama.cpp) or `unsloth` (unslothai/llama.cpp,
+        /// the fork that carries the DiffusionGemma runner).
+        #[arg(long, default_value = "upstream")]
+        channel: String,
+        /// GPU target of the Unsloth zip (e.g. gfx120X, gfx1151); default:
+        /// config.rocm_family, else guessed from the cards.
+        #[arg(long)]
+        gfx: Option<String>,
     },
 }
 
@@ -243,8 +251,8 @@ fn main() -> anyhow::Result<()> {
             cmd_bench(&cfg, &platform, &profile_id, concurrency, tokens, warmups, no_save)
         }
         Cmd::Rocm { cmd } => cmd_rocm(&cfg, cli.json, cmd),
-        Cmd::Update { install, source, promote, all, rollback, tag } => {
-            cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag)
+        Cmd::Update { install, source, promote, all, rollback, tag, channel, gfx } => {
+            cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag, &channel, gfx)
         }
     }
 }
@@ -342,9 +350,19 @@ fn cmd_update(
     all: bool,
     rollback: bool,
     tag: Option<String>,
+    channel: &str,
+    gfx: Option<String>,
 ) -> anyhow::Result<()> {
     use fidim_core::update::{self, PromoteScope};
 
+    match channel {
+        "upstream" | "unsloth" => {}
+        other => bail!("unknown --channel `{other}`: use upstream or unsloth"),
+    }
+    if gfx.is_some() && channel != "unsloth" {
+        bail!("--gfx picks the GPU target of an Unsloth build; add --channel unsloth");
+    }
+    // Rollback undoes the last promotion batch whichever channel made it.
     if rollback {
         let r = update::rollback(cfg)?;
         if json {
@@ -359,6 +377,9 @@ fn cmd_update(
             }
         }
         return Ok(());
+    }
+    if channel == "unsloth" {
+        return cmd_update_unsloth(cfg, json, install, source, promote, all, tag.as_deref(), gfx.as_deref());
     }
 
     let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
@@ -460,18 +481,142 @@ fn cmd_update(
             }
         };
         let r = update::promote(cfg, &to_dir, to_version, scope)?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&r)?);
-        } else {
-            println!("promoted {} profile(s) onto {}:", r.batch.entries.len(), to_dir.display());
-            for e in &r.batch.entries {
-                println!("  {:<20} {} -> {}", e.profile_id, e.from.version.as_deref().unwrap_or("?"), e.to.version.as_deref().unwrap_or("?"));
-            }
-            for (id, why) in &r.skipped {
-                println!("  {id:<20} skipped: {why}");
-            }
-            println!("nothing was launched — bench a profile when the GPUs are free; `fidim update --rollback` undoes this.");
+        print_promote(json, &r, &to_dir)?;
+    } else if json {
+        if let Some(r) = &report {
+            println!("{}", serde_json::to_string_pretty(r)?);
         }
+    }
+    Ok(())
+}
+
+fn print_promote(json: bool, r: &fidim_core::update::PromoteReport, to_dir: &std::path::Path) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(r)?);
+        return Ok(());
+    }
+    println!("promoted {} profile(s) onto {}:", r.batch.entries.len(), to_dir.display());
+    for e in &r.batch.entries {
+        println!("  {:<20} {} -> {}", e.profile_id, e.from.version.as_deref().unwrap_or("?"), e.to.version.as_deref().unwrap_or("?"));
+    }
+    for (id, why) in &r.skipped {
+        println!("  {id:<20} skipped: {why}");
+    }
+    println!("nothing was launched — bench a profile when the GPUs are free; `fidim update --rollback` undoes this.");
+    Ok(())
+}
+
+/// `fidim update --channel unsloth`: unslothai/llama.cpp's prebuilt Windows
+/// ROCm zip, the build that carries the DiffusionGemma runner. Installed
+/// side by side like upstream builds; its promotion considers every profile
+/// and moves only diffusion ones (`update::promote_skip_reason`).
+#[allow(clippy::too_many_arguments)]
+fn cmd_update_unsloth(
+    cfg: &Config,
+    json: bool,
+    install: bool,
+    source: bool,
+    promote: bool,
+    all: bool,
+    tag: Option<&str>,
+    gfx: Option<&str>,
+) -> anyhow::Result<()> {
+    use fidim_core::update::{self, PromoteScope};
+
+    if source {
+        bail!("--source compiles upstream from a checkout; the Unsloth channel installs its prebuilt zip only");
+    }
+    if all {
+        bail!("--all does not apply to --channel unsloth: its promotion already looks at every profile and moves only diffusion ones");
+    }
+    let names: Vec<String> = WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect();
+    let c = update::check_unsloth(cfg, &names, gfx, tag)?;
+    if !json {
+        println!("unsloth latest  : {} ({})", c.latest.tag, c.latest.published_at);
+        println!("upstream base   : {}", c.upstream_tag.as_deref().unwrap_or("?"));
+        let others = if c.gfx_available.is_empty() { String::new() } else { format!("  (release has {})", c.gfx_available.join(", ")) };
+        println!("gpu target      : {}{others}", c.gfx);
+        match (&c.asset, &c.asset_error) {
+            (Some(a), _) => {
+                // `sha256:` plus 12 hex digits is enough to compare by eye.
+                let digest = a.digest.as_deref().map(|d| format!("{}…", d.get(..19).unwrap_or(d)));
+                println!(
+                    "asset           : {} ({} MB, {})",
+                    a.name,
+                    a.size >> 20,
+                    digest.as_deref().unwrap_or("no digest published")
+                );
+            }
+            (None, Some(e)) => println!("asset           : unavailable — {e}"),
+            (None, None) => {}
+        }
+        println!("install dir     : {}{}", c.install_dir.display(), if c.already_installed { "  [present]" } else { "" });
+        if c.installed.is_empty() {
+            println!("installed       : none");
+        }
+        for i in &c.installed {
+            println!("installed       : {} ({}) at {}", i.tag, i.version, i.path.display());
+        }
+    }
+    if !install && !promote {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&c)?);
+        } else if c.already_installed {
+            println!("installed. --promote moves diffusion profiles onto it.");
+        } else {
+            println!("run with --install to fetch it (--gfx picks another GPU target).");
+        }
+        return Ok(());
+    }
+
+    let mut progress = |line: String| {
+        if !json {
+            println!("  {line}");
+        }
+    };
+    let report = if install {
+        let r = update::install_unsloth(cfg, &c.latest, &c.gfx, &mut progress)?;
+        if !json {
+            let v = &r.verify;
+            println!(
+                "installed {} at {} — bundled llama-server reports {}; HIP {}; runner {}",
+                r.tag,
+                r.dir.display(),
+                v.version.as_deref().unwrap_or("?"),
+                if v.hip_ok { "OK" } else { "NOT LOADED" },
+                if v.runner_present { "present" } else { "MISSING" }
+            );
+            for d in &v.devices {
+                println!("    {}{}  {}  {} MiB", d.backend, d.index, d.name, d.total_mib);
+            }
+            if !v.detail.is_empty() {
+                println!("    {}", v.detail.trim().replace('\n', "\n    "));
+            }
+        }
+        Some(r)
+    } else {
+        None
+    };
+
+    if promote {
+        let (dir, verify) = match &report {
+            Some(r) => (r.dir.clone(), r.verify.clone()),
+            None if c.already_installed => {
+                if !json {
+                    println!("verifying {} (--version and --list-devices, no model load)", c.install_dir.display());
+                }
+                (c.install_dir.clone(), update::verify_unsloth(&c.install_dir))
+            }
+            None => bail!("{} is not installed; add --install", c.latest.tag),
+        };
+        if !verify.hip_ok {
+            bail!("refusing to promote onto {}: the bundled HIP backend did not load\n{}", dir.display(), verify.detail.trim());
+        }
+        if !verify.runner_present {
+            bail!("refusing to promote onto {}: it has no DiffusionGemma runner", dir.display());
+        }
+        let r = update::promote(cfg, &dir, verify.version.clone(), PromoteScope::All)?;
+        print_promote(json, &r, &dir)?;
     } else if json {
         if let Some(r) = &report {
             println!("{}", serde_json::to_string_pretty(r)?);
@@ -501,7 +646,12 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
             .as_deref()
             .map(|e| format!("  [BROKEN: {e}]"))
             .unwrap_or_default();
-        println!("  {:<22} {:<7} {:<11} {}{err}", b.tag, ver, commit, b.path.display());
+        let channel = match b.channel {
+            discovery::Channel::Upstream => "",
+            discovery::Channel::Unsloth => "  [unsloth]",
+        };
+        let dg = if b.runner_exe.is_some() { " +dg" } else { "" };
+        println!("  {:<22} {:<7} {:<11} {}{channel}{dg}{err}", b.tag, ver, commit, b.path.display());
     }
     println!("\nMODELS ({})", models.len());
     for m in &models {
@@ -515,7 +665,8 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
             None => ("PARSE-ERROR".into(), "-".into(), "-".into()),
         };
         let extras = format!(
-            "{}{}",
+            "{}{}{}",
+            if m.engine.is_diffusion() { " dg" } else { "" },
             if m.mmproj_candidates.is_empty() { "" } else { " +mmproj" },
             if m.draft_candidates.is_empty() { "" } else { " +draft" },
         );
@@ -586,11 +737,18 @@ fn pick_build<'b>(builds: &'b [Build], tag: Option<&str>) -> anyhow::Result<&'b 
             .find(|b| b.tag == t)
             .with_context(|| format!("no build tagged {t}")),
         // Newest by release number: a string compare ranks b9817 above b10771.
-        None => Ok(builds
-            .iter()
-            .filter(|b| b.version.is_some())
-            .max_by_key(|b| b.version.as_deref().and_then(fidim_core::update::version_number).unwrap_or(0))
-            .unwrap_or(&builds[0])),
+        // Upstream first: a fork build reports a higher upstream number and
+        // enumerates under its own bundled runtime.
+        None => {
+            let newest = move |upstream_only: bool| {
+                builds
+                    .iter()
+                    .filter(|b| !upstream_only || b.channel == discovery::Channel::Upstream)
+                    .filter(|b| b.version.is_some())
+                    .max_by_key(|b| b.version.as_deref().and_then(fidim_core::update::version_number).unwrap_or(0))
+            };
+            Ok(newest(true).or_else(|| newest(false)).unwrap_or(&builds[0]))
+        }
     }
 }
 
@@ -843,6 +1001,9 @@ fn cmd_launch(
     let ka = profile.keep_alive_seconds.unwrap_or(cfg.keep_alive_seconds);
     match supervise::spawn_keepalive(&mut state, &cfg.runs_dir, ka) {
         Ok(Some(kp)) => println!("  keep-alive every {ka} s (pid {kp}) - VRAM stays resident when the displays power off"),
+        Ok(None) if ka > 0 && profile.engine.is_diffusion() => {
+            println!("  keep-alive: not used for the diffusion engine")
+        }
         Ok(None) => {}
         Err(e) => println!("  keep-alive NOT started: {e}"),
     }
@@ -853,13 +1014,14 @@ fn cmd_launch(
 /// Residency ground truth (acceptance §09): PDH per-process dedicated GPU
 /// memory, attributed to physical cards via adapter LUIDs. WDDM virtualizes
 /// VRAM, so free-memory deltas from `--list-devices` cannot see another
-/// process's allocations — per-process counters can.
+/// process's allocations — per-process counters can. Summed over the run's
+/// process tree: a diffusion helper's runner child holds the model.
 fn verify_residency(
     platform: &dyn Platform,
     state: &supervise::RunState,
     prepared: &launch::PreparedLaunch,
 ) {
-    let mem = match platform.gpu_process_memory(state.pid) {
+    let mem = match fidim_core::platform::sum_gpu_memory(platform, &fidim_core::platform::run_pids(state.pid)) {
         Ok(m) => m,
         Err(e) => {
             println!("  residency: GPU counters unavailable ({e}) — cannot verify placement");
@@ -1034,6 +1196,7 @@ fn cmd_bench(
     no_save: bool,
 ) -> anyhow::Result<()> {
     let profile = load_profile(cfg, profile_id)?;
+    fidim_core::bench::ensure_benchable(&profile)?;
     let run = find_run(cfg, profile_id)?;
     if run.crashed {
         bail!("run for {profile_id} has crashed — relaunch before benchmarking");
@@ -1057,8 +1220,10 @@ fn cmd_bench(
     let sweep =
         fidim_core::bench::run_sweep(&run.state.host, run.state.port, &run.state.alias, &opts)?;
 
-    // Measured VRAM from the PDH counters, per profile device.
-    let mem = platform.gpu_process_memory(run.state.pid).unwrap_or_default();
+    // Measured VRAM from the PDH counters, per profile device, over the
+    // run's whole process tree.
+    let mem = fidim_core::platform::sum_gpu_memory(platform, &fidim_core::platform::run_pids(run.state.pid))
+        .unwrap_or_default();
     let adapters = platform.video_adapters().unwrap_or_default();
     let key_to_luid: Vec<(String, Option<u64>)> = run
         .state
@@ -1197,7 +1362,8 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
             }
         }
         RouterCmd::Add { profile_id, load_on_startup } => {
-            Profile::load(&cfg.profile_dir.join(format!("{profile_id}.json"))).context("no such profile")?;
+            let p = Profile::load(&cfg.profile_dir.join(format!("{profile_id}.json"))).context("no such profile")?;
+            router::check_member(&p)?;
             rc.members.retain(|m| m.profile_id != profile_id);
             rc.members.push(RouterMember { profile_id: profile_id.clone(), load_on_startup });
             router::save_config(&rc)?;
@@ -1274,7 +1440,10 @@ fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
         } else {
             vec![live::sample(&r.state.host, r.state.port, None)]
         };
-        let busy: f64 = util.iter().filter(|u| u.pid == r.state.pid).map(|u| u.percent).sum();
+        // Over the process tree: a diffusion runner and the router's model
+        // instances do their GPU work in child processes.
+        let pids = fidim_core::platform::run_pids(r.state.pid);
+        let busy: f64 = util.iter().filter(|u| pids.contains(&u.pid)).map(|u| u.percent).sum();
         rows.push((r, samples, if busy <= 0.0 { 0.0 } else { busy.min(100.0) }));
     }
     if json {

@@ -6,12 +6,15 @@
 //! editor and the launcher can never disagree. Any Block prevents launch; the
 //! user may override with an explicit confirmation that names the risk.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 
 use crate::devices::Device;
-use crate::estimate::VramEstimate;
+use crate::estimate::{DiffusionSizing, VramEstimate};
+use crate::gguf::GgufHeader;
 use crate::platform::SystemCommit;
-use crate::profile::Profile;
+use crate::profile::{Engine, Profile};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "outcome", content = "message", rename_all = "lowercase")]
@@ -58,6 +61,59 @@ pub struct ResolvedDevice {
     pub rebound: bool,
 }
 
+/// What the model header says about the engine it needs (check 13).
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelFacts {
+    pub architecture: Option<String>,
+    pub is_diffusion: bool,
+    /// The DiffusionGemma runner can load it (its own architecture, with
+    /// the canvas key).
+    pub runner_supported: bool,
+    pub block_count: Option<u64>,
+}
+
+impl ModelFacts {
+    pub fn from_header(h: &GgufHeader) -> Self {
+        ModelFacts {
+            architecture: h.architecture.clone(),
+            is_diffusion: h.is_diffusion(),
+            runner_supported: h.runner_supported(),
+            block_count: h.block_count,
+        }
+    }
+}
+
+/// What a diffusion launch needs besides the build's llama-server (check 1)
+/// and how its context will be sized (check 15).
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffusionPreflight {
+    /// `fidim-dg.exe` beside the running Llama FIDIM; None = not installed.
+    pub helper_exe: Option<PathBuf>,
+    /// The running Llama FIDIM's folder, where the helper is looked for.
+    pub helper_dir: Option<PathBuf>,
+    pub runner_exe: PathBuf,
+    pub runner_present: bool,
+    /// `bin/ggml-vulkan.dll` is present in the build.
+    pub vulkan_backend: bool,
+    /// Where the helper writes request files (`<runs_dir>/dg-<id>-<port>`),
+    /// and why the runner could not open them there (non-ASCII, too long).
+    pub req_prefix: PathBuf,
+    pub req_prefix_error: Option<String>,
+    /// The helper's `%TEMP%` fallback, judged the same way. Both unusable =
+    /// the helper exits 7 at launch, so check 1 Blocks first.
+    pub req_fallback: PathBuf,
+    pub req_fallback_error: Option<String>,
+    pub sizing: Option<DiffusionSizing>,
+}
+
+/// A live run on one of this launch's cards (check 14).
+#[derive(Debug, Clone, Serialize)]
+pub struct CoResident {
+    pub profile_id: String,
+    pub device_key: String,
+    pub engine: Engine,
+}
+
 /// Everything §04 needs, assembled by the launch path (or a fake in tests).
 #[derive(Debug, Clone, Serialize)]
 pub struct LaunchContext {
@@ -96,10 +152,17 @@ pub struct LaunchContext {
     /// PCI Express Link State Power Management, AC index of the active power
     /// plan: 0 = Off, 1 = Moderate, 2 = Maximum. None = could not read.
     pub pcie_aspm: Option<u32>,
+    /// From the model header; None = unreadable.
+    pub model_facts: Option<ModelFacts>,
+    /// Set for diffusion profiles.
+    pub diffusion: Option<DiffusionPreflight>,
+    /// Live runs on this launch's cards, except one on this profile's port
+    /// (launch takes that one over).
+    pub co_resident: Vec<CoResident>,
 }
 
 pub fn run_all(ctx: &LaunchContext) -> Vec<CheckResult> {
-    vec![
+    let mut out = vec![
         check_build(ctx),
         check_files(ctx),
         check_resolution(ctx),
@@ -112,7 +175,20 @@ pub fn run_all(ctx: &LaunchContext) -> Vec<CheckResult> {
         check_display(ctx),
         check_versions(ctx),
         check_pcie_aspm(ctx),
-    ]
+    ];
+    // The engine checks only appear where a diffusion model, profile or run
+    // is involved, so every llama-server-only launch keeps its 12 results.
+    let diffusion = ctx.profile.engine.is_diffusion();
+    if diffusion || ctx.model_facts.as_ref().is_some_and(|m| m.is_diffusion) {
+        out.push(check_engine_model(ctx));
+    }
+    if !ctx.co_resident.is_empty() && (diffusion || ctx.co_resident.iter().any(|c| c.engine.is_diffusion())) {
+        out.push(check_card_sharing(ctx));
+    }
+    if diffusion {
+        out.push(check_diffusion_context(ctx));
+    }
+    out
 }
 
 pub fn any_block(results: &[CheckResult]) -> bool {
@@ -121,7 +197,66 @@ pub fn any_block(results: &[CheckResult]) -> bool {
 
 // ---------------------------------------------------------------- checks ----
 
+/// For a diffusion profile: what is missing for the helper and runner to
+/// start, first match wins. None = the llama-server checks below decide.
+fn diffusion_build_block(ctx: &LaunchContext) -> Option<String> {
+    let Some(d) = &ctx.diffusion else {
+        return Some("the launch path did not describe the diffusion runner; nothing to check it against".into());
+    };
+    if d.helper_exe.is_none() {
+        // Most people install from the release zip and have no install script.
+        let dir = d.helper_dir.as_ref().map(|p| p.display().to_string());
+        return Some(format!(
+            "{exe} not found in {}; it ships beside llama-fidim.exe and fidim.exe in the release zip, so keep \
+             the three in one folder (or run scripts\\install.ps1 from a source checkout)",
+            dir.as_deref().unwrap_or("the running Llama FIDIM's folder"),
+            exe = crate::supervise::DG_HELPER_EXE
+        ));
+    }
+    if !d.runner_present {
+        let tag = ctx
+            .profile
+            .build
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ctx.profile.build.path.display().to_string());
+        return Some(format!(
+            "build {tag} has no {}; install one with `fidim update --channel unsloth --install` (or the Updates tab)",
+            crate::discovery::RUNNER_EXE
+        ));
+    }
+    if d.vulkan_backend {
+        return Some(
+            "build has ggml-vulkan.dll: Vulkan devices are not hidden by HIP_VISIBLE_DEVICES, so the runner \
+             would see 2 devices and abort every prompt"
+                .into(),
+        );
+    }
+    if let (Some(e1), Some(e2)) = (&d.req_prefix_error, &d.req_fallback_error) {
+        return Some(format!(
+            "the runner cannot open request files under {} ({e1}) or under the %TEMP% fallback {} ({e2}); \
+             fidim-dg.exe would exit 7 at launch. Point FIDIM_HOME or %TEMP% at a short ASCII path",
+            d.req_prefix.display(),
+            d.req_fallback.display()
+        ));
+    }
+    None
+}
+
 fn check_build(ctx: &LaunchContext) -> CheckResult {
+    if ctx.profile.engine.is_diffusion() {
+        if let Some(msg) = diffusion_build_block(ctx) {
+            return CheckResult {
+                id: "build-runs",
+                spec_number: 1,
+                title: "Build binary exists and runs",
+                outcome: Outcome::Block(msg),
+            };
+        }
+    }
+    // For diffusion too: the runner shares llama-server's ROCm DLLs, so a
+    // llama-server that runs proves they load.
     let outcome = match &ctx.build_version_output {
         // The binary runs. Also catch a build directory that was rebuilt or
         // replaced underneath the profile: the stored version is what the
@@ -140,6 +275,19 @@ fn check_build(ctx: &LaunchContext) -> CheckResult {
             "build binary {} did not run — reinstall or rescan builds",
             ctx.profile.build.path.display()
         )),
+    };
+    // The helper falls back to %TEMP% when the runs-dir prefix is unusable
+    // for the runner: say where the conversation files will live.
+    let outcome = match (&ctx.diffusion, outcome) {
+        (Some(d), Outcome::Pass) if ctx.profile.engine.is_diffusion() && d.req_prefix_error.is_some() => {
+            Outcome::Note(format!(
+                "request files will live under %TEMP% ({}) because {} is unusable for the runner ({})",
+                d.req_fallback.display(),
+                d.req_prefix.display(),
+                d.req_prefix_error.as_deref().unwrap_or("")
+            ))
+        }
+        (_, o) => o,
     };
     CheckResult { id: "build-runs", spec_number: 1, title: "Build binary exists and runs", outcome }
 }
@@ -198,6 +346,12 @@ fn check_discrete(ctx: &LaunchContext) -> CheckResult {
         .collect();
     let outcome = if igpus.is_empty() {
         Outcome::Pass
+    } else if ctx.profile.engine.is_diffusion() {
+        Outcome::Block(format!(
+            "target resolves to integrated graphics: {} — the diffusion bundle targets gfx1200/gfx1201 only; \
+             pick a discrete card",
+            igpus.join(", ")
+        ))
     } else if ctx.allow_integrated {
         Outcome::Warn(format!(
             "target resolves to integrated graphics: {} — allowed by Settings; expect a fraction of a discrete card's throughput",
@@ -225,7 +379,13 @@ fn check_visibility(ctx: &LaunchContext) -> CheckResult {
     let expected: Vec<String> =
         ctx.resolved.iter().map(|r| r.device.hip_index.to_string()).collect();
     let expected_str = expected.join(",");
-    let outcome = if ctx.resolved.is_empty() {
+    let outcome = if ctx.profile.engine.is_diffusion() && ctx.resolved.len() != 1 {
+        Outcome::Block(format!(
+            "the diffusion runner needs exactly one visible device, but the profile resolves to {}: with more \
+             than one it takes its unified path, which aborts every prompt",
+            ctx.resolved.len()
+        ))
+    } else if ctx.resolved.is_empty() {
         Outcome::Block("no resolved devices to pin visibility to".into())
     } else if ctx.visibility_env == expected_str {
         Outcome::Pass
@@ -253,13 +413,20 @@ fn check_vram(ctx: &LaunchContext) -> CheckResult {
             outcome: Outcome::Warn("no VRAM estimate available (model header unreadable)".into()),
         };
     };
-    let mut worst: Option<(f64, String)> = None;
+    // A diffusion profile at auto (ctx_total = 0) lets the runner size its
+    // context budget to the VRAM it sees at load, so the load fits by
+    // construction. The estimate's kv term there is the working set of a
+    // full-budget prompt, which the runner keeps after the request but never
+    // budgets for: report it, and Block only when the load itself does not fit.
+    let auto_sized = ctx.profile.engine.is_diffusion() && ctx.profile.runtime.ctx_total == 0;
+    let mut worst: Option<(f64, f64, String)> = None;
     for (d, r) in est.per_device.iter().zip(&ctx.resolved) {
         let free_bytes = r.device.free_mib as f64 * 1024.0 * 1024.0;
         if free_bytes <= 0.0 {
             continue;
         }
         let ratio = d.total_bytes as f64 / free_bytes;
+        let load_ratio = d.total_bytes.saturating_sub(d.kv_bytes) as f64 / free_bytes;
         let msg = format!(
             "{}: estimated {} vs {:.2} GiB free ({:.0}%)",
             r.device.name,
@@ -267,15 +434,28 @@ fn check_vram(ctx: &LaunchContext) -> CheckResult {
             free_bytes / (1024.0 * 1024.0 * 1024.0),
             ratio * 100.0
         );
-        if worst.as_ref().map(|(w, _)| ratio > *w).unwrap_or(true) {
-            worst = Some((ratio, msg));
+        if worst.as_ref().map(|(w, _, _)| ratio > *w).unwrap_or(true) {
+            worst = Some((ratio, load_ratio, msg));
         }
     }
     let outcome = match worst {
-        Some((r, msg)) if r > 1.0 => Outcome::Block(format!(
+        Some((_, load, msg)) if auto_sized && load > 1.0 => Outcome::Block(format!(
+            "{msg} — the weights and buffers alone exceed free VRAM, so no context budget fits and the runner \
+             fails to load"
+        )),
+        Some((r, _, msg)) if auto_sized && r > 1.0 => Outcome::Warn(format!(
+            "{msg} — the load fits (the runner sizes MAXTOK to the card at load), but the working set of a \
+             full-budget prompt would not; set an explicit context budget (MAXTOK) below the auto prediction so \
+             the largest prompt stays on the card"
+        )),
+        Some((r, _, msg)) if auto_sized && r > 0.90 => Outcome::Note(format!(
+            "{msg} — the runner sizes MAXTOK to the card at load, so this fits; the figure is the working set \
+             of a full-budget prompt, kept after the request. An explicit context budget (MAXTOK) caps it"
+        )),
+        Some((r, _, msg)) if r > 1.0 => Outcome::Block(format!(
             "{msg} — spill costs ~3.4x prefill and presents as \"the model got slow\", not an error"
         )),
-        Some((r, msg)) if r > 0.90 => Outcome::Warn(format!(
+        Some((r, _, msg)) if r > 0.90 => Outcome::Warn(format!(
             "{msg} — over 90% leaves no headroom for desktop compositing if a display attaches to this card"
         )),
         Some(_) => Outcome::Pass,
@@ -465,12 +645,19 @@ fn check_display(ctx: &LaunchContext) -> CheckResult {
 /// powers off has its whole allocation evicted to system RAM within 20 s
 /// (25.6 GB, 4-6 s to re-page); at Off the model stays resident with no
 /// traffic at all. The keep-alive helper masks this, so it is a Warn, but
-/// the setting is the actual fix.
+/// the setting is the actual fix. Diffusion runs get no keep-alive (every
+/// request is a whole denoise block), so their text omits that remedy.
 fn check_pcie_aspm(ctx: &LaunchContext) -> CheckResult {
+    let keepalive = if ctx.profile.engine.is_diffusion() {
+        ""
+    } else {
+        ", or enable the keep-alive interval on this profile as a workaround"
+    };
     let outcome = match ctx.pcie_aspm {
         Some(0) => Outcome::Pass,
         Some(n) => Outcome::Warn(format!(
-            "PCI Express Link State Power Management is {} — an idle card with its display off will be              evicted from VRAM into system RAM; set it to Off in the power plan (measured 2026-09-05).              or enable the keep-alive interval on this profile as a workaround.",
+            "PCI Express Link State Power Management is {} — an idle card with its display off will be \
+             evicted from VRAM into system RAM; set it to Off in the power plan (measured 2026-09-05){keepalive}",
             match n { 1 => "Moderate".to_string(), 2 => "Maximum power savings".to_string(), o => format!("index {o}") }
         )),
         None => Outcome::Note("PCI Express Link State Power Management could not be read (powercfg)".into()),
@@ -509,6 +696,138 @@ fn check_versions(ctx: &LaunchContext) -> CheckResult {
         title: "Driver and SDK match the profile's baselines",
         outcome,
     }
+}
+
+/// Check 13: the profile's engine can load the model. The editor switches
+/// engines when a model is picked, so a mismatch means a hand-edited or
+/// re-pointed profile.
+fn check_engine_model(ctx: &LaunchContext) -> CheckResult {
+    let arch = ctx
+        .model_facts
+        .as_ref()
+        .and_then(|m| m.architecture.clone())
+        .unwrap_or_else(|| "an unknown architecture".into());
+    let outcome = match (&ctx.model_facts, ctx.profile.engine.is_diffusion()) {
+        (Some(m), false) if m.is_diffusion => Outcome::Block(format!(
+            "llama-server cannot load {arch}; pick this model again in the editor so it switches to the \
+             diffusion engine"
+        )),
+        (Some(m), true) if !m.is_diffusion => {
+            Outcome::Block("the diffusion runner exits with \"not a diffusion model\"".into())
+        }
+        (Some(m), true) if !m.runner_supported => Outcome::Block(format!(
+            "no runner for architecture {arch}; only diffusion-gemma is supported"
+        )),
+        _ => Outcome::Pass,
+    };
+    CheckResult { id: "engine-matches-model", spec_number: 13, title: "Engine can load this model", outcome }
+}
+
+/// Check 14: a diffusion run and another model on one card. The runner sizes
+/// its context from the VRAM WDDM reports free, which does not include other
+/// processes' allocations, and its prompt-KV store is allocated per request
+/// after load, so pre-flight's own free-VRAM figure understates the clash.
+fn check_card_sharing(ctx: &LaunchContext) -> CheckResult {
+    let mut others: Vec<&str> = Vec::new();
+    let mut diffusion_runs: Vec<&str> = Vec::new();
+    for c in &ctx.co_resident {
+        if !others.contains(&c.profile_id.as_str()) {
+            others.push(&c.profile_id);
+        }
+        if c.engine.is_diffusion() && !diffusion_runs.contains(&c.profile_id.as_str()) {
+            diffusion_runs.push(&c.profile_id);
+        }
+    }
+    let outcome = if ctx.profile.engine.is_diffusion() && ctx.profile.runtime.ctx_total == 0 {
+        Outcome::Warn(format!(
+            "card also hosts {}; the runner auto-sizes its context to the VRAM it believes is free, and WDDM \
+             hides other processes' allocations, so it will oversubscribe. Pick an empty card",
+            others.join(", ")
+        ))
+    } else if ctx.profile.engine.is_diffusion() {
+        let store = ctx
+            .diffusion
+            .as_ref()
+            .and_then(|d| d.sizing.as_ref())
+            .map(|s| {
+                format!(
+                    " (up to {:.1} GiB)",
+                    (s.pkv_bytes_per_token * s.max_prompt_tokens as u64) as f64 / GIB_F
+                )
+            })
+            .unwrap_or_default();
+        Outcome::Warn(format!(
+            "card also hosts {}; this profile allocates its prompt-KV store{store} per request, after load; \
+             sharing can push either model into shared memory",
+            others.join(", ")
+        ))
+    } else {
+        Outcome::Warn(format!(
+            "{} on this card sized its context to the card at load and allocates its prompt-KV store per \
+             request; sharing can push either model into shared memory",
+            diffusion_runs.join(", ")
+        ))
+    };
+    CheckResult {
+        id: "diffusion-card-sharing",
+        spec_number: 14,
+        title: "Card is not shared with a diffusion run",
+        outcome,
+    }
+}
+
+/// Check 15: what context budget (MAXTOK) the runner will end up with.
+fn check_diffusion_context(ctx: &LaunchContext) -> CheckResult {
+    let sizing = ctx.diffusion.as_ref().and_then(|d| d.sizing.as_ref());
+    let outcome = match sizing {
+        None => Outcome::Note(
+            "context budget not predicted (model header unreadable or no device resolved); the runner decides \
+             at load"
+                .into(),
+        ),
+        Some(s) => {
+            let ctx_total = ctx.profile.runtime.ctx_total;
+            let mut warns = Vec::new();
+            match s.predicted_auto_maxtok {
+                Some(p) if ctx_total > p as u64 => warns.push(format!(
+                    "explicit budget {ctx_total} is above what fits (auto MAXTOK predicted ≈ {p}); the runner \
+                     will degrade it at load"
+                )),
+                None if ctx_total > 0 => warns.push(format!(
+                    "explicit budget {ctx_total}: no context fits the VRAM left after the weights; the runner \
+                     will degrade it at load, down to its floor, or fail to load"
+                )),
+                None => warns.push(format!(
+                    "no context candidate fits the VRAM left after the weights; the runner falls back to its \
+                     floor ({} tokens) or fails to load",
+                    s.maxtok_used
+                )),
+                _ => {}
+            }
+            if !s.full_offload {
+                warns.push(
+                    "NGL < block_count+1: partial offload is slow and the context is sized against system RAM"
+                        .into(),
+                );
+            }
+            if !warns.is_empty() {
+                Outcome::Warn(warns.join("; "))
+            } else if ctx_total > 0 {
+                Outcome::Note(format!(
+                    "explicit MAXTOK {ctx_total} (largest prompt ≈ {} tokens); auto would pick ≈ {}",
+                    s.max_prompt_tokens,
+                    s.predicted_auto_maxtok.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                ))
+            } else {
+                let p = s.predicted_auto_maxtok.unwrap_or(s.maxtok_used);
+                Outcome::Note(format!(
+                    "auto MAXTOK predicted ≈ {p} (largest prompt ≈ {} tokens); the runner decides at load",
+                    p.saturating_sub(s.canvas)
+                ))
+            }
+        }
+    };
+    CheckResult { id: "diffusion-context", spec_number: 15, title: "Diffusion context budget", outcome }
 }
 
 #[cfg(test)]
@@ -603,6 +922,9 @@ mod tests {
             sdk_now: None,
             sdk_baseline: None,
             pcie_aspm: Some(0),
+            model_facts: None,
+            diffusion: None,
+            co_resident: vec![],
         }
     }
 
@@ -825,5 +1147,260 @@ mod tests {
         let results = run_all(&ctx);
         let v = results.iter().find(|r| r.id == "versions-match").unwrap();
         assert!(matches!(v.outcome, Outcome::Note(_)), "{v:?}");
+    }
+
+    // ------------------------------------------------------------ diffusion ----
+
+    fn diffusion_facts() -> ModelFacts {
+        ModelFacts {
+            architecture: Some("diffusion-gemma".into()),
+            is_diffusion: true,
+            runner_supported: true,
+            block_count: Some(30),
+        }
+    }
+
+    fn sizing(predicted: Option<u32>, maxtok_used: u32, full_offload: bool) -> DiffusionSizing {
+        DiffusionSizing {
+            canvas: 256,
+            predicted_auto_maxtok: predicted,
+            maxtok_used,
+            max_prompt_tokens: maxtok_used - 256,
+            pkv_bytes_per_token: 450_560,
+            full_offload,
+        }
+    }
+
+    /// dg-26b as the editor creates it: one card (bus08), auto context, the
+    /// Unsloth build with its runner, and fidim-dg.exe installed.
+    fn healthy_diffusion_ctx() -> LaunchContext {
+        let mut ctx = healthy_ctx();
+        ctx.profile.engine = Engine::DiffusionGemma;
+        ctx.profile.runtime.ctx_total = 0;
+        ctx.model_facts = Some(diffusion_facts());
+        ctx.diffusion = Some(DiffusionPreflight {
+            helper_exe: Some("C:/Programs/LlamaFIDIM/fidim-dg.exe".into()),
+            helper_dir: Some("C:/Programs/LlamaFIDIM".into()),
+            runner_exe: "C:/b/bin/llama-diffusion-gemma-visual-server.exe".into(),
+            runner_present: true,
+            vulkan_backend: false,
+            req_prefix: "C:/Users/u/.fidim/runs/dg-dg-26b-9760".into(),
+            req_prefix_error: None,
+            req_fallback: "C:/Users/u/AppData/Local/Temp/fidim-dg-9760".into(),
+            req_fallback_error: None,
+            sizing: Some(sizing(Some(12288), 12288, true)),
+        });
+        ctx
+    }
+
+    fn outcome_of<'a>(results: &'a [CheckResult], id: &str) -> &'a Outcome {
+        &results.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("no {id} in {results:?}")).outcome
+    }
+
+    #[test]
+    fn diffusion_checks() {
+        // The fixture: no Block, and check 15 notes the predicted budget.
+        let results = run_all(&healthy_diffusion_ctx());
+        assert!(!any_block(&results), "{results:?}");
+        assert_eq!(results.len(), 14, "13 and 15 appear for diffusion; 14 only when a card is shared");
+        match outcome_of(&results, "diffusion-context") {
+            Outcome::Note(m) => assert!(m.contains("12288") && m.contains("12032"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(outcome_of(&results, "engine-matches-model"), &Outcome::Pass);
+
+        // Check 1: a missing helper, a missing runner or a Vulkan backend each Block.
+        let block_msg = |ctx: &LaunchContext| match outcome_of(&run_all(ctx), "build-runs") {
+            Outcome::Block(m) => m.clone(),
+            o => panic!("{o:?}"),
+        };
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.diffusion.as_mut().unwrap().helper_exe = None;
+        let m = block_msg(&ctx);
+        assert!(m.contains("fidim-dg.exe not found in C:/Programs/LlamaFIDIM"), "{m}");
+        assert!(m.contains("release zip") && m.contains("install.ps1"), "{m}");
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.diffusion.as_mut().unwrap().runner_present = false;
+        assert!(block_msg(&ctx).contains("--channel unsloth"));
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.diffusion.as_mut().unwrap().vulkan_backend = true;
+        assert!(block_msg(&ctx).contains("ggml-vulkan.dll"));
+
+        // Check 4: the iGPU Blocks even when Settings allow integrated graphics.
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.allow_integrated = true;
+        ctx.resolved = vec![resolved_for(1, 1.0)];
+        ctx.visibility_env = "1".into();
+        assert!(matches!(outcome_of(&run_all(&ctx), "discrete-only"), Outcome::Block(_)));
+        let mut llama = ctx.clone();
+        llama.profile.engine = Engine::LlamaServer;
+        assert!(matches!(outcome_of(&run_all(&llama), "discrete-only"), Outcome::Warn(_)));
+
+        // Check 5: two resolved devices Block even when correctly pinned.
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.resolved = vec![resolved_for(0, 0.5), resolved_for(2, 0.5)];
+        ctx.visibility_env = "0,2".into();
+        assert!(matches!(outcome_of(&run_all(&ctx), "visibility-pinned"), Outcome::Block(_)));
+
+        // Check 13: engine and model disagree, either way.
+        let mut ctx = healthy_ctx();
+        ctx.model_facts = Some(diffusion_facts());
+        match outcome_of(&run_all(&ctx), "engine-matches-model") {
+            Outcome::Block(m) => assert!(m.contains("llama-server cannot load diffusion-gemma"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.model_facts = Some(ModelFacts {
+            architecture: Some("gemma4".into()),
+            is_diffusion: false,
+            runner_supported: false,
+            block_count: Some(30),
+        });
+        assert!(matches!(outcome_of(&run_all(&ctx), "engine-matches-model"), Outcome::Block(_)));
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.model_facts = Some(ModelFacts { architecture: Some("llada".into()), runner_supported: false, ..diffusion_facts() });
+        match outcome_of(&run_all(&ctx), "engine-matches-model") {
+            Outcome::Block(m) => assert!(m.contains("only diffusion-gemma"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+
+        // Check 14: an auto-sized diffusion profile next to any run, and a
+        // llama-server profile on a card that hosts a diffusion run.
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.co_resident = vec![CoResident {
+            profile_id: "daily-driver".into(),
+            device_key: ctx.resolved[0].device.stable_key.clone(),
+            engine: Engine::LlamaServer,
+        }];
+        match outcome_of(&run_all(&ctx), "diffusion-card-sharing") {
+            Outcome::Warn(m) => assert!(m.contains("daily-driver") && m.contains("WDDM"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        let mut ctx = healthy_ctx();
+        ctx.co_resident = vec![CoResident {
+            profile_id: "dg-26b".into(),
+            device_key: ctx.resolved[0].device.stable_key.clone(),
+            engine: Engine::DiffusionGemma,
+        }];
+        match outcome_of(&run_all(&ctx), "diffusion-card-sharing") {
+            Outcome::Warn(m) => assert!(m.contains("dg-26b"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        // Two llama-server runs sharing a card are not this check's business.
+        ctx.co_resident[0].engine = Engine::LlamaServer;
+        assert_eq!(run_all(&ctx).len(), 12);
+
+        // Check 15: an explicit budget above the prediction, and partial offload.
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.profile.runtime.ctx_total = 16384;
+        ctx.diffusion.as_mut().unwrap().sizing = Some(sizing(Some(12288), 16384, true));
+        match outcome_of(&run_all(&ctx), "diffusion-context") {
+            Outcome::Warn(m) => assert!(m.contains("above what fits"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.diffusion.as_mut().unwrap().sizing = Some(sizing(Some(12288), 12288, false));
+        match outcome_of(&run_all(&ctx), "diffusion-context") {
+            Outcome::Warn(m) => assert!(m.contains("partial offload"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+
+        // Check 12: no keep-alive remedy for diffusion, and no stray runs of spaces.
+        let mut ctx = healthy_diffusion_ctx();
+        ctx.pcie_aspm = Some(1);
+        match outcome_of(&run_all(&ctx), "pcie-aspm-off") {
+            Outcome::Warn(m) => {
+                assert!(!m.contains("keep-alive"), "{m}");
+                assert!(!m.contains("   "), "{m}");
+            }
+            o => panic!("{o:?}"),
+        }
+        let mut ctx = healthy_ctx();
+        ctx.pcie_aspm = Some(1);
+        match outcome_of(&run_all(&ctx), "pcie-aspm-off") {
+            Outcome::Warn(m) => {
+                assert!(m.contains("(measured 2026-09-05), or enable the keep-alive interval"), "{m}");
+                assert!(!m.contains("   "), "{m}");
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// Check 1 mirrors the helper's request-path resolution: a fallback to
+    /// %TEMP% is a Note naming it; neither path usable is a Block before the
+    /// launch instead of exit 7 after it (a non-ASCII user name breaks both).
+    #[test]
+    fn diffusion_request_path_checks() {
+        let mut ctx = healthy_diffusion_ctx();
+        let d = ctx.diffusion.as_mut().unwrap();
+        d.req_prefix = "C:/Users/Pål/.fidim/runs/dg-dg-26b-9760".into();
+        d.req_prefix_error = crate::diffusion::protocol::check_req_prefix(&d.req_prefix).err();
+        assert!(d.req_prefix_error.is_some());
+        match outcome_of(&run_all(&ctx), "build-runs") {
+            Outcome::Note(m) => assert!(m.contains("%TEMP%") && m.contains("fidim-dg-9760"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        let d = ctx.diffusion.as_mut().unwrap();
+        d.req_fallback = "C:/Users/Pål/AppData/Local/Temp/fidim-dg-9760".into();
+        d.req_fallback_error = crate::diffusion::protocol::check_req_prefix(&d.req_fallback).err();
+        match outcome_of(&run_all(&ctx), "build-runs") {
+            Outcome::Block(m) => assert!(m.contains("exit 7") && m.contains("ASCII"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// Check 6 for a diffusion profile at auto: the runner sizes MAXTOK to the
+    /// card at load, so a full-budget working set near or over the card is a
+    /// Note or a Warn, never a Block; only the load itself Blocks. With an
+    /// explicit budget, and for llama-server, the usual thresholds apply.
+    #[test]
+    fn diffusion_vram_at_auto_is_not_a_block() {
+        fn with_estimate(ctx: &mut LaunchContext, weights: u64, kv: u64) {
+            let key = ctx.resolved[0].profile_key.clone();
+            ctx.estimate = Some(crate::estimate::VramEstimate {
+                per_device: vec![crate::estimate::DeviceEstimate {
+                    key,
+                    fraction: 1.0,
+                    weights_bytes: weights,
+                    kv_bytes: kv,
+                    compute_bytes: 0,
+                    overhead_bytes: 0,
+                    total_bytes: weights + kv,
+                }],
+                total_bytes: weights + kv,
+                assumptions: vec![],
+            });
+        }
+        let free = healthy_diffusion_ctx().resolved[0].device.free_mib * 1024 * 1024;
+        assert!(free > 0);
+        // 55% load + 42% working set = 97%: Note at auto, Warn when explicit.
+        let mut ctx = healthy_diffusion_ctx();
+        with_estimate(&mut ctx, free * 55 / 100, free * 42 / 100);
+        match outcome_of(&run_all(&ctx), "vram-fits") {
+            Outcome::Note(m) => assert!(m.contains("sizes MAXTOK"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        ctx.profile.runtime.ctx_total = 8192;
+        assert!(matches!(outcome_of(&run_all(&ctx), "vram-fits"), Outcome::Warn(_)));
+        // 55% + 50% = 105%: Warn at auto (set an explicit budget), Block when explicit.
+        let mut ctx = healthy_diffusion_ctx();
+        with_estimate(&mut ctx, free * 55 / 100, free * 50 / 100);
+        match outcome_of(&run_all(&ctx), "vram-fits") {
+            Outcome::Warn(m) => assert!(m.contains("explicit context budget"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        ctx.profile.runtime.ctx_total = 8192;
+        assert!(matches!(outcome_of(&run_all(&ctx), "vram-fits"), Outcome::Block(_)));
+        // The load alone over the card Blocks at auto too.
+        let mut ctx = healthy_diffusion_ctx();
+        with_estimate(&mut ctx, free * 105 / 100, 0);
+        match outcome_of(&run_all(&ctx), "vram-fits") {
+            Outcome::Block(m) => assert!(m.contains("no context budget fits"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        // llama-server keeps the old thresholds.
+        let mut ctx = healthy_ctx();
+        with_estimate(&mut ctx, free * 55 / 100, free * 42 / 100);
+        assert!(matches!(outcome_of(&run_all(&ctx), "vram-fits"), Outcome::Warn(_)));
     }
 }

@@ -67,10 +67,17 @@ fn cached_devices(
     }
     let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
     // Newest by release NUMBER — a string compare ranks b9817 above b10771.
-    let build = builds
-        .iter()
-        .filter(|b| b.version.is_some())
-        .max_by_key(|b| b.version.as_deref().and_then(fidim_core::update::version_number).unwrap_or(0))
+    // Upstream first: a fork build reports a higher upstream number and
+    // enumerates under its own bundled runtime.
+    let newest = |upstream_only: bool| {
+        builds
+            .iter()
+            .filter(|b| !upstream_only || b.channel == discovery::Channel::Upstream)
+            .filter(|b| b.version.is_some())
+            .max_by_key(|b| b.version.as_deref().and_then(fidim_core::update::version_number).unwrap_or(0))
+    };
+    let build = newest(true)
+        .or_else(|| newest(false))
         .or(builds.first())
         .ok_or("no builds found under configured build_roots")?;
     let devices = launch::enumerate_devices(cfg, &build.server_exe, &WindowsPlatform)
@@ -78,6 +85,15 @@ fn cached_devices(
     let mut cache = cache_arc.lock().unwrap();
     cache.devices = Some((Instant::now(), devices.clone()));
     Ok(devices)
+}
+
+/// Forget everything derived from the installed builds, so a build that
+/// was just installed shows up in the pickers without waiting for a TTL.
+fn invalidate_build_caches(cache: &Arc<Mutex<UiCache>>) {
+    let mut c = cache.lock().unwrap();
+    c.scan = None;
+    c.devices = None;
+    c.build_probes.clear();
 }
 
 fn cached_build_probe(
@@ -92,7 +108,9 @@ fn cached_build_probe(
         }
     }
     let exe = build_path.join("bin").join("llama-server.exe");
-    let probe = launch::run_capture(&exe, &["--version"], cfg.rocm_bin.as_deref())
+    // A build that bundles its ROCm runs with nothing on PATH, as a launch does.
+    let prefix = if discovery::read_build_meta(build_path).bundled_runtime { None } else { cfg.rocm_bin.as_deref() };
+    let probe = launch::run_capture(&exe, &["--version"], prefix)
         .ok()
         .filter(|t| discovery::parse_version_output(t).is_some());
     let mut cache = cache_arc.lock().unwrap();
@@ -270,6 +288,9 @@ fn live_check_blocking(
         "command_line": prepared.plan.command_line(),
         "env": prepared.plan.env,
         "commit": prepared.context.commit,
+        // Diffusion profiles: helper/runner presence and the predicted
+        // context budget the editor shows as the "auto" placeholder.
+        "diffusion": prepared.context.diffusion,
     }))
 }
 
@@ -361,8 +382,10 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
     };
 
     // Placement verification (committed proves placement; dedicated fills on
-    // first inference).
-    let mem = platform.gpu_process_memory(state.pid).unwrap_or_default();
+    // first inference), over the run's process tree: a diffusion helper's
+    // runner child holds the model.
+    let mem = fidim_core::platform::sum_gpu_memory(&platform, &fidim_core::platform::run_pids(state.pid))
+        .unwrap_or_default();
     let placement: Vec<serde_json::Value> = prepared
         .context
         .resolved
@@ -494,6 +517,7 @@ fn do_bench(id: &str, concurrency: Option<u32>, tokens: u32) -> Result<serde_jso
     let platform = WindowsPlatform;
     let profile =
         Profile::load(&cfg.profile_dir.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
+    bench::ensure_benchable(&profile).map_err(|e| e.to_string())?;
     let runs = supervise::reattach(&cfg.runs_dir);
     let run = runs
         .into_iter()
@@ -508,7 +532,8 @@ fn do_bench(id: &str, concurrency: Option<u32>, tokens: u32) -> Result<serde_jso
     let sweep = bench::run_sweep(&run.state.host, run.state.port, &run.state.alias, &opts)
         .map_err(|e| e.to_string())?;
 
-    let mem = platform.gpu_process_memory(run.state.pid).unwrap_or_default();
+    let mem = fidim_core::platform::sum_gpu_memory(&platform, &fidim_core::platform::run_pids(run.state.pid))
+        .unwrap_or_default();
     let adapters = platform.video_adapters().unwrap_or_default();
     let per_device_vram_gb: Vec<f64> = run
         .state
@@ -636,9 +661,11 @@ async fn update_check() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn update_install(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     tag: Option<String>,
     source: bool,
 ) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
     blocking(move || {
         let cfg = cfg()?;
         let release = match &tag {
@@ -655,6 +682,7 @@ async fn update_install(
             update::install_prebuilt(&cfg, &release, &mut progress)
         }
         .map_err(|e| e.to_string())?;
+        invalidate_build_caches(&cache);
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
     .await
@@ -694,6 +722,65 @@ async fn update_rollback() -> Result<serde_json::Value, String> {
     .await
 }
 
+/// Card names for the Unsloth GPU-target guess. WMI, so blocking pool only.
+fn adapter_names() -> Vec<String> {
+    WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect()
+}
+
+/// Latest (or `tag`) Unsloth fork release, the zip for this machine's GPU
+/// target, and the fork builds already installed. Network + a build scan.
+#[tauri::command]
+async fn unsloth_check(tag: Option<String>, gfx: Option<String>) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let c = update::check_unsloth(&cfg, &adapter_names(), gfx.as_deref(), tag.as_deref())
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(c).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Download, digest-check, install and verify an Unsloth fork build.
+/// Progress streams as `update-progress`. Never starts the runner.
+#[tauri::command]
+async fn unsloth_install(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    tag: Option<String>,
+    gfx: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
+    blocking(move || {
+        let cfg = cfg()?;
+        let release = match &tag {
+            Some(t) => update::unsloth_release_by_tag(t),
+            None => update::latest_unsloth_release(),
+        }
+        .map_err(|e| e.to_string())?;
+        let gfx = update::unsloth_gfx(&cfg, &adapter_names(), gfx.as_deref());
+        let mut progress = |line: String| {
+            let _ = app.emit("update-progress", line);
+        };
+        let r = update::install_unsloth(&cfg, &release, &gfx, &mut progress).map_err(|e| e.to_string())?;
+        invalidate_build_caches(&cache);
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Move diffusion profiles onto a fork build. Every profile is considered;
+/// the promote rules skip llama-server ones and anything pinned.
+#[tauri::command]
+async fn unsloth_promote(to_path: String, to_version: Option<String>) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let r = update::promote(&cfg, &PathBuf::from(to_path), to_version, PromoteScope::All)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 // --------------------------------------------------------------- settings ----
 
 /// The tool's own configuration (roots, runtime, install paths) plus where
@@ -711,10 +798,7 @@ fn get_config() -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn save_config(state: tauri::State<'_, AppState>, config: Config) -> Result<(), String> {
     config.save(&Config::config_path()).map_err(|e| e.to_string())?;
-    let mut c = state.cache.lock().unwrap();
-    c.devices = None;
-    c.build_probes.clear();
-    c.scan = None;
+    invalidate_build_caches(&state.cache);
     Ok(())
 }
 
@@ -977,6 +1061,9 @@ pub fn run() {
             update_promote,
             update_rollback,
             update_history,
+            unsloth_check,
+            unsloth_install,
+            unsloth_promote,
             list_runtimes,
             creator_defaults,
             get_config,

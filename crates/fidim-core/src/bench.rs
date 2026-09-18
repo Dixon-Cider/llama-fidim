@@ -196,6 +196,24 @@ pub fn run_sweep(
     Ok(SweepResult { warmups: opts.warmups, serial, concurrent })
 }
 
+/// Refuse profiles the sweep cannot measure. The sweep posts `/completion`,
+/// which the diffusion helper does not serve, and its throughput model
+/// (decode tokens per second, slot concurrency) does not describe block
+/// denoising anyway.
+pub fn ensure_benchable(p: &Profile) -> Result<()> {
+    if p.engine.is_diffusion() {
+        return Err(Error::Config(
+            "benchmarking the diffusion engine is not supported yet: every request runs whole 256-token \
+             denoise blocks serially; use the timings in the chat response"
+                .into(),
+        ));
+    }
+    if !p.engine.is_llama_server() {
+        return Err(Error::Config(format!("profile `{}` has an unknown engine; nothing to benchmark", p.id)));
+    }
+    Ok(())
+}
+
 /// Pure math, unit-tested: per-stream mean + wall-clock aggregate.
 pub fn summarize_concurrent(streams: Vec<StreamMeasure>, wall_seconds: f64) -> ConcurrentMeasure {
     let n = streams.len() as u32;
@@ -309,6 +327,27 @@ mod tests {
         // A runtime change does.
         p.runtime.ctx_total = 16384;
         assert_ne!(profile_fingerprint(&p), f1);
+    }
+
+    #[test]
+    fn ensure_benchable() {
+        let mut p: Profile = serde_json::from_value(serde_json::json!({
+            "schema": 1, "id": "t", "name": "t",
+            "build": { "path": "C:/b" }, "model": { "path": "E:/m.gguf" },
+            "devices": [ { "key": "pci:A:bus08" } ],
+            "server": { "port": 9701, "alias": "t" },
+            "runtime": { "ctx_total": 8192 }
+        }))
+        .unwrap();
+        assert!(super::ensure_benchable(&p).is_ok());
+        // Computed with the code as it was before the diffusion engine: the
+        // new profile fields must not orphan a single saved baseline.
+        assert_eq!(profile_fingerprint(&p), "de26e3f74dbbf4c5");
+        p.engine = crate::profile::Engine::DiffusionGemma;
+        match super::ensure_benchable(&p) {
+            Err(Error::Config(m)) => assert!(m.contains("not supported yet"), "{m}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
