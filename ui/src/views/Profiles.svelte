@@ -104,6 +104,15 @@
   const canvas = $derived(header?.diffusion_canvas_length ?? 256);
   const dgSizing = $derived(check?.diffusion?.sizing ?? null);
   const runnerBuilds = $derived(builds.filter((b) => b.runner_exe));
+  // A locally patched runner build declares what it changes in its manifest
+  // (discovery::dg_feature). dg-fa-pad: FA runs the 512-dim heads on the GPU.
+  const hasFeature = (b, f) => !!b?.patch?.features?.includes(f);
+  const patchLabel = (b) => (b?.patch ? ` · ${b.patch.name || "patched"}` : "");
+  const faWorks = $derived(hasFeature(selectedBuild, "dg-fa-pad"));
+  const faTurnSizing = $derived(faWorks && hasFeature(selectedBuild, "dg-fa-turn-sizing"));
+  // A patched runner's test hooks never reach it (the helper strips them).
+  const DG_TEST_HOOK_ENV = ["DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_RING_POISON", "DG_DUMP_LOGITS", "DG_EXIT_AFTER_DUMP"];
+  const faSized = $derived(hasFeature(selectedBuild, "dg-fa-pad") && hasFeature(selectedBuild, "dg-fa-turn-sizing") && !!draft?.diffusion?.flash_attn);
   // Env keys FIDIM composes for every diffusion run (profile::DG_OWNED_ENV):
   // validate refuses them, and the editor has no env field to clear them.
   const DG_OWNED_ENV = ["HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", "NGL", "MAXTOK", "FA", "DG_FREE_VRAM_MB", "DG_FREE_RAM_MB", "GGML_BACKEND_PATH", "GGML_CUDA_DEVICES", "GGML_CUDA_ENABLE_UNIFIED_MEMORY"];
@@ -113,6 +122,8 @@
     if (!isDiffusion) return [];
     const upper = (k) => String(k).toUpperCase();
     return Object.keys(draft?.env ?? {}).filter((k) => DG_OWNED_ENV.includes(upper(k)) ||
+      DG_TEST_HOOK_ENV.includes(upper(k)) ||
+      (upper(k) === "GPU_RESOURCE_CACHE_SIZE" && String(draft.env[k]).trim() !== "0") ||
       (draft?.diffusion?.hipblaslt_safeguard !== false && upper(k).startsWith("ROCBLAS_USE_HIPBLASLT")));
   });
   function dropEnvConflicts() {
@@ -128,9 +139,12 @@
     const newestOf = (list) => list.filter((b) => b.version).sort((a, b) => buildNum(b) - buildNum(a))[0];
     return newestOf(builds.filter((b) => (b.channel ?? "upstream") === "upstream")) ?? newestOf(builds);
   }
+  // Newest runner build; at the same release a patched one wins (it shares
+  // its base's release tag and version).
   function newestRunnerBuild() {
     const runs = runnerBuilds.filter((b) => !b.version_error);
-    return (runs.length ? runs : runnerBuilds).slice().sort((a, b) => buildNum(b) - buildNum(a))[0];
+    return (runs.length ? runs : runnerBuilds).slice()
+      .sort((a, b) => buildNum(b) - buildNum(a) || (b.patch ? 1 : 0) - (a.patch ? 1 : 0))[0];
   }
 
   function enterDiffusion() {
@@ -165,6 +179,9 @@
     if (!selectedBuild?.runner_exe) {
       const b = newestRunnerBuild();
       if (b) onBuildPick(b.path);
+    } else {
+      // Kept build: flash attention follows it, as a build pick would set it.
+      draft.diffusion.flash_attn = hasFeature(selectedBuild, "dg-fa-pad");
     }
   }
 
@@ -230,6 +247,9 @@
     // A bundled build runs on its own ROCm and replaces the runtime picker,
     // so a runtime left set would be a hidden setting that does nothing.
     if (isDiffusion && b?.bundled_runtime) draft.rocm_runtime = null;
+    // Flash attention helps only a runner that pads keys for it; on the stock
+    // runner it puts the 512-dim heads on the CPU. Follow the build.
+    if (isDiffusion && draft.diffusion) draft.diffusion.flash_attn = hasFeature(b, "dg-fa-pad");
     scheduleCheck();
   }
   function onDraftPick(path) {
@@ -760,14 +780,14 @@
           </label>
           {/if}
           <label class="field" style="grid-column: span 3;" title={isDiffusion
-            ? "Which build supplies the DiffusionGemma runner (llama-diffusion-gemma-visual-server.exe). Only Unsloth's builds carry it today; install one from the Updates tab."
+            ? "Which build supplies the DiffusionGemma runner (llama-diffusion-gemma-visual-server.exe). Unsloth's builds carry it (install one from the Updates tab), and so does a locally patched build of Unsloth's source, labelled with its patch name."
             : "Which llama.cpp build launches this profile. Updates installs new builds side by side and can promote profiles to them."}>
             <span class="k">llama.cpp build</span>
             <select value={selectedBuild?.path ?? ""} onchange={(e) => onBuildPick(e.target.value)}>
               <option value="" disabled>choose a build…</option>
               {#each builds as b}
                 {@const noRunner = isDiffusion && !b.runner_exe}
-                <option value={b.path} disabled={!!b.version_error || noRunner}>{b.tag} · {b.version ?? "broken"}{b.version_error ? " (does not run)" : ""}{noRunner ? " (no diffusion runner)" : ""}</option>
+                <option value={b.path} disabled={!!b.version_error || noRunner}>{b.tag} · {b.version ?? "broken"}{patchLabel(b)}{b.version_error ? " (does not run)" : ""}{noRunner ? " (no diffusion runner)" : ""}</option>
               {/each}
               {#if draft.build.path && !selectedBuild}<option value={draft.build.path}>{draft.build.path} (not in scan)</option>{/if}
             </select>
@@ -874,9 +894,11 @@
             {@const predicted = dgSizing?.predicted_auto_maxtok ?? null}
             <Range bind:value={() => draft.runtime.ctx_total || null, (v) => (draft.runtime.ctx_total = v ?? 0)}
               label="context budget (MAXTOK)" min={2048} max={65536} step={256} nullable offLabel="auto"
-              placeholder={predicted ?? 12288} format={fmtInt} onchange={scheduleCheck} span={3}
+              placeholder={predicted ?? (faSized ? 65536 : 12288)} format={fmtInt} onchange={scheduleCheck} span={3}
               hint={`auto = largest that fits VRAM at load${predicted ? ` (≈ ${fmtInt(predicted)})` : ""}; one reply uses ceil(max_tokens/${canvas}) blocks`}
-              title={`Prompt plus reply, in tokens (the runner's MAXTOK). Off = auto: the runner picks the largest budget that fits the card's VRAM when it loads; its scores buffer grows with the square of the budget, so a 32 GB card lands near 12K. A reply is denoised in whole ${canvas}-token blocks, so ceil(max_tokens/${canvas}) blocks of this budget go to the answer and the rest bounds the prompt.`} />
+              title={`Prompt plus reply, in tokens (the runner's MAXTOK). Off = auto: the runner picks the largest budget that fits the card's VRAM when it loads. ${faSized
+                ? "With flash attention on this patched runner it sizes by the per-request working set (a 32 GB card reaches the 65,536 ceiling); an explicit budget above the ceiling is ignored."
+                : "With flash attention off its scores buffer grows with the square of the budget, so a 32 GB card lands near 12K."} A reply is denoised in whole ${canvas}-token blocks, so ceil(max_tokens/${canvas}) blocks of this budget go to the answer and the rest bounds the prompt.`} />
             <Range bind:value={draft.runtime.n_gpu_layers} label="GPU offload (layers, NGL)" min={0} max={layerMax + 1} step={1}
               hint={header ? `≥ ${layerMax + 1} = all, incl. the output layer; runner default is 0 = CPU` : "runner default is 0 = CPU; FIDIM always sends NGL"} onchange={scheduleCheck} span={3}
               title={`Layers on the GPU, sent to the runner as NGL. Full offload needs the ${header ? layerMax : "model's"} blocks plus the output layer${header ? ` (${layerMax + 1})` : ""}; below that the runner is slow and sizes its context against system RAM. The runner's own default is 0 = CPU only, so Llama FIDIM always sends NGL.`} />
@@ -917,11 +939,14 @@
                 {#if !draft.diffusion.hipblaslt_safeguard}<span class="chip warn">intermittent MUL_MAT failures</span>{/if}
               </span>
             </label>
-            <label class="field" style="grid-column: span 3;" title="Sends FA=1 to the runner. DiffusionGemma's 512-dim attention heads have no flash-attention kernel on HIP and fall back to the CPU, which is slower. Separate from llama-server's flash attention setting; leave it off unless you have measured otherwise.">
+            <label class="field" style="grid-column: span 3;" title={faWorks
+              ? `Sends FA=1 to the runner. This build pads keys for the flash-attention kernel of DiffusionGemma's 512-dim heads, so they run on the GPU and it is faster${faTurnSizing ? "; the runner then sizes its context by the per-request working set instead of the N² scores buffer (65,536 on a 32 GB card instead of ≈12K)" : ""}. Separate from llama-server's flash attention setting.`
+              : "Sends FA=1 to the runner. On this build DiffusionGemma's 512-dim attention heads get no flash-attention kernel (their key count is not padded to its 256-key stride) and fall back to the CPU, which is slower. A locally patched runner build fixes that. Separate from llama-server's flash attention setting."}>
               <span class="k">flash attention</span>
               <span>
                 <input type="checkbox" bind:checked={draft.diffusion.flash_attn} onchange={scheduleCheck} /> FA=1
-                {#if draft.diffusion.flash_attn}<span class="chip warn">512-dim heads fall back to CPU on HIP</span>{/if}
+                {#if draft.diffusion.flash_attn && !faWorks}<span class="chip warn">512-dim heads fall back to CPU on this build</span>
+                {:else if !draft.diffusion.flash_attn && faWorks}<span class="chip accent">recommended on this build</span>{/if}
               </span>
             </label>
           </div>
@@ -935,6 +960,7 @@
           <div class="faint small" style="margin-top: 10px;">
             The model always thinks; its reasoning arrives as <span class="mono">reasoning_content</span>. Tool calls come back as raw text in the reply.
             Diffusion profiles run standalone: no keep-alive, no router membership, no benchmarks.
+            Llama FIDIM also sends <span class="mono">GPU_RESOURCE_CACHE_SIZE=0</span>, so the runner does not keep freed memory after long prompts; a profile env entry overrides it.
           </div>
         </section>
       {/if}

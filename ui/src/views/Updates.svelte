@@ -400,7 +400,8 @@
           <td colspan="3">
             {#each dg.installed as b}
               <div><span class="mono">{b.tag}</span> <span class="faint mono">{b.version}</span>
-                <span class="chip accent" title="Runs on the ROCm DLLs inside the build, never a runtime from the list below.">bundled ROCm</span></div>
+                <span class="chip accent" title="Runs on the ROCm DLLs inside the build, never a runtime from the list below.">bundled ROCm</span>
+                {#if b.patch}<span class="chip plain" title="A locally patched build of this release. Promotion never moves a diffusion profile off it onto an unpatched build.">patch: {b.patch}</span>{/if}</div>
             {:else}<span class="faint">none yet</span>{/each}
           </td></tr>
       </tbody>
@@ -442,7 +443,7 @@
     {#if dgInstall.verify.hip_ok && dgInstall.verify.runner_present}
       <div class="toolbar" style="margin-top: 10px;">
         <button class="btn primary" onclick={dgDoPromote}
-          title="Re-point every unpinned diffusion profile at this build. llama-server profiles are never moved here. Roll back most recent undoes it.">
+          title="Re-point every unpinned diffusion profile at this build. llama-server profiles are never moved here, and neither are diffusion profiles on a patched runner build. Roll back most recent undoes it.">
           Move diffusion profiles onto it
         </button>
       </div>

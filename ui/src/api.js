@@ -162,14 +162,17 @@ function mockCheckResults(p) {
       results.push({
         id: "diffusion-card-sharing", spec_number: 14, title: "Card is not shared with a diffusion run",
         outcome: { outcome: "warn", message: p.runtime?.ctx_total
-          ? `card also hosts ${others.join(", ")}; this profile allocates its prompt-KV store (up to 5.0 GiB) per request, after load; sharing can push either model into shared memory`
+          ? `card also hosts ${others.join(", ")}; this profile allocates its prompt-KV store (up to ${(mockDiffusion(p).sizing.request_bytes / 2 ** 30).toFixed(1)} GiB) per request, after load; sharing can push either model into shared memory`
           : `card also hosts ${others.join(", ")}; the runner auto-sizes its context to the VRAM it believes is free, and WDDM hides other processes' allocations, so it will oversubscribe. Pick an empty card` },
       });
     }
     const s = mockDiffusion(p).sizing;
     const ctx = p.runtime?.ctx_total ?? 0;
     const warns = [];
-    if (ctx > s.predicted_auto_maxtok) warns.push(`explicit budget ${ctx} is above what fits (auto MAXTOK predicted ≈ ${s.predicted_auto_maxtok}); the runner will degrade it at load`);
+    const fa = !!p.diffusion?.flash_attn, faPad = !!mockDiffusion(p).runner.fa_pad;
+    if (fa && !faPad) warns.push("diffusion.flash_attn is on, but this build's runner does not pad keys for flash attention: DiffusionGemma's 512-dim heads fall back to the CPU, which is slower. Turn it off, or pick a patched runner build");
+    if (s.explicit_capped) warns.push(`explicit budget ${ctx} is above the runner's flash-attention ceiling ${s.ctx_ceiling} (training context, and the pad kernel's 65,536-row grid limit); it auto-sizes instead (≈ ${s.predicted_auto_maxtok})`);
+    if (s.explicit_fits === false) warns.push(`explicit budget ${ctx} is above what fits (auto MAXTOK predicted ≈ ${s.predicted_auto_maxtok}); the runner will degrade it at load`);
     if (!s.full_offload) warns.push("NGL < block_count+1: partial offload is slow and the context is sized against system RAM");
     results.push({
       id: "diffusion-context", spec_number: 15, title: "Diffusion context budget",
@@ -185,18 +188,29 @@ function mockCheckResults(p) {
 // mock DiffusionGemma 26B-A4B header on a 32 GB card.
 function mockDiffusion(p) {
   const build = MOCK_BUILDS.find((b) => b.path === p?.build?.path);
+  const has = (f) => !!build?.patch?.features?.includes(f);
+  const runner = { pkv_f16: has("dg-pkv-f16"), swa_ring: has("dg-swa-ring"), fa_pad: has("dg-fa-pad"), fa_turn_sizing: has("dg-fa-pad") && has("dg-fa-turn-sizing"), runtime_cache_off: true };
+  const faSized = runner.fa_turn_sizing && !!p?.diffusion?.flash_attn;
   const ctx = p?.runtime?.ctx_total ?? 0;
-  const predicted = 12288;
-  const used = ctx > 0 ? ctx : predicted;
+  const predicted = faSized ? 65536 : 12288;
+  const capped = faSized && ctx > 65536;
+  const used = ctx > 0 && !capped ? ctx : predicted;
+  // estimate::estimate_diffusion for the 26B-A4B header: the patched runner's
+  // FA turn, or the stock store + prefill term (runtime cache off).
+  const perTok = runner.swa_ring ? 20480 : 450560, p2 = used - 256;
+  const request = faSized ? 45056 * used + 628940800 + 268435456 : 400 * 2 ** 20 + perTok * p2 + (runner.swa_ring ? 628940800 : 0) + 14 * p2 * p2;
   return {
     helper_exe: "C:\\Users\\me\\AppData\\Local\\Programs\\LlamaFIDIM\\fidim-dg.exe",
     helper_dir: "C:\\Users\\me\\AppData\\Local\\Programs\\LlamaFIDIM",
     runner_exe: `${p?.build?.path ?? ""}\\bin\\llama-diffusion-gemma-visual-server.exe`,
     runner_present: !!build?.runner_exe,
     vulkan_backend: false,
+    runner,
     sizing: {
       canvas: 256, predicted_auto_maxtok: predicted, maxtok_used: used, max_prompt_tokens: used - 256,
-      pkv_bytes_per_token: 450560, full_offload: (p?.runtime?.n_gpu_layers ?? 0) >= 31,
+      pkv_bytes_per_token: perTok, request_bytes: request, fa_sized: faSized, ctx_ceiling: 65536,
+      explicit_fits: ctx > 0 && !capped ? (faSized || ctx <= 13824) : null, explicit_capped: capped,
+      full_offload: (p?.runtime?.n_gpu_layers ?? 0) >= 31,
     },
   };
 }
@@ -209,7 +223,6 @@ function mockFindings(p) {
   const ctx = p.runtime?.ctx_total ?? 0;
   if ((p.devices?.length ?? 0) !== 1) f.push({ severity: "error", code: "dg-single-device", message: `the diffusion engine needs exactly one device (profile lists ${p.devices?.length ?? 0})` });
   if (!dg.default_max_tokens) f.push({ severity: "error", code: "dg-max-tokens", message: "diffusion.default_max_tokens must be at least 1" });
-  if (dg.flash_attn) f.push({ severity: "warning", code: "dg-flash-attn", message: "diffusion.flash_attn is on: DiffusionGemma's 512-dim attention heads fall back to the CPU on HIP, which is slower; leave it off unless measured" });
   if (dg.hipblaslt_safeguard === false) f.push({ severity: "warning", code: "dg-safeguard-off", message: "diffusion.hipblaslt_safeguard is off: the first denoise step intermittently fails with 'MUL_MAT failed / ROCm error: invalid argument' when rocBLAS routes through hipBLASLt" });
   if (ctx !== 0 && (ctx < 2048 || ctx % 256 !== 0 || ctx > 65536)) f.push({ severity: "warning", code: "dg-context", message: `runtime.ctx_total ${ctx} is the diffusion context budget (MAXTOK, 0 = auto-size): expected a multiple of 256 between 2048 and 65536` });
   return f;
@@ -218,7 +231,7 @@ function mockFindings(p) {
 function mockEstimate(p) {
   if (p?.engine === "diffusion-gemma") {
     const s = mockDiffusion(p).sizing;
-    const w = 15.65 * 2 ** 30, kv = s.pkv_bytes_per_token * s.max_prompt_tokens, c = 1.93 * 2 ** 30, o = 0.4 * 2 ** 30;
+    const w = 15.65 * 2 ** 30, kv = s.request_bytes, c = 1.93 * 2 ** 30, o = 0.4 * 2 ** 30;
     return {
       per_device: [{ key: p.devices?.[0]?.key ?? "?", fraction: 1.0, weights_bytes: w, kv_bytes: kv, compute_bytes: c, overhead_bytes: o, total_bytes: w + kv + c + o }],
       total_bytes: w + kv + c + o,
@@ -264,6 +277,14 @@ const MOCK_BUILDS = [
     version: "b11027", commit: "f6b9ea743", version_error: null,
     channel: "unsloth", bundled_runtime: true, release_tag: "b11027-mix-3e83366",
     runner_exe: "C:\\llama.cpp\\b11027-mix-3e83366-unsloth\\bin\\llama-diffusion-gemma-visual-server.exe",
+  },
+  {
+    path: "C:\\llama.cpp\\b11027-mix-3e83366-unsloth-dgpatch", tag: "b11027-mix-3e83366-unsloth-dgpatch",
+    server_exe: "C:\\llama.cpp\\b11027-mix-3e83366-unsloth-dgpatch\\bin\\llama-server.exe",
+    version: "b11027", commit: "f6b9ea743", version_error: null,
+    channel: "unsloth", bundled_runtime: true, release_tag: "b11027-mix-3e83366",
+    patch: { name: "dgpatch", base_commit: "f6b9ea743", features: ["dg-pkv-f16", "dg-swa-ring", "dg-fa-pad", "dg-fa-turn-sizing", "dg-step-fail-err"] },
+    runner_exe: "C:\\llama.cpp\\b11027-mix-3e83366-unsloth-dgpatch\\bin\\llama-diffusion-gemma-visual-server.exe",
   },
 ];
 
