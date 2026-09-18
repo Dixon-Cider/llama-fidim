@@ -160,6 +160,14 @@ model.
   by its per-request working set: 65,536 tokens on a 32 GB card. Promotion
   never moves a diffusion profile onto a build that lacks its patch's
   features.
+- **Watch it denoise.** In Running, open a diffusion slot to see the current
+  block the way Unsloth Studio shows it. Each step repaints the model's
+  guess for the whole block until it settles and commits. **Replay last
+  reply** plays every step of the last reply back. The stat cards show two
+  speeds:
+  - **output**: text delivered per second; compare it with an
+    autoregressive model's decode speed;
+  - **canvas**: Studio's "Speed", 256 tokens re-predicted per step.
 - **Freed memory is released.** Every diffusion run gets
   `GPU_RESOURCE_CACHE_SIZE=0`: otherwise the HIP runtime keeps freed device
   memory, and the runner holds about 4 GiB more after a 10K-token prompt. A
