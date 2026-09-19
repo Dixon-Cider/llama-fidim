@@ -4,6 +4,7 @@
   import Range from "../components/Range.svelte";
   import { scale, fade } from "svelte/transition";
   import { LAYOUT } from "../motion.js";
+  import { chat, deleteAllSaved } from "../lib/chat.svelte.js";
 
   let cfg = $state(null);       // editable copy of config.json
   let path = $state("");
@@ -34,7 +35,28 @@
     allow_integrated: "Let profiles bind integrated graphics. Off, pre-flight blocks it, because next to a discrete card an iGPU is a trap: it runs at a fraction of the speed and never errors. On an APU-only machine, or a Strix Halo with up to 96 GB of shared memory, turn this on.",
     keep_alive: "Off by default. VRAM eviction on idle comes from the PCIe Link State Power Management power setting; pre-flight check 12 warns when it is not Off. If it cannot be Off, a 1-token request every N seconds keeps the GPU awake. Profiles can override.",
     hf_token: "Hugging Face token, used only to read generation_config.json from gated repos. HF_TOKEN in the environment wins.",
+    save_chats: "On, each Chat conversation is kept on this PC as a plain JSON file in the tool's chats folder, and listed in the Chat tab. Off, conversations last only until the app closes; files saved earlier stay until you delete them.",
   };
+
+  // Delete every saved conversation: two clicks, the first arms it.
+  let chatsArmed = $state(false);
+  let chatsNote = $state("");
+  async function deleteChats() {
+    if (!chatsArmed) {
+      chatsArmed = true;
+      setTimeout(() => (chatsArmed = false), 3000);
+      return;
+    }
+    chatsArmed = false;
+    try {
+      const n = await deleteAllSaved();
+      chatsNote = n === 1 ? "Deleted 1 saved conversation." : "Deleted " + n + " saved conversations.";
+      log("settings: deleted saved chats");
+    } catch (e) {
+      chatsNote = String(e);
+    }
+    setTimeout(() => (chatsNote = ""), 4000);
+  }
 
   async function load() {
     error = "";
@@ -63,6 +85,7 @@
       if (out[k] === "" || out[k] === undefined) out[k] = null;
     out.keep_alive_seconds = Math.max(0, Math.round(Number(out.keep_alive_seconds) || 0));
     out.allow_integrated = !!out.allow_integrated;
+    out.save_chats = out.save_chats !== false;
     if (out.default_runtime === "default") out.default_runtime = null;
     let manual = [];
     if (manualRuntimesText.trim()) manual = JSON.parse(manualRuntimesText);
@@ -76,6 +99,7 @@
     try {
       const c = assembled();
       await api("save_config", { config: c });
+      chat.saving = c.save_chats;
       saved = "Saved. Models, builds and devices will rescan.";
       log("settings saved");
       await load();
@@ -217,6 +241,20 @@
         <span class="k">Hugging Face token (gated repos only)</span>
         <input type="password" bind:value={cfg.hf_token} oninput={touch} placeholder="hf_…" autocomplete="off" />
       </label>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="sec">Chat <span class="faint">conversations in the Chat tab</span></div>
+    <div class="formgrid" style="align-items: end;">
+      <label class="field" style="grid-column: span 4;" title={HINTS.save_chats}>
+        <span class="k">save chats</span>
+        <span><input type="checkbox" checked={cfg.save_chats !== false} onchange={(e) => { cfg.save_chats = e.target.checked; touch(); }} /> keep conversations on this PC (plain JSON, deletable)</span>
+      </label>
+      <div style="grid-column: span 2; display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: wrap;">
+        {#if chatsNote}<span class="faint small">{chatsNote}</span>{/if}
+        <button class="btn danger" onclick={deleteChats}>{chatsArmed ? "Click again to delete them all" : "Delete saved chats"}</button>
+      </div>
     </div>
   </section>
 
