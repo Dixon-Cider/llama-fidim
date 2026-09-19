@@ -13,16 +13,19 @@
 //! machine, so those steps carry `needs_consent`; so does an Unsloth mix
 //! chosen for an unmerged pull request. Within that order a verified step
 //! (the source was read) beats an unverified one (only a heuristic or
-//! nothing could be checked), which is offered as an alternative.
+//! nothing could be checked), which is offered as an alternative. A source
+//! build based on upstream older than `FIRST_ROCM7_BUILD` comes last with a
+//! warning: its HIP code does not compile with a ROCm 7 HIP SDK.
 //!
 //! `plan_build` is pure over what `gather_plan_inputs` collected, so every
 //! decision is tested offline.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::github::{self, Api, GitRef, PrCandidate, RefKind, ResolvedRef};
+use super::github::{self, Api, GitRef, PrCandidate, RefKind, ResolvedRef, UPSTREAM_BRANCH};
 use super::{
     compat_err, describe_missing, probe_build, probe_source, source_caps, source_of, ModelNeeds, Support, UPSTREAM_OWNER,
     UPSTREAM_REPO,
@@ -143,35 +146,66 @@ pub fn unsloth_merged_prs(body: &str) -> Vec<u32> {
     out
 }
 
+/// The first upstream build whose HIP code compiles with ROCm 7's hipBLAS
+/// (llama.cpp#14634, July 2025: ROCm 7 dropped `hipblasDatatype_t`). With
+/// a ROCm 7 HIP SDK, `build-from-ref.bat` stops an older tree after
+/// configure (exit 76).
+pub const FIRST_ROCM7_BUILD: u32 = 5872;
+
+/// Upstream's build number where a ref branched off: the newest release's
+/// number less how far the ref is behind master. Upstream numbers every
+/// master commit and master is at most a few commits past its newest
+/// release, so this is an estimate within a few builds.
+fn base_build(behind_by: Option<u32>, upstream_latest: Option<u32>) -> Option<u32> {
+    upstream_latest?.checked_sub(behind_by?)
+}
+
+/// A warning for a source build based on upstream too old for ROCm 7.
+fn old_base_warning(base: Option<u32>) -> Option<String> {
+    let b = base.filter(|b| *b < FIRST_ROCM7_BUILD)?;
+    Some(format!(
+        "based on upstream around b{b}, older than b{FIRST_ROCM7_BUILD} (July 2025): its HIP code does not compile with \
+         a ROCm 7 HIP SDK (the build stops after configure); a ROCm 6 HIP SDK may still build it"
+    ))
+}
+
 struct Collector {
     verified: Vec<PlanStep>,
     unverified: Vec<PlanStep>,
+    /// Steps that will most likely fail to compile here: offered last.
+    doubtful: Vec<PlanStep>,
     rejected: Vec<String>,
 }
 
 impl Collector {
     /// File a candidate by its support: a step, an unverified step, or a
-    /// rejection that names what is missing.
-    fn offer(&mut self, needs: &ModelNeeds, support: &Support, what: &str, mut step: PlanStep) {
-        match support {
+    /// rejection that names what is missing. A `doubtful` step keeps its
+    /// support's verdict but goes after every other.
+    fn offer(&mut self, needs: &ModelNeeds, support: &Support, what: &str, mut step: PlanStep, doubtful: bool) {
+        let list = match support {
             Support::Yes => {
                 step.verified = true;
-                self.verified.push(step);
+                &mut self.verified
             }
             Support::Unknown(why) => {
                 step.verified = false;
                 step.warnings.insert(0, format!("not verified: {why}"));
-                self.unverified.push(step);
+                &mut self.unverified
             }
-            Support::No { missing } => self.rejected.push(format!("{what} lacks {}", describe_missing(needs, missing))),
-        }
+            Support::No { missing } => {
+                self.rejected.push(format!("{what} lacks {}", describe_missing(needs, missing)));
+                return;
+            }
+        };
+        if doubtful { self.doubtful.push(step) } else { list.push(step) }
     }
 }
 
 /// Order every candidate into one recommendation (see the module notes).
 pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> BuildPlan {
-    let mut c = Collector { verified: vec![], unverified: vec![], rejected: vec![] };
+    let mut c = Collector { verified: vec![], unverified: vec![], doubtful: vec![], rejected: vec![] };
     let diffusion = needs.engine.is_diffusion();
+    let upstream_n = inputs.upstream_latest.as_ref().and_then(|u| update::version_number(&u.release.tag));
     let gpu_targets = update::normalize_gpu_targets(&inputs.gfx).unwrap_or_default();
     let gfx_warning = gpu_targets.is_empty().then(|| {
         format!("no GPU target is known for this machine (`{}`); pass one (e.g. gfx1201) before building", inputs.gfx)
@@ -194,11 +228,11 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
         match &p.support {
             Support::Yes if !took_yes => {
                 took_yes = true;
-                c.offer(needs, &p.support, &name, step);
+                c.offer(needs, &p.support, &name, step, false);
             }
             Support::Unknown(_) if !took_unknown => {
                 took_unknown = true;
-                c.offer(needs, &p.support, &name, step);
+                c.offer(needs, &p.support, &name, step, false);
             }
             Support::No { .. } => lacking.push(name),
             _ => {}
@@ -244,6 +278,7 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
                         verified: false,
                         warnings: vec![],
                     },
+                    false,
                 ),
                 (Err(e), _) | (_, Err(e)) => c.rejected.push(format!("{what}: {e}")),
             }
@@ -298,10 +333,15 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
 
     // 4. Upstream pull requests, from the search and from the card.
     let mut prs: Vec<PrCandidate> = inputs.prs.clone();
+    // How far behind master a pull request is, known for card links only.
+    let mut pr_behind: HashMap<u32, u32> = HashMap::new();
     for cc in &inputs.card_refs {
         if let (Some(r), Some(s)) = (&cc.resolved, &cc.support) {
             if r.is_upstream {
                 if let Some(pr) = &r.pr {
+                    if let Some(b) = r.behind_by {
+                        pr_behind.insert(pr.number, b);
+                    }
                     if !prs.iter().any(|p| p.pr.number == pr.number) {
                         prs.push(PrCandidate { pr: pr.clone(), support: s.clone() });
                     }
@@ -346,6 +386,8 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
                     .to_string(),
             );
         }
+        let old_base = old_base_warning(base_build(pr_behind.get(&pr.number).copied(), upstream_n));
+        warnings.extend(old_base.clone());
         warnings.extend(gfx_warning.clone());
         c.offer(
             needs,
@@ -366,6 +408,7 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
                 verified: false,
                 warnings,
             },
+            old_base.is_some(),
         );
     }
     if prs.is_empty() && !diffusion {
@@ -376,9 +419,9 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
     let mut forks = 0;
     for cc in &inputs.card_refs {
         let r = &cc.git_ref;
-        // A bare link to upstream is how cards say "use llama.cpp"; its
-        // releases were rung 2. Upstream pull requests were rung 4.
-        if r.is_upstream_repo() && matches!(r.kind, RefKind::Repo | RefKind::Pull(_)) {
+        // A link to upstream or its master is how cards say "use llama.cpp";
+        // its releases were rung 2. Upstream pull requests were rung 4.
+        if r.is_upstream_master() || (r.is_upstream_repo() && matches!(r.kind, RefKind::Pull(_))) {
             continue;
         }
         forks += 1;
@@ -386,7 +429,7 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
             c.rejected.push(format!("{}: {}", r.url(), cc.error.as_deref().unwrap_or("not resolved")));
             continue;
         };
-        if res.is_upstream && res.pr.is_some() {
+        if res.is_upstream && (res.pr.is_some() || res.git_ref == UPSTREAM_BRANCH) {
             continue;
         }
         let support = cc.support.clone().unwrap_or_else(|| Support::Unknown("its source was not read".into()));
@@ -413,6 +456,8 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
         if let Some(b) = res.behind_by.filter(|b| *b >= 500) {
             warnings.push(format!("{b} commits behind upstream master: fixes since then are missing"));
         }
+        let old_base = old_base_warning(base_build(res.behind_by, upstream_n));
+        warnings.extend(old_base.clone());
         if let Some(pr) = &res.pr {
             if pr.draft {
                 warnings.push("a draft pull request".to_string());
@@ -459,6 +504,7 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
                 verified: false,
                 warnings,
             },
+            old_base.is_some(),
         );
     }
     if forks == 0 {
@@ -467,6 +513,7 @@ pub fn plan_build(cfg: &Config, needs: &ModelNeeds, inputs: &PlanInputs) -> Buil
 
     let mut steps = c.verified;
     steps.extend(c.unverified);
+    steps.extend(c.doubtful);
     let mut rejected = c.rejected;
     rejected.extend(inputs.errors.iter().map(|e| format!("could not check: {e}")));
     let step = if steps.is_empty() {
@@ -510,6 +557,38 @@ const BUILD_COST: &str = "several minutes of compiling, about 0.6 GB of scratch 
 /// each).
 const MAX_CARD_LOOKUPS: usize = 3;
 
+/// The card links worth resolving, best first, at most `MAX_CARD_LOOKUPS`:
+/// forks, then upstream pull requests, then other upstream branches and
+/// commits. Upstream itself or its master (a folder link like
+/// `/tree/master/tools/server` included) is rung 2's release; a pull request
+/// the search already checked, or a link that names the same thing as one
+/// taken (ggerganov/llama.cpp is upstream's old name), costs nothing twice.
+pub fn card_lookups<'a>(card_refs: &'a [GitRef], checked_prs: &[u32]) -> Vec<&'a GitRef> {
+    let rank = |r: &GitRef| match (r.is_upstream_repo(), &r.kind) {
+        (false, _) => 0,
+        (true, RefKind::Pull(_)) => 1,
+        _ => 2,
+    };
+    let mut candidates: Vec<&GitRef> = card_refs
+        .iter()
+        .filter(|r| !r.is_upstream_master())
+        .filter(|r| !(r.is_upstream_repo() && matches!(r.kind, RefKind::Pull(n) if checked_prs.contains(&n))))
+        .collect();
+    candidates.sort_by_key(|r| rank(r));
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in candidates {
+        let owner = if r.is_upstream_repo() { UPSTREAM_OWNER.to_string() } else { r.owner.to_ascii_lowercase() };
+        if seen.insert((owner, r.repo.to_ascii_lowercase(), r.kind.clone())) {
+            out.push(r);
+            if out.len() == MAX_CARD_LOOKUPS {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Collect what `plan_build` needs, cheapest first, stopping as soon as a
 /// verified answer makes the rest moot: installed builds (offline), then
 /// upstream's newest release (one API request, source read at the tag),
@@ -527,6 +606,26 @@ pub fn gather_plan_inputs(
     upstream_latest: Option<Release>,
 ) -> PlanInputs {
     let api = Api::new(cfg);
+    let mut inputs = gather_with(&api, needs, installed, card_refs, gfx, model_hint, upstream_latest);
+    if api.token_rejected() {
+        inputs.errors.push(
+            "the GitHub token (config.github_token or GITHUB_TOKEN) was rejected with 401, so lookups went without \
+             it, at 60 requests an hour: renew or remove it"
+                .into(),
+        );
+    }
+    inputs
+}
+
+fn gather_with(
+    api: &Api,
+    needs: &ModelNeeds,
+    installed: &[Build],
+    card_refs: &[GitRef],
+    gfx: &str,
+    model_hint: Option<&str>,
+    upstream_latest: Option<Release>,
+) -> PlanInputs {
     let mut inputs = PlanInputs { gfx: gfx.to_string(), ..Default::default() };
     inputs.installed = installed.iter().map(|b| ProbedBuild { build: b.clone(), support: probe_build(b, needs) }).collect();
     // A tensor type the probe could not check offline: read the build's
@@ -545,7 +644,7 @@ pub fn gather_plan_inputs(
     }
     let diffusion = needs.engine.is_diffusion();
     if diffusion {
-        match latest_unsloth(&api) {
+        match latest_unsloth(api) {
             Ok(r) => inputs.unsloth_latest = Some(r),
             Err(e) => inputs.errors.push(format!("Unsloth releases: {e}")),
         }
@@ -553,7 +652,7 @@ pub fn gather_plan_inputs(
     }
     let latest = match upstream_latest {
         Some(r) => Ok(r),
-        None => latest_upstream(&api),
+        None => latest_upstream(api),
     };
     match latest {
         Ok(release) => {
@@ -567,22 +666,22 @@ pub fn gather_plan_inputs(
         }
         Err(e) => inputs.errors.push(format!("upstream releases: {e}")),
     }
-    match github::find_upstream_pr_with(&api, needs, model_hint, &mut |sha: &str| {
+    match github::find_upstream_pr_with(api, needs, model_hint, &mut |sha: &str| {
         source_caps(UPSTREAM_OWNER, UPSTREAM_REPO, sha).map(|c| c.support(needs))
     }) {
         Ok(p) => inputs.prs = p,
         Err(e) => inputs.errors.push(format!("upstream pull requests: {e}")),
     }
     if inputs.prs.iter().any(|p| p.support.is_yes()) {
-        match latest_unsloth(&api) {
+        match latest_unsloth(api) {
             Ok(r) => inputs.unsloth_latest = Some(r),
             Err(e) => inputs.errors.push(format!("Unsloth releases: {e}")),
         }
         return inputs;
     }
-    let lookups = card_refs.iter().filter(|r| !(r.is_upstream_repo() && r.kind == RefKind::Repo)).take(MAX_CARD_LOOKUPS);
-    for r in lookups {
-        inputs.card_refs.push(match github::resolve_ref_with(&api, r) {
+    let checked: Vec<u32> = inputs.prs.iter().map(|p| p.pr.number).collect();
+    for r in card_lookups(card_refs, &checked) {
+        inputs.card_refs.push(match github::resolve_ref_with(api, r) {
             Ok(res) => {
                 let support = probe_source(&res.owner, &res.repo, &res.sha, needs)
                     .unwrap_or_else(|e| Support::Unknown(format!("its source could not be read: {e}")));

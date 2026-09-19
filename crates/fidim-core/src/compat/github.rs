@@ -6,20 +6,25 @@
 //! (shared by every program on the machine) and 10 searches a minute, so
 //! every API answer is cached on disk with its ETag: for five minutes no
 //! request is made at all, and after that a revalidation that comes back
-//! 304 costs nothing against the limit. A token (`GITHUB_TOKEN`, or
-//! `config.github_token`) raises the limits to 5000 and 30. File reads go
-//! to raw.githubusercontent.com at a pinned commit, which has no quota.
+//! 304 costs nothing against the limit. A token (`config.github_token`, or
+//! `GITHUB_TOKEN`) raises the limits to 5000 and 30; one GitHub rejects
+//! (expired, revoked) is dropped after the first 401, since every lookup
+//! here works without one. File reads go to raw.githubusercontent.com at a
+//! pinned commit, which has no quota.
 //!
 //! Model cards are untrusted text: only URLs are taken from them, through
 //! one strict pattern, and nothing they say is acted on.
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::{compat_err, is_hex, valid_owner, valid_repo, ModelNeeds, Support, UPSTREAM_OWNER, UPSTREAM_REPO};
+use super::{
+    compat_err, is_hex, valid_owner, valid_repo, ModelNeeds, Support, UPSTREAM_OLD_OWNER, UPSTREAM_OWNER, UPSTREAM_REPO,
+};
 use crate::config::Config;
 use crate::{Error, Result};
 
@@ -36,14 +41,12 @@ const FRESH: Duration = Duration::from_secs(300);
 /// `llama.cpp`).
 const MAX_RAW_BYTES: u64 = 16 << 20;
 
-/// The GitHub token: `GITHUB_TOKEN` in the environment, else
-/// `config.github_token`. Blank values count as none.
+/// The GitHub token: `config.github_token`, else `GITHUB_TOKEN` (the
+/// environment is shared with other tools; the config is FIDIM's own).
+/// Blank values count as none.
 pub fn token(cfg: &Config) -> Option<String> {
-    std::env::var("GITHUB_TOKEN")
-        .ok()
-        .or_else(|| cfg.github_token.clone())
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+    let clean = |t: String| Some(t.trim().to_string()).filter(|t| !t.is_empty());
+    cfg.github_token.clone().and_then(clean).or_else(|| std::env::var("GITHUB_TOKEN").ok().and_then(clean))
 }
 
 fn now_unix() -> u64 {
@@ -100,6 +103,8 @@ struct Cached {
 pub struct Api {
     base: String,
     token: Option<String>,
+    /// GitHub answered 401 to the token: requests go without it from then on.
+    token_rejected: AtomicBool,
     cache_dir: Option<PathBuf>,
     fresh: Duration,
 }
@@ -109,6 +114,7 @@ impl Api {
         Api {
             base: API.to_string(),
             token: token(cfg),
+            token_rejected: AtomicBool::new(false),
             cache_dir: Some(Config::config_dir().join("cache").join("github")),
             fresh: FRESH,
         }
@@ -116,7 +122,13 @@ impl Api {
 
     /// Against another host (tests run a local fake), with or without a cache.
     pub fn with_base(base: &str, token: Option<String>, cache_dir: Option<PathBuf>, fresh: Duration) -> Self {
-        Api { base: base.trim_end_matches('/').to_string(), token, cache_dir, fresh }
+        Api { base: base.trim_end_matches('/').to_string(), token, token_rejected: AtomicBool::new(false), cache_dir, fresh }
+    }
+
+    /// GitHub rejected the token (expired or revoked), so requests went
+    /// without it: worth telling the user, who has it set for a reason.
+    pub fn token_rejected(&self) -> bool {
+        self.token_rejected.load(Ordering::Relaxed)
     }
 
     fn cache_path(&self, url: &str, accept: &str) -> Option<PathBuf> {
@@ -154,18 +166,30 @@ impl Api {
                 return Ok(c.body.clone());
             }
         }
-        let mut req = agent()
-            .get(&url)
-            .set("User-Agent", USER_AGENT)
-            .set("Accept", accept)
-            .set("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(t) = &self.token {
-            req = req.set("Authorization", &format!("Bearer {t}"));
+        let send = |token: Option<&str>| {
+            let mut req = agent()
+                .get(&url)
+                .set("User-Agent", USER_AGENT)
+                .set("Accept", accept)
+                .set("X-GitHub-Api-Version", "2022-11-28");
+            if let Some(t) = token {
+                req = req.set("Authorization", &format!("Bearer {t}"));
+            }
+            if let Some(etag) = cached.as_ref().and_then(|c| c.etag.as_deref()) {
+                req = req.set("If-None-Match", etag);
+            }
+            req.call()
+        };
+        let token = self.token.as_deref().filter(|_| !self.token_rejected());
+        let mut result = send(token);
+        // Every endpoint used here is public: a stale token in the
+        // environment must not cost the answer.
+        if token.is_some() && matches!(result, Err(ureq::Error::Status(401, _))) {
+            self.token_rejected.store(true, Ordering::Relaxed);
+            result = send(None);
         }
-        if let Some(etag) = cached.as_ref().and_then(|c| c.etag.as_deref()) {
-            req = req.set("If-None-Match", etag);
-        }
-        match req.call() {
+        let authed = token.is_some() && !self.token_rejected();
+        match result {
             Ok(resp) if resp.status() == 304 => {
                 let mut c = cached.ok_or_else(|| compat_err(format!("{url}: 304 without a cached copy")))?;
                 c.fetched_unix = now_unix();
@@ -183,7 +207,7 @@ impl Api {
                 Ok(None)
             }
             Err(ureq::Error::Status(code, resp)) => {
-                let err = status_error(&url, code, resp, self.token.is_some());
+                let err = status_error(&url, code, resp, authed, self.token_rejected());
                 match cached {
                     Some(c) if code == 403 || code == 429 || code >= 500 => Ok(c.body),
                     _ => Err(err),
@@ -198,7 +222,8 @@ impl Api {
 }
 
 /// A readable error for a failed API call; the rate limit names its fix.
-fn status_error(url: &str, code: u16, resp: ureq::Response, authed: bool) -> Error {
+/// `rejected`: a token is set but GitHub refused it.
+fn status_error(url: &str, code: u16, resp: ureq::Response, authed: bool, rejected: bool) -> Error {
     let remaining = resp.header("X-RateLimit-Remaining").map(str::to_string);
     let reset = resp.header("X-RateLimit-Reset").and_then(|s| s.parse::<u64>().ok());
     let retry_after = resp.header("Retry-After").map(str::to_string);
@@ -217,6 +242,9 @@ fn status_error(url: &str, code: u16, resp: ureq::Response, authed: bool) -> Err
         };
         let fix = if authed {
             String::new()
+        } else if rejected {
+            "; GitHub rejected the token in config.github_token / GITHUB_TOKEN (401): renew it for 5000 requests an hour"
+                .into()
         } else {
             "; set GITHUB_TOKEN or config.github_token (any read-only token) for 5000 requests an hour".into()
         };
@@ -226,8 +254,8 @@ fn status_error(url: &str, code: u16, resp: ureq::Response, authed: bool) -> Err
             if authed { "for this token" } else { "per IP address without a token" }
         ));
     }
-    if code == 401 {
-        return compat_err("GitHub rejected the token (401): check GITHUB_TOKEN / config.github_token".to_string());
+    if code == 401 && authed {
+        return compat_err("GitHub rejected the token (401): check config.github_token / GITHUB_TOKEN".to_string());
     }
     compat_err(format!("GitHub API {url}: HTTP {code}{}", if message.is_empty() { String::new() } else { format!(": {message}") }))
 }
@@ -248,7 +276,7 @@ pub(crate) fn pct(s: &str) -> String {
 // ------------------------------------------------------------ card refs ----
 
 /// What a llama.cpp link points at.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum RefKind {
     /// The repository itself: its default branch.
@@ -270,8 +298,23 @@ pub struct GitRef {
 }
 
 impl GitRef {
+    /// ggml-org/llama.cpp, or ggerganov/llama.cpp, its name until 2025
+    /// (GitHub redirects it; model cards still link it).
     pub fn is_upstream_repo(&self) -> bool {
-        self.owner.eq_ignore_ascii_case(UPSTREAM_OWNER) && self.repo.eq_ignore_ascii_case(UPSTREAM_REPO)
+        (self.owner.eq_ignore_ascii_case(UPSTREAM_OWNER) || self.owner.eq_ignore_ascii_case(UPSTREAM_OLD_OWNER))
+            && self.repo.eq_ignore_ascii_case(UPSTREAM_REPO)
+    }
+
+    /// Upstream itself: the repository or its master branch. Cards link it
+    /// to say "use llama.cpp"; its releases are the plan's second rung, so
+    /// it is never a fork to build.
+    pub fn is_upstream_master(&self) -> bool {
+        self.is_upstream_repo()
+            && match &self.kind {
+                RefKind::Repo => true,
+                RefKind::Branch(b) => b == UPSTREAM_BRANCH,
+                _ => false,
+            }
     }
 
     /// `github.com/<o>/<r>/tree/<b>` etc., for display.
@@ -316,6 +359,12 @@ pub fn card_refs(readme: &str) -> Vec<GitRef> {
                 if b.is_empty() || b.starts_with(['-', '/', '.']) || b.contains("..") || b.contains("//") {
                     continue;
                 }
+                // `/tree/master/tools/server` is a folder in master: git
+                // cannot hold a branch `master/...` beside `master`.
+                let b = match b.split_once('/') {
+                    Some((head, _)) if head == "master" || head == "main" => head,
+                    _ => b,
+                };
                 RefKind::Branch(b.to_string())
             }
             (Some(k), Some(rest)) if k == "pull" => {

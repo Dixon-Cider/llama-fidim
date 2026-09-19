@@ -55,6 +55,8 @@ fn compat_err(msg: impl Into<String>) -> Error {
 /// Upstream llama.cpp, the base every fork is compared against.
 pub const UPSTREAM_OWNER: &str = "ggml-org";
 pub const UPSTREAM_REPO: &str = "llama.cpp";
+/// Upstream's owner until 2025; github.com/ggerganov/llama.cpp redirects.
+pub const UPSTREAM_OLD_OWNER: &str = "ggerganov";
 
 /// Architectures upstream names in `LLM_ARCH_NAMES` but does not build a
 /// graph for: the loader throws "unsupported model architecture" for them,

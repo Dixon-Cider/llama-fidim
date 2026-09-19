@@ -879,3 +879,163 @@ fn plan_for_diffusion_gemma() {
     assert!(!plan.step.needs_consent, "FIDIM's diffusion channel");
     assert!(plan.rejected.iter().any(|r| r.contains("no DiffusionGemma runner")));
 }
+
+// ------------------------------------------------ upstream under any name ----
+
+/// Cards link upstream by its old name and link folders inside master;
+/// neither is a fork, and neither may use up the lookups a real fork needs.
+#[test]
+fn card_links_to_upstream_are_not_forks() {
+    let card = "Quantized with [llama.cpp](https://github.com/ggerganov/llama.cpp); serve with \
+                https://github.com/ggml-org/llama.cpp/tree/master/tools/server; upstream PR \
+                https://github.com/ggerganov/llama.cpp/pull/12345; until then use \
+                https://github.com/example-org/llama.cpp/tree/add-new-arch\n";
+    let refs = card_refs(card);
+    let gref = |o: &str, kind: RefKind| GitRef { owner: o.into(), repo: "llama.cpp".into(), kind };
+    assert_eq!(
+        refs,
+        vec![
+            gref("ggerganov", RefKind::Repo),
+            gref("ggml-org", RefKind::Branch("master".into())),
+            gref("ggerganov", RefKind::Pull(12345)),
+            gref("example-org", RefKind::Branch("add-new-arch".into())),
+        ],
+        "a folder in master is master"
+    );
+    assert!(refs[0].is_upstream_repo() && refs[0].is_upstream_master());
+    assert!(refs[1].is_upstream_master());
+    assert!(refs[2].is_upstream_repo() && !refs[2].is_upstream_master());
+    assert!(!refs[3].is_upstream_repo());
+
+    // The fork is looked up first; upstream itself never.
+    let lookups = card_lookups(&refs, &[]);
+    assert_eq!(lookups, vec![&refs[3], &refs[2]]);
+    // A pull request the search already read is not read again.
+    assert_eq!(card_lookups(&refs, &[12345]), vec![&refs[3]]);
+    // The same pull request under both names is one lookup; forks come
+    // first however late the card names them, three at most.
+    let mut more = refs.clone();
+    more.insert(0, gref("ggml-org", RefKind::Pull(12345)));
+    for o in ["a", "b", "c"] {
+        more.push(gref(o, RefKind::Repo));
+    }
+    let picked: Vec<String> = card_lookups(&more, &[]).iter().map(|r| r.url()).collect();
+    assert_eq!(
+        picked,
+        [
+            "https://github.com/example-org/llama.cpp/tree/add-new-arch",
+            "https://github.com/a/llama.cpp",
+            "https://github.com/b/llama.cpp"
+        ]
+    );
+    let few = vec![gref("ggml-org", RefKind::Pull(12345)), gref("ggerganov", RefKind::Pull(12345))];
+    assert_eq!(card_lookups(&few, &[]).len(), 1);
+    // Branch names with a slash stay whole unless they start in master.
+    assert_eq!(
+        card_refs("https://github.com/ggml-org/llama.cpp/tree/gg/new-arch https://github.com/x/llama.cpp/tree/main/docs"),
+        vec![gref("ggml-org", RefKind::Branch("gg/new-arch".into())), gref("x", RefKind::Branch("main".into()))]
+    );
+}
+
+/// A card link that resolves to upstream master (its old name redirects
+/// there) is never offered as a fork build.
+#[test]
+fn plan_never_builds_upstream_master_as_a_fork() {
+    let mut inputs = k2_inputs();
+    let old_name = GitRef { owner: "ggerganov".into(), repo: "llama.cpp".into(), kind: RefKind::Repo };
+    let mut upstream = inputs.card_refs[0].clone();
+    upstream.git_ref = old_name.clone();
+    let r = upstream.resolved.as_mut().unwrap();
+    r.requested = old_name;
+    (r.owner, r.repo, r.remote_url, r.git_ref) =
+        ("ggml-org".into(), "llama.cpp".into(), "https://github.com/ggml-org/llama.cpp".into(), "master".into());
+    r.is_upstream = true;
+    r.is_fork_of_ggml = false;
+    let mut folder = upstream.clone();
+    folder.git_ref = GitRef { owner: "ggml-org".into(), repo: "llama.cpp".into(), kind: RefKind::Branch("master".into()) };
+    folder.resolved = None;
+    folder.error = Some("no such ref".into());
+    inputs.card_refs.insert(0, upstream);
+    inputs.card_refs.insert(0, folder);
+    let plan = plan_build(&cfg(), &k2(), &inputs);
+    assert!(matches!(&plan.step.action, PlanAction::BuildFork { owner, .. } if owner == "ifm-ai"), "{:?}", plan.step);
+    assert!(plan.alternatives.is_empty(), "{:?}", plan.alternatives);
+    assert!(!plan.rejected.iter().any(|r| r.contains("ggerganov") || r.contains("tree/master")), "{:?}", plan.rejected);
+}
+
+/// A fork based on upstream from before ROCm 7's hipBLAS change cannot be
+/// compiled with a ROCm 7 HIP SDK: it is still offered, last, and says so.
+#[test]
+fn plan_puts_forks_too_old_for_rocm7_last() {
+    let mut inputs = k2_inputs();
+    let mut old = inputs.card_refs[0].clone();
+    old.git_ref = GitRef { owner: "old-org".into(), repo: "llama.cpp".into(), kind: RefKind::Branch("k2".into()) };
+    let r = old.resolved.as_mut().unwrap();
+    r.requested = old.git_ref.clone();
+    (r.owner, r.remote_url, r.git_ref, r.sha) =
+        ("old-org".into(), "https://github.com/old-org/llama.cpp".into(), "k2".into(), "1".repeat(40));
+    r.redirected = false;
+    // Upstream's newest release is b11046: 6000 behind is about b5046.
+    r.behind_by = Some(6000);
+    inputs.card_refs.insert(0, old.clone());
+    let plan = plan_build(&cfg(), &k2(), &inputs);
+    assert!(matches!(&plan.step.action, PlanAction::BuildFork { owner, .. } if owner == "ifm-ai"), "{:?}", plan.step);
+    assert!(!plan.step.warnings.iter().any(|w| w.contains("b5872")), "380 behind is recent: {:?}", plan.step.warnings);
+    assert_eq!(plan.alternatives.len(), 1);
+    let alt = &plan.alternatives[0];
+    assert!(matches!(&alt.action, PlanAction::BuildFork { owner, .. } if owner == "old-org"));
+    assert!(alt.verified, "the source knows the model; only the build is in doubt");
+    let w = alt.warnings.join("\n");
+    assert!(w.contains("around b5046") && w.contains("older than b5872") && w.contains("ROCm 7"), "{w}");
+
+    // Alone, it is still the plan, with the warning.
+    inputs.card_refs = vec![old];
+    let plan = plan_build(&cfg(), &k2(), &inputs);
+    assert!(matches!(&plan.step.action, PlanAction::BuildFork { owner, .. } if owner == "old-org"));
+    assert!(plan.step.warnings.iter().any(|w| w.contains("older than b5872")));
+    // Without upstream's newest release number there is no estimate.
+    inputs.upstream_latest = None;
+    let plan = plan_build(&cfg(), &k2(), &inputs);
+    assert!(!plan.step.warnings.iter().any(|w| w.contains("b5872")), "{:?}", plan.step.warnings);
+}
+
+/// A token GitHub rejects (expired, revoked, from another tool's
+/// environment) costs one request, not the answer.
+#[test]
+fn api_drops_a_rejected_token() {
+    let unauthorized = Resp { status: 401, headers: vec![], body: r#"{"message":"Bad credentials"}"#.into() };
+    let reset = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600).to_string();
+    let limited = Resp {
+        status: 403,
+        headers: vec![("X-RateLimit-Remaining".into(), "0".into()), ("X-RateLimit-Reset".into(), reset)],
+        body: r#"{"message":"API rate limit exceeded for 127.0.0.1."}"#.into(),
+    };
+    let (base, seen) = fake_github(vec![
+        ("/r", vec![unauthorized.clone(), ok("fine")]),
+        ("/r2", vec![ok("two")]),
+        ("/limited", vec![limited]),
+        ("/private", vec![unauthorized]),
+    ]);
+    let auth = |i: usize| seen.lock().unwrap()[i].1.get("authorization").cloned();
+    let a = Api::with_base(&base, Some("stale".into()), None, Duration::ZERO);
+    assert_eq!(a.get("/r", "application/json").unwrap().as_deref(), Some("fine"));
+    assert_eq!(auth(0).as_deref(), Some("Bearer stale"));
+    assert_eq!(auth(1), None, "asked again without the token");
+    assert!(a.token_rejected());
+    assert_eq!(a.get("/r2", "application/json").unwrap().as_deref(), Some("two"));
+    assert_eq!(auth(2), None, "and never sent again");
+    let e = a.get("/limited", "application/json").unwrap_err().to_string();
+    assert!(e.contains("rate limit") && e.contains("rejected the token"), "{e}");
+    // Without a token, a 401 is not about one.
+    let plain = Api::with_base(&base, None, None, Duration::ZERO);
+    let e = plain.get("/private", "application/json").unwrap_err().to_string();
+    assert!(e.contains("HTTP 401") && !e.contains("token"), "{e}");
+    assert!(!plain.token_rejected());
+
+    // FIDIM's own setting beats the environment other tools share.
+    let mut c = Config::default_for_machine();
+    c.github_token = Some(" from-config ".into());
+    assert_eq!(token(&c).as_deref(), Some("from-config"));
+    c.github_token = Some("  ".into());
+    assert_ne!(token(&c).as_deref(), Some(""), "blank is none");
+}
