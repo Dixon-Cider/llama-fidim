@@ -18,6 +18,12 @@ pub enum Error {
     #[error("malformed GGUF metadata at {path}: {detail}")]
     GgufMalformed { path: PathBuf, detail: String },
 
+    /// The bytes ran out before the header did. On a local file that is a
+    /// damaged or partial file; on a Range-read prefix it means "fetch at
+    /// least `at` bytes and parse again".
+    #[error("GGUF header at {path} ends early: the parser needed the first {at} bytes")]
+    GgufTruncated { path: PathBuf, at: u64 },
+
     #[error("could not parse `--list-devices` output: {0}")]
     ListDevicesUnparseable(String),
 
