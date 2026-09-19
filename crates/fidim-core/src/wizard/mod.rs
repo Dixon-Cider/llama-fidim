@@ -836,6 +836,16 @@ pub fn needs_of(h: &GgufHeader) -> Option<ModelNeeds> {
     Some(ModelNeeds::new(arch, pre, types, h.engine()))
 }
 
+/// A header as a view or plan carries it: the parsed fields only. The raw
+/// metadata (a chat template runs to tens of KB) is for parsing and never
+/// read after it, and a float in it that JSON cannot hold (NaN) would make
+/// the view fail its trip back from the web view.
+fn slim(mut h: GgufHeader) -> GgufHeader {
+    h.metadata.clear();
+    h.tensors.clear();
+    h
+}
+
 fn build_name(b: &Build) -> String {
     b.git.as_ref().map(|g| g.display()).unwrap_or_else(|| b.tag.clone())
 }
@@ -1255,7 +1265,7 @@ pub fn inspect_with(env: &dyn Env, cfg: &Config, input: &str, rev: Option<&str>)
         Ok(h) => {
             view.header_of = Some(first.label.clone());
             view.needs = needs_of(&h);
-            view.header = Some(h);
+            view.header = Some(slim(h));
         }
         Err(e) => {
             view.header_error = Some(e.to_string());
@@ -1603,7 +1613,7 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
         match env.header(&view.repo, &view.sha, &choice.files, ReadMode::Full) {
             Ok(h) => {
                 needs = needs_of(&h).or(needs);
-                header = Some(h);
+                header = Some(slim(h));
             }
             Err(e) => {
                 if let Some(h) = header.as_mut() {

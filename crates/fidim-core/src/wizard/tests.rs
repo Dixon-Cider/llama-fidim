@@ -380,6 +380,26 @@ fn needs_come_from_the_header() {
     assert_eq!(needs_of(&typed).unwrap().max_type_id, Some(39), "MXFP4");
 }
 
+/// The view and the plan cross the Tauri boundary twice (to the web view
+/// and back): a header value JSON cannot hold must not break the trip.
+#[test]
+fn headers_travel_without_their_raw_metadata() {
+    let mut f = Fake::supported("slim");
+    let mut h = gemma_header();
+    h.metadata.insert("general.sampling.temp".into(), crate::gguf::Value::F64(f64::NAN));
+    h.metadata.insert("tokenizer.chat_template".into(), crate::gguf::Value::Str("x".repeat(40_000)));
+    f.header = Some(h);
+    let cfg = f.cfg();
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    assert!(view.header.as_ref().unwrap().metadata.is_empty());
+    let view: RepoView = serde_json::from_str(&serde_json::to_string(&view).unwrap()).unwrap();
+    let plan = plan_with(&f, &cfg, &view, &PlanRequest::default()).unwrap();
+    assert!(plan.header.as_ref().unwrap().metadata.is_empty());
+    assert!(serde_json::to_string(&plan).unwrap().len() < 40_000);
+    let back: WizardPlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+    assert_eq!(back.header.unwrap().block_count, Some(36));
+}
+
 #[test]
 fn sizes_read_in_their_unit() {
     assert_eq!(human_size(1_185_376), "1.1 MiB");
