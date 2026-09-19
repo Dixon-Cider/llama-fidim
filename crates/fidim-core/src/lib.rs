@@ -10,6 +10,7 @@ pub mod config;
 pub mod devices;
 pub mod diffusion;
 pub mod discovery;
+pub mod disk;
 pub mod error;
 pub mod estimate;
 pub mod export;
