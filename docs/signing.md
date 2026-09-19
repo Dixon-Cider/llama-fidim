@@ -137,8 +137,10 @@ To turn signing off again, delete the `AS_ACCOUNT` variable.
   signs `target\release\llama-fidim.exe`.
 - *Verify signatures* requires a valid, timestamped signature (and the
   `AS_SIGNER` name when set) on the zip's three executables and on
-  setup.exe. *Test the installer* installs, upgrades and uninstalls
-  silently and, when signing, checks every installed file.
+  setup.exe. *Test the installer* installs, upgrades from an older build
+  of the same installer (silently, and by running the installed
+  uninstaller first as the interactive installer does) and uninstalls,
+  and when signing checks every installed file.
 
 ## Not verified yet
 

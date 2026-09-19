@@ -31,7 +31,10 @@ build with uncommitted changes.
   publisher, description, version) and the app icon.
 - Release signing through Azure Artifact Signing, off until the repository
   is set up for it ([docs/signing.md](docs/signing.md)). Every release run
-  now installs, upgrades and uninstalls the installer silently as a test.
+  now tests the installer: it installs it, upgrades to it from an older
+  build both ways an upgrade happens (silently over the old version, and
+  through the old version's uninstaller as the interactive installer
+  does), and uninstalls it.
 
 ### Changed
 

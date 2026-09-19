@@ -3,9 +3,9 @@ name: release
 # Tag a commit `vX.Y.Z` (scripts/release.ps1 does) and this builds the CLI
 # and the desktop app on a clean Windows runner and ships them two ways: a
 # zip with the license, README and changelog, and a per-user NSIS installer
-# (setup.exe) that is installed, upgraded and uninstalled silently here as a
-# test. Both go to a GitHub release for that tag, with the version's
-# CHANGELOG.md section as the notes.
+# (setup.exe) that is installed, upgraded from an older version and
+# uninstalled here as a test. Both go to a GitHub release for that tag,
+# with the version's CHANGELOG.md section as the notes.
 #
 # Code signing is optional. It switches on once the repository variable
 # AS_ACCOUNT is set (docs/signing.md lists every step): a tag build then runs
@@ -223,8 +223,12 @@ jobs:
           & target\release\fidim-dg.exe --help
           if ($LASTEXITCODE -ne 0) { throw "fidim-dg.exe --help exited $LASTEXITCODE" }
 
-      # Install, upgrade over running helpers and uninstall, silently, as the
-      # runner's user; with signing, every installed file must be signed.
+      # Install, upgrade over running helpers and uninstall, as the runner's
+      # user. The upgrades start from the same installer rebuilt as an older
+      # version (from Tauri's installer.nsi): once silently, installing over
+      # it, and once the way the interactive installer does it, running the
+      # installed version's uninstaller first. With signing, every installed
+      # file must be signed.
       - name: Test the installer
         shell: pwsh
         env:
@@ -232,7 +236,7 @@ jobs:
         run: |
           $extra = @{}
           if ($env:SIGN -eq 'true') { $extra.Signed = $true; if ($env:AS_SIGNER) { $extra.Signer = $env:AS_SIGNER } }
-          & scripts\test-installer.ps1 -ThrowawayMachine -Setup $env:SETUP -Version $env:VERSION -Binaries $env:STAGE @extra
+          & scripts\test-installer.ps1 -ThrowawayMachine -Setup $env:SETUP -Version $env:VERSION -Binaries $env:STAGE -NsisDir target\release\nsis\x64 @extra
           if ($LASTEXITCODE -ne 0) { throw "installer test failed" }
 
       - uses: actions/upload-artifact@v4

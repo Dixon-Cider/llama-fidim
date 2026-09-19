@@ -22,8 +22,10 @@
 ; finds it, and a later install deletes the renamed copy once it has
 ; exited. scripts/install.ps1 follows the same rule.
 ;
-; An upgrade runs the installed version's uninstaller first, with that
-; version's hooks, so PREUNINSTALL moves running helpers aside as well.
+; An interactive upgrade (the reinstall page's default choice) runs the
+; installed version's uninstaller first, with that version's hooks, so
+; PREUNINSTALL moves running helpers aside as well. A silent or passive
+; upgrade installs over the old version without it.
 ;
 ; Macro arguments are pasted into the macro body: never pass a register
 ; ($0-$9, $R0-$R9) as one, the macros use them.
