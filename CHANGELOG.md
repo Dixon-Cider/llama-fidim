@@ -15,13 +15,39 @@ build with uncommitted changes.
 
 ### Added
 
-- Groundwork for a "Get a model" wizard, in the core library: a Hugging
-  Face Hub client (search, a repo's files with their SHA-256s, and a
-  model's GGUF header read with HTTP range requests before anything is
-  downloaded), a downloader that resumes and checks size and SHA-256
-  before a file is used, a catalog that groups a repo's files by quant and
-  estimates each one on your cards, and free-space and path checks. The
-  app and the CLI use them in a later release.
+- **Get a model.** A Models tab finds a model on Hugging Face (search, or
+  paste a repo or a link to one of its files), lists its files by quant
+  with each one's size, estimated VRAM, whether it fits one card or a
+  split over two and the longest context that fits, and recommends one. It
+  checks which installed llama.cpp build knows the model's architecture,
+  pre-tokenizer and tensor types; when none does, it plans how to get one
+  (the newest upstream release, an Unsloth build, an upstream pull request
+  or a fork the model card links) and shows that fork's repository, commit,
+  distance from upstream and newest commits. Building a pull request's or
+  a fork's code needs a tick in a consent box. It then downloads the file,
+  and a vision projector or MTP head if asked, into
+  `<model folder>\<owner>\<repo>`, resumable and checked against the
+  size and SHA-256 the Hub lists, and makes a profile (an idle card or a
+  split, the first free port from 9710, the context that fits up to
+  32,768), with its pre-flight shown. It never loads the model: Launch is
+  a separate button. A download keeps running, and shows, while you use
+  other tabs; Stop keeps what has arrived and Resume continues it. A repo
+  llama.cpp cannot run (safetensors, a LoRA adapter, FP8, AWQ, GPTQ, MLX)
+  is explained, with the GGUF versions of it the Hub knows.
+- `fidim models search`, `show`, `needs` and `get` do the same from the
+  command line. `get` prints the plan and asks first (`--yes` skips the
+  question); a fork or pull-request build also needs `--allow-fork`;
+  Ctrl+C stops it and keeps a partial download for the next run. With
+  `--json`, `get` without `--yes` prints the plan and does nothing.
+- The core library under both: a Hugging Face Hub client (search, a
+  repo's files with their SHA-256s, and a model's GGUF header read with
+  HTTP range requests before anything is downloaded), a downloader that
+  resumes and checks size and SHA-256 before a file is used, a catalog
+  that groups a repo's files by quant and estimates each one on your
+  cards, free-space and path checks, and one planner the app and the CLI
+  share.
+- Settings has fields for the GitHub token and for using the token
+  `huggingface-cli login` saved.
 - A Hugging Face token can come from the file `HF_TOKEN_PATH` names, and
   with `"hf_use_cli_token": true` in `config.json`, from the token
   `huggingface-cli login` saved.
@@ -49,8 +75,9 @@ build with uncommitted changes.
   card links. The model wizard builds on this.
 - **Pre-flight check 16.** A launch on a build that does not know the
   model's architecture is blocked before llama-server fails with "unknown
-  model architecture"; a pre-tokenizer or tensor type it could not confirm
-  is a warning.
+  model architecture", and points to the Models tab (or `fidim models
+  get`) for a build that does; a pre-tokenizer or tensor type it could not
+  confirm is a warning.
 - `github_token` in `config.json` (or `GITHUB_TOKEN`) for GitHub API
   lookups; without one, answers are cached to stay within 60 requests an
   hour. A token GitHub rejects is dropped after one request, and the plan
@@ -145,6 +172,8 @@ build with uncommitted changes.
 
 ### Fixed
 
+- Radio buttons in the app (the diffusion engine's card picker) are drawn
+  at the size of the checkboxes, not as full-width inputs.
 - `fidim scan` named quantizations after the wrong table: IQ4_XS files
   read as BF16 and BF16 files as `file_type 32`.
 - fidim-dg skips a queued streamed request within a quarter second of its
