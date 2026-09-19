@@ -85,9 +85,23 @@ export function log(line) {
   invoke("ui_log", { line }).catch(() => {});
 }
 
-/// Subscribe to a Tauri event; returns an unlisten function. No-op outside Tauri.
+// Events the browser preview's mocks send (the model wizard's progress),
+// delivered to onEvent subscribers as Tauri would.
+const mockListeners = new Map(); // name -> Set(cb)
+function mockEmit(name, payload) {
+  for (const cb of mockListeners.get(name) ?? []) {
+    try { cb(structuredClone(payload)); } catch (e) { console.error(e); }
+  }
+}
+
+/// Subscribe to a Tauri event; returns an unlisten function. Outside Tauri
+/// it hears the mocks' events.
 export async function onEvent(name, cb) {
-  if (!inTauri) return () => {};
+  if (!inTauri) {
+    if (!mockListeners.has(name)) mockListeners.set(name, new Set());
+    mockListeners.get(name).add(cb);
+    return () => mockListeners.get(name)?.delete(cb);
+  }
   const { listen } = await import("@tauri-apps/api/event");
   return listen(name, (e) => cb(e.payload));
 }
@@ -500,6 +514,31 @@ const mockStreams = new Map();   // streamId -> { cancelled }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Saved profiles; the model wizard's mock adds the ones it creates.
+const mockProfiles = [MOCK_PROFILE, MOCK_SPLIT_PROFILE, MOCK_DG_PROFILE];
+
+// The model wizard's mock, loaded only in the browser preview.
+let wizardMock = null;
+const wizardMockCtx = {
+  devices: () => MOCK_DEVICES.map((d) => d.device),
+  devicesRaw: () => MOCK_DEVICES,
+  builds: () => MOCK_BUILDS,
+  profiles: () => mockProfiles,
+  addBuild: (b) => { if (!MOCK_BUILDS.some((x) => x.path === b.path)) MOCK_BUILDS.push(b); },
+  addProfile: (p, plan) => {
+    mockProfiles.push(p);
+    const h = plan.header ?? {};
+    MOCK_MODELS.push({
+      path: p.model.path, file_size: plan.choice.total_size, modified_unix: Math.floor(Date.now() / 1000), header_error: null,
+      engine: "llama-server", mmproj_candidates: p.model.mmproj ? [p.model.mmproj] : [], draft_candidates: p.model.draft ? [p.model.draft.path] : [],
+      header: { architecture: h.architecture, model_name: p.name, size_label: null, file_type: null, block_count: h.block_count, context_length: h.context_length },
+      source: { repo: plan.repo, commit: plan.sha, path: plan.choice.first_file, sha256: plan.choice.files[0]?.sha256 ?? null },
+    });
+  },
+  emit: mockEmit,
+  sleep,
+};
+
 // One llama-server reply: prompt progress, thinking (unless turned off),
 // markdown in small pieces with live timings, then the finish.
 function mockLlamaScript(t, body) {
@@ -605,15 +644,14 @@ const MOCK_LOG_LINES = [
 
 async function mock(cmd, args) {
   await new Promise((r) => setTimeout(r, 120));
+  wizardMock ??= (await import("./lib/wizardMock.js")).createWizardMock(wizardMockCtx);
+  const wizard = await wizardMock.handle(cmd, args);
+  if (wizard !== undefined) return wizard;
   switch (cmd) {
     case "devices":
       return MOCK_DEVICES;
     case "list_profiles":
-      return [
-        { profile: MOCK_PROFILE, findings: [] },
-        { profile: MOCK_SPLIT_PROFILE, findings: [] },
-        { profile: MOCK_DG_PROFILE, findings: [] },
-      ];
+      return mockProfiles.map((p) => ({ profile: structuredClone(p), findings: [] }));
     case "live_check": {
       const p = args.p;
       if (p?.engine === "diffusion-gemma") {
@@ -721,7 +759,7 @@ async function mock(cmd, args) {
     case "app_version":
       return { version: "0.2.0", long: "0.2.0+3 (4f2a1c9 2026-09-20)", commit: "4f2a1c9", commit_date: "2026-09-20", commits_ahead: 3, modified: false };
     case "get_config":
-      mockConfigState ??= { build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models"], rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.fidim\\profiles", runs_dir: "C:\\Users\\me\\.fidim\\runs", keep_alive_seconds: 0, save_chats: true, runtimes: [] };
+      mockConfigState ??= { hf_use_cli_token: false, github_token: null, build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models", "E:\\models"],rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.fidim\\profiles", runs_dir: "C:\\Users\\me\\.fidim\\runs", keep_alive_seconds: 0, save_chats: true, runtimes: [] };
       return { path: "C:\\Users\\me\\.fidim\\config.json", config: structuredClone(mockConfigState) };
     case "save_config":
       mockConfigState = structuredClone(args.config);

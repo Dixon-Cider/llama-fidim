@@ -4,6 +4,7 @@
   import { fly, fade, slide, scale } from "svelte/transition";
   import { flip } from "svelte/animate";
   import { arrive, leave, flipParams, toastFly, stagger, LAYOUT } from "../motion.js";
+  import { takeProfileId } from "../lib/handoff.js";
 
   // App passes `go(viewId)` so a missing build can link straight to Updates.
   let { go = () => {} } = $props();
@@ -70,7 +71,10 @@
     allMmproj = s.mmproj ?? [];
     loadErrors = errs;
     loading = false;
-    if (!selectedId && profiles.length) select(profiles[0].profile.id);
+    // A profile the Models view just made opens here.
+    const handed = takeProfileId();
+    if (handed && profiles.some((r) => r.profile.id === handed)) select(handed);
+    else if (!selectedId && profiles.length) select(profiles[0].profile.id);
   }
   load();
 
@@ -664,7 +668,7 @@
           </div>
         </button>
       {:else}
-        <div class="empty">No profiles yet. New, or <span class="mono">fidim seed</span>.</div>
+        <div class="empty">No profiles yet. New, or get a model in <button class="link" onclick={() => go("models")}>Models</button>.</div>
       {/each}
     </div>
   </aside>

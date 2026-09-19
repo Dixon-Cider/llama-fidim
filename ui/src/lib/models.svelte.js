@@ -1,0 +1,297 @@
+// The Models view's state and actions ("Get a model"). Module level, not
+// component state: the app remounts the active view on every nav switch,
+// and a search, a choice or a running download must still be there when
+// the person comes back. The job itself runs in Rust; its events are
+// heard here even while the view is not shown, and a slow poll of
+// wizard_jobs keeps the steps right if an event was missed.
+import { api, onEvent, log } from "../api.js";
+import { applyWizardEvent } from "./wizard.js";
+
+export const wz = $state({
+  step: 1,
+  // 1 Find
+  query: "",
+  allFormats: false,
+  hits: null,           // null = not searched yet
+  searched: "",         // the query the hits are for
+  searching: false,
+  findError: "",
+  opening: "",          // the repo being inspected
+  // 2 Choose file
+  view: null,           // wizard_inspect result
+  choice: null,         // a choice label
+  mmproj: "",           // repo path, "" = none
+  draft: "",
+  ctx: null,            // null = the estimate's, at most 32768
+  // 3 Build, 4 Get
+  plan: null,           // wizard_plan result
+  planning: false,
+  planError: "",
+  build: { kind: "auto" },
+  consent: false,
+  destRoot: null,
+  roots: [],
+  rootError: "",
+  rootBusy: false,
+  // the job
+  job: null,            // wizard_jobs snapshot, kept current by events
+  starting: false,
+  jobError: "",
+  // 5 Done
+  check: null,          // live_check of the new profile
+  checking: false,
+  inited: false,
+});
+
+let poll = null;
+
+export function init() {
+  if (wz.inited) return;
+  wz.inited = true;
+  onEvent("wizard-progress", (ev) => {
+    if (wz.job && ev.job === wz.job.job && !wz.job.finished) applyWizardEvent(wz.job.progress, ev);
+  });
+  onEvent("wizard-done", (d) => {
+    if (wz.job && d.job === wz.job.job) finish(d);
+  });
+  reattach();
+  loadRoots();
+}
+
+/// Pick up the latest job of this session: running, or finished and not
+/// dismissed yet.
+async function reattach() {
+  try {
+    const jobs = await api("wizard_jobs");
+    const last = jobs.at(-1);
+    if (!last || (wz.job && wz.job.job === last.job)) return;
+    wz.job = last;
+    wz.plan ??= last.plan;
+    wz.consent = last.consent;
+    if (last.finished) finish(last.finished, true);
+    else {
+      wz.step = 4;
+      watch();
+    }
+  } catch (e) {
+    log(`models: wizard_jobs failed: ${String(e)}`);
+  }
+}
+
+function watch() {
+  if (poll) return;
+  poll = setInterval(sync, 2000);
+}
+
+function unwatch() {
+  if (poll) clearInterval(poll);
+  poll = null;
+}
+
+async function sync() {
+  if (!wz.job || wz.job.finished) return unwatch();
+  try {
+    const j = (await api("wizard_jobs")).find((x) => x.job === wz.job?.job);
+    if (!j) return unwatch();
+    wz.job.progress = j.progress;
+    wz.job.cancelling = j.cancelling;
+    if (j.finished) finish(j.finished);
+  } catch {
+    /* the next tick tries again */
+  }
+}
+
+function finish(done, quiet = false) {
+  if (!wz.job) return;
+  unwatch();
+  wz.job.finished = done;
+  wz.job.cancelling = false;
+  if (done.ok) {
+    wz.step = 5;
+    runCheck();
+  } else {
+    wz.step = 4;
+  }
+  if (!quiet) loadRoots();
+}
+
+export async function loadRoots() {
+  try {
+    wz.roots = await api("wizard_roots");
+    if (!wz.destRoot || !wz.roots.some((r) => r.path === wz.destRoot)) wz.destRoot = wz.roots[0]?.path ?? null;
+  } catch (e) {
+    wz.rootError = String(e);
+  }
+}
+
+/// A repo id or a Hub link opens directly; anything else is a search.
+export const looksLikeRepo = (q) =>
+  /^\s*(https?:\/\/)?(www\.)?(huggingface\.co|hf\.co)\//i.test(q) || /^\s*[\w.-]+\/[\w.-]+\s*$/.test(q);
+
+export async function submit() {
+  const q = wz.query.trim();
+  if (!q) return;
+  if (looksLikeRepo(q)) return open(q);
+  wz.searching = true;
+  wz.findError = "";
+  try {
+    wz.hits = await api("hub_search", { query: q, limit: 40, all: wz.allFormats });
+    wz.searched = q;
+  } catch (e) {
+    wz.findError = String(e);
+  }
+  wz.searching = false;
+}
+
+export async function open(input) {
+  wz.opening = input;
+  wz.findError = "";
+  try {
+    const v = await api("wizard_inspect", { input, rev: null });
+    wz.view = v;
+    wz.choice = v.preselect ?? v.recommended ?? v.catalog?.choices?.[0]?.label ?? null;
+    wz.mmproj = "";
+    wz.draft = "";
+    wz.ctx = null;
+    wz.plan = null;
+    wz.planError = "";
+    wz.build = { kind: "auto" };
+    wz.consent = false;
+    if (v.model_roots?.length) wz.roots = v.model_roots;
+    if (!wz.destRoot || !wz.roots.some((r) => r.path === wz.destRoot)) wz.destRoot = wz.roots[0]?.path ?? null;
+    wz.step = 2;
+    log(`models: opened ${v.repo} (${v.kind?.kind}, ${v.catalog?.choices?.length ?? 0} choices)`);
+  } catch (e) {
+    wz.findError = String(e);
+  }
+  wz.opening = "";
+}
+
+function request() {
+  return {
+    choice: wz.choice,
+    mmproj: wz.mmproj || null,
+    draft: wz.draft || null,
+    dest_root: wz.destRoot,
+    build: $state.snapshot(wz.build),
+    profile: true,
+    ctx: wz.ctx ? Math.round(Number(wz.ctx)) : null,
+  };
+}
+
+/// Plan again for the current picks. The consent given stays only while
+/// it is consent to the same thing.
+export async function makePlan() {
+  if (!wz.view) return false;
+  wz.planning = true;
+  wz.planError = "";
+  const before = wz.plan?.consent ?? null;
+  try {
+    const p = await api("wizard_plan", { view: $state.snapshot(wz.view), request: request() });
+    if (p.consent !== before) wz.consent = false;
+    wz.plan = p;
+  } catch (e) {
+    wz.planError = String(e);
+  }
+  wz.planning = false;
+  return !wz.planError;
+}
+
+export async function toBuild() {
+  if (await makePlan()) wz.step = 3;
+}
+
+export function setBuild(choice) {
+  wz.build = choice;
+  makePlan();
+}
+
+export function setDest(path) {
+  wz.destRoot = path;
+  makePlan();
+}
+
+export async function addRoot(path) {
+  const p = String(path ?? "").trim();
+  if (!p) return false;
+  wz.rootBusy = true;
+  wz.rootError = "";
+  try {
+    wz.roots = await api("wizard_add_root", { path: p });
+    const added = wz.roots.find((r) => r.path.toLowerCase() === p.replace(/[\\/]+$/, "").toLowerCase());
+    wz.rootBusy = false;
+    if (added) setDest(added.path);
+    return true;
+  } catch (e) {
+    wz.rootError = String(e);
+  }
+  wz.rootBusy = false;
+  return false;
+}
+
+export async function start() {
+  if (!wz.plan) return;
+  wz.starting = true;
+  wz.jobError = "";
+  wz.check = null;
+  try {
+    const id = await api("wizard_start", { plan: $state.snapshot(wz.plan), consent: !!wz.consent });
+    const snap = (await api("wizard_jobs")).find((j) => j.job === id);
+    wz.job = snap ?? { job: id, plan: $state.snapshot(wz.plan), progress: { steps: [], log: [] }, finished: null, cancelling: false, consent: wz.consent };
+    wz.step = 4;
+    if (wz.job.finished) finish(wz.job.finished);
+    else watch();
+    log(`models: started ${id} for ${wz.plan.repo} ${wz.plan.choice?.label}`);
+  } catch (e) {
+    wz.jobError = String(e);
+  }
+  wz.starting = false;
+}
+
+export async function cancel() {
+  if (!wz.job || wz.job.finished) return;
+  try {
+    if (await api("wizard_cancel", { job: wz.job.job })) wz.job.cancelling = true;
+  } catch (e) {
+    wz.jobError = String(e);
+  }
+}
+
+/// Try a failed or stopped job again: plan afresh (what is on disk now),
+/// then start. Downloads resume from their .part files.
+export async function resume() {
+  const old = wz.job;
+  if (wz.view && (await makePlan())) {
+    if (old?.finished) await api("wizard_forget", { job: old.job }).catch(() => {});
+    wz.job = null;
+    await start();
+  } else if (!wz.view && old?.plan) {
+    // Came back to a job whose repo view is gone: its own plan.
+    await api("wizard_forget", { job: old.job }).catch(() => {});
+    wz.job = null;
+    wz.plan = old.plan;
+    await start();
+  }
+}
+
+export async function runCheck() {
+  const p = wz.job?.finished?.result?.profile;
+  if (!p) return;
+  wz.checking = true;
+  try {
+    wz.check = await api("live_check", { p });
+  } catch (e) {
+    wz.check = { error: String(e) };
+  }
+  wz.checking = false;
+}
+
+/// Back to a clean Find step; a finished job is dismissed.
+export async function startOver() {
+  if (wz.job && !wz.job.finished) return;
+  if (wz.job) await api("wizard_forget", { job: wz.job.job }).catch(() => {});
+  Object.assign(wz, {
+    step: 1, view: null, choice: null, mmproj: "", draft: "", ctx: null, plan: null, planError: "",
+    build: { kind: "auto" }, consent: false, job: null, jobError: "", check: null,
+  });
+}
