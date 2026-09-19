@@ -84,18 +84,35 @@ fn summary_of(v: &Value) -> Option<ConvSummary> {
     })
 }
 
-/// Every readable conversation, most recently updated first. A file that
-/// does not parse is skipped, never deleted: it may be a newer schema.
-pub fn list(dir: &Path) -> Vec<ConvSummary> {
-    let mut out: Vec<ConvSummary> = std::fs::read_dir(dir)
+/// Every `*.json` file in the folder that holds a conversation (an object
+/// with an id and messages), whatever the file is called.
+fn conv_files(dir: &Path) -> Vec<(PathBuf, Value)> {
+    std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")))
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .filter_map(|t| serde_json::from_str::<Value>(t.trim_start_matches('\u{feff}')).ok())
-        .filter_map(|v| summary_of(&v))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")))
+        .filter_map(|p| {
+            let t = std::fs::read_to_string(&p).ok()?;
+            let v = serde_json::from_str::<Value>(t.trim_start_matches('\u{feff}')).ok()?;
+            let is_conv = v.get("id").is_some_and(Value::is_string) && v.get("messages").is_some_and(Value::is_array);
+            is_conv.then_some((p, v))
+        })
+        .collect()
+}
+
+/// Every readable conversation, most recently updated first. Only a file
+/// named after the id inside it is listed: `load` and `delete` find a
+/// conversation by that name, so a copy made in Explorer (`<id> - Copy.json`)
+/// or a renamed file would be a row that cannot be opened or deleted. A
+/// file that does not parse is skipped, never deleted: it may be a newer
+/// schema.
+pub fn list(dir: &Path) -> Vec<ConvSummary> {
+    let mut out: Vec<ConvSummary> = conv_files(dir)
+        .into_iter()
+        // Windows file names ignore case, and so does `load`.
+        .filter_map(|(p, v)| summary_of(&v).filter(|s| p.file_stem().is_some_and(|n| n.eq_ignore_ascii_case(&s.id))))
         .collect();
     out.sort_by(|a, b| b.updated_unix.cmp(&a.updated_unix).then_with(|| a.id.cmp(&b.id)));
     out
@@ -131,12 +148,25 @@ pub fn delete(dir: &Path, id: &str) -> Result<bool> {
     }
 }
 
-/// Remove every saved conversation (the files `list` would show).
+/// Remove every saved conversation: each file that holds one, by its path,
+/// so copies and renamed files go too, and the temporary files a crash
+/// mid-save left behind (never one this process is writing now). Settings
+/// calls it to take every prompt off the disk.
 pub fn delete_all(dir: &Path) -> Result<usize> {
     let mut n = 0;
-    for c in list(dir) {
-        if delete(dir, &c.id)? {
-            n += 1;
+    for (p, _) in conv_files(dir) {
+        match std::fs::remove_file(&p) {
+            Ok(()) => n += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(&p, e)),
+        }
+    }
+    let ours = format!(".{}-", std::process::id());
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // `write_atomic`'s `.<name>.<pid>-<n>.tmp`.
+        if name.starts_with('.') && name.ends_with(".tmp") && !name.contains(&ours) && e.path().is_file() {
+            let _ = std::fs::remove_file(e.path());
         }
     }
     Ok(n)
@@ -216,6 +246,30 @@ mod tests {
         assert_eq!(delete_all(&dir).unwrap(), 2);
         assert!(list(&dir).is_empty());
         assert!(dir.join("junk.json").exists(), "delete_all only removes conversations");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A copy made in Explorer keeps the id inside: it must not show as a
+    /// second row that cannot be opened, and Delete saved chats must take
+    /// it (and a crash's temporary file) off the disk too.
+    #[test]
+    fn copies_and_renamed_files_are_not_listed_but_are_deleted() {
+        let dir = temp("copies");
+        save(&dir, &conv("c-a1", 10)).unwrap();
+        std::fs::copy(dir.join("c-a1.json"), dir.join("c-a1 - Copy.json")).unwrap();
+        std::fs::write(dir.join("c-b2.json"), conv("c-zz", 20).to_string()).unwrap();
+        std::fs::write(dir.join("C-A3.json"), conv("c-a3", 5).to_string()).unwrap();
+        let stale = dir.join(".c-a1.json.4000000001-0.tmp");
+        std::fs::write(&stale, conv("c-a1", 9).to_string()).unwrap();
+        let ids: Vec<String> = list(&dir).into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, ["c-a1", "c-a3"], "a file is listed under the name load and delete use");
+        assert_eq!(load(&dir, "c-a3").unwrap()["id"], "c-a3", "names ignore case, as Windows does");
+
+        std::fs::write(dir.join("notes.json"), json!({ "id": "x", "title": "not a conversation" }).to_string()).unwrap();
+        assert_eq!(delete_all(&dir).unwrap(), 4);
+        let left: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["notes.json"], "only what is not a conversation stays");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
