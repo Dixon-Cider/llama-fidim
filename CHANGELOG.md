@@ -13,6 +13,26 @@ build with uncommitted changes.
 
 ## [Unreleased]
 
+### Added
+
+- **The DiffusionGemma runner patch as an overlay.** `fidim update --channel
+  unsloth --install --overlay`, or **Install with FIDIM runner patch** on the
+  Updates tab, installs an Unsloth release with Llama FIDIM's runner patch
+  (dgpatch5: F16 prompt-KV store with a sliding-window ring, flash attention
+  on the GPU, up to 65,536 tokens on a 32 GB card, prefill reuse across
+  blocks) laid over it, as `<tag>-unsloth-dgpatch5`. Only the llama-level
+  binaries are replaced; every file is checked against the overlay's
+  descriptor and the Unsloth zip it was built for. `--overlay-from` installs
+  a locally built overlay, `--base-zip` reuses a downloaded Unsloth zip.
+- `packaging/dg-overlay`: the patch, and the scripts and workflow that build,
+  gate, sign (when configured) and publish an overlay for an Unsloth release.
+
+### Changed
+
+- The patched runner's profiler and split-count switches (`DG_PROFILE`,
+  `DG_SC_SPLITK`, `DG_SC_SPLITK_CHECK`) are treated as test hooks: never
+  passed to the runner, and flagged when a profile sets one.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added

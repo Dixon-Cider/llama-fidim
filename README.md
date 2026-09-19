@@ -130,8 +130,9 @@ fidim export <id>          a standalone .bat or .ps1 that runs without the tool
                            (a diffusion profile's still needs fidim-dg.exe)
 fidim router ...           configure, launch and manage the one-port router
 fidim update [--install]   llama.cpp releases, changelog, install, promote, roll back
-fidim update --channel unsloth [--install]
-                           Unsloth builds, which carry the DiffusionGemma runner
+fidim update --channel unsloth [--install] [--overlay]
+                           Unsloth builds, which carry the DiffusionGemma runner,
+                           optionally with Llama FIDIM's runner patch over them
 fidim rocm list|install    ROCm runtimes from AMD's channels
 fidim runtimes             every runtime a profile can name
 ```
@@ -167,6 +168,16 @@ model.
   by its per-request working set: 65,536 tokens on a 32 GB card. Promotion
   never moves a diffusion profile onto a build that lacks its patch's
   features.
+- **The runner patch, installed for you.** Where an overlay is published for
+  an Unsloth release, **Install with FIDIM runner patch** on the Updates tab
+  (or `fidim update --channel unsloth --install --overlay`) installs that
+  release with Llama FIDIM's patch (dgpatch5) laid over it, as
+  `<tag>-unsloth-dgpatch5` beside the plain build. The overlay replaces only
+  the llama-level binaries, rebuilt from the same release's source; Unsloth's
+  ggml and ROCm files stay as shipped. Every file is checked against the
+  overlay's descriptor, which also names the exact Unsloth zip it fits.
+  `--overlay-from <folder>` installs one built locally. How overlays are built
+  and published: `packaging/dg-overlay`.
 - **Watch it denoise.** In Running, open a diffusion slot to see the current
   block the way Unsloth Studio shows it. Each step repaints the model's
   guess for the whole block until it settles and commits. **Replay last
@@ -223,7 +234,10 @@ crates/fidim-cli    the fidim and fidim-dg binaries
 ui/                 Tauri 2 + Svelte 5 desktop app
 scripts/            install.ps1, build-from-tag.bat (source builds),
                     release.ps1 (sets the version, dates CHANGELOG.md, tags)
-fixtures/           captured --list-devices / hipInfo / WMI output used by tests
+packaging/          dg-overlay: the DiffusionGemma runner patch, and the scripts and
+                    workflow that build it as an overlay for each Unsloth release
+fixtures/           captured --list-devices / hipInfo / WMI output and an overlay
+                    descriptor, used by tests
 ```
 
 ```
