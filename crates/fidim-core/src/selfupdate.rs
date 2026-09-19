@@ -17,9 +17,10 @@
 //! diffusion server holding `fidim-dg.exe`, a terminal's `fidim live`),
 //! renames it aside as `<name>.old-<time>` — the process keeps running from
 //! the renamed image — copies the staged files in, and reopens the desktop
-//! app through Explorer so the new app belongs to the desktop session rather
-//! than to whatever started the update. Copies renamed aside by earlier
-//! updates are deleted once nothing runs from them.
+//! app, breaking out of the caller's job object when that job allows it
+//! (an update started from a terminal or an agent must not end with that
+//! session). Copies renamed aside by earlier updates are deleted once
+//! nothing runs from them.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -549,6 +550,9 @@ pub struct ApplyReport {
     /// Files that were in use and now run from a `.old-<time>` name.
     pub moved_aside: Vec<String>,
     pub relaunched: bool,
+    /// Why the app did not reopen, when it was asked to and did not. The
+    /// files are installed regardless.
+    pub relaunch_error: Option<String>,
 }
 
 /// Start the staged `fidim.exe` detached to do the replacing once the
@@ -673,37 +677,44 @@ fn apply_in(
     }
 
     let (source, tag) = staged.as_ref().map(|s| (s.source.clone(), s.tag.clone())).unwrap_or_else(|| ("?".into(), None));
-    match &result {
-        Ok(()) => push_history(updates, HistoryEntry {
-            at_unix: now_unix(),
-            from: from.clone(),
-            to: to.clone(),
-            source,
-            tag,
-            install_dir: install_dir.to_path_buf(),
-            ok: true,
-            detail: if moved_aside.is_empty() { String::new() } else { format!("in use, moved aside: {}", moved_aside.join(", ")) },
-        }),
-        Err(e) => push_history(updates, HistoryEntry {
-            at_unix: now_unix(),
-            from: from.clone(),
-            to: to.clone(),
-            source,
-            tag,
-            install_dir: install_dir.to_path_buf(),
-            ok: false,
-            detail: e.to_string(),
-        }),
+    let entry = |ok: bool, detail: String| HistoryEntry {
+        at_unix: now_unix(),
+        from: from.clone(),
+        to: to.clone(),
+        source: source.clone(),
+        tag: tag.clone(),
+        install_dir: install_dir.to_path_buf(),
+        ok,
+        detail,
+    };
+    if let Err(e) = &result {
+        push_history(updates, entry(false, e.to_string()));
     }
     result?;
 
-    let mut relaunched = false;
-    if relaunch {
-        relaunch_gui(install_dir)?;
-        log("reopened the desktop app".into());
-        relaunched = true;
+    // The files are in place from here; a relaunch that fails is reported,
+    // not an update that failed.
+    let mut notes: Vec<String> = Vec::new();
+    if !moved_aside.is_empty() {
+        notes.push(format!("in use, moved aside: {}", moved_aside.join(", ")));
     }
-    Ok(ApplyReport { install_dir: install_dir.to_path_buf(), from, to, replaced, moved_aside, relaunched })
+    let mut relaunched = false;
+    let mut relaunch_error = None;
+    if relaunch {
+        match relaunch_gui(install_dir) {
+            Ok(pid) => {
+                log(format!("reopened the desktop app (pid {pid})"));
+                relaunched = true;
+            }
+            Err(e) => {
+                log(format!("the desktop app did not reopen: {e}"));
+                notes.push(format!("relaunch failed: {e}"));
+                relaunch_error = Some(e.to_string());
+            }
+        }
+    }
+    push_history(updates, entry(true, notes.join("; ")));
+    Ok(ApplyReport { install_dir: install_dir.to_path_buf(), from, to, replaced, moved_aside, relaunched, relaunch_error })
 }
 
 /// Delete `<name>.old-*` copies earlier updates renamed aside, where
@@ -719,18 +730,40 @@ fn remove_old_copies(dir: &Path, name: &str, log: &mut dyn FnMut(String)) {
     }
 }
 
-/// Open the desktop app through Explorer, so it belongs to the desktop
-/// session rather than to the process that ran the update (a terminal's or
-/// an agent's job object would otherwise own it).
-pub fn relaunch_gui(install_dir: &Path) -> Result<()> {
+/// Start the desktop app from `install_dir` and confirm it stays up.
+/// First out of the caller's job object, so an update started from a
+/// terminal or an agent does not end with that session; when the job
+/// forbids breaking away, as a plain child. (Handing the path to
+/// explorer.exe, the usual trick, starts nothing from a windowless
+/// process.) Returns the new pid.
+pub fn relaunch_gui(install_dir: &Path) -> Result<u32> {
     let exe = install_dir.join(GUI_EXE);
     if !exe.is_file() {
         return Err(upd(format!("{} is missing", exe.display())));
     }
-    let mut cmd = Command::new("explorer.exe");
-    cmd.arg(&exe).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    cmd.spawn().map_err(|e| upd(format!("explorer.exe {}: {e}", exe.display())))?;
-    Ok(())
+    let spawn = |breakaway: bool| {
+        let mut cmd = Command::new(&exe);
+        cmd.current_dir(install_dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+            cmd.creation_flags(if breakaway { CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB } else { CREATE_NEW_PROCESS_GROUP });
+        }
+        #[cfg(not(windows))]
+        let _ = breakaway;
+        cmd.spawn()
+    };
+    let mut child = match spawn(true) {
+        Ok(c) => c,
+        Err(_) => spawn(false).map_err(|e| upd(format!("start {}: {e}", exe.display())))?,
+    };
+    std::thread::sleep(Duration::from_millis(1500));
+    match child.try_wait() {
+        Ok(Some(status)) => Err(upd(format!("{GUI_EXE} exited right after starting ({status})"))),
+        _ => Ok(child.id()),
+    }
 }
 
 /// End every `llama-fidim.exe` running from `install_dir`, other than this
@@ -959,7 +992,7 @@ mod tests {
         assert!(h[0].ok && h[0].from == "none", "{h:?}");
         assert_eq!(r.replaced.len(), 3);
         assert!(r.moved_aside.is_empty());
-        assert!(!r.relaunched);
+        assert!(!r.relaunched && r.relaunch_error.is_none());
         for exe in EXES {
             assert_eq!(std::fs::read_to_string(dest.join(exe)).unwrap(), format!("new {exe}"));
         }
