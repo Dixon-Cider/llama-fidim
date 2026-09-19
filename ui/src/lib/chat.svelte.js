@@ -556,10 +556,15 @@ export async function stop(convId = chat.currentId) {
   const st = chat.streams[convId];
   if (!st) return;
   st.stopping = true;
-  try {
-    await api("chat_cancel", { streamId: st.streamId });
-  } catch {
-    // the stream ends by itself
+  // A Stop in the first moments can beat the command to registering its
+  // stream: ask again for a couple of seconds until it is found or ends.
+  for (let i = 0; i < 10 && !st.finished; i++) {
+    try {
+      if (await api("chat_cancel", { streamId: st.streamId })) return;
+    } catch {
+      return; // the stream ends by itself
+    }
+    await new Promise((r) => setTimeout(r, 200));
   }
 }
 

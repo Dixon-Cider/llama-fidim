@@ -98,20 +98,22 @@ pub fn is_loopback(host: &str) -> bool {
 
 /// The `--api-key` a llama-server profile sets (as a flag or through
 /// `LLAMA_API_KEY`), so the chat can authenticate without JS ever holding it.
+/// A value with control characters is ignored: it goes into a header line.
 pub fn api_key(p: &Profile) -> Option<String> {
     if !p.engine.is_llama_server() {
         return None;
     }
+    let usable = |v: &String| !v.is_empty() && !v.chars().any(char::is_control);
     let flags = &p.runtime.extra_flags;
     for (i, f) in flags.iter().enumerate() {
         if let Some(v) = f.strip_prefix("--api-key=") {
-            return Some(v.to_string()).filter(|v| !v.is_empty());
+            return Some(v.to_string()).filter(usable);
         }
         if f == "--api-key" {
-            return flags.get(i + 1).cloned().filter(|v| !v.is_empty());
+            return flags.get(i + 1).cloned().filter(usable);
         }
     }
-    p.env.iter().find(|(k, _)| k.eq_ignore_ascii_case("LLAMA_API_KEY")).map(|(_, v)| v.clone()).filter(|v| !v.is_empty())
+    p.env.iter().find(|(k, _)| k.eq_ignore_ascii_case("LLAMA_API_KEY")).map(|(_, v)| v.clone()).filter(usable)
 }
 
 // ---------------------------------------------------------------- request ----

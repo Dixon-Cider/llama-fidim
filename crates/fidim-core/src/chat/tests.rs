@@ -181,6 +181,9 @@ fn api_key_from_flags_or_env() {
     // A trailing flag with no value is no key.
     let p = profile(json!({ "runtime": { "ctx_total": 1, "extra_flags": ["--api-key"] } }));
     assert_eq!(api_key(&p), None);
+    // Nor is one that would break the header line.
+    let p = profile(json!({ "runtime": { "ctx_total": 1, "extra_flags": ["--api-key=k\r\nX-Evil: 1"] } }));
+    assert_eq!(api_key(&p), None);
     // fidim-dg has no key.
     let p = profile(json!({ "engine": "diffusion-gemma", "env": { "LLAMA_API_KEY": "k" } }));
     assert_eq!(api_key(&p), None);
