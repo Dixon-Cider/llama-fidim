@@ -89,8 +89,11 @@ welcome, and a report that includes your card, driver version and the
   the newest upstream release, an Unsloth build, an upstream pull request,
   or a fork the model card links, shown with its commit and newest commits
   and built only after you tick the consent box. Then it downloads (resumable,
-  SHA-256 checked, into `<model folder>\<owner>\<repo>`) and saves a
-  profile with its pre-flight. It never loads the model on its own.
+  SHA-256 checked, into `<model folder>\<owner>\<repo>`, with the free space
+  checked again as it starts) and saves a profile with its pre-flight. A
+  draft goes in as what it is: an MTP head, a DFlash draft or a draft model
+  (EAGLE3 and DSpark heads are listed, not offered: profiles cannot run them
+  yet). It never loads the model on its own.
 - **Benchmarks.** Serial and concurrent decode sweeps against a running
   server, stored per profile as its baseline.
 - **Nearly everything the GUI does, the `fidim` CLI does too.** The live
@@ -220,7 +223,8 @@ fidim models needs <gguf|repo>
                            what a model needs from a build, and who has it
 fidim models get <repo> [--quant Q] [--mmproj] [--draft] [--dest DIR]
                            download it (and the build it needs) and make a profile;
-                           asks first, --allow-fork for a fork's code, never launches
+                           asks first, --allow-fork for a fork's code, --gfx for a
+                           source build's GPU target, never launches
 fidim toolchain            check Visual Studio, git, CMake, Ninja and the HIP SDK
                            for source builds, with a test compile
 fidim rocm list|install    ROCm runtimes from AMD's channels

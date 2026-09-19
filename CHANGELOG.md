@@ -25,20 +25,30 @@ build with uncommitted changes.
   or a fork the model card links) and shows that fork's repository, commit,
   distance from upstream and newest commits. Building a pull request's or
   a fork's code needs a tick in a consent box. It then downloads the file,
-  and a vision projector or MTP head if asked, into
-  `<model folder>\<owner>\<repo>`, resumable and checked against the
-  size and SHA-256 the Hub lists, and makes a profile (an idle card or a
+  and a vision projector or a draft if asked (an MTP head, a DFlash draft
+  or a draft model, each in its own speculative mode; EAGLE3 and DSpark
+  heads are shown but not offered, as profiles cannot run them yet), into
+  `<model folder>\<owner>\<repo>` (a whole drive such as `E:\` can be
+  one), resumable and checked against the size and SHA-256 the Hub lists,
+  with the free space checked again when it starts and before each file,
+  and makes a profile (an idle card or a
   split, the first free port from 9710, the context that fits up to
   32,768), with its pre-flight shown. It never loads the model: Launch is
   a separate button. A download keeps running, and shows, while you use
-  other tabs; Stop keeps what has arrived and Resume continues it. A repo
+  other tabs; Stop keeps what has arrived and Resume continues it, and Stop
+  also ends a build or a prebuilt install in progress. A repo
   llama.cpp cannot run (safetensors, a LoRA adapter, FP8, AWQ, GPTQ, MLX)
   is explained, with the GGUF versions of it the Hub knows.
 - `fidim models search`, `show`, `needs` and `get` do the same from the
   command line. `get` prints the plan and asks first (`--yes` skips the
   question); a fork or pull-request build also needs `--allow-fork`;
   Ctrl+C stops it and keeps a partial download for the next run. With
-  `--json`, `get` without `--yes` prints the plan and does nothing.
+  `--json`, `get` without `--yes` prints the plan and does nothing, and
+  with `--yes` prints the result as one JSON document. `--gfx` gives the
+  GPU target a source build compiles for when the machine does not say.
+  Text that comes from a model file or its card (an architecture name,
+  gating terms) is printed with control characters escaped, so it cannot
+  rewrite what the terminal shows.
 - The core library under both: a Hugging Face Hub client (search, a
   repo's files with their SHA-256s, and a model's GGUF header read with
   HTTP range requests before anything is downloaded), a downloader that
