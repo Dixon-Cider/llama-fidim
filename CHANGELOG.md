@@ -19,10 +19,14 @@ build with uncommitted changes.
   <branch|pull/N/head|commit>` compiles a llama.cpp fork's branch, an
   upstream pull request or any commit for this machine's GPU. The commit
   is pinned first and checked after the fetch; the build runs in FIDIM's
-  own clone under `~/.fidim/src`, never in your checkouts; stopping it
-  (Ctrl+C) stops every process it started; and the result is labelled by
-  where it came from (`ifm-ai K2Horizon fork @42adf01`) and never ranked
-  or promoted as an upstream release.
+  own clone under `~/.fidim/src`, never in your checkouts, one build at a
+  time; stopping it (Ctrl+C) stops every process it started; and the
+  result is labelled by where it came from (`ifm-ai K2Horizon fork
+  @42adf01`) and never ranked or promoted as an upstream release. The ref
+  is fetched by its full name, so a branch and a tag of the same name are
+  never confused; git never opens a credential prompt; trees from every
+  upstream layout configure; and one too old for the ROCm 7 HIP SDK
+  (before b5872) stops after configure with that reason.
 - **Toolchain doctor.** `fidim toolchain` checks Visual Studio's C++ tools,
   git, CMake, Ninja and the HIP SDK, and compiles a test file to catch the
   MSVC `<cmath>` clash with HIP clang (llama.cpp#22570) before a build
@@ -39,7 +43,8 @@ build with uncommitted changes.
   is a warning.
 - `github_token` in `config.json` (or `GITHUB_TOKEN`) for GitHub API
   lookups; without one, answers are cached to stay within 60 requests an
-  hour.
+  hour. A token GitHub rejects is dropped after one request, and the plan
+  says so.
 
 ## [0.2.0] - 2026-09-18
 

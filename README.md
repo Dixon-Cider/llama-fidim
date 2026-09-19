@@ -64,7 +64,10 @@ welcome, and a report that includes your card, driver version and the
   clone (never your checkouts), and keeps the result out of upstream's
   ranking, so it is never promoted by accident. A toolchain doctor catches
   a missing tool or the MSVC/HIP `<cmath>` clash in seconds, before the
-  build starts.
+  build starts. One source build runs at a time. Refs based on upstream
+  from before b5872 (July 2025) do not compile with the ROCm 7 HIP SDK:
+  the plan says so and puts them last, and the build stops right after
+  configure with that reason.
 - **Benchmarks.** Serial and concurrent decode sweeps against a running
   server, stored per profile as its baseline.
 - **Nearly everything the GUI does, the `fidim` CLI does too.** The live
@@ -230,9 +233,13 @@ These came from real failures on real hardware and are deliberate:
   runs code nobody reviewed for your machine: the CLI builds only a remote
   and ref you name, and the build planner marks such steps as needing your
   consent. Links in a model card are only ever read as URLs, and the ref
-  is pinned to one commit before anything is fetched or compiled. GitHub
-  allows 60 API requests an hour without a token, so answers are cached;
-  `GITHUB_TOKEN` (or `github_token` in `config.json`) raises that to 5000.
+  is pinned to one commit before anything is fetched or compiled, then
+  fetched by its full name (a branch and a tag may share a name). git never
+  asks for credentials: a missing or private repository fails at once
+  instead of opening a sign-in window. GitHub allows 60 API requests an
+  hour without a token, so answers are cached; `github_token` in
+  `config.json` (or `GITHUB_TOKEN`) raises that to 5000, and a token GitHub
+  rejects is dropped after one request instead of failing every lookup.
 
 ## Layout
 
