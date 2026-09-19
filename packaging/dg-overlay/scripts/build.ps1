@@ -75,7 +75,12 @@ switch ($BoringSsl) {
         $recorded += '-DLLAMA_BUILD_BORINGSSL=OFF', '-DLLAMA_OPENSSL=OFF'
     }
     default {
-        $dir = (Resolve-Path -LiteralPath $BoringSsl).Path
+        # FetchContent builds this folder in place: nothing is cloned, and
+        # build\_deps\boringssl-src never exists (Get-BoringSslSourceDir).
+        $dir = Get-BoringSslSourceDir $BoringSsl $buildDir
+        foreach ($need in 'CMakeLists.txt', 'LICENSE') {
+            if (-not (Test-Path -LiteralPath (Join-Path $dir $need))) { throw "$dir is not a BoringSSL source folder (it has no $need)" }
+        }
         $actual += '-DLLAMA_BUILD_BORINGSSL=ON', "-DFETCHCONTENT_SOURCE_DIR_BORINGSSL=$dir"
         $recorded += '-DLLAMA_BUILD_BORINGSSL=ON', '-DFETCHCONTENT_SOURCE_DIR_BORINGSSL=<local BoringSSL source>'
     }
@@ -102,8 +107,9 @@ function Get-CMakeCompiler([string]$Lang) {
     $ver = [regex]::Match($t, "set\(CMAKE_${Lang}_COMPILER_VERSION `"([^`"]*)`"\)").Groups[1].Value
     "$id $ver".Trim()
 }
-$boringLicense = Join-Path $buildDir '_deps\boringssl-src\LICENSE'
-if ($BoringSsl -ne 'off' -and -not (Test-Path -LiteralPath $boringLicense)) { throw "BoringSSL was built in but $boringLicense is missing" }
+$boringSrc = Get-BoringSslSourceDir $BoringSsl $buildDir
+$boringLicense = if ($boringSrc) { Join-Path $boringSrc 'LICENSE' } else { $null }
+if ($boringLicense -and -not (Test-Path -LiteralPath $boringLicense)) { throw "BoringSSL was built in but $boringLicense is missing" }
 $info = [ordered]@{
     runner        = if ($env:GITHUB_ACTIONS -eq 'true') { "github-actions $env:ImageOS $env:ImageVersion".Trim() } else { 'local' }
     toolchain     = $Toolchain
@@ -118,7 +124,9 @@ $info = [ordered]@{
 }
 Write-Utf8NoBom (Join-Path $WorkDir 'build-info.json') (ConvertTo-PrettyJson $info)
 
-# Collect: every llama-level binary; ggml and the rest stay Unsloth's.
+# Collect: every llama-level binary; ggml and the rest stay Unsloth's. A new
+# overlay has not been through the gate.
+foreach ($n in $GatePassName, 'ggml-imports.json') { Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath (Join-Path $WorkDir $n) }
 $overlay = Join-Path $WorkDir 'overlay'
 if (Test-Path -LiteralPath $overlay) { Remove-Item -Recurse -Force -LiteralPath $overlay }
 New-Item -ItemType Directory -Force $overlay | Out-Null
@@ -148,5 +156,5 @@ if (Test-Path -LiteralPath (Join-Path $src 'licenses')) {
 $vendored = Get-ChildItem -LiteralPath (Join-Path $src 'vendor') -Recurse -File |
     Where-Object { $_.Name -like 'LICENSE*' -or $_.Name -like 'COPYING*' }
 foreach ($f in $vendored) { Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $lic ('LICENSE-' + $f.Directory.Name + $f.Extension)) }
-if ($BoringSsl -ne 'off') { Copy-Item -LiteralPath $boringLicense -Destination (Join-Path $lic 'LICENSE-boringssl') }
+if ($boringLicense) { Copy-Item -LiteralPath $boringLicense -Destination (Join-Path $lic 'LICENSE-boringssl') }
 Write-Host "  license texts: $((Get-ChildItem -LiteralPath $lic -File | ForEach-Object { $_.Name }) -join ', ')"

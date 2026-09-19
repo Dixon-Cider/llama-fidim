@@ -79,18 +79,13 @@ if ($Gfx) {
 }
 
 # Unpack unless this exact source is already there (then the build can be
-# incremental). apply-patch.ps1 records what it applied the same way.
+# incremental). If that tree carries a patch, apply-patch.ps1 decides from
+# patch.stamp whether it is the one wanted, and unpacks again if not.
 $src = Join-Path $WorkDir 'src'
 $stamp = Join-Path $WorkDir 'src.stamp'
 $have = if (Test-Path -LiteralPath $stamp) { (Get-Content -Raw -LiteralPath $stamp).Trim() } else { '' }
 if ($have -ne $srcSha -or -not (Test-Path -LiteralPath (Join-Path $src 'CMakeLists.txt'))) {
-    if (Test-Path -LiteralPath $src) { Remove-Item -Recurse -Force -LiteralPath $src }
-    Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath (Join-Path $WorkDir 'patch.stamp')
-    New-Item -ItemType Directory -Force $src | Out-Null
-    Write-Host "  unpacking into $src"
-    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-    Invoke-Native "unpack $srcName" { & $tar -xzf $tarball -C $src --strip-components=1 }
-    Write-Utf8NoBom $stamp $srcSha
+    Expand-BaseSource $WorkDir $tarball $srcSha
 } else {
     Write-Host "  source already unpacked in $src"
 }

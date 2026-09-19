@@ -12,7 +12,8 @@
   disagree. DESCRIPTOR.md documents the format.
 
   Reads <WorkDir>\overlay, licenses, base.json, build-info.json and
-  ggml-imports.json. Run it after signing: the descriptor records the files
+  ggml-imports.json, and refuses unless gate.ps1 passed on these overlay
+  files (gate.pass). Run it after signing: the descriptor records the files
   as shipped.
 
 .EXAMPLE
@@ -36,6 +37,7 @@ $WorkDir = (Resolve-Path -LiteralPath $WorkDir).Path
 $base = Read-BaseInfo $WorkDir
 $Tag = [string]$base.release_tag
 Assert-UnslothTag $Tag
+Assert-GatePassed $WorkDir
 function Read-Json([string]$Name, [string]$Producer) {
     $p = Join-Path $WorkDir $Name
     if (-not (Test-Path -LiteralPath $p)) { throw "no ${p}: run $Producer first" }
@@ -69,9 +71,15 @@ $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
 
 # The notices, filled in for this release.
 $notices = Get-Content -Raw -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.md')
-$withBoring = Test-Path -LiteralPath (Join-Path $licenses 'LICENSE-boringssl')
+$boringText = Join-Path $licenses 'LICENSE-boringssl'
 $notices = $notices.Replace('{{PATCH}}', $PatchName).Replace('{{BASE_TAG}}', $Tag).Replace('{{SOURCE_COMMIT}}', [string]$base.source_commit)
-$notices = $notices.Replace('{{BORINGSSL}}', $(if ($withBoring) { 'statically linked into the binaries' } else { 'not included in this build' }))
+if (Test-Path -LiteralPath $boringText) {
+    # Named from the text that ships beside it, so the two cannot disagree.
+    $notices = $notices.Replace('{{BORINGSSL}}', "$(Get-BoringSslLicenseName $boringText); statically linked into the binaries")
+    $notices = $notices.Replace('{{BORINGSSL_TEXT}}', 'LICENSE-boringssl')
+} else {
+    $notices = $notices.Replace('{{BORINGSSL}}', 'not included in this build').Replace('{{BORINGSSL_TEXT}}', '-')
+}
 $noticesPath = Join-Path $OutDir 'THIRD-PARTY-NOTICES.md'
 Write-Utf8NoBom $noticesPath $notices
 

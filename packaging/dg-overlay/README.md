@@ -51,8 +51,9 @@ split count).
   except `llama-cvector-generator.exe`, which stays Unsloth's: it imports
   ggml-hip for its GPU path.
 - The gate (`scripts/gate.ps1`) checks every name the overlay imports from
-  Unsloth's ggml DLLs against their exports, and that nothing imports
-  ggml-hip.dll.
+  Unsloth's ggml DLLs against their exports, that nothing imports
+  ggml-hip.dll, and that the overlay replaces every llama-level file of the
+  base. Only an overlay the gate passed is packaged (`gate.pass`).
 - The descriptor (`fidim-overlay.json`, see DESCRIPTOR.md) pins the release,
   the source commit and the sha256 of every Windows ROCm zip of the release,
   and lists every file of the overlay. Llama FIDIM refuses an install where
@@ -113,7 +114,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build-local.ps1 -Tag b11030-mix
 Needs Visual Studio 2022 with the C++ tools (its bundled CMake and Ninja are
 used) and git; no ROCm. Options: `-Toolchain clang|msvc` (auto picks clang
 when the VS "C++ Clang tools" component is installed), `-BoringSsl off` to
-build llama-common without HTTPS instead of cloning BoringSSL,
+build llama-common without HTTPS instead of cloning BoringSSL, or
+`-BoringSsl <folder>` to build a BoringSSL source you already have,
 `-WorkDir` (short, and outside any git checkout: the build stamps its version
 from the first repository above the source). The release assets land in
 `<WorkDir>\out`; VALIDATION.md is what to run on them before publishing.
@@ -121,12 +123,13 @@ from the first repository above the source). The release assets land in
 | Script | Does |
 | --- | --- |
 | `scripts/fetch-base.ps1` | the release's source tarball (checked), unpacked; optionally one of its Windows ROCm zips; `base.json` |
-| `scripts/apply-patch.ps1` | `git apply --check`, `git apply`, the overlay's build fingerprint |
+| `scripts/apply-patch.ps1` | `git apply --check`, `git apply`, the overlay's build fingerprint; an edited patch, or another tag, starts again from the unpacked tarball |
 | `scripts/build.ps1` | configure and build, collect the overlay binaries and license texts |
-| `scripts/gate.ps1` | symbol closure and file set against the base zip; `-Smoke` runs it |
-| `scripts/package.ps1` | the zip, the descriptor, the patch, SHA256SUMS |
+| `scripts/gate.ps1` | symbol closure and file set against the base zip; `-Smoke` runs it; `gate.pass` when it passes |
+| `scripts/package.ps1` | the zip, the descriptor, the patch, SHA256SUMS; only after the gate passed |
 | `scripts/build-local.ps1` | all of the above in order |
 | `scripts/common.ps1` | shared settings: the repository name (`$OverlayRepo`), the patch name, the file allowlist |
+| `tests/scripts.tests.ps1` | self-tests of the above that need no network or build |
 
 ## The repository name
 
@@ -142,7 +145,8 @@ When a new Unsloth release changes the files the patch touches, `git apply
 --check` fails. Unpack the new source, apply the patch with `git apply
 --3way` (in a scratch git repository holding the old and new trees) or by
 hand, regenerate `patches/dgpatch5.diff` with `git diff`, and run
-build-local.ps1 and VALIDATION.md again before publishing.
+build-local.ps1 (on the same WorkDir it unpacks the release's source again
+for the new patch) and VALIDATION.md again before publishing.
 
 ## License
 

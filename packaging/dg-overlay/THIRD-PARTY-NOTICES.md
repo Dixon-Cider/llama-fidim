@@ -19,7 +19,7 @@ of this archive and are not modified; their notices are Unsloth's and AMD's.
 | sha1, sha256 (llama.cpp vendor/hash) | Public domain | LICENSE-sha256 |
 | stb_image, miniaudio | Public domain or MIT, at the user's choice | in their headers in the llama.cpp source |
 | subprocess.h (sheredom) | The Unlicense | in its header in the llama.cpp source |
-| BoringSSL | OpenSSL / ISC-style; {{BORINGSSL}} | LICENSE-boringssl |
+| BoringSSL | {{BORINGSSL}} | {{BORINGSSL_TEXT}} |
 | The {{PATCH}} patch and the overlay build scripts | MIT, Copyright (c) 2026 Dixon-Cider | LICENSE-fidim-dg-overlay |
 
 llama-server embeds llama.cpp's web UI (tools/ui in the llama.cpp source,

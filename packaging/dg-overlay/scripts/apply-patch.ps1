@@ -11,6 +11,10 @@
   BUILD_COMMIT stay as Unsloth stamped them, so the version line still names
   the release's build and source commit.
 
+  Rerunning it with the same patch and tag does nothing. With an edited
+  patch, or another tag of the same source, it unpacks the release's source
+  again from dl\ first: the patch applies to that, not to a patched tree.
+
 .EXAMPLE
   .\apply-patch.ps1 -WorkDir $env:TEMP\fidim-dgo
 #>
@@ -30,9 +34,23 @@ $Patch = (Resolve-Path -LiteralPath $Patch).Path
 $src = Join-Path $WorkDir 'src'
 $patchSha = Get-Sha256 $Patch
 $stamp = Join-Path $WorkDir 'patch.stamp'
-if ((Test-Path -LiteralPath $stamp) -and ((Get-Content -Raw -LiteralPath $stamp).Trim() -eq "$patchSha $Tag")) {
+$want = "$patchSha $Tag"
+$have = if (Test-Path -LiteralPath $stamp) { (Get-Content -Raw -LiteralPath $stamp).Trim() } else { '' }
+if ($have -eq $want) {
     Write-Host "== $PatchName already applied to $src"
     return
+}
+if ($have) {
+    # The tree carries something else: another revision of the patch, the
+    # same source under another tag (the fingerprint names the tag), or an
+    # apply that did not finish. The patch fits the release's source, not
+    # that, so start again from the tarball.
+    Write-Host "== $src carries another patch or tag ($have): unpacking the release's source again"
+    $tarball = Join-Path $WorkDir "dl\$($base.source_asset)"
+    if (-not (Test-Path -LiteralPath $tarball) -or (Get-Sha256 $tarball) -ne [string]$base.source_sha256) {
+        throw "$tarball is missing or is not the source base.json names: run fetch-base.ps1 again"
+    }
+    Expand-BaseSource $WorkDir $tarball ([string]$base.source_sha256)
 }
 
 Write-Host "== applying $(Split-Path -Leaf $Patch) ($patchSha) to $Tag"
@@ -44,6 +62,9 @@ try {
     Invoke-Native "git apply --check (the patch no longer fits ${Tag}: rebase it)" {
         git -c core.autocrlf=false -c core.longpaths=true apply --check $Patch
     }
+    # From here on the tree is no longer the release's source: a rerun that
+    # finds this stamp unpacks it again instead of patching a patched tree.
+    Write-Utf8NoBom $stamp "applying $want"
     Invoke-Native 'git apply' { git -c core.autocrlf=false -c core.longpaths=true apply $Patch }
 } finally { Pop-Location }
 
@@ -70,4 +91,4 @@ if (-not $replaced) {
 }
 [System.IO.File]::WriteAllText($bi, $text, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "  build fingerprint: (Llama FIDIM $PatchName overlay on Unsloth $Tag)"
-Write-Utf8NoBom $stamp "$patchSha $Tag"
+Write-Utf8NoBom $stamp $want

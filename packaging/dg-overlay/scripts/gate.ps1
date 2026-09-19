@@ -18,8 +18,10 @@
      usage, exits). Neither loads a model. --version does initialise the HIP
      runtime, which enumerates the GPUs; nothing is allocated on them.
 
-  Writes <WorkDir>\ggml-imports.json (what the overlay needs from each ggml
-  DLL) for the descriptor.
+  Only when every check passes, writes <WorkDir>\ggml-imports.json (what the
+  overlay needs from each ggml DLL, for the descriptor) and gate.pass, which
+  package.ps1 requires. A failing run removes both, so an overlay that
+  failed cannot be packaged by accident.
 
 .EXAMPLE
   .\gate.ps1 -WorkDir $env:TEMP\fidim-dgo -Smoke
@@ -45,6 +47,8 @@ $ExpectCommit = [string]$base.source_commit
 $OverlayDir = Join-Path $WorkDir 'overlay'
 $gate = Join-Path $WorkDir 'gate'
 $baseTop = Join-Path $gate 'base'
+$importsPath = Join-Path $WorkDir 'ggml-imports.json'
+foreach ($p in (Join-Path $WorkDir $GatePassName), $importsPath) { Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $p }
 if (Test-Path -LiteralPath $gate) { Remove-Item -Recurse -Force -LiteralPath $gate }
 Write-Host "== gate: $(Split-Path -Leaf $BaseZip)"
 Expand-ZipTopLevel $BaseZip $baseTop
@@ -115,7 +119,6 @@ foreach ($f in Get-ChildItem -LiteralPath $OverlayDir -File) {
 }
 $importsOut = [ordered]@{}
 foreach ($d in $ggml) { if ($needed[$d].Count) { $importsOut[$d] = @($needed[$d]) } }
-Write-Utf8NoBom (Join-Path $WorkDir 'ggml-imports.json') (ConvertTo-PrettyJson $importsOut)
 foreach ($d in $importsOut.Keys) { Write-Host ("  overlay needs {0,4} names from {1}" -f $importsOut[$d].Count, $d) }
 
 # ---- 2. file set
@@ -175,4 +178,6 @@ if ($problems.Count) {
     $problems | ForEach-Object { Write-Host "  $_" }
     exit 1
 }
+Write-Utf8NoBom $importsPath (ConvertTo-PrettyJson $importsOut)
+Write-GatePass $WorkDir $overlayNames (Split-Path -Leaf $BaseZip) ([bool]$Smoke)
 Write-Host "== gate passed"

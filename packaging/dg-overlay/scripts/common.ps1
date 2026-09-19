@@ -40,7 +40,11 @@ $KeepBaseFiles = @('llama-cvector-generator.exe')
 #   dl\        downloads            src\       the patched source
 #   build\     the CMake build      overlay\   the overlay binaries
 #   licenses\  their license texts  gate\      the gate's scratch
-#   base.json (fetch-base), build-info.json (build), ggml-imports.json (gate)
+#   base.json (fetch-base), build-info.json (build),
+#   ggml-imports.json and gate.pass (gate, written only when it passes)
+#   src.stamp: the sha256 of the tarball src\ was unpacked from
+#   patch.stamp: what apply-patch did to src\ ("<patch sha256> <tag>", or
+#     "applying ..." while it runs); no patch.stamp = src\ is as unpacked
 function Read-BaseInfo([string]$WorkDir) {
     $p = Join-Path $WorkDir 'base.json'
     if (-not (Test-Path -LiteralPath $p)) { throw "no ${p}: run fetch-base.ps1 first" }
@@ -48,6 +52,65 @@ function Read-BaseInfo([string]$WorkDir) {
 }
 
 function Get-Sha256([string]$Path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
+
+# Unpack the release's source tarball into <WorkDir>\src, replacing whatever
+# is there, and record it: src.stamp names the tarball, and patch.stamp goes
+# because the tree is now exactly the release's source.
+function Expand-BaseSource([string]$WorkDir, [string]$Tarball, [string]$Sha) {
+    $src = Join-Path $WorkDir 'src'
+    if (Test-Path -LiteralPath $src) { Remove-Item -Recurse -Force -LiteralPath $src }
+    Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath (Join-Path $WorkDir 'patch.stamp')
+    New-Item -ItemType Directory -Force $src | Out-Null
+    Write-Host "  unpacking into $src"
+    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    Invoke-Native "unpack $(Split-Path -Leaf $Tarball)" { & $tar -xzf $Tarball -C $src --strip-components=1 }
+    Write-Utf8NoBom (Join-Path $WorkDir 'src.stamp') $Sha
+}
+
+# The BoringSSL source folder a build with -BoringSsl <mode> compiles, where
+# its LICENSE is: FetchContent clones into build\_deps\boringssl-src, but
+# with FETCHCONTENT_SOURCE_DIR_BORINGSSL it builds the given folder in place
+# and never creates that one. $null for `off`.
+function Get-BoringSslSourceDir([string]$BoringSsl, [string]$BuildDir) {
+    switch ($BoringSsl) {
+        'off' { return $null }
+        'fetch' { return (Join-Path $BuildDir '_deps\boringssl-src') }
+        default { return (Resolve-Path -LiteralPath $BoringSsl).Path }
+    }
+}
+
+# The license a BoringSSL LICENSE file carries, for the notices. The version
+# the source pins (0.20260903.0) is Apache 2.0, no longer the OpenSSL/ISC
+# pair of older BoringSSL; any other text stops the packaging rather than be
+# mislabelled.
+function Get-BoringSslLicenseName([string]$LicenseFile) {
+    $head = @(Get-Content -LiteralPath $LicenseFile -TotalCount 5 | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($head.Count -ge 2 -and $head[0] -eq 'Apache License' -and $head[1] -match '^Version 2\.0\b') { return 'Apache License 2.0' }
+    throw "$LicenseFile is not the Apache 2.0 license text; update THIRD-PARTY-NOTICES for BoringSSL's license"
+}
+
+# gate.pass: written by gate.ps1 only when every check passed, removed when
+# the gate starts and when build.ps1 collects a new overlay. It names the
+# files that were gated; signing changes their bytes, not their names.
+$GatePassName = 'gate.pass'
+function Write-GatePass([string]$WorkDir, [string[]]$OverlayFiles, [string]$BaseZip, [bool]$Smoke) {
+    $pass = [ordered]@{
+        passed_at     = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        base_zip      = $BaseZip
+        smoke         = $Smoke
+        overlay_files = @($OverlayFiles | Sort-Object)
+    }
+    Write-Utf8NoBom (Join-Path $WorkDir $GatePassName) (ConvertTo-PrettyJson $pass)
+}
+function Assert-GatePassed([string]$WorkDir) {
+    $p = Join-Path $WorkDir $GatePassName
+    if (-not (Test-Path -LiteralPath $p)) { throw "the gate has not passed on this overlay (no $p): run gate.ps1 and fix what it reports" }
+    $gated = @((Get-Content -Raw -LiteralPath $p | ConvertFrom-Json).overlay_files | ForEach-Object { ([string]$_).ToLowerInvariant() } | Sort-Object)
+    $now = @(Get-ChildItem -LiteralPath (Join-Path $WorkDir 'overlay') -File | ForEach-Object { $_.Name.ToLowerInvariant() } | Sort-Object)
+    if (($gated -join '|') -ne ($now -join '|')) {
+        throw "the overlay's files changed since the gate passed ($p): run gate.ps1 again"
+    }
+}
 
 # UTF-8 without a BOM and with LF line ends, so sha256sum and Llama FIDIM's
 # JSON reader (serde_json does not skip a BOM) both take the files as-is.
