@@ -9,6 +9,7 @@
   import Updates from "./views/Updates.svelte";
   import Settings from "./views/Settings.svelte";
   import Router from "./views/Router.svelte";
+  import Chat from "./views/Chat.svelte";
   import { api, log } from "./api.js";
   import { fly } from "svelte/transition";
   import { arrive } from "./motion.js";
@@ -18,6 +19,7 @@
   const groups = [
     { label: "operate", views: [
       { id: "running", label: "Running", component: Running },
+      { id: "chat", label: "Chat", component: Chat },
       { id: "profiles", label: "Profiles", component: Profiles },
       { id: "router", label: "Router", component: Router },
     ]},
@@ -46,6 +48,10 @@
   // template expression otherwise just leaves the view half-updated.
   window.addEventListener("error", (e) => log(`uncaught: ${e.message} @ ${e.filename}:${e.lineno} ${e.error?.stack ?? ""}`));
   window.addEventListener("unhandledrejection", (e) => log(`unhandled rejection: ${e.reason?.stack ?? String(e.reason)}`));
+
+  // A reload of this web view leaves any chat reply streaming to nobody:
+  // stop them all once at boot.
+  api("chat_cancel_all").catch(() => {});
 
   // Live server count for the nav badge.
   async function count() {

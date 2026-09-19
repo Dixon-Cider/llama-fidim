@@ -4,10 +4,16 @@
   // repainted every step, fading in as it settles. Live follows the running
   // request (~5 polls/s while this is open); Replay plays back every step of
   // the current or last reply from the helper's /frames.
-  import { onDestroy } from "svelte";
+  //
+  // Running passes the slot it already polls. The chat passes `follow`
+  // (poll whatever the slot is doing), `idTask` (draw only its own request;
+  // `queued` says where it waits meanwhile) and, after a reply, `snapshot`:
+  // that reply's frames, kept because another client's request would
+  // replace them on the server.
+  import { onDestroy, onMount } from "svelte";
   import { api } from "../api.js";
 
-  let { host, port, slot } = $props();
+  let { host, port, slot = null, follow = false, idTask = null, queued = null, snapshot = null, start = "live" } = $props();
 
   let mode = $state("live");      // "live" | "replay"
   let fresh = $state(null);       // latest slot from the fast poll
@@ -21,7 +27,13 @@
   let timer = null;
   let holding = false;
 
-  const s = $derived(fresh ?? slot);
+  const seen = $derived(fresh ?? slot);
+  // With an idTask, a slot busy with any other request is not ours to draw;
+  // nor is anything while our request still waits in the queue.
+  const theirs = $derived(
+    seen != null && (idTask != null ? seen.id_task !== idTask : follow && queued != null)
+  );
+  const s = $derived(theirs ? null : seen);
   const d = $derived(s?.diffusion ?? null);
   const processing = $derived(!!s?.is_processing);
 
@@ -34,10 +46,10 @@
     return chars.slice(chars.length - n).join("");
   });
 
-  // Fast poll while live, open and running.
+  // Fast poll while live, open and running (or always, when following).
   let inflight = false;
   $effect(() => {
-    if (mode !== "live" || !slot?.is_processing) { fresh = null; return; }
+    if (mode !== "live" || !(follow || slot?.is_processing)) { fresh = null; return; }
     const id = setInterval(async () => {
       if (inflight) return;
       inflight = true;
@@ -73,20 +85,24 @@
     mode = "replay";
     replayErr = "";
     try {
-      const r = await api("dg_frames", { host, port });
+      const r = snapshot ?? (await api("dg_frames", { host, port }));
+      if (idTask != null && r?.id_task !== idTask) {
+        throw new Error(`the server's replay now holds another request (#${r?.id_task ?? "?"}), not this reply (#${idTask})`);
+      }
       frames = r?.frames ?? [];
       dropped = r?.dropped ?? 0;
       idx = 0;
       setPlaying(frames.length > 1);
     } catch (e) {
       frames = [];
-      replayErr = String(e);
+      replayErr = String(e?.message ?? e);
       setPlaying(false);
     }
   }
   function goLive() { setPlaying(false); mode = "live"; }
   function scrub(e) { setPlaying(false); idx = parseInt(e.target.value, 10) || 0; }
   function setSpeed(ms) { stepMs = ms; if (playing) schedule(stepMs); }
+  onMount(() => { if (start === "replay") startReplay(); });
   onDestroy(() => clearTimeout(timer));
 
   const f = $derived(mode === "replay" ? frames[idx] : null);
@@ -96,12 +112,14 @@
   const text = $derived(mode === "replay" ? (f?.x ?? "") : draft);
   const meta = $derived(mode === "replay"
     ? (f ? `replay · block ${f.b + 1} · step ${f.s + 1}/${f.t} · frame ${idx + 1}/${frames.length}` : "replay")
+    : theirs ? (queued ? `queued #${queued}` : "waiting")
     : !processing ? "idle"
     : !d || d.state === "prefill" ? "prefilling the prompt"
     : `block ${d.block + 1} of ${d.n_blocks} · step ${d.step + 1}/${d.total}`);
   const placeholder = $derived(mode === "replay"
     ? (replayErr || (frames.length ? "" : "No steps captured yet: the helper keeps the current or last reply's steps."))
-    : !processing ? "Idle. Replay plays the last reply back, step by step."
+    : theirs ? (queued ? `Another request is denoising; you're #${queued} in the queue.` : "Another request is denoising; this one starts after it.")
+    : !processing ? (follow ? "Waiting for the engine to start this reply…" : "Idle. Replay plays the last reply back, step by step.")
     : !draft ? (d?.state === "denoise" ? "Block committed; starting the next one…" : "Prefilling the prompt…")
     : "");
 </script>
@@ -117,8 +135,10 @@
     {#if text}<pre class="cv" style="opacity: {(0.55 + 0.45 * frac).toFixed(2)};">{text}</pre>{/if}
   </div>
   <div class="controls">
-    <button class="btn small" class:primary={mode === "live"} onclick={goLive} title="Follow the running request">Live</button>
-    <button class="btn small" class:primary={mode === "replay"} onclick={startReplay} title="Play back every denoise step of the current or last reply">Replay last reply</button>
+    {#if !snapshot}
+      <button class="btn small" class:primary={mode === "live"} onclick={goLive} title="Follow the running request">Live</button>
+    {/if}
+    <button class="btn small" class:primary={mode === "replay"} onclick={startReplay} title="Play back every denoise step of the current or last reply">{snapshot ? "Replay this reply" : "Replay last reply"}</button>
     {#if mode === "replay" && frames.length}
       <button class="btn small" onclick={() => setPlaying(!playing)}>{playing ? "Pause" : "Play"}</button>
       <button class="btn small" onclick={() => { idx = 0; setPlaying(true); }}>Restart</button>
