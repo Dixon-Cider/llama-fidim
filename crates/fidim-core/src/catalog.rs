@@ -299,13 +299,22 @@ impl FitOptions {
 }
 
 /// The cards a model can go on: the discrete ones, largest first (every
-/// device on a machine with no discrete card, e.g. an APU).
+/// device on a machine with no discrete card, e.g. an APU). Among cards of
+/// one size the one with the most VRAM free comes first: the verdicts are
+/// against the card's size either way, but `fits_free_now` must not say no
+/// because the card judged is busy while an identical one is idle, and the
+/// split's main card, which also holds the compute buffers, is the freer.
 fn cards(devices: &[Device]) -> Vec<&Device> {
     let mut v: Vec<&Device> = devices.iter().filter(|d| !d.integrated).collect();
     if v.is_empty() {
         v = devices.iter().collect();
     }
-    v.sort_by(|a, b| b.total_mib.cmp(&a.total_mib).then_with(|| a.stable_key.cmp(&b.stable_key)));
+    v.sort_by(|a, b| {
+        b.total_mib
+            .cmp(&a.total_mib)
+            .then_with(|| b.free_mib.cmp(&a.free_mib))
+            .then_with(|| a.stable_key.cmp(&b.stable_key))
+    });
     v
 }
 
@@ -662,7 +671,7 @@ mod tests {
         let gib = q4.one_card.need_bytes as f64 / GIB;
         assert!((gib - 28.48).abs() < 0.02, "{gib}");
         assert_eq!(q4.one_card.capacity_bytes, 32624 * MIB);
-        assert!(q4.one_card.fits_free_now, "the largest card is the idle one");
+        assert!(q4.one_card.fits_free_now, "judged on the idle card");
         assert!(q4.one_card.detail.contains("R9700"));
         // Q5_K_M needs a second card; layer split over both fits.
         let q5 = get("Q5_K_M");
@@ -685,6 +694,27 @@ mod tests {
         let picked = fits.iter().find(|f| f.label == pick).unwrap();
         assert_eq!(picked.one_card.fit, Fit::Fits);
         assert!(picked.total_size < 22_368_011_616, "{pick}");
+    }
+
+    /// Two cards of one size, the one that sorts first busy with another
+    /// model: a choice that fits the idle one fits one card now, and the
+    /// split puts its main (compute) share on the idle card.
+    #[test]
+    fn equal_cards_are_judged_on_the_idle_one() {
+        let c = classify(&fixture_files("model-info-NANI-Nithin__K2-Horizon-MoVA-36B-A4B-GGUF.json"));
+        for devices in [
+            [r9700("pci:a:bus03", 1000), r9700("pci:a:bus08", 32472)],
+            [r9700("pci:a:bus08", 32472), r9700("pci:a:bus03", 1000)],
+        ] {
+            assert_eq!(cards(&devices)[0].stable_key, "pci:a:bus08");
+            let fits = estimate_choices(&mova_36b(), &c.choices, &devices, &FitOptions::default());
+            let q4 = fits.iter().find(|f| f.label == "Q4_K_M").unwrap();
+            assert_eq!(q4.one_card.fit, Fit::Fits);
+            assert!(q4.one_card.fits_free_now, "bus08 is idle: {}", q4.one_card.detail);
+        }
+        // Equal free VRAM too: the order stays stable.
+        let devices = [r9700("pci:a:bus08", 32472), r9700("pci:a:bus03", 32472)];
+        assert_eq!(cards(&devices)[0].stable_key, "pci:a:bus03");
     }
 
     /// K2-Horizon-7B's own keys, from the 64 KiB prefix of a real file: BF16
