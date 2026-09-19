@@ -94,6 +94,11 @@ const EXTRA_HITS = [
 export function createWizardMock(ctx) {
   // ctx: { devices(), builds(), models, profiles, emit(name, payload), sleep }
   const jobs = new Map();       // id -> { plan, progress, cancel, finished, consent, started_unix }
+  // Views and plans handed out, by id: as in the app, the view names them
+  // and the mock plans and runs its own copies.
+  const madeViews = new Map();
+  const madePlans = new Map();
+  let nextMade = 1;
   const partial = new Map();    // dest -> bytes fetched earlier (a cancelled download resumes)
   const present = new Set();    // dests downloaded in this preview
   const roots = [
@@ -490,16 +495,29 @@ export function createWizardMock(ctx) {
     switch (cmd) {
       case "hub_search":
         return searchHits(args.query).slice(0, args.limit ?? 30);
-      case "wizard_inspect":
+      case "wizard_inspect": {
         await ctx.sleep(700);
-        return inspect(args.input);
-      case "wizard_plan":
+        const v = inspect(args.input);
+        v.view_id = `v${nextMade++}`;
+        madeViews.set(v.view_id, structuredClone(v));
+        return v;
+      }
+      case "wizard_plan": {
         await ctx.sleep(400);
-        return plan(args.view, args.request ?? {});
+        const v = madeViews.get(args.viewId);
+        if (!v) throw "this repo's page is out of date: open the repo again";
+        const p = plan(v, args.request ?? {});
+        p.plan_id = `p${nextMade++}`;
+        madePlans.set(p.plan_id, structuredClone(p));
+        return p;
+      }
       case "wizard_start": {
-        const p = args.plan;
+        const p = madePlans.get(args.planId) ?? [...jobs.values()].find((j) => j.plan.plan_id === args.planId)?.plan;
+        if (!p) throw "this plan is out of date: plan it again";
         if (p.blocked) throw `the plan cannot run: ${p.notes.filter((n) => n.level === "error").map((n) => n.message).join("; ")}`;
-        if (p.steps.some((s) => s.needs_consent) && !args.consent) throw `${p.consent} Nothing was done: confirm it first (the consent box in the app, --allow-fork in the CLI).`;
+        // As core: a fork or pull request build needs consent whatever the flags say.
+        const needsConsent = (s) => s.needs_consent || (s.action.kind === "build" && (s.action.plan.needs_consent || ["build_fork", "build_pr"].includes(s.action.plan.action.action)));
+        if (p.steps.some(needsConsent) && !args.consent) throw `${p.consent} Nothing was done: confirm it first (the consent box in the app, --allow-fork in the CLI).`;
         const mine = p.steps.filter((s) => s.action.kind === "download").map((s) => s.action.dest);
         for (const [other, j] of jobs) {
           if (j.finished) continue;

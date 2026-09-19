@@ -828,12 +828,65 @@ fn a_fork_build_never_runs_without_consent() {
     assert!(events.is_empty());
     assert!(f.saved.borrow().is_empty());
 
-    // A plan edited to drop the consent flag from the step is refused too.
+    // A plan edited to drop every consent flag (the step's, its build
+    // plan's, the plan's) and its sentence is refused too: consent follows
+    // what the step builds, not the flags.
     let mut edited = plan.clone();
     edited.steps[0].needs_consent = false;
+    if let StepAction::Build { plan: ps } = &mut edited.steps[0].action {
+        ps.needs_consent = false;
+    }
     edited.needs_consent = false;
-    assert!(run_with(&f, &cfg, &edited, false, &mut |_| {}, &AtomicBool::new(false)).is_err());
+    edited.consent = None;
+    assert!(edited.requires_consent());
+    let err = run_with(&f, &cfg, &edited, false, &mut |_| {}, &AtomicBool::new(false)).unwrap_err();
+    assert!(err.to_string().contains("runs code from ifm-ai/llama.cpp"), "the sentence comes from the step: {err}");
+    assert!(check_runnable(&edited, false).is_err());
     assert_eq!(f.calls().len(), before);
+    // The same for a pull request's build.
+    let mut pr = edited.clone();
+    if let StepAction::Build { plan: ps } = &mut pr.steps[0].action {
+        let PlanAction::BuildFork { source, gpu_targets, install_dir, .. } = ps.action.clone() else { unreachable!() };
+        ps.action = PlanAction::BuildPr { number: 17000, source, gpu_targets, install_dir };
+    }
+    assert!(check_runnable(&pr, false).unwrap_err().to_string().contains("pull request #17000"));
+    // With consent it is runnable; a plan with no build needs none.
+    assert!(check_runnable(&edited, true).is_ok());
+    let mut downloads_only = plan.clone();
+    downloads_only.steps.remove(0);
+    assert!(!downloads_only.requires_consent() && check_runnable(&downloads_only, false).is_ok());
+}
+
+#[test]
+fn an_unsloth_mix_for_a_pull_request_needs_consent() {
+    let f = Fake::k2("run-unsloth");
+    let cfg = f.cfg();
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    let mut plan = plan_with(&f, &cfg, &view, &PlanRequest::default()).unwrap();
+    let dir = cfg.install_root.clone().unwrap().join("b11027-mix-3e83366-unsloth");
+    let mix = PlanStep {
+        action: PlanAction::InstallUnsloth { tag: "b11027-mix-3e83366".into(), gfx: "gfx120X".into(), install_dir: dir },
+        explanation: "merges pull request #17000".into(),
+        needs_consent: true,
+        verified: true,
+        warnings: vec![],
+    };
+    plan.steps[0] = Step { title: step_title(&mix), detail: String::new(), needs_consent: true, action: StepAction::Build { plan: mix.clone() } };
+    assert!(check_runnable(&plan, false).unwrap_err().to_string().contains("Unsloth's b11027-mix-3e83366"));
+    // Without its flag, an Unsloth install (a published release) runs as
+    // any prebuilt does.
+    let mut plain = plan.clone();
+    plain.steps[0].needs_consent = false;
+    if let StepAction::Build { plan: ps } = &mut plain.steps[0].action {
+        ps.needs_consent = false;
+    }
+    assert!(check_runnable(&plain, false).is_ok());
+    // With its flag on the build plan only, the step still needs consent.
+    let mut half = plain.clone();
+    if let StepAction::Build { plan: ps } = &mut half.steps[0].action {
+        ps.needs_consent = true;
+    }
+    assert!(check_runnable(&half, false).is_err());
 }
 
 #[test]

@@ -409,6 +409,13 @@ impl WizardPlan {
             })
             .collect()
     }
+
+    /// A step runs code nobody reviewed for this machine (see
+    /// `step_needs_consent`: judged by what the steps do, not by the
+    /// plan's `needs_consent`).
+    pub fn requires_consent(&self) -> bool {
+        self.steps.iter().any(step_needs_consent)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,11 +618,18 @@ pub struct LiveEnv {
     /// Cards the caller already enumerated (the GUI keeps them for a few
     /// seconds); None = enumerate them when asked.
     pub devices: Option<Vec<Device>>,
+    /// GPU target(s) for source builds given by the user (`--gfx`); None =
+    /// what hipInfo or the card names say.
+    pub gfx: Option<String>,
 }
 
 impl LiveEnv {
     pub fn new(cfg: Config) -> Self {
-        LiveEnv { cfg, devices: None }
+        LiveEnv { cfg, devices: None, gfx: None }
+    }
+
+    pub fn with_devices(cfg: Config, devices: Option<Vec<Device>>) -> Self {
+        LiveEnv { cfg, devices, gfx: None }
     }
 }
 
@@ -1360,7 +1374,7 @@ pub fn inspect_with(env: &dyn Env, cfg: &Config, input: &str, rev: Option<&str>)
 // -------------------------------------------------------------------- plan ----
 
 pub fn plan(cfg: &Config, view: &RepoView, req: &PlanRequest) -> Result<WizardPlan> {
-    let env = LiveEnv { cfg: cfg.clone(), devices: Some(view.devices.clone()).filter(|d| !d.is_empty()) };
+    let env = LiveEnv::with_devices(cfg.clone(), Some(view.devices.clone()).filter(|d| !d.is_empty()));
     plan_with(&env, cfg, view, req)
 }
 
@@ -1373,10 +1387,12 @@ struct BuildPick {
 }
 
 fn consent_text(step: &PlanStep) -> Option<String> {
-    if !step.needs_consent {
-        return None;
-    }
-    Some(match &step.action {
+    step.needs_consent.then(|| consent_sentence(&step.action))
+}
+
+/// What running `action` means, in one sentence, for the consent box.
+fn consent_sentence(action: &PlanAction) -> String {
+    match action {
         PlanAction::BuildFork { owner, repo, source, .. } => format!(
             "Building {} runs code from {owner}/{repo} (commit {}) that nobody reviewed for your machine.",
             source.git_source().display(),
@@ -1391,7 +1407,22 @@ fn consent_text(step: &PlanStep) -> Option<String> {
             "Unsloth's {tag} merges upstream pull requests nobody reviewed for your machine, and runs their code."
         ),
         _ => "This step runs code nobody reviewed for your machine.".to_string(),
-    })
+    }
+}
+
+/// Whether a step runs code nobody reviewed for this machine. Building a
+/// pull request's or a fork's code always does, whatever the flags of the
+/// plan say (a plan that went to a web view and came back may have lost
+/// them); an Unsloth mix does when the plan picked it for an unmerged pull
+/// request, which only its flag records.
+pub fn step_needs_consent(s: &Step) -> bool {
+    s.needs_consent
+        || match &s.action {
+            StepAction::Build { plan: ps } => {
+                ps.needs_consent || matches!(ps.action, PlanAction::BuildPr { .. } | PlanAction::BuildFork { .. })
+            }
+            _ => false,
+        }
 }
 
 /// The directory a build step installs into.
@@ -1725,13 +1756,15 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
                 }
             }
         }
-        consent = consent_text(ps);
-        steps.push(Step {
+        let mut step = Step {
             title: step_title(ps),
             detail: ps.explanation.clone(),
-            needs_consent: ps.needs_consent,
+            needs_consent: false,
             action: StepAction::Build { plan: ps.clone() },
-        });
+        };
+        step.needs_consent = step_needs_consent(&step);
+        consent = step.needs_consent.then(|| consent_text(ps).unwrap_or_else(|| consent_sentence(&ps.action)));
+        steps.push(step);
     }
 
     // The downloads.
@@ -1943,22 +1976,34 @@ pub fn run(
     progress: &mut dyn FnMut(&WizardEvent),
     cancel: &AtomicBool,
 ) -> Result<WizardResult> {
-    run_with(&LiveEnv { cfg: cfg.clone(), devices }, cfg, plan, consent, progress, cancel)
+    run_with(&LiveEnv::with_devices(cfg.clone(), devices), cfg, plan, consent, progress, cancel)
 }
 
 /// The refusals `run` makes before it does anything: a plan with errors,
 /// consent missing for code nobody reviewed, and a plan that does not say
 /// what `plan` would have (a repo, commit or destination changed by hand).
+///
+/// Consent is required by what a step does (building a pull request or a
+/// fork), not by the flags the plan carries. The app does not take plans
+/// back from its web view (it runs the copy `plan` made), but this check
+/// holds for any caller.
 pub fn check_runnable(plan: &WizardPlan, consent: bool) -> Result<()> {
     if plan.blocked {
         let errors: Vec<&str> = plan.notes.iter().filter(|n| n.level == Level::Error).map(|n| n.message.as_str()).collect();
         return Err(Error::InvalidInput(format!("the plan cannot run: {}", errors.join("; "))));
     }
-    if plan.steps.iter().any(|s| s.needs_consent) && !consent {
-        return Err(Error::InvalidInput(format!(
-            "{} Nothing was done: confirm it first (the consent box in the app, --allow-fork in the CLI).",
-            plan.consent.as_deref().unwrap_or("A step runs code nobody reviewed for your machine.")
-        )));
+    if !consent {
+        if let Some(s) = plan.steps.iter().find(|s| step_needs_consent(s)) {
+            // The sentence is made from the step itself, not taken from the
+            // plan's `consent`, which is only text.
+            let sentence = match &s.action {
+                StepAction::Build { plan: ps } => consent_sentence(&ps.action),
+                _ => "A step runs code nobody reviewed for your machine.".to_string(),
+            };
+            return Err(Error::InvalidInput(format!(
+                "{sentence} Nothing was done: confirm it first (the consent box in the app, --allow-fork in the CLI)."
+            )));
+        }
     }
     hub::validate_repo(&plan.repo)?;
     if plan.sha.len() != 40 || !plan.sha.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1969,11 +2014,6 @@ pub fn check_runnable(plan: &WizardPlan, consent: bool) -> Result<()> {
             hub::validate_repo_path(&file.path)?;
             if catalog::dest_path(&plan.dest_root, &plan.repo, &file.path) != *dest {
                 return Err(Error::InvalidInput(format!("{} is not where {} belongs", dest.display(), file.path)));
-            }
-        }
-        if let StepAction::Build { plan: ps } = &s.action {
-            if ps.needs_consent && !s.needs_consent {
-                return Err(Error::InvalidInput("a build step lost its consent flag".into()));
             }
         }
     }

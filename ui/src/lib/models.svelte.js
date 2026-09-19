@@ -187,7 +187,8 @@ export async function makePlan() {
   wz.planError = "";
   const before = wz.plan?.consent ?? null;
   try {
-    const p = await api("wizard_plan", { view: $state.snapshot(wz.view), request: request() });
+    // The view by its id: core plans from its own copy of it.
+    const p = await api("wizard_plan", { viewId: wz.view.view_id, request: request() });
     if (p.consent !== before) wz.consent = false;
     wz.plan = p;
   } catch (e) {
@@ -235,7 +236,8 @@ export async function start() {
   wz.jobError = "";
   wz.check = null;
   try {
-    const id = await api("wizard_start", { plan: $state.snapshot(wz.plan), consent: !!wz.consent });
+    // The plan by its id: core runs its own copy, never one sent back.
+    const id = await api("wizard_start", { planId: wz.plan.plan_id, consent: !!wz.consent });
     const snap = (await api("wizard_jobs")).find((j) => j.job === id);
     wz.job = snap ?? { job: id, plan: $state.snapshot(wz.plan), progress: { steps: [], log: [] }, finished: null, cancelling: false, consent: wz.consent };
     wz.step = 4;
