@@ -47,10 +47,21 @@ export const current = () => (chat.currentId ? chat.convs[chat.currentId] ?? nul
 export const targetOf = (conv) => (conv ? chat.targets.find((t) => t.key === targetKey(conv.target)) ?? null : null);
 export const isDiffusion = (conv) => (targetOf(conv)?.engine ?? conv?.target?.engine) === "diffusion-gemma";
 
+/// The first 60 characters, cut between graphemes. Never by UTF-16 code
+/// unit: a cut through an emoji leaves half a surrogate pair, which the IPC
+/// sends as a lone `\ud83d` that Rust's JSON parser rejects, and then every
+/// save of the conversation fails.
 function titleFrom(text) {
   const t = String(text).replace(/\s+/g, " ").trim();
-  return t.length > 60 ? t.slice(0, 60) + "…" : t;
+  const parts = typeof Intl.Segmenter === "function"
+    ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(t), (s) => s.segment)
+    : Array.from(t);
+  return parts.length > 60 ? parts.slice(0, 60).join("") + "…" : t;
 }
+
+/// Text typed or pasted into the page, safe for the IPC: a lone surrogate
+/// (see titleFrom) becomes U+FFFD instead of breaking every later save.
+const wellFormed = (s) => (typeof s.toWellFormed === "function" ? s.toWellFormed() : s);
 
 // ------------------------------------------------------------------ loading ----
 
@@ -315,7 +326,7 @@ export function setParam(k, v) {
 export function setSystem(s) {
   const c = current();
   if (!c) return;
-  c.system_prompt = s;
+  c.system_prompt = wellFormed(String(s ?? ""));
   touch(c);
 }
 
@@ -394,7 +405,7 @@ export function buildBody(conv, target) {
 
 export async function send(text) {
   const conv = current();
-  const t = String(text ?? "").trim();
+  const t = wellFormed(String(text ?? "")).trim();
   if (!conv || !t || chat.streams[conv.id]) return false;
   conv.messages.push({ id: uid("m"), role: "user", content: t, created_unix: nowS() });
   if (!conv.title) conv.title = titleFrom(t);
@@ -583,7 +594,7 @@ export function regenerate(msgId) {
 /// Change a user message, drop everything after it and ask again.
 export function editAndResend(msgId, text) {
   const conv = current();
-  const t = String(text ?? "").trim();
+  const t = wellFormed(String(text ?? "")).trim();
   if (!conv || !t || chat.streams[conv.id]) return;
   const i = conv.messages.findIndex((m) => m.id === msgId);
   if (i < 0 || conv.messages[i].role !== "user") return;

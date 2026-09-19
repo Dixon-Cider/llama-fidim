@@ -54,8 +54,22 @@ function mockDiffusionSample(t) {
   };
 }
 
+// Tauri's IPC parses a command's arguments with serde_json, which rejects
+// a lone surrogate (JSON.stringify writes half an emoji as "\ud83d"). The
+// mocks refuse the same way, so the browser preview shows such a bug too.
+function wellFormed(v) {
+  if (typeof v === "string") return typeof v.isWellFormed !== "function" || v.isWellFormed();
+  if (Array.isArray(v)) return v.every(wellFormed);
+  if (v && typeof v === "object") return Object.entries(v).every(([k, x]) => wellFormed(k) && wellFormed(x));
+  return true;
+}
+const IPC_REJECTS = "lone leading surrogate in hex escape (mock of Tauri's IPC)";
+
 export async function api(cmd, args = {}) {
-  if (!invoke) return mock(cmd, args);
+  if (!invoke) {
+    if (!wellFormed(args)) throw IPC_REJECTS;
+    return mock(cmd, args);
+  }
   try {
     return await invoke(cmd, args);
   } catch (e) {
@@ -84,7 +98,10 @@ export async function onEvent(name, cb) {
 /// last events can land after the promise resolves. Outside Tauri the mock
 /// stream answers.
 export async function stream(cmd, args, onEvent) {
-  if (!invoke) return mockStream(cmd, args, onEvent);
+  if (!invoke) {
+    if (!wellFormed(args)) throw IPC_REJECTS;
+    return mockStream(cmd, args, onEvent);
+  }
   const { Channel } = await import("@tauri-apps/api/core");
   const ch = new Channel();
   ch.onmessage = onEvent;
