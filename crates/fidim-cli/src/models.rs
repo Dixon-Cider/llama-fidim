@@ -108,7 +108,7 @@ pub fn cmd_models(cfg: &Config, json: bool, cmd: ModelsCmd) -> anyhow::Result<()
 const GIB: f64 = (1u64 << 30) as f64;
 
 fn gib(b: u64) -> String {
-    format!("{:.1} GiB", b as f64 / GIB)
+    wizard::human_size(b)
 }
 
 fn short(s: &str) -> &str {
@@ -160,9 +160,10 @@ fn print_builds(builds: &[BuildVerdict], needs: Option<&fidim_core::compat::Mode
     if builds.is_empty() {
         println!("  none");
     }
+    let w = builds.iter().map(|b| b.name.chars().count()).max().unwrap_or(0).max(10);
     for b in builds {
         println!(
-            "  {:<34} {:<9} {:<8} {}{}",
+            "  {:<w$} {:<9} {:<8} {}{}",
             b.name,
             b.channel.as_str(),
             b.version.as_deref().unwrap_or("?"),
@@ -317,7 +318,15 @@ fn show(cfg: &Config, json: bool, repo: &str, rev: Option<&str>) -> anyhow::Resu
         (Some(p), _) => println!("\n{} can load it.", view.builds.iter().find(|b| &b.path == p).map(|b| b.name.as_str()).unwrap_or("an installed build")),
         (None, Some(bp)) => {
             print_build_plan(bp);
-            for src in &view.build_sources {
+            // The sources of the steps offered, not the ones ruled out.
+            let offered: Vec<&str> = std::iter::once(&bp.step)
+                .chain(&bp.alternatives)
+                .filter_map(|s| match &s.action {
+                    PlanAction::BuildFork { source, .. } | PlanAction::BuildPr { source, .. } => Some(source.sha.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for src in view.build_sources.iter().filter(|s| offered.iter().any(|o| o.eq_ignore_ascii_case(&s.sha))) {
                 println!();
                 print_source(src);
             }
@@ -347,9 +356,10 @@ fn needs(cfg: &Config, json: bool, target: &str) -> anyhow::Result<()> {
     println!("  pre-tokenizer  {}", n.tokenizer_pre.as_deref().unwrap_or("(not needed: not a BPE vocabulary)"));
     println!(
         "  tensor types   {}",
-        match n.max_type_id {
-            Some(t) => format!("up to {} (id {t})", fidim_core::gguf::ggml_type_name(t)),
-            None => "not checked".into(),
+        match (n.max_type_id, r.max_tensor_type) {
+            (Some(t), _) => format!("up to {} (id {t}), checked against each build", fidim_core::gguf::ggml_type_name(t)),
+            (None, Some(t)) => format!("up to {} (id {t}), which every build knows", fidim_core::gguf::ggml_type_name(t)),
+            (None, None) => "not read".into(),
         }
     );
     println!("  engine         {}", n.engine.label());
@@ -646,24 +656,18 @@ impl<'a> Printer<'a> {
         if is_download {
             let (Some(done), Some(total)) = (e.done, e.total) else { return };
             let stage = e.stage.clone().unwrap_or_default();
-            let tenth = if total > 0 { done * 10 / total } else { 0 };
+            let tenth = (done * 10).checked_div(total).unwrap_or(0);
             let now = Instant::now();
             let due = now.duration_since(self.last_print).as_millis() >= 500 || done == total || stage != self.stage;
             if self.tty && due {
                 let bps = e.bps.unwrap_or(0.0);
                 let eta = if bps > 0.0 && total > done { format!("  {}", eta((total - done) as f64 / bps)) } else { String::new() };
-                print!(
-                    "\r   {:<9} {:.2} / {:.2} GiB  {:>6.1} MB/s{eta}   ",
-                    stage,
-                    done as f64 / GIB,
-                    total as f64 / GIB,
-                    bps / 1e6
-                );
+                print!("\r   {:<11} {} / {}  {:>6.1} MB/s{eta}   ", stage, gib(done), gib(total), bps / 1e6);
                 std::io::stdout().flush().ok();
                 self.open_line = true;
                 self.last_print = now;
             } else if !self.tty && (tenth > self.last_tenth || stage != self.stage) {
-                println!("   {stage} {:.2} / {:.2} GiB", done as f64 / GIB, total as f64 / GIB);
+                println!("   {stage} {} / {}", gib(done), gib(total));
                 self.last_tenth = tenth;
             }
             self.stage = stage;

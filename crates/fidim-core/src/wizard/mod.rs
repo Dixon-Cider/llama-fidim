@@ -546,8 +546,9 @@ pub struct NeedsReport {
     pub target: String,
     pub repo: Option<String>,
     pub needs: ModelNeeds,
-    /// The tensor table was read, so tensor types were checked.
-    pub types_checked: bool,
+    /// The largest tensor type in the file, when its tensor table was read
+    /// (`needs.max_type_id` has it only when a build might lack it).
+    pub max_tensor_type: Option<u32>,
     pub builds: Vec<BuildVerdict>,
     pub usable_build: Option<PathBuf>,
     pub build_plan: Option<BuildPlan>,
@@ -625,9 +626,12 @@ fn full_headers() -> &'static Mutex<HashMap<String, GgufHeader>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// When the doctor ran for a GPU target, and what it found.
+type DoctorAnswers = HashMap<String, (Instant, Vec<crate::toolchain::Finding>)>;
+
 /// Toolchain doctor answers by GPU target: a test compile takes seconds.
-fn doctor_cache() -> &'static Mutex<HashMap<String, (Instant, Vec<crate::toolchain::Finding>)>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<crate::toolchain::Finding>)>>> = OnceLock::new();
+fn doctor_cache() -> &'static Mutex<DoctorAnswers> {
+    static CACHE: OnceLock<Mutex<DoctorAnswers>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 const DOCTOR_TTL: Duration = Duration::from_secs(600);
@@ -807,9 +811,16 @@ fn engine_of_arch(arch: &str) -> Engine {
     }
 }
 
+/// Tensor types every build the wizard deals in knows: GGML_TYPE_COUNT at
+/// upstream b4400 (December 2024), through BF16, every K and IQ quant and
+/// the ternary types. A source build for the ROCm 7 HIP SDK is b5872 or
+/// newer. Only a file with a newer type (MXFP4 is 39) needs the check.
+pub const TYPES_EVERY_BUILD_KNOWS: u32 = 39;
+
 /// What a model needs from a build, from its header: the architecture, the
 /// pre-tokenizer of a BPE (`gpt2`) vocabulary (llama.cpp ignores it for any
-/// other), and the largest tensor type when the tensor table was read.
+/// other), and the largest tensor type when the tensor table was read and it
+/// is one a build might lack (see `TYPES_EVERY_BUILD_KNOWS`).
 pub fn needs_of(h: &GgufHeader) -> Option<ModelNeeds> {
     let arch = h.architecture.clone().filter(|a| !a.trim().is_empty())?;
     let tok_model = h
@@ -821,7 +832,8 @@ pub fn needs_of(h: &GgufHeader) -> Option<ModelNeeds> {
         .clone()
         .or_else(|| h.metadata.get("tokenizer.ggml.pre").and_then(|v| v.as_str()).map(str::to_string));
     let pre = if tok_model.as_deref() == Some("gpt2") { pre } else { None };
-    Some(ModelNeeds::new(arch, pre, h.max_tensor_type(), h.engine()))
+    let types = h.max_tensor_type().filter(|t| *t >= TYPES_EVERY_BUILD_KNOWS);
+    Some(ModelNeeds::new(arch, pre, types, h.engine()))
 }
 
 fn build_name(b: &Build) -> String {
@@ -945,8 +957,20 @@ pub fn repo_kind(info: &RepoInfo, cat: &Catalog) -> RepoKind {
     }
 }
 
+/// A size in the unit that reads best: KiB, MiB or GiB.
+pub fn human_size(b: u64) -> String {
+    let b = b as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.1} MiB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KiB", (b / 1024.0).ceil())
+    }
+}
+
 fn gib(b: u64) -> String {
-    format!("{:.1} GiB", b as f64 / GIB)
+    human_size(b)
 }
 
 fn short(sha: &str) -> &str {
@@ -1567,6 +1591,9 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
     if !dest_root.is_absolute() {
         return Err(Error::InvalidInput(format!("{} is not an absolute folder path", dest_root.display())));
     }
+    // One separator throughout the paths shown and saved.
+    #[cfg(windows)]
+    let dest_root = PathBuf::from(dest_root.to_string_lossy().replace('/', "\\"));
     let mut notes: Vec<Note> = Vec::new();
 
     // The chosen file's whole header: tensor types, for the build check.
@@ -1759,35 +1786,32 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
     };
     let mut profile_preview = None;
     if req.profile {
-        match &pick.build {
-            Some(pb) => {
-                let build = builds
-                    .iter()
-                    .find(|b| same_path(&b.path, &pb.path))
-                    .cloned()
-                    .or_else(|| pick.step.as_ref().map(|s| future_build(s, pb)));
-                if let Some(build) = build {
-                    let model = planned_model(&first_dest, &choice, &view.repo, &view.sha, header.clone(), engine, &dests, mmproj_dest.clone(), draft_dest.clone());
-                    let p = profile::new_for_model(cfg, &model, &build, &view.devices, &env.profiles(), &profile_opts);
-                    steps.push(Step {
-                        title: format!("Create profile {}", p.id),
-                        detail: format!(
-                            "on {} with {}, port {}, context {}; nothing is launched",
-                            pb.name,
-                            if p.devices.len() > 1 { "a layer split over two cards".to_string() } else { "one card".to_string() },
-                            p.server.port,
-                            if p.runtime.ctx_total == 0 { "auto".to_string() } else { p.runtime.ctx_total.to_string() }
-                        ),
-                        needs_consent: false,
-                        action: StepAction::Profile { id: p.id.clone(), path: cfg.profile_dir.join(format!("{}.json", p.id)) },
-                    });
-                    for f in profile::validate(&p).into_iter().filter(|f| f.severity == profile::Severity::Error) {
-                        notes.push(Note::new(Level::Warning, "profile", format!("the new profile will need a fix: {}", f.message)));
-                    }
-                    profile_preview = Some(p);
+        if let Some(pb) = &pick.build {
+            let build = builds
+                .iter()
+                .find(|b| same_path(&b.path, &pb.path))
+                .cloned()
+                .or_else(|| pick.step.as_ref().map(|s| future_build(s, pb)));
+            if let Some(build) = build {
+                let model = planned_model(&first_dest, &choice, &view.repo, &view.sha, header.clone(), engine, &dests, mmproj_dest.clone(), draft_dest.clone());
+                let p = profile::new_for_model(cfg, &model, &build, &view.devices, &env.profiles(), &profile_opts);
+                steps.push(Step {
+                    title: format!("Create profile {}", p.id),
+                    detail: format!(
+                        "on {} with {}, port {}, context {}; nothing is launched",
+                        pb.name,
+                        if p.devices.len() > 1 { "a layer split over two cards".to_string() } else { "one card".to_string() },
+                        p.server.port,
+                        if p.runtime.ctx_total == 0 { "auto".to_string() } else { p.runtime.ctx_total.to_string() }
+                    ),
+                    needs_consent: false,
+                    action: StepAction::Profile { id: p.id.clone(), path: cfg.profile_dir.join(format!("{}.json", p.id)) },
+                });
+                for f in profile::validate(&p).into_iter().filter(|f| f.severity == profile::Severity::Error) {
+                    notes.push(Note::new(Level::Warning, "profile", format!("the new profile will need a fix: {}", f.message)));
                 }
+                profile_preview = Some(p);
             }
-            None => {}
         }
     }
 
@@ -2132,7 +2156,7 @@ pub fn needs_with(env: &dyn Env, cfg: &Config, target: &str) -> Result<NeedsRepo
     Ok(NeedsReport {
         target: target.to_string(),
         repo,
-        types_checked: needs.max_type_id.is_some(),
+        max_tensor_type: header.max_tensor_type(),
         needs,
         builds: v,
         usable_build,

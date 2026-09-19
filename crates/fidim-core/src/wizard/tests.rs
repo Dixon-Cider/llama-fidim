@@ -246,7 +246,7 @@ impl Env for Fake {
         h.file_size = files.iter().map(|f| f.size).sum();
         if mode == ReadMode::Full {
             h.partial = false;
-            h.max_tensor_type_id = Some(12);
+            h.max_tensor_type_id = Some(41);
         }
         Ok(h)
     }
@@ -371,6 +371,21 @@ fn needs_come_from_the_header() {
     let mut none = h.clone();
     none.architecture = None;
     assert!(needs_of(&none).is_none());
+    // Tensor types every build knows are not a need; newer ones are.
+    let mut typed = h.clone();
+    typed.partial = false;
+    typed.max_tensor_type_id = Some(12);
+    assert_eq!(needs_of(&typed).unwrap().max_type_id, None, "Q4_K");
+    typed.max_tensor_type_id = Some(39);
+    assert_eq!(needs_of(&typed).unwrap().max_type_id, Some(39), "MXFP4");
+}
+
+#[test]
+fn sizes_read_in_their_unit() {
+    assert_eq!(human_size(1_185_376), "1.1 MiB");
+    assert_eq!(human_size(5_592_219_008), "5.2 GiB");
+    assert_eq!(human_size(2598), "3 KiB");
+    assert_eq!(human_size(0), "0 KiB");
 }
 
 #[test]
@@ -586,7 +601,7 @@ fn plan_for_a_supported_model_downloads_and_makes_a_profile() {
     assert_eq!(plan.download_bytes, plan.choice.total_size);
     // The whole header of the chosen file was read for its tensor types.
     assert!(f.calls().iter().any(|c| c == "header Full K2-Horizon-7B-Q4_K_M.gguf"), "{:?}", f.calls());
-    assert_eq!(plan.needs.as_ref().unwrap().max_type_id, Some(12));
+    assert_eq!(plan.needs.as_ref().unwrap().max_type_id, Some(41));
     // The profile: on the upstream build, an idle card, the first free port.
     let p = plan.profile.as_ref().unwrap();
     assert_eq!(p.build.path, f.builds[0].path);
@@ -893,18 +908,18 @@ fn needs_of_a_local_file_and_a_repo() {
     let cfg = f.cfg();
     let r = needs_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF").unwrap();
     assert_eq!(r.needs.arch, "k2-horizon");
-    assert!(r.types_checked, "the whole header was read");
+    assert_eq!(r.max_tensor_type, Some(41), "the whole header was read");
     assert!(r.usable_build.is_none());
     assert!(matches!(r.build_plan.as_ref().unwrap().step.action, PlanAction::BuildFork { .. }));
 
     // A local file: its own header, read from disk.
     let path = f.root.join("m.gguf");
-    std::fs::write(&path, crate::gguf::testing::split_shard(Some("gemma4"), 0, 1, &[("t", 1)])).unwrap();
+    std::fs::write(&path, crate::gguf::testing::split_shard(Some("gemma4"), 0, 1, &[("t", 1), ("u", 40)])).unwrap();
     let mut ok = Fake::supported("needs-local");
     ok.builds.truncate(1);
     let r = needs_with(&ok, &cfg, path.to_str().unwrap()).unwrap();
     assert_eq!(r.needs.arch, "gemma4");
-    assert_eq!(r.needs.max_type_id, Some(1));
+    assert_eq!(r.needs.max_type_id, Some(40));
     assert_eq!(r.usable_build.as_deref(), Some(ok.builds[0].path.as_path()));
     assert!(needs_with(&ok, &cfg, "no such thing").is_err());
     std::fs::remove_dir_all(&f.root).ok();
