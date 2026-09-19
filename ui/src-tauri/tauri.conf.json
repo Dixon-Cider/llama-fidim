@@ -24,6 +24,8 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": false,
+    "publisher": "Dixon-Cider",
+    "copyright": "Copyright (c) 2026 Dixon-Cider"
   }
 }
