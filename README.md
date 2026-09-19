@@ -115,6 +115,11 @@ Everything lives under `~\.fidim`: `config.json`, `profiles\*.json`,
 run state and logs under `runs\`, and the router preset. All of it is plain
 JSON you can edit by hand.
 
+For gated Hugging Face repos (Gemma, Llama), the app sends a token from
+`HF_TOKEN`, the file `HF_TOKEN_PATH` names, or the token in Settings. To
+use the one `huggingface-cli login` saved, set `"hf_use_cli_token": true`
+in `config.json`.
+
 ## The CLI
 
 ```
@@ -208,6 +213,10 @@ These came from real failures on real hardware and are deliberate:
 - **Runtime selection is real.** Each runtime gets its own shim folder for
   DLLs a build imports under a different name, so picking a runtime means
   that runtime, not whatever is in the exe folder.
+- **A split model is one model.** A GGUF published in parts
+  (`-00001-of-00003.gguf` ...) is listed once, at its first part, which is
+  the file llama.cpp is given. Its VRAM estimate counts every part;
+  counting only the first would call a model that cannot fit a fit.
 - **The Updates tab leaves running servers alone.** Installing, promoting
   and rolling back change files and profiles only. The one process it
   starts is a brief `llama-server --list-devices` to confirm a new build's
@@ -218,16 +227,19 @@ These came from real failures on real hardware and are deliberate:
 ```
 crates/fidim-core   discovery, GGUF headers, devices, VRAM estimate, pre-flight,
                     launch, supervision, router, live view, updates, ROCm runtimes,
-                    the DiffusionGemma server
+                    the DiffusionGemma server, the Hugging Face Hub client and
+                    resumable downloads
 crates/fidim-cli    the fidim and fidim-dg binaries
 ui/                 Tauri 2 + Svelte 5 desktop app
 scripts/            install.ps1, build-from-tag.bat (source builds),
                     release.ps1 (sets the version, dates CHANGELOG.md, tags)
-fixtures/           captured --list-devices / hipInfo / WMI output used by tests
+fixtures/           captured --list-devices / hipInfo / WMI output, Hugging Face API
+                    responses and a GGUF header prefix, used by tests
 ```
 
 ```
 cargo test          # set FIDIM_TEST_MODELS=<folder of .gguf> to also parse real files
+cargo test -p fidim-core -- --ignored live_    # the Hub client against huggingface.co
 ```
 
 ## Name

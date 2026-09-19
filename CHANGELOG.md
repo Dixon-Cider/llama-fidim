@@ -13,6 +13,31 @@ build with uncommitted changes.
 
 ## [Unreleased]
 
+### Added
+
+- Groundwork for a "Get a model" wizard, in the core library: a Hugging
+  Face Hub client (search, a repo's files with their SHA-256s, and a
+  model's GGUF header read with HTTP range requests before anything is
+  downloaded), a downloader that resumes and checks size and SHA-256
+  before a file is used, a catalog that groups a repo's files by quant and
+  estimates each one on your cards, and free-space and path checks. The
+  app and the CLI use them in a later release.
+- A Hugging Face token can come from the file `HF_TOKEN_PATH` names, and
+  with `"hf_use_cli_token": true` in `config.json`, from the token
+  `huggingface-cli login` saved.
+
+### Changed
+
+- A model split into several files (`-00001-of-00003.gguf` ...) is listed
+  once, and its VRAM estimate counts every part, not just the first.
+- Importance-matrix files (`*imatrix*.gguf`) are no longer listed as
+  models.
+
+### Fixed
+
+- `fidim scan` named quantizations after the wrong table: IQ4_XS files
+  read as BF16 and BF16 files as `file_type 32`.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added
