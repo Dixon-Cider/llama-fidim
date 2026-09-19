@@ -23,6 +23,7 @@ pub mod rocm;
 pub mod router;
 pub mod runtime;
 pub mod supervise;
+pub mod toolchain;
 pub mod update;
 
 pub use error::Error;
