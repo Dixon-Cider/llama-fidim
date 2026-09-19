@@ -6,6 +6,7 @@
 pub mod bench;
 pub mod build_info;
 pub mod catalog;
+pub mod compat;
 pub mod config;
 pub mod devices;
 pub mod diffusion;
@@ -27,6 +28,7 @@ pub mod rocm;
 pub mod router;
 pub mod runtime;
 pub mod supervise;
+pub mod toolchain;
 pub mod update;
 
 #[cfg(test)]

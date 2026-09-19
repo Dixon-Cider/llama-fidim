@@ -1,0 +1,12 @@
+In file included from <built-in>:1:
+In file included from C:\Program Files\AMD\ROCm\7.1\lib\clang\21\include\__clang_hip_runtime_wrapper.h:144:
+C:\Program Files\AMD\ROCm\7.1\lib\clang\21\include\__clang_cuda_math_forward_declares.h:92:17: error: __device__ function 'isgreater' cannot overload __host__ __device__ function 'isgreater'
+   92 | __DEVICE__ bool isgreater(double, double);
+      |                 ^
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\include\cmath:688:17: note: previous declaration is here
+  688 | _CLANG_BUILTIN2(isgreater)
+      |                 ^
+In file included from <built-in>:1:
+In file included from C:\Program Files\AMD\ROCm\7.1\lib\clang\21\include\__clang_hip_runtime_wrapper.h:144:
+C:\Program Files\AMD\ROCm\7.1\lib\clang\21\include\__clang_cuda_math_forward_declares.h:93:17: error: __device__ function 'isgreaterequal' cannot overload __host__ __device__ function 'isgreaterequal'
+   93 | __DEVICE__ bool isgreaterequal(double, double);

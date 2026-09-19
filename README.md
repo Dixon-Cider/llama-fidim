@@ -39,7 +39,9 @@ welcome, and a report that includes your card, driver version and the
   in the free VRAM of each card, the port is free, the alias is unique, the
   driver matches what you benchmarked on, and a few Windows-specific traps
   (a display on a compute card, the PCIe power setting that evicts VRAM on
-  idle). Anything that would fail is blocked with a reason.
+  idle). One more appears when the build does not know the model's
+  architecture, read from the architecture table inside its `llama.dll`.
+  Anything that would fail is blocked with a reason.
 - **One port for every model.** Router mode puts every profile behind one
   OpenAI-compatible endpoint. Clients keep one base URL and pick a model by
   name; with autoload on, instances start on the first request that names
@@ -56,6 +58,16 @@ welcome, and a report that includes your card, driver version and the
   runtimes install the same way from AMD's release and nightly channels,
   and a profile can pick any installed version. Promote profiles to a new
   build in one click, roll back in one click.
+- **Builds of any git ref.** A model whose architecture no release knows
+  yet, only a fork or an open pull request, can be compiled from that ref:
+  FIDIM pins the commit, builds it with the local HIP toolchain in its own
+  clone (never your checkouts), and keeps the result out of upstream's
+  ranking, so it is never promoted by accident. A toolchain doctor catches
+  a missing tool or the MSVC/HIP `<cmath>` clash in seconds, before the
+  build starts. One source build runs at a time. Refs based on upstream
+  from before b5872 (July 2025) do not compile with the ROCm 7 HIP SDK:
+  the plan says so and puts them last, and the build stops right after
+  configure with that reason.
 - **Benchmarks.** Serial and concurrent decode sweeps against a running
   server, stored per profile as its baseline.
 - **Nearly everything the GUI does, the `fidim` CLI does too.** The live
@@ -137,6 +149,11 @@ fidim router ...           configure, launch and manage the one-port router
 fidim update [--install]   llama.cpp releases, changelog, install, promote, roll back
 fidim update --channel unsloth [--install]
                            Unsloth builds, which carry the DiffusionGemma runner
+fidim update --source --remote <url> --ref <branch|pull/N/head|commit>
+                           compile any llama.cpp git ref (a fork's branch, a pull
+                           request) for this machine's GPU; --gfx, --label optional
+fidim toolchain            check Visual Studio, git, CMake, Ninja and the HIP SDK
+                           for source builds, with a test compile
 fidim rocm list|install    ROCm runtimes from AMD's channels
 fidim runtimes             every runtime a profile can name
 ```
@@ -223,6 +240,17 @@ These came from real failures on real hardware and are deliberate:
   and rolling back change files and profiles only. The one process it
   starts is a brief `llama-server --list-devices` to confirm a new build's
   HIP backend loads.
+- **Building a fork or a pull request is always an explicit choice.** It
+  runs code nobody reviewed for your machine: the CLI builds only a remote
+  and ref you name, and the build planner marks such steps as needing your
+  consent. Links in a model card are only ever read as URLs, and the ref
+  is pinned to one commit before anything is fetched or compiled, then
+  fetched by its full name (a branch and a tag may share a name). git never
+  asks for credentials: a missing or private repository fails at once
+  instead of opening a sign-in window. GitHub allows 60 API requests an
+  hour without a token, so answers are cached; `github_token` in
+  `config.json` (or `GITHUB_TOKEN`) raises that to 5000, and a token GitHub
+  rejects is dropped after one request instead of failing every lookup.
 
 ## Layout
 
@@ -233,10 +261,12 @@ crates/fidim-core   discovery, GGUF headers, devices, VRAM estimate, pre-flight,
                     resumable downloads
 crates/fidim-cli    the fidim and fidim-dg binaries
 ui/                 Tauri 2 + Svelte 5 desktop app
-scripts/            install.ps1, build-from-tag.bat (source builds),
+scripts/            install.ps1, build-from-tag.bat (source builds of a release),
+                    build-from-ref.bat (source builds of any git ref),
                     release.ps1 (sets the version, dates CHANGELOG.md, tags)
-fixtures/           captured --list-devices / hipInfo / WMI output, Hugging Face API
-                    responses and a GGUF header prefix, used by tests
+fixtures/           captured --list-devices / hipInfo / WMI output, Hugging Face and
+                    GitHub API responses, a GGUF header prefix and llama.cpp
+                    table excerpts, used by tests
 ```
 
 ```

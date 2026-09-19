@@ -1,0 +1,225 @@
+{
+ "url": "https://api.github.com/repos/ggml-org/llama.cpp/compare/master...ifm-ai:llama.cpp:42adf019f76013dac873b5b43950d54d5ab27216",
+ "html_url": "https://github.com/ggml-org/llama.cpp/compare/master...ifm-ai:llama.cpp:42adf019f76013dac873b5b43950d54d5ab27216",
+ "status": "diverged",
+ "ahead_by": 10,
+ "behind_by": 380,
+ "total_commits": 10,
+ "base_commit": {
+  "sha": "60081bb2b5b3294165a4d67c5cbeebe74c868014"
+ },
+ "merge_base_commit": {
+  "sha": "4e97ac86ebe2c4cb8212d98d2641ad6768810896",
+  "commit": {
+   "message": "tests : run test-save-load-state across all architectures (#27755)"
+  }
+ },
+ "commits": [
+  {
+   "sha": "490c4195045cbd768d954646d3cb1d5658322654",
+   "commit": {
+    "message": "model: K2 Horizon gguf conversion code",
+    "author": {
+     "date": "2026-08-29T14:34:19Z"
+    }
+   }
+  },
+  {
+   "sha": "992bdde80308f453821c2833bd11778e2959f22a",
+   "commit": {
+    "message": "model: loading hparams and tensors in k2-horizon.cpp",
+    "author": {
+     "date": "2026-08-30T17:14:05Z"
+    }
+   }
+  },
+  {
+   "sha": "d63ad5e64f4b5668ef85283e00f14f31545a07ea",
+   "commit": {
+    "message": "model: K2 Horizon compute graph",
+    "author": {
+     "date": "2026-08-31T11:41:29Z"
+    }
+   }
+  },
+  {
+   "sha": "d6b148a7954728a6569898f1692adeed36dca4ec",
+   "commit": {
+    "message": "model: K2 Horizon compute graph adjustment and registering tokenizers",
+    "author": {
+     "date": "2026-09-01T15:55:03Z"
+    }
+   }
+  },
+  {
+   "sha": "35999d101cf2233fc54f09c3c8d599da7303ce02",
+   "commit": {
+    "message": "model: K2 Horizon chat template and accomodate safetensors naming",
+    "author": {
+     "date": "2026-09-01T18:04:20Z"
+    }
+   }
+  },
+  {
+   "sha": "69d3a4e825c242f1378cd7d12ed9c68b38120725",
+   "commit": {
+    "message": "unicode : add the K2-Horizon pre-tokenizer splitter\n\nThe K2-Horizon regex had no arm in unicode_regex_split_custom and fell through to the\ngeneral std::regex fallback, which fails two ways.\n\nOn MSVC std::regex rejects \\p{...}, so no K2-Horizon GGUF loads on Windows at all:\nllama-quantize, llama-imatrix and llama-perplexity all abort with\nregex_error(error_escape) before a token is produced.\n\nWhere the fallback does compile it is still wrong. unicode_regex_split collapses each\ncodepoint to a single byte naming its Unicode category before matching, and U+200C/U+200D\nare category Control, which has no entry in k_ucat_cpt, so both become the 0xD0 fallback\nbyte. The literal ‌ and ‍ alternatives in K2's regex can then never match and\nevery ZWNJ or ZWJ ends a letter run.\n\nThe splitter is the existing llama3 one with a single rule widened, since K2's regex\ndiffers from llama3's only in that a letter run also takes marks, ZWNJ and ZWJ.\n\ntests/test-unicode.cpp gains a case for this: it fails before the change with\n[Amy] [ZWNJ khaham] and passes after with the run intact.",
+    "author": {
+     "date": "2026-09-11T08:08:48Z"
+    }
+   }
+  },
+  {
+   "sha": "a8104b5532af306b72e2e811d46e23fce9531514",
+   "commit": {
+    "message": "tests: expand K2 Horizon unicode splitter coverage",
+    "author": {
+     "date": "2026-09-14T21:18:00Z"
+    }
+   }
+  },
+  {
+   "sha": "0de0799e63d14fabdfc75fabf1d4eeb10e0d36f3",
+   "commit": {
+    "message": "Merge pull request #1 from a-contributor/test/k2-pr1-expanded-tests\n\ntests: expand K2 Horizon unicode splitter coverage",
+    "author": {
+     "date": "2026-09-15T07:25:46Z"
+    }
+   }
+  },
+  {
+   "sha": "e78bd9435e3773974f3d080b635dcf17c52e7c00",
+   "commit": {
+    "message": "unicode: handle K2 Horizon case folding and empty input\n\nAssisted-by: Codex",
+    "author": {
+     "date": "2026-09-17T13:06:37Z"
+    }
+   }
+  },
+  {
+   "sha": "42adf019f76013dac873b5b43950d54d5ab27216",
+   "commit": {
+    "message": "Merge pull request #1 from another-contributor/k2-horizon-msvc-pretokenizer\n\nunicode : add the K2-Horizon pre-tokenizer splitter",
+    "author": {
+     "date": "2026-09-17T13:12:32Z"
+    }
+   }
+  }
+ ],
+ "files": [
+  {
+   "filename": "conversion/__init__.py",
+   "status": "modified",
+   "additions": 2,
+   "deletions": 0
+  },
+  {
+   "filename": "conversion/base.py",
+   "status": "modified",
+   "additions": 8,
+   "deletions": 0
+  },
+  {
+   "filename": "conversion/k2_horizon.py",
+   "status": "added",
+   "additions": 212,
+   "deletions": 0
+  },
+  {
+   "filename": "convert_hf_to_gguf_update.py",
+   "status": "modified",
+   "additions": 3,
+   "deletions": 0
+  },
+  {
+   "filename": "gguf-py/gguf/constants.py",
+   "status": "modified",
+   "additions": 44,
+   "deletions": 0
+  },
+  {
+   "filename": "gguf-py/gguf/gguf_writer.py",
+   "status": "modified",
+   "additions": 6,
+   "deletions": 0
+  },
+  {
+   "filename": "gguf-py/gguf/tensor_mapping.py",
+   "status": "modified",
+   "additions": 9,
+   "deletions": 0
+  },
+  {
+   "filename": "models/templates/k2-horizon.jinja",
+   "status": "added",
+   "additions": 883,
+   "deletions": 0
+  },
+  {
+   "filename": "src/llama-arch.cpp",
+   "status": "modified",
+   "additions": 10,
+   "deletions": 0
+  },
+  {
+   "filename": "src/llama-arch.h",
+   "status": "modified",
+   "additions": 8,
+   "deletions": 0
+  },
+  {
+   "filename": "src/llama-hparams.h",
+   "status": "modified",
+   "additions": 4,
+   "deletions": 0
+  },
+  {
+   "filename": "src/llama-model.cpp",
+   "status": "modified",
+   "additions": 4,
+   "deletions": 1
+  },
+  {
+   "filename": "src/llama-model.h",
+   "status": "modified",
+   "additions": 4,
+   "deletions": 0
+  },
+  {
+   "filename": "src/llama-vocab.cpp",
+   "status": "modified",
+   "additions": 9,
+   "deletions": 0
+  },
+  {
+   "filename": "src/llama-vocab.h",
+   "status": "modified",
+   "additions": 1,
+   "deletions": 0
+  },
+  {
+   "filename": "src/models/k2-horizon.cpp",
+   "status": "added",
+   "additions": 663,
+   "deletions": 0
+  },
+  {
+   "filename": "src/models/models.h",
+   "status": "modified",
+   "additions": 28,
+   "deletions": 0
+  },
+  {
+   "filename": "src/unicode.cpp",
+   "status": "modified",
+   "additions": 157,
+   "deletions": 0
+  },
+  {
+   "filename": "tests/test-unicode.cpp",
+   "status": "modified",
+   "additions": 211,
+   "deletions": 13
+  }
+ ]
+}

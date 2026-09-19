@@ -528,6 +528,20 @@ pub fn prepare_with_inputs(
     // the model needs (check 13). A split model's weights are every shard.
     let header = crate::discovery::read_model_header(&profile.model.path).ok();
     let model_facts = header.as_ref().map(ModelFacts::from_header);
+    // Check 16: does the build know the model? Only for a build that ran
+    // (check 1) and an engine that matches the model (check 13), and for a
+    // diffusion profile only when its runner is there (check 1 again).
+    let build_support = match (&header, &build_version_output) {
+        (Some(h), Some(version_text)) => crate::compat::ModelNeeds::from_header(h)
+            .filter(|n| n.engine == profile.engine)
+            .filter(|_| !diffusion || runner_exe(profile).is_file())
+            .map(|needs| {
+                let commit = discovery::parse_version_output(version_text).map(|(_, c)| c);
+                let support = crate::compat::probe_build_at(&profile.build.path, commit.as_deref(), &needs);
+                crate::preflight::BuildSupport { needs, support }
+            }),
+        _ => None,
+    };
     let mut sizing: Option<DiffusionSizing> = None;
     let estimate: Option<VramEstimate> = match &header {
         None => None,
@@ -667,6 +681,7 @@ pub fn prepare_with_inputs(
         model_facts,
         diffusion: diffusion_pre,
         co_resident,
+        build_support,
     };
     Ok(PreparedLaunch { context, plan, devices_now })
 }
