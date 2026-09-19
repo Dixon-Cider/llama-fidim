@@ -262,7 +262,8 @@ pub struct Model {
     pub file_size: u64,
     /// Modified time (unix seconds) — feeds the cold-cache heuristic (R-08).
     pub modified_unix: Option<u64>,
-    /// Read from `path`; for a split model `file_size` is the whole set's.
+    /// Read from `path`; for a split model, with every shard's size and
+    /// tensor table folded in (`discovery::read_split_header`).
     pub header: Option<GgufHeader>,
     pub header_error: Option<String>,
     /// The engine this model needs, from its header (llama-server when the
@@ -501,14 +502,35 @@ pub fn split_shards(first: &Path) -> Option<Vec<PathBuf>> {
     Some((1..=count).map(|i| first.with_file_name(format!("{prefix}-{i:05}-of-{count:05}{ext}"))).collect())
 }
 
-/// A model's header with `file_size` covering the whole model: for the
-/// first shard of a split set, the size of every shard present. The VRAM
-/// estimate takes the weights from `file_size`.
+/// A model's header, covering the whole model: for the first shard of a
+/// split set, every shard's folded in (see `read_split_header`). The VRAM
+/// estimate takes the weights from `file_size`; a build check takes
+/// `max_tensor_type`.
 pub fn read_model_header(path: &Path) -> Result<GgufHeader> {
-    let mut h = gguf::read_header(path)?;
-    if let Some(shards) = split_shards(path) {
-        h.file_size = shards.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    match split_shards(path) {
+        Some(shards) => read_split_header(&shards),
+        None => gguf::read_header(path),
     }
+}
+
+/// The header of a split model from its shards, in order: the first
+/// shard's keys, with every shard's size and tensor table (each shard
+/// lists only its own tensors) folded in. A missing shard is an error:
+/// llama.cpp cannot load the model, and its size and tensor types would
+/// come out short.
+pub fn read_split_header(shards: &[PathBuf]) -> Result<GgufHeader> {
+    if let Some(missing) = shards.iter().find(|p| !p.is_file()) {
+        return Err(Error::io(
+            missing,
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "this part of a split model is missing, and llama.cpp needs every part",
+            ),
+        ));
+    }
+    let (first, rest) = shards.split_first().ok_or_else(|| Error::InvalidInput("a split model with no parts".into()))?;
+    let mut h = gguf::read_header(first)?;
+    h.fold_split_shards(rest.iter().map(|p| gguf::read_header(p)).collect::<Result<Vec<_>>>()?);
     Ok(h)
 }
 
@@ -522,13 +544,14 @@ fn load_model(files: ModelFiles, mmproj: &[PathBuf], drafts: &[PathBuf], sidecar
         .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .max();
-    let (header, header_error) = match (&files.problem, gguf::read_header(&files.path)) {
-        (Some(problem), _) => (None, Some(problem.clone())),
-        (None, Ok(mut h)) => {
-            h.file_size = file_size;
-            (Some(h), None)
-        }
-        (None, Err(e)) => (None, Some(e.to_string())),
+    let read = match &files.problem {
+        Some(problem) => Err(problem.clone()),
+        None if files.shards.is_empty() => gguf::read_header(&files.path).map_err(|e| e.to_string()),
+        None => read_split_header(&files.shards).map_err(|e| e.to_string()),
+    };
+    let (header, header_error) = match read {
+        Ok(h) => (Some(h), None),
+        Err(e) => (None, Some(e)),
     };
     let source = sidecar.and_then(|s| s.source_of(&files.path));
     Model {
@@ -645,6 +668,7 @@ pub fn write_source_sidecar(dir: &Path, repo: &str, sha: &str, files: &[crate::h
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gguf::testing::split_shard;
 
     #[test]
     fn version_parse_handles_semver_era_output() {
@@ -896,7 +920,9 @@ mod tests {
         std::fs::create_dir_all(&elsewhere).unwrap();
         let first = tiny_gguf("gemma4", None);
         std::fs::write(dir.join("gemma-4-26B-A4B-it-BF16-00001-of-00002.gguf"), &first).unwrap();
-        std::fs::write(dir.join("gemma-4-26B-A4B-it-BF16-00002-of-00002.gguf"), vec![7u8; 5000]).unwrap();
+        let mut second = split_shard(None, 1, 2, &[("blk.0.ffn_up.weight", 30)]);
+        second.resize(5000, 0); // the tensor data follows the header
+        std::fs::write(dir.join("gemma-4-26B-A4B-it-BF16-00002-of-00002.gguf"), &second).unwrap();
         std::fs::write(dir.join("gemma-4-26B-A4B-it-Q8_0-00001-of-00003.gguf"), &first).unwrap();
         std::fs::write(dir.join("gemma-4-26B-A4B-it-Q8_0-00003-of-00003.gguf"), vec![7u8; 10]).unwrap();
         std::fs::write(dir.join("gemma-4-26B-A4B-it-Q4_K_M.gguf"), &first).unwrap();
@@ -922,6 +948,7 @@ mod tests {
         let h = split.header.as_ref().unwrap();
         assert_eq!(h.file_size, split.file_size, "the estimate sees every shard");
         assert_eq!(h.architecture.as_deref(), Some("gemma4"));
+        assert_eq!(h.max_tensor_type(), Some(30), "the second shard's tensors count");
         assert!(
             split.mmproj_candidates.iter().any(|p| p.ends_with("mmproj-gemma-4-26B-A4B-it-F16.gguf")),
             "a split model pairs by its name before the shard number"
@@ -943,6 +970,54 @@ mod tests {
         assert_eq!(h.file_size, split.file_size);
         assert_eq!(read_model_header(&single.path).unwrap().file_size, first.len() as u64);
         assert_eq!(split_shards(&split.shards[1]), None, "only the first shard names the set");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Every shard lists only its own tensors, so a split model's highest
+    /// tensor type is the highest over every shard: here a fork-only type
+    /// in the last shard, and a first shard written with
+    /// `--no-tensor-first-split` that has no tensors at all. A missing
+    /// shard is an error, never a smaller model.
+    #[test]
+    fn split_models_read_every_shard() {
+        let root = std::env::temp_dir().join(format!("fidim-disc-shards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("o").join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shards = [
+            ("M-Q4_K_M-00001-of-00003.gguf", split_shard(Some("k2-horizon"), 0, 3, &[("token_embd.weight", 12)])),
+            ("M-Q4_K_M-00002-of-00003.gguf", split_shard(None, 1, 3, &[("blk.0.ffn_up.weight", 14)])),
+            ("M-Q4_K_M-00003-of-00003.gguf", split_shard(None, 2, 3, &[("blk.1.ffn_up.weight", 105), ("output.weight", 8)])),
+            ("N-00001-of-00002.gguf", split_shard(Some("llama"), 0, 2, &[])),
+            ("N-00002-of-00002.gguf", split_shard(None, 1, 2, &[("blk.0.attn_q.weight", 12)])),
+        ];
+        for (name, bytes) in &shards {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+
+        let models = scan_models(&[root.clone()]);
+        assert_eq!(models.len(), 2);
+        let m = &models[0];
+        let h = m.header.as_ref().unwrap_or_else(|| panic!("{:?}", m.header_error));
+        assert_eq!(h.max_tensor_type(), Some(105), "the last shard's type counts");
+        assert_eq!(h.tensor_count, 4);
+        assert_eq!(h.architecture.as_deref(), Some("k2-horizon"));
+        assert_eq!(h.file_size, shards[..3].iter().map(|(_, b)| b.len() as u64).sum::<u64>());
+        let h = models[1].header.as_ref().unwrap();
+        assert_eq!(h.max_tensor_type(), Some(12), "a tensor-free first shard");
+
+        // The launch path reads the same.
+        let first = dir.join(shards[0].0);
+        let h = read_model_header(&first).unwrap();
+        assert_eq!((h.max_tensor_type(), h.file_size), (Some(105), m.file_size));
+        // The first shard alone does not claim to know the model's types.
+        assert_eq!(gguf::read_header(&first).unwrap().max_tensor_type(), None);
+
+        std::fs::remove_file(dir.join(shards[1].0)).unwrap();
+        match read_model_header(&first) {
+            Err(Error::Io { path, .. }) => assert!(path.ends_with(shards[1].0), "{path:?}"),
+            other => panic!("{other:?}"),
+        }
         std::fs::remove_dir_all(root).ok();
     }
 

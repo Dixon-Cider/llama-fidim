@@ -216,7 +216,9 @@ These came from real failures on real hardware and are deliberate:
 - **A split model is one model.** A GGUF published in parts
   (`-00001-of-00003.gguf` ...) is listed once, at its first part, which is
   the file llama.cpp is given. Its VRAM estimate counts every part;
-  counting only the first would call a model that cannot fit a fit.
+  counting only the first would call a model that cannot fit a fit. Each
+  part lists its own tensors, so their types are read from every part
+  too, and pre-flight blocks a launch while any part is missing.
 - **The Updates tab leaves running servers alone.** Installing, promoting
   and rolling back change files and profiles only. The one process it
   starts is a brief `llama-server --list-devices` to confirm a new build's

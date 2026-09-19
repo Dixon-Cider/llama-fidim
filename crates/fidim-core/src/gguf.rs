@@ -211,9 +211,10 @@ pub struct GgufHeader {
     pub split_no: Option<u16>,
     #[serde(default)]
     pub split_count: Option<u16>,
-    /// The tensor-info table (`ReadMode::Full` only). Not serialized: a
-    /// model has hundreds to thousands of entries, and every scan result
-    /// carries its header. `max_tensor_type` is the summary callers need.
+    /// The tensor-info table (`ReadMode::Full` only): this file's, or once
+    /// `fold_split_shards` has run, every shard's. Not serialized: a model
+    /// has hundreds to thousands of entries, and every scan result carries
+    /// its header. `max_tensor_type` is the summary callers need.
     #[serde(skip)]
     pub tensors: Vec<TensorInfo>,
     /// Highest ggml type id among the tensors, kept beside the table so it
@@ -221,6 +222,12 @@ pub struct GgufHeader {
     /// tensors.
     #[serde(default)]
     pub max_tensor_type_id: Option<u32>,
+    /// The table holds one shard of a split set (`split.count` > 1): each
+    /// gguf-split shard lists only its own tensors, and a first shard
+    /// written with `--no-tensor-first-split` lists none, so the model's
+    /// tensor types are not known until `fold_split_shards` adds the rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tensor_types_partial: bool,
     /// Parsed in `ReadMode::UntilTokenizer`: the keys after the tokenizer
     /// and the tensor table are missing by design.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -253,11 +260,35 @@ impl GgufHeader {
         }
     }
 
-    /// Highest ggml tensor type id in the file: a build whose ggml has fewer
-    /// types (GGML_TYPE_COUNT) cannot load it. None when the tensor table was
-    /// not read (`ReadMode::UntilTokenizer`) or is empty.
+    /// Highest ggml tensor type id in the model: a build whose ggml has
+    /// fewer types (GGML_TYPE_COUNT) cannot load it. None = unknown: the
+    /// tensor table was not read (`ReadMode::UntilTokenizer`), is empty, or
+    /// is one shard's of a split set whose other shards were not folded in
+    /// (`tensor_types_partial`).
     pub fn max_tensor_type(&self) -> Option<u32> {
-        self.tensors.iter().map(|t| t.ggml_type).max().or(self.max_tensor_type_id)
+        if self.tensor_types_partial {
+            return None;
+        }
+        self.tensors.iter().map(|t| t.ggml_type).max().max(self.max_tensor_type_id)
+    }
+
+    /// Fold the rest of a split set into this header of its first shard:
+    /// `rest` is every other shard's header (read in `ReadMode::Full`), in
+    /// order. Their tensor tables join this one, and `tensor_count`,
+    /// `file_size` and `max_tensor_type` become the whole model's. The
+    /// types stay unknown if a shard is missing or was read only up to its
+    /// tokenizer.
+    pub fn fold_split_shards(&mut self, rest: Vec<GgufHeader>) {
+        let complete = !self.partial
+            && !rest.iter().any(|s| s.partial)
+            && self.split_count.is_none_or(|n| usize::from(n) == rest.len() + 1);
+        for s in rest {
+            self.file_size += s.file_size;
+            self.tensor_count += s.tensor_count;
+            self.max_tensor_type_id = self.max_tensor_type_id.max(s.max_tensor_type_id);
+            self.tensors.extend(s.tensors);
+        }
+        self.tensor_types_partial = !complete;
     }
 }
 
@@ -351,6 +382,7 @@ pub fn read_header_from<R: Read + Seek>(r: &mut R, file_size: u64, label: &Path,
         })
     };
     let split_u16 = |key: &str| metadata.get(key).and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok());
+    let split_count = split_u16("split.count");
 
     Ok(GgufHeader {
         path: label.to_path_buf(),
@@ -409,8 +441,9 @@ pub fn read_header_from<R: Read + Seek>(r: &mut R, file_size: u64, label: &Path,
         tokenizer_pre: string("tokenizer.ggml.pre"),
         rope_scaling_type: arch_val("rope.scaling.type").and_then(|v| v.as_str().map(String::from)),
         split_no: split_u16("split.no"),
-        split_count: split_u16("split.count"),
+        split_count,
         max_tensor_type_id: tensors.iter().map(|t| t.ggml_type).max(),
+        tensor_types_partial: mode == ReadMode::Full && split_count.is_some_and(|n| n > 1),
         tensors,
         partial,
         architecture: arch,
@@ -773,6 +806,44 @@ pub fn split_name(file_name: &str) -> Option<(&str, u32, u32)> {
     (no >= 1 && no <= count).then_some((prefix, no, count))
 }
 
+/// GGUF builders shared by the tests of the modules that read headers.
+#[cfg(test)]
+pub(crate) mod testing {
+    /// A gguf-split shard: `general.architecture` on the first only, the
+    /// `split.*` keys, and this shard's own tensor-info table of
+    /// (name, ggml type).
+    pub fn split_shard(arch: Option<&str>, no: u16, count: u16, tensors: &[(&str, u32)]) -> Vec<u8> {
+        fn key(out: &mut Vec<u8>, k: &str) {
+            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            out.extend_from_slice(k.as_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(2 + arch.is_some() as u64).to_le_bytes());
+        if let Some(arch) = arch {
+            key(&mut out, "general.architecture");
+            out.extend_from_slice(&8u32.to_le_bytes());
+            out.extend_from_slice(&(arch.len() as u64).to_le_bytes());
+            out.extend_from_slice(arch.as_bytes());
+        }
+        for (k, v) in [("split.no", no), ("split.count", count)] {
+            key(&mut out, k);
+            out.extend_from_slice(&2u32.to_le_bytes()); // u16
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for (name, ggml_type) in tensors {
+            key(&mut out, name);
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&64u64.to_le_bytes());
+            out.extend_from_slice(&ggml_type.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,15 +1115,24 @@ mod tests {
             full.tensors[1],
             TensorInfo { name: "blk.0.attn_q.weight".into(), ggml_type: 12, dims: vec![4096, 4096] }
         );
-        assert_eq!(full.max_tensor_type(), Some(14));
+        assert_eq!(full.max_tensor_type_id, Some(14));
+        // Shard 1 of 3: the other two list their own tensors.
+        assert!(full.tensor_types_partial);
+        assert_eq!(full.max_tensor_type(), None);
+        let mut whole = full.clone();
+        whole.fold_split_shards(vec![full.clone(), full.clone()]);
+        assert_eq!(whole.max_tensor_type(), Some(14));
 
         // The table is summarised, not serialised; the summary survives.
-        let json = serde_json::to_value(&full).unwrap();
+        let json = serde_json::to_value(&whole).unwrap();
         assert!(json.get("tensors").is_none());
         assert!(json.get("partial").is_none(), "only a partial read says so");
+        assert!(json.get("tensor_types_partial").is_none());
         let back: GgufHeader = serde_json::from_value(json).unwrap();
         assert!(back.tensors.is_empty());
         assert_eq!(back.max_tensor_type(), Some(14));
+        let back: GgufHeader = serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
+        assert_eq!(back.max_tensor_type(), None, "a lone shard stays unknown");
 
         let early =
             read_header_from(&mut std::io::Cursor::new(&bytes), size, label, ReadMode::UntilTokenizer).unwrap();
@@ -1129,6 +1209,41 @@ mod tests {
             }
             assert!(rounds < 10_000);
         }
+    }
+
+    /// A split set's shards each list their own tensors (the first can list
+    /// none): folded together they give the model's highest type, unless
+    /// a shard is missing or was read only up to its tokenizer.
+    #[test]
+    fn folding_split_shards() {
+        let shard = |no: u16, tensors: &[(&str, u32, &[u64])]| {
+            let bytes = synth_gguf_with_tensors(
+                &[("general.architecture", SynthVal::Str("k2-horizon")), ("split.no", SynthVal::U16(no)), ("split.count", SynthVal::U16(3))],
+                tensors,
+            );
+            let size = bytes.len() as u64 + 1000;
+            read_header_from(&mut std::io::Cursor::new(bytes), size, Path::new("s"), ReadMode::Full).unwrap()
+        };
+        let first = shard(0, &[]);
+        let second = shard(1, &[("blk.0.ffn_up.weight", 12, &[8, 8])]);
+        let third = shard(2, &[("blk.1.ffn_up.weight", 101, &[8, 8]), ("output.weight", 14, &[8])]);
+        assert!([&first, &second, &third].iter().all(|h| h.max_tensor_type().is_none()));
+
+        let mut h = first.clone();
+        h.fold_split_shards(vec![second.clone(), third.clone()]);
+        assert_eq!(h.max_tensor_type(), Some(101));
+        assert_eq!(h.tensor_count, 3);
+        assert_eq!(h.tensors.len(), 3);
+        assert_eq!(h.file_size, first.file_size + second.file_size + third.file_size);
+
+        let mut short = first.clone();
+        short.fold_split_shards(vec![second.clone()]);
+        assert_eq!(short.max_tensor_type(), None, "a shard is missing");
+        let mut early = third.clone();
+        early.partial = true;
+        let mut h = first;
+        h.fold_split_shards(vec![second, early]);
+        assert_eq!(h.max_tensor_type(), None, "a shard read only to its tokenizer");
     }
 
     /// A local file cut short is reported as truncated, not as an I/O error.

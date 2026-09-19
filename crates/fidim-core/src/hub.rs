@@ -793,6 +793,10 @@ fn auth_check_at(base: &str, token: Option<&str>, repo: &str) -> Result<()> {
 /// pre-tokenizer name), 1 MiB for `Full`, doubling on `GgufTruncated` up to
 /// 32 MiB. `file_size` is the file's size from the repo listing; the header
 /// reports it as `file_size` and names the file `hf://<repo>@<sha>/<path>`.
+///
+/// For one shard of a split set, the tensor table is that shard's alone
+/// and `max_tensor_type` stays None: read a split model with
+/// `remote_model_header`.
 pub fn remote_header(
     cfg: &Config,
     repo: &str,
@@ -804,6 +808,38 @@ pub fn remote_header(
     remote_header_at(&endpoint(), token(cfg).as_deref(), repo, sha, path, file_size, mode)
 }
 
+/// The header of a model published as `files`: a single file, or every
+/// shard of a split set in order (a catalog `Choice`'s `files`), with
+/// `file_size` the whole model's. In `Full` mode each later shard's header
+/// is read too, from 64 KiB up (it holds the `split.*` keys and that
+/// shard's tensor table), and folded in, so `max_tensor_type` covers every
+/// tensor of the model. `UntilTokenizer` reads the first file only.
+pub fn remote_model_header(cfg: &Config, repo: &str, sha: &str, files: &[RepoFile], mode: ReadMode) -> Result<GgufHeader> {
+    remote_model_header_at(&endpoint(), token(cfg).as_deref(), repo, sha, files, mode)
+}
+
+fn remote_model_header_at(
+    base: &str,
+    token: Option<&str>,
+    repo: &str,
+    sha: &str,
+    files: &[RepoFile],
+    mode: ReadMode,
+) -> Result<GgufHeader> {
+    let (first, rest) = files.split_first().ok_or_else(|| Error::InvalidInput("no model files to read".into()))?;
+    let mut h = read_remote_header(base, token, repo, sha, &first.path, first.size, mode, None)?;
+    if mode == ReadMode::Full && !rest.is_empty() {
+        let shards = rest
+            .iter()
+            .map(|f| read_remote_header(base, token, repo, sha, &f.path, f.size, mode, Some(UNTIL_TOKENIZER_FIRST)))
+            .collect::<Result<Vec<_>>>()?;
+        h.fold_split_shards(shards);
+    } else {
+        h.file_size = files.iter().map(|f| f.size).sum();
+    }
+    Ok(h)
+}
+
 fn remote_header_at(
     base: &str,
     token: Option<&str>,
@@ -813,17 +849,33 @@ fn remote_header_at(
     file_size: u64,
     mode: ReadMode,
 ) -> Result<GgufHeader> {
+    read_remote_header(base, token, repo, sha, path, file_size, mode, None)
+}
+
+/// `remote_header` with the first read's size (None: the mode's default).
+#[allow(clippy::too_many_arguments)]
+fn read_remote_header(
+    base: &str,
+    token: Option<&str>,
+    repo: &str,
+    sha: &str,
+    path: &str,
+    file_size: u64,
+    mode: ReadMode,
+    first_read: Option<u64>,
+) -> Result<GgufHeader> {
     validate_repo(repo)?;
     validate_repo_path(path)?;
     let url = resolve_url_at(base, repo, sha, path);
     let short: String = sha.chars().take(12).collect();
     let label = PathBuf::from(format!("hf://{repo}@{short}/{path}"));
     let cap = if file_size > 0 { HEADER_CAP.min(file_size) } else { HEADER_CAP };
-    let mut want = match mode {
-        ReadMode::UntilTokenizer => UNTIL_TOKENIZER_FIRST,
-        ReadMode::Full => FULL_FIRST,
-    }
-    .min(cap);
+    let mut want = first_read
+        .unwrap_or(match mode {
+            ReadMode::UntilTokenizer => UNTIL_TOKENIZER_FIRST,
+            ReadMode::Full => FULL_FIRST,
+        })
+        .min(cap);
     let agent = agent(API_READ_TIMEOUT);
     let what = format!("{repo}/{path}");
     let mut buf: Vec<u8> = Vec::new();
@@ -1304,6 +1356,64 @@ mod tests {
             assert!(validate_repo_path(p).is_err(), "{p:?}");
         }
         assert!(validate_repo_path("BF16/x-00001-of-00002.gguf").is_ok());
+    }
+
+    /// A split model's header covers every shard: the first (written with
+    /// `--no-tensor-first-split`, no tensors) and a later one carrying a
+    /// fork-only tensor type. One small Range read per later shard.
+    #[test]
+    fn remote_split_model_header_reads_every_shard() {
+        use crate::gguf::testing::split_shard;
+        let files: Arc<Vec<(String, Vec<u8>)>> = Arc::new(vec![
+            ("Q4/M-Q4_K_M-00001-of-00003.gguf".into(), split_shard(Some("k2-horizon"), 0, 3, &[])),
+            ("Q4/M-Q4_K_M-00002-of-00003.gguf".into(), split_shard(None, 1, 3, &[("blk.0.ffn_up.weight", 12)])),
+            ("Q4/M-Q4_K_M-00003-of-00003.gguf".into(), split_shard(None, 2, 3, &[("blk.1.ffn_up.weight", 107)])),
+        ]);
+        let f = files.clone();
+        let srv = Server::start("127.0.0.1", move |req| {
+            let path = req.path().strip_prefix("/o/r/resolve/abc/").unwrap_or("");
+            match f.iter().find(|(p, _)| p == path) {
+                Some((_, bytes)) => range_handler(Arc::new(bytes.clone()), true)(req),
+                None => Resp::new(404, "Entry not found").header("X-Error-Code", "EntryNotFound"),
+            }
+        })
+        .unwrap();
+        // Sizes as the listing gives them: gigabytes of tensor data follow
+        // each header (the server holds the headers alone).
+        let listed: Vec<RepoFile> = files
+            .iter()
+            .map(|(p, b)| RepoFile { path: p.clone(), size: b.len() as u64 + (4 << 30), sha256: None })
+            .collect();
+        let total: u64 = listed.iter().map(|f| f.size).sum();
+
+        let h = remote_model_header_at(&srv.base, None, "o/r", "abc", &listed, ReadMode::Full).unwrap();
+        assert_eq!(h.architecture.as_deref(), Some("k2-horizon"));
+        assert_eq!(h.max_tensor_type(), Some(107));
+        assert_eq!(h.file_size, total);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 3, "one read per shard");
+        assert_eq!(reqs[0].header("range"), Some("bytes=0-1048575"));
+        assert!(reqs[1..].iter().all(|r| r.header("range") == Some("bytes=0-65535")), "later shards start small");
+
+        // The first shard alone does not claim to know the model's types.
+        let one = remote_header_at(&srv.base, None, "o/r", "abc", &listed[0].path, listed[0].size, ReadMode::Full).unwrap();
+        assert_eq!(one.max_tensor_type(), None);
+        // UntilTokenizer reads the first shard only, sized as the whole set.
+        let n = srv.requests().len();
+        let early = remote_model_header_at(&srv.base, None, "o/r", "abc", &listed, ReadMode::UntilTokenizer).unwrap();
+        assert_eq!((early.file_size, early.max_tensor_type()), (total, None));
+        assert_eq!(srv.requests().len(), n + 1);
+        // A shard the repo does not have fails the read.
+        let mut gone = listed.clone();
+        gone[2].path = "Q4/elsewhere.gguf".into();
+        assert!(matches!(
+            remote_model_header_at(&srv.base, None, "o/r", "abc", &gone, ReadMode::Full),
+            Err(Error::Http { kind: HttpErrorKind::EntryNotFound, .. })
+        ));
+        assert!(matches!(
+            remote_model_header_at(&srv.base, None, "o/r", "abc", &[], ReadMode::Full),
+            Err(Error::InvalidInput(_))
+        ));
     }
 
     /// The token goes to the Hub and never to the CDN it redirects to.
