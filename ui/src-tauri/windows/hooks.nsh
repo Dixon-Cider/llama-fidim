@@ -7,6 +7,11 @@
 ;              files, write the uninstaller, registry and shortcuts, POSTINSTALL
 ;   Uninstall  PREUNINSTALL, close a running GUI, delete the files
 ;
+; Closing the GUI can stop the install: the user answers Cancel to Tauri's
+; prompt, or the GUI cannot be killed (it runs elevated). So PREINSTALL and
+; PREUNINSTALL run that same check first, before they change anything, and
+; Tauri's own check right after them finds nothing left to close.
+;
 ; Tauri closes only llama-fidim.exe (it terminates every copy the user runs).
 ; fidim.exe and fidim-dg.exe can be running as well, detached from the GUI:
 ; a DiffusionGemma server (fidim-dg.exe) holding a model in VRAM, or a
@@ -116,7 +121,7 @@
 
 ; Retire what scripts/install.ps1 put in ${OLDDIR}: its three executables,
 ; with running ones moved aside, and then the folder if nothing else is in
-; it. Runs after Tauri has closed the GUI, so only helpers can be running.
+; it. Runs after the GUI was closed, so only helpers can be running.
 !macro FIDIM_RETIRE_OLD_INSTALL OLDDIR
   ${If} ${FileExists} "${OLDDIR}\*.*"
     !insertmacro FIDIM_MOVE_ASIDE "${OLDDIR}" "fidim-dg.exe"
@@ -131,7 +136,29 @@
   ${EndIf}
 !macroend
 
+; The check Tauri runs right after PREINSTALL and PREUNINSTALL (its
+; utils.nsh): find the user's running GUI, ask to kill it (a silent or
+; passive run just kills it), and abort on Cancel or when it cannot be
+; killed. Its labels are numbered by the line the hook is inserted at, so
+; this copy does not collide with Tauri's in the same section.
+!macro FIDIM_CLOSE_APP
+  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+!macroend
+
+; On a first install Tauri's section creates $INSTDIR (SetOutPath) before
+; PREINSTALL, so an install stopped at the app check, or failed any other
+; way, would leave an empty folder behind. Remove it: RMDir without /r
+; removes a folder only when it is empty. SetOutPath also made it the
+; current directory, which Windows does not remove, so move out first.
+; (Tauri's template has no .onInstFailed; should a later one bring its
+; own, makensis stops at the duplicate.)
+Function .onInstFailed
+  SetOutPath $TEMP
+  RMDir "$INSTDIR"
+FunctionEnd
+
 !macro NSIS_HOOK_PREINSTALL
+  !insertmacro FIDIM_CLOSE_APP
   !insertmacro FIDIM_MOVE_ASIDE "$INSTDIR" "fidim-dg.exe"
   !insertmacro FIDIM_MOVE_ASIDE "$INSTDIR" "fidim.exe"
   ${If} "$INSTDIR" != "${FIDIM_OLD_INSTALL_DIR}"
@@ -146,6 +173,7 @@
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro FIDIM_CLOSE_APP
   !insertmacro FIDIM_MOVE_ASIDE "$INSTDIR" "fidim-dg.exe"
   !insertmacro FIDIM_MOVE_ASIDE "$INSTDIR" "fidim.exe"
 !macroend

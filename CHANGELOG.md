@@ -20,7 +20,8 @@ build with uncommitted changes.
   rights, installs into `%LOCALAPPDATA%\Llama FIDIM` with a Start Menu
   entry, and uninstalls from Settings > Apps. Installing, upgrading and
   uninstalling leave a running DiffusionGemma server or keep-alive helper
-  running, and never touch `~\.fidim`. It also retires the old
+  running, and never touch `~\.fidim`. Declining to close the app stops
+  them before anything has changed. It also retires the old
   `%LOCALAPPDATA%\Programs\LlamaFIDIM` install that `install.ps1` made.
 - `fidim path add|remove|status`: put the folder holding `fidim.exe` on the
   user PATH, take it off, or see what a new terminal would find. A long

@@ -80,9 +80,9 @@ welcome, and a report that includes your card, driver version and the
 it. It installs for your user only, without administrator rights, into
 `%LOCALAPPDATA%\Llama FIDIM`, adds a Start Menu entry, and registers an
 uninstaller under Settings > Apps. A newer version installs over the old
-one. Installing, upgrading or uninstalling closes the app's window but
-leaves a running DiffusionGemma server or keep-alive helper running, and
-never touches `~\.fidim`. The installer and the programs are not
+one. Installing, upgrading or uninstalling closes the app's window (answer
+Cancel and nothing is changed) but leaves a running DiffusionGemma server
+or keep-alive helper running, and never touches `~\.fidim`. The installer and the programs are not
 code-signed yet, so SmartScreen warns about an unknown publisher (More
 info, Run anyway), and Smart App Control, when it is on, may block them.
 
