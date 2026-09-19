@@ -350,11 +350,25 @@ fn show(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, gfx: Option<Str
     let ctx = view.fits.first().map(|f| f.ctx).unwrap_or(0);
     println!("estimates at context {ctx}, f16 KV; * = recommended");
     fits_table(&view.fits, view.recommended.as_deref(), &labels);
-    for (what, list) in [("projectors", &view.catalog.mmproj), ("drafts", &view.catalog.drafts)] {
-        if !list.is_empty() {
-            let names: Vec<String> = list.iter().map(|f| format!("{} ({})", safe(&f.path), gib(f.size))).collect();
-            println!("  {what}: {}", names.join(", "));
-        }
+    if !view.catalog.mmproj.is_empty() {
+        let names: Vec<String> = view.catalog.mmproj.iter().map(|f| format!("{} ({})", safe(&f.path), gib(f.size))).collect();
+        println!("  projectors: {}", names.join(", "));
+    }
+    if !view.catalog.drafts.is_empty() {
+        // Each with the speculative mode a profile would run it in.
+        let names: Vec<String> = view
+            .catalog
+            .drafts
+            .iter()
+            .map(|f| {
+                let mode = match view.draft_modes.get(&f.path) {
+                    Some(Some(m)) => m.clone(),
+                    _ => format!("{}, which profiles cannot run", fidim_core::profile::unsupported_draft_kind(&f.path)),
+                };
+                format!("{} ({}, {mode})", safe(&f.path), gib(f.size))
+            })
+            .collect();
+        println!("  drafts: {}", names.join(", "));
     }
     print_builds(&view.builds, view.needs.as_ref());
     match (&view.usable_build, &view.build_plan) {

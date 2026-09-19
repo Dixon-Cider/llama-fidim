@@ -303,11 +303,14 @@
             {#each v.catalog.mmproj as m}<option value={m.path}>{m.path} · {gib(m.size)}</option>{/each}
           </select>
         </label>
-        <label class="field" style="grid-column: span 2;" title="A draft model or MTP head for speculative decoding; the profile turns it on.">
+        <label class="field" style="grid-column: span 2;" title="A draft model, MTP head or DFlash draft for speculative decoding; the profile turns it on in that mode. EAGLE3 and DSpark heads need speculative types profiles do not have yet.">
           <span class="k">draft / MTP head</span>
           <select bind:value={wz.draft} disabled={!v.catalog.drafts.length}>
             <option value="">{v.catalog.drafts.length ? "none" : "none in this repo"}</option>
-            {#each v.catalog.drafts as d}<option value={d.path}>{d.path} · {gib(d.size)}</option>{/each}
+            {#each v.catalog.drafts as d}
+              {@const mode = v.draft_modes?.[d.path] ?? null}
+              <option value={d.path} disabled={!mode}>{d.path} · {gib(d.size)} · {mode ?? "not supported by profiles"}</option>
+            {/each}
           </select>
         </label>
         <label class="field" style="grid-column: span 2;" title="The new profile's context in tokens. Empty = the largest that fits one card, at most 32,768. Change it later in Profiles.">

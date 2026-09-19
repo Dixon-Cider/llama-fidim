@@ -810,6 +810,42 @@ fn plan_with_projector_draft_and_partial_downloads() {
     std::fs::remove_dir_all(&f.root).ok();
 }
 
+/// ggml-org/gpt-oss-20b-GGUF's layout: the model with an EAGLE3 head
+/// beside it (and, here, a DFlash draft and an MTP/ folder too).
+#[test]
+fn draft_heads_get_their_own_mode_or_are_refused() {
+    let mut f = Fake::supported("plan-heads");
+    f.info = info_with(
+        "ggml-org/gpt-oss-20b-GGUF",
+        &["gpt-oss-20b-mxfp4.gguf", "eagle3-gpt-oss-20b-Q8_0.gguf", "dflash-gpt-oss-20b-Q8_0.gguf", "MTP/gpt-oss-20b-head-Q8_0.gguf"],
+        None,
+        &[],
+    );
+    for s in &mut f.info.siblings {
+        s.size = if s.path.starts_with("gpt-oss") { 12_109_566_560 } else { 100 << 20 };
+    }
+    let cfg = f.cfg();
+    let view = inspect_with(&f, &cfg, "ggml-org/gpt-oss-20b-GGUF", None).unwrap();
+    assert_eq!(view.catalog.drafts.len(), 3, "{:?}", view.catalog.drafts);
+    assert_eq!(view.draft_modes.get("eagle3-gpt-oss-20b-Q8_0.gguf"), Some(&None));
+    assert_eq!(view.draft_modes.get("dflash-gpt-oss-20b-Q8_0.gguf"), Some(&Some("dflash".to_string())));
+    assert_eq!(view.draft_modes.get("MTP/gpt-oss-20b-head-Q8_0.gguf"), Some(&Some("mtp".to_string())));
+    // `--draft` with no name never picks the EAGLE3 head.
+    let choice = &view.catalog.choices[0];
+    assert_ne!(default_draft(&view.catalog, choice).map(|d| d.path.as_str()), Some("eagle3-gpt-oss-20b-Q8_0.gguf"));
+    // Asked for by name, it is refused.
+    let req = |d: &str| PlanRequest { draft: Some(d.into()), ..Default::default() };
+    let err = plan_with(&f, &cfg, &view, &req("eagle3-gpt-oss-20b-Q8_0.gguf")).unwrap_err().to_string();
+    assert!(err.contains("an EAGLE3 head") && err.contains("pick another draft"), "{err}");
+    // A DFlash draft gets draft-dflash; the head in MTP/ is MTP though its
+    // name, flattened on disk, does not say so.
+    let p = plan_with(&f, &cfg, &view, &req("dflash-gpt-oss-20b-Q8_0.gguf")).unwrap().profile.unwrap();
+    assert_eq!(p.speculative_effective().spec_type(), Some("draft-dflash"));
+    let p = plan_with(&f, &cfg, &view, &req("MTP/gpt-oss-20b-head-Q8_0.gguf")).unwrap().profile.unwrap();
+    assert_eq!(p.model.draft.as_ref().unwrap().path.file_name().unwrap(), "gpt-oss-20b-head-Q8_0.gguf");
+    assert_eq!(p.speculative.as_ref().unwrap().mode, "mtp");
+}
+
 #[test]
 fn plan_keeps_going_when_the_whole_header_cannot_be_read() {
     let mut f = Fake::supported("plan-nofull");

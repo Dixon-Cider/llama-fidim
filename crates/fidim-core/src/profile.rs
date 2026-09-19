@@ -466,6 +466,12 @@ pub struct NewProfileOpts {
     /// A draft or MTP head to decode speculatively with.
     #[serde(default)]
     pub draft: Option<PathBuf>,
+    /// The speculative mode for `draft` when the caller knows it (the
+    /// wizard reads it from the file's path in its repo, whose `MTP/`
+    /// folder the download flattens away); None = from the file name
+    /// (`draft_mode_of`).
+    #[serde(default)]
+    pub draft_mode: Option<String>,
     /// Stable keys of cards a running server holds: a new profile goes on
     /// an idle card when there is one.
     #[serde(default)]
@@ -479,6 +485,35 @@ pub struct NewProfileOpts {
     /// Free text for `notes`, e.g. where the model came from.
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+/// The speculative mode a draft file is for, from its path in a repo (or
+/// its file name): `dflash` for a DFlash draft, `mtp` for an MTP head
+/// (`mtp` in the name, or in an `MTP/` folder), `draft` for a separate
+/// small model. None for the heads llama-server runs with spec types a
+/// profile cannot name yet (EAGLE3: `draft-eagle3`, DSpark:
+/// `draft-dspark`): as `draft` they would be loaded as a standalone model,
+/// which they are not. Only the file name and folder names equal to `mtp`
+/// count, never a folder that merely contains the letters.
+pub fn draft_mode_of(path: &str) -> Option<&'static str> {
+    let segs: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let name = segs.last().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    let in_mtp_dir = segs.iter().rev().skip(1).any(|d| d.eq_ignore_ascii_case("mtp"));
+    if name.starts_with("eagle") || name.contains("eagle3") || name.contains("dspark") {
+        None
+    } else if name.contains("dflash") {
+        Some("dflash")
+    } else if in_mtp_dir || name.contains("mtp") {
+        Some("mtp")
+    } else {
+        Some("draft")
+    }
+}
+
+/// What the head `draft_mode_of` refuses is, for a message.
+pub fn unsupported_draft_kind(path: &str) -> &'static str {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+    if name.contains("dspark") { "a DSpark head" } else { "an EAGLE3 head" }
 }
 
 /// `K2-Horizon-7B-Q4_K_M` -> `k2-horizon-7b-q4-k-m`: lowercase letters,
@@ -586,11 +621,18 @@ pub fn new_for_model(
     let mmproj = if diffusion { None } else { opts.mmproj.clone().or_else(|| model.mmproj_candidates.first().cloned()) };
     let (draft, speculative) = match (&opts.draft, diffusion) {
         (Some(d), false) => {
-            let mode = if d.to_string_lossy().to_ascii_lowercase().contains("mtp") { "mtp" } else { "draft" };
-            (
-                Some(DraftRef { path: d.clone(), enabled: true }),
-                Some(Speculative { mode: mode.into(), n_max: None, n_min: None, p_min: None }),
-            )
+            // The file name only: the folders above are the model's, and a
+            // repo named "...mtp..." says nothing about this file.
+            let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mode = opts.draft_mode.clone().or_else(|| draft_mode_of(&name).map(String::from));
+            match mode {
+                Some(mode) => (
+                    Some(DraftRef { path: d.clone(), enabled: true }),
+                    Some(Speculative { mode, n_max: None, n_min: None, p_min: None }),
+                ),
+                // A head no mode runs: kept in the profile, switched off.
+                None => (Some(DraftRef { path: d.clone(), enabled: false }), None),
+            }
         }
         _ => (None, None),
     };
@@ -1688,6 +1730,47 @@ mod tests {
             let p = new_for_model(&cfg(), &m, &b, &cards(), &[], &plain);
             assert_eq!(p.speculative.as_ref().unwrap().mode, "draft");
             assert!(validate(&p).is_empty(), "{:?}", validate(&p));
+            let with = |draft: &str, mode: Option<&str>| {
+                let opts = NewProfileOpts { draft: Some(PathBuf::from(draft)), draft_mode: mode.map(String::from), ..Default::default() };
+                new_for_model(&cfg(), &m, &b, &cards(), &[], &opts)
+            };
+            // A folder named for MTP holds a plain draft: the file decides.
+            let p = with(r"E:\m\someone\qwen3-mtp-drafts\draft-qwen3-0.6b-Q8_0.gguf", None);
+            assert_eq!(p.speculative.as_ref().unwrap().mode, "draft");
+            // DFlash drafts get their own spec type.
+            let p = with(r"E:\m\g\dflash-gpt-oss-20b-Q8_0.gguf", None);
+            assert_eq!(p.speculative_effective().spec_type(), Some("draft-dflash"));
+            assert!(validate(&p).is_empty(), "{:?}", validate(&p));
+            // An EAGLE3 head is not a draft model: kept, switched off.
+            for head in [r"E:\m\g\eagle3-gpt-oss-20b-Q8_0.gguf", r"E:\m\g\dspark-qwen3-8b.gguf"] {
+                let p = with(head, None);
+                assert!(p.speculative.is_none(), "{head}");
+                assert!(!p.model.draft.as_ref().unwrap().enabled, "{head}");
+                assert_eq!(p.speculative_effective().spec_type(), None, "{head}");
+            }
+            // The caller's mode wins (an MTP/ folder flattened away).
+            let p = with(r"E:\m\g\gemma-4-26B-A4B-it-Q8_0-head.gguf", Some("mtp"));
+            assert_eq!(p.speculative.as_ref().unwrap().mode, "mtp");
+        }
+
+        #[test]
+        fn draft_modes_by_name() {
+            for (path, mode) in [
+                ("MTP/gemma-4-26B-A4B-it-Q8_0.gguf", Some("mtp")),
+                ("mtp-gemma-4-26B-A4B-it.gguf", Some("mtp")),
+                (r"E:\m\u\g\MTP\mtp-x.gguf", Some("mtp")),
+                ("draft-qwen3-0.6b-Q8_0.gguf", Some("draft")),
+                ("mtp-things/draft-qwen3.gguf", Some("draft")),
+                ("dflash-qwen3-8b-Q8_0.gguf", Some("dflash")),
+                ("Qwen3-8B-DFlash-b16.gguf", Some("dflash")),
+                ("eagle3-gpt-oss-20b-Q8_0.gguf", None),
+                ("EAGLE3/llama-3.1-8b-eagle3-f16.gguf", None),
+                ("dspark-qwen3-8b.gguf", None),
+            ] {
+                assert_eq!(draft_mode_of(path), mode, "{path}");
+            }
+            assert_eq!(unsupported_draft_kind("eagle3-x.gguf"), "an EAGLE3 head");
+            assert_eq!(unsupported_draft_kind("x/dspark-x.gguf"), "a DSpark head");
         }
 
         #[test]

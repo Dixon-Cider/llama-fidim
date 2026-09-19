@@ -81,9 +81,30 @@ const REPOS = {
     ignored: [[file("imatrix_unsloth.gguf_file", 56941536), "importance matrix (quantizer input, not a model)"]],
     supported: true,
   },
+  "ggml-org/gpt-oss-20b-GGUF": {
+    sha: hex(9, 40), arch: "gpt-oss", pre: null, ctx: 131072, layers: 24, kv: 49152, params: 20914757184,
+    downloads: 98110, likes: 160, modified: "2026-08-05T10:12:40.000Z", license: "apache-2.0", pipeline: "text-generation",
+    base: [["quantized", "openai/gpt-oss-20b"]], library: null,
+    files: [{ label: "MXFP4", files: [file("gpt-oss-20b-mxfp4.gguf", 12109566560)] }],
+    // An EAGLE3 head: llama-server's draft-eagle3, which profiles cannot name yet.
+    drafts: [file("eagle3-gpt-oss-20b-Q8_0.gguf", 937560064, 5)],
+    ignored: [],
+    supported: true,
+  },
   "IFM/K2-Horizon-7B": { kind: "safetensors", sha: hex(7, 40), downloads: 2210, likes: 77, license: "apache-2.0", library: "transformers" },
   "IFM/K2-Horizon-7B-Uno": { kind: "adapter", sha: hex(8, 40), downloads: 120, likes: 9, license: "apache-2.0", library: "peft", base: [["adapter", "IFM/K2-Horizon-7B"]] },
 };
+
+/// A draft's speculative mode, as core's profile::draft_mode_of: null for
+/// the heads profiles cannot run (EAGLE3, DSpark).
+function draftMode(path) {
+  const segs = String(path).split(/[\\/]/).filter(Boolean);
+  const name = (segs.at(-1) ?? "").toLowerCase();
+  if (name.startsWith("eagle") || name.includes("eagle3") || name.includes("dspark")) return null;
+  if (name.includes("dflash")) return "dflash";
+  if (segs.slice(0, -1).some((d) => d.toLowerCase() === "mtp") || name.includes("mtp")) return "mtp";
+  return "draft";
+}
 
 const EXTRA_HITS = [
   ["IFM/K2-Horizon-32B-GGUF", "k2-horizon", 34779304960, 612, 31], ["IFM/K2-Horizon-0.9B-GGUF", "k2-horizon", 1078285824, 1480, 22],
@@ -200,6 +221,7 @@ export function createWizardMock(ctx) {
     const base = {
       input, repo: id, sha: r.sha, rev: null, info: info(id, r), catalog: catalog(r), notes: [], derivatives: [], derivatives_of: null,
       header: null, header_of: null, header_error: null, needs: null, preselect: null, devices: ctx.devices(), fits: [], recommended: null,
+      draft_modes: Object.fromEntries((r.drafts ?? []).map((f) => [f.path, draftMode(f.path)])),
       builds: [], usable_build: null, build_plan: null, build_sources: [], model_roots: roots.map((x) => ({ ...x })),
     };
     if (r.kind === "safetensors" || r.kind === "adapter") {
@@ -276,6 +298,7 @@ export function createWizardMock(ctx) {
     if (!choice) throw `${v.repo} has no file ${JSON.stringify(label)}`;
     const mmproj = req.mmproj ? v.catalog.mmproj.find((f) => f.path === req.mmproj) : null;
     const draft = req.draft ? v.catalog.drafts.find((f) => f.path === req.draft) : null;
+    if (draft && !draftMode(draft.path)) throw `${draft.path} is an EAGLE3 head: llama-server runs it with a speculative type profiles do not have yet, and as a plain draft model it would not load; pick another draft, or none`;
     const rootPath = req.dest_root ?? roots[0].path;
     const root = roots.find((x) => x.path.toLowerCase() === String(rootPath).toLowerCase()) ?? { path: rootPath, free_bytes: null };
     const [owner, name] = v.repo.split("/");
@@ -372,7 +395,7 @@ export function createWizardMock(ctx) {
         split_mode: devs.length > 1 ? "layer" : null, main_device: 0,
         server: { port, alias: id, host: "127.0.0.1" },
         runtime: { n_gpu_layers: 99, ctx_total: Math.floor(Math.min(ctxWant, r.ctx) / 256) * 256, slots: 1, kv_type_k: "f16", kv_type_v: "f16", flash_attn: "on", batch_logical: 2048, batch_physical: 512, cont_batching: true, kv_unified: false, cache_reuse: null },
-        sampling: {}, speculative: draft ? { mode: /mtp/i.test(draft.path) ? "mtp" : "draft" } : undefined, chat: {}, env: {},
+        sampling: {}, speculative: draft ? { mode: draftMode(draft.path) } : undefined, chat: {}, env: {},
         notes: `From ${v.repo} at ${v.sha.slice(0, 7)} (${choice.label}), by the model wizard.`,
       };
       steps.push({

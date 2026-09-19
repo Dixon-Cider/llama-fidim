@@ -22,7 +22,7 @@
 //! Every side effect goes through `Env`, so the orchestration is tested
 //! with fakes and no network; `LiveEnv` is the real machine.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -229,6 +229,10 @@ pub struct RepoView {
     pub needs: Option<ModelNeeds>,
     /// The choice a pasted file URL named.
     pub preselect: Option<String>,
+    /// Each draft's speculative mode (`mtp`, `draft`, `dflash`) by its
+    /// repo path; None for a head profiles cannot run (EAGLE3, DSpark).
+    #[serde(default)]
+    pub draft_modes: BTreeMap<String, Option<String>>,
     /// This machine's GPUs, as the estimates saw them.
     pub devices: Vec<Device>,
     pub fits: Vec<ChoiceFit>,
@@ -1102,14 +1106,16 @@ pub fn default_mmproj(cat: &Catalog) -> Option<&RepoFile> {
 }
 
 /// The draft to take when the user asks for one without naming it: one
-/// named for the chosen quant, else a Q8_0 one, else the smallest.
+/// named for the chosen quant, else a Q8_0 one, else the smallest; never a
+/// head profiles cannot run (`profile::draft_mode_of`).
 pub fn default_draft<'a>(cat: &'a Catalog, choice: &Choice) -> Option<&'a RepoFile> {
     let lower = |f: &RepoFile| f.name().to_ascii_lowercase();
     let quant = choice.quant.as_deref().map(str::to_ascii_lowercase);
+    let usable = || cat.drafts.iter().filter(|f| profile::draft_mode_of(&f.path).is_some());
     quant
-        .and_then(|q| cat.drafts.iter().find(|f| lower(f).contains(&q)))
-        .or_else(|| cat.drafts.iter().find(|f| lower(f).contains("q8_0")))
-        .or_else(|| cat.drafts.iter().min_by_key(|f| f.size))
+        .and_then(|q| usable().find(|f| lower(f).contains(&q)))
+        .or_else(|| usable().find(|f| lower(f).contains("q8_0")))
+        .or_else(|| usable().min_by_key(|f| f.size))
 }
 
 fn root_infos(cfg: &Config) -> Vec<RootInfo> {
@@ -1195,6 +1201,7 @@ pub fn inspect_with(env: &dyn Env, cfg: &Config, input: &str, rev: Option<&str>)
     let sha = info.sha.clone();
     let catalog = catalog::classify(&info.siblings);
     let kind = repo_kind(&info, &catalog);
+    let draft_modes = catalog.drafts.iter().map(|f| (f.path.clone(), profile::draft_mode_of(&f.path).map(String::from))).collect();
     let mut notes: Vec<Note> = Vec::new();
     let mut view = RepoView {
         input: input.trim().to_string(),
@@ -1212,6 +1219,7 @@ pub fn inspect_with(env: &dyn Env, cfg: &Config, input: &str, rev: Option<&str>)
         header_error: None,
         needs: None,
         preselect: None,
+        draft_modes,
         devices: Vec::new(),
         fits: Vec::new(),
         recommended: None,
@@ -1761,6 +1769,23 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
     };
     let mmproj = aux(&req.mmproj, &view.catalog.mmproj, "projector")?;
     let draft = aux(&req.draft, &view.catalog.drafts, "draft")?;
+    // The mode comes from the file's place in the repo: the download
+    // flattens an `MTP/` folder away. A head no profile mode runs is
+    // refused rather than set up as a draft model it is not.
+    let draft_mode = match &draft {
+        Some(f) => Some(
+            profile::draft_mode_of(&f.path)
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "{} is {}: llama-server runs it with a speculative type profiles do not have yet, and as                          a plain draft model it would not load; pick another draft, or none",
+                        f.path,
+                        profile::unsupported_draft_kind(&f.path)
+                    ))
+                })?
+                .to_string(),
+        ),
+        None => None,
+    };
     let dest_root = req
         .dest_root
         .clone()
@@ -1961,6 +1986,7 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
         split,
         mmproj: mmproj_dest.clone(),
         draft: draft_dest.clone(),
+        draft_mode,
         busy_cards: env.busy_cards(),
         taken_ports: env.taken_ports(),
         name: None,
