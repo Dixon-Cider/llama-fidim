@@ -182,6 +182,11 @@ build with uncommitted changes.
 
 ### Fixed
 
+- `fidim router show` renders the preset with the router's build, the one
+  `fidim router launch` uses. It used the newest build, whose device
+  numbering can differ: a local gfx1201-only build has no iGPU entry, so
+  the preview said `device = ROCm2` for a card the launch correctly
+  passed as `ROCm1`.
 - Radio buttons in the app (the diffusion engine's card picker) are drawn
   at the size of the checkboxes, not as full-width inputs.
 - `fidim scan` named quantizations after the wrong table: IQ4_XS files

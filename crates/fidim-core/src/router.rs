@@ -420,6 +420,20 @@ mod tests {
     }
 
     #[test]
+    fn device_index_follows_the_builds_enumeration() {
+        // The same card is ROCm2 to a build that also lists the iGPU and
+        // ROCm1 to a gfx1201-only local build. The preset must carry the
+        // index of whichever build renders it, never a cached one.
+        let rc = RouterConfig { members: vec![RouterMember { profile_id: "dd".into(), load_on_startup: true }], ..Default::default() };
+        let with_igpu = render_ini(&rc, &[profile()], &[dev(0, "pci:x:bus08"), dev(1, "pci:igpu:bus19"), dev(2, "pci:x:bus03")]).unwrap();
+        let local_only = render_ini(&rc, &[profile()], &[dev(0, "pci:x:bus08"), dev(1, "pci:x:bus03")]).unwrap();
+        assert!(with_igpu.text.contains("device = ROCm2"), "{}", with_igpu.text);
+        assert!(!with_igpu.text.contains("device = ROCm1"), "{}", with_igpu.text);
+        assert!(local_only.text.contains("device = ROCm1"), "{}", local_only.text);
+        assert!(!local_only.text.contains("device = ROCm2"), "{}", local_only.text);
+    }
+
+    #[test]
     fn unknown_member_is_an_error() {
         let rc = RouterConfig { members: vec![RouterMember { profile_id: "nope".into(), load_on_startup: false }], ..Default::default() };
         assert!(render_ini(&rc, &[profile()], &[]).is_err());

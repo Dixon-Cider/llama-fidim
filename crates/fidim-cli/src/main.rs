@@ -1702,6 +1702,16 @@ fn cmd_bench(
 /// baseline for the export acceptance test.
 // ---------------------------------------------------------------- router ----
 
+/// The build the router runs on: its configured one, else the newest
+/// installed upstream build. Show and Launch must agree on this, because
+/// the `device = ROCmN` a preset carries is that build's enumeration.
+fn router_build_dir(rc: &fidim_core::router::RouterConfig, builds: &[Build]) -> anyhow::Result<PathBuf> {
+    Ok(match &rc.build {
+        Some(b) => b.clone(),
+        None => fidim_core::update::newest_installed(builds).context("no installed build")?.path,
+    })
+}
+
 fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
     use fidim_core::router::{self, RouterMember};
     let mut rc = router::load_config()?;
@@ -1710,8 +1720,11 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
             let profiles = Profile::load_all(&cfg.profile_dir)?;
             let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
             let platform = WindowsPlatform;
-            let exe = pick_build(&builds, None)?.server_exe.clone();
-            let devices = launch::enumerate_devices(cfg, &exe, &platform)?;
+            // Same build as Launch: device indices are per build (a local
+            // gfx1201-only build has no iGPU entry), so a preview rendered
+            // with any other build shows the wrong `device = ROCmN`.
+            let build_dir = router_build_dir(&rc, &builds)?;
+            let devices = launch::enumerate_devices(cfg, &build_dir.join("bin").join("llama-server.exe"), &platform)?;
             let ini = router::render_ini(&rc, &profiles, &devices);
             if json {
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "config": rc, "ini": ini.as_ref().map(|r| r.text.clone()).ok() }))?);
@@ -1751,10 +1764,7 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
         RouterCmd::Launch { ready_timeout } => {
             let profiles = Profile::load_all(&cfg.profile_dir)?;
             let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-            let build_dir = match &rc.build {
-                Some(b) => b.clone(),
-                None => fidim_core::update::newest_installed(&builds).context("no installed build")?.path,
-            };
+            let build_dir = router_build_dir(&rc, &builds)?;
             let platform = WindowsPlatform;
             let devices = launch::enumerate_devices(cfg, &build_dir.join("bin").join("llama-server.exe"), &platform)?;
             let r = router::launch(cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(ready_timeout))?;
