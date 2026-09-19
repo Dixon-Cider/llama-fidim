@@ -5,6 +5,7 @@
 
 pub mod bench;
 pub mod build_info;
+pub mod catalog;
 pub mod config;
 pub mod devices;
 pub mod diffusion;
