@@ -539,9 +539,10 @@ fn verify_existing(
     Ok(len)
 }
 
-/// Rename the verified `.part` over `dest`. An antivirus scanner that
-/// opened the fresh file can hold it for a moment: retry briefly.
-fn rename_into_place(part: &Path, dest: &Path) -> Result<()> {
+/// Rename a freshly written file (a verified `.part`, a temporary file)
+/// over `dest`. An antivirus scanner that opened it can hold it for a
+/// moment: retry briefly.
+pub(crate) fn rename_into_place(part: &Path, dest: &Path) -> Result<()> {
     let mut last = None;
     for i in 0..5 {
         match std::fs::rename(part, dest) {

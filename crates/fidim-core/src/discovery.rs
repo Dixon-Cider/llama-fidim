@@ -626,12 +626,24 @@ pub fn model_source(path: &Path) -> Option<ModelSource> {
     read_source_sidecar(path.parent()?)?.source_of(path)
 }
 
+/// Serializes sidecar updates within this process (see `SidecarLock` for
+/// other processes).
+static SIDECAR_WRITERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Record that `files` of `repo` at commit `sha` were downloaded into
 /// `dir`. Entries for other files of the same repo are kept (one folder
 /// collects several quants over time); a sidecar naming another repo is
 /// replaced. Written to a temporary file and renamed, so a reader never
 /// sees half of it.
+///
+/// Safe to call from parallel downloads into one folder: updates run one
+/// at a time (in this process, and on Windows across processes), so none
+/// writes the old record over another's file.
 pub fn write_source_sidecar(dir: &Path, repo: &str, sha: &str, files: &[crate::hub::RepoFile]) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    // A panic elsewhere while holding it leaves nothing half-done here.
+    let _in_process = SIDECAR_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let _across = SidecarLock::acquire(dir)?;
     let mut kept: Vec<SourceFile> = match read_source_sidecar(dir) {
         Some(old) if old.repo == repo => {
             let old_sha = old.sha.clone();
@@ -658,11 +670,65 @@ pub fn write_source_sidecar(dir: &Path, repo: &str, sha: &str, files: &[crate::h
     }
     kept.sort_by(|a, b| a.path.cmp(&b.path));
     let sidecar = SourceSidecar { repo: repo.to_string(), sha: sha.to_string(), files: kept };
-    std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     let path = dir.join(SOURCE_SIDECAR);
-    let tmp = dir.join(format!("{SOURCE_SIDECAR}.tmp"));
+    // Named for this process: where no lock spans processes, two writers
+    // never share (and truncate) one temporary file.
+    let tmp = dir.join(format!("{SOURCE_SIDECAR}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, serde_json::to_string_pretty(&sidecar)?).map_err(|e| Error::io(&tmp, e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))
+    crate::fetch::rename_into_place(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// `fidim-source.json.lock` in the folder, held while this process updates
+/// the sidecar. On Windows it is opened with no sharing, so another
+/// process's open fails until this one closes it, which also happens if
+/// the process dies; it is removed afterwards unless another writer
+/// already holds it. Elsewhere this is a no-op (the in-process mutex
+/// still applies).
+struct SidecarLock {
+    #[cfg(windows)]
+    file: Option<std::fs::File>,
+    #[cfg(windows)]
+    path: PathBuf,
+}
+
+impl SidecarLock {
+    #[cfg(windows)]
+    fn acquire(dir: &Path) -> Result<SidecarLock> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let path = dir.join(format!("{SOURCE_SIDECAR}.lock"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(&path) {
+                Ok(file) => return Ok(SidecarLock { file: Some(file), path }),
+                // Held by another writer, or being deleted by the last one.
+                Err(e)
+                    if matches!(e.raw_os_error(), Some(ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED))
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => return Err(Error::io(&path, e)),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn acquire(_dir: &Path) -> Result<SidecarLock> {
+        Ok(SidecarLock {})
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SidecarLock {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        // Fails, harmlessly, when another writer opened it in between.
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[cfg(test)]
@@ -1021,6 +1087,71 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Downloads finishing together (the shards of one split set, say)
+    /// each record their file; none is lost and the record stays whole.
+    #[test]
+    fn concurrent_sidecar_writes_keep_every_file() {
+        use crate::hub::RepoFile;
+        let dir = std::env::temp_dir().join(format!("fidim-disc-sidecar-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 12u32;
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (1..=n)
+                .map(|i| {
+                    let dir = &dir;
+                    s.spawn(move || {
+                        let f = RepoFile { path: format!("M-{i:05}-of-{n:05}.gguf"), size: i as u64, sha256: None };
+                        write_source_sidecar(dir, "o/r", "sha1", &[f])
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap().unwrap();
+            }
+        });
+        let s = read_source_sidecar(&dir).expect("a whole sidecar");
+        assert_eq!(s.files.len(), n as usize, "{:?}", s.files.iter().map(|f| &f.path).collect::<Vec<_>>());
+        let tmp: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(tmp.is_empty(), "{tmp:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Another process updating the same sidecar (its lock file open with
+    /// no sharing) is waited for.
+    #[cfg(windows)]
+    #[test]
+    fn sidecar_writes_wait_for_another_process() {
+        use crate::hub::RepoFile;
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("fidim-disc-sidecar-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(dir.join(format!("{SOURCE_SIDECAR}.lock")))
+            .unwrap();
+        std::thread::scope(|s| {
+            let writer = s.spawn(|| {
+                let f = RepoFile { path: "m.gguf".into(), size: 1, sha256: None };
+                write_source_sidecar(&dir, "o/r", "sha1", &[f])
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!dir.join(SOURCE_SIDECAR).exists(), "written while another process held the lock");
+            drop(held);
+            writer.join().unwrap().unwrap();
+        });
+        assert_eq!(read_source_sidecar(&dir).unwrap().files.len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn source_sidecar_round_trip() {
         use crate::hub::RepoFile;
@@ -1032,7 +1163,7 @@ mod tests {
         std::fs::write(&model, tiny_gguf("k2-horizon", None)).unwrap();
         let q4 = RepoFile { path: "K2-Horizon-7B-Q4_K_M.gguf".into(), size: 5, sha256: Some("aa".repeat(32)) };
         write_source_sidecar(&dir, "ngquocvinh/K2-Horizon-7B-GGUF", "sha1", std::slice::from_ref(&q4)).unwrap();
-        assert!(!dir.join(format!("{SOURCE_SIDECAR}.tmp")).exists());
+        assert!(!dir.join(format!("{SOURCE_SIDECAR}.{}.tmp", std::process::id())).exists());
 
         let models = scan_models(&[root.clone()]);
         let src = models[0].source.as_ref().unwrap();
