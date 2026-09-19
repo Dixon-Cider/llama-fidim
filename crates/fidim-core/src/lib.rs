@@ -6,6 +6,7 @@
 pub mod bench;
 pub mod build_info;
 pub mod catalog;
+pub mod chat;
 pub mod compat;
 pub mod config;
 pub mod devices;

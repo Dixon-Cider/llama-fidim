@@ -53,6 +53,19 @@ welcome, and a report that includes your card, driver version and the
   the text it is generating, with a detector for endless loops.
 
   ![A slot caught looping: the tile reads "loop x8", the drawer shows the repeated fragment](docs/loop.png)
+- **Chat.** Talk to any server Llama FIDIM started, a router model (it
+  loads on the first message) or a DiffusionGemma run. Replies stream in
+  with their reasoning folded away, prefill progress, decode speed and
+  draft acceptance, and Stop frees the slot at once. A DiffusionGemma
+  reply shows its block denoising beside the text and can be replayed
+  afterwards. Each conversation can override the system prompt, thinking
+  and sampler (every field shows the server's own default), and a profile
+  can keep those as the default for new chats. A profile's API key
+  (`--api-key`, `--api-key-file` or their environment variables) is sent
+  by the app; the page never holds it. Conversations are saved on this PC
+  as plain JSON; Settings turns that off. **Copy endpoint** in Running
+  hands the OpenAI base URL, model id and ready-to-paste snippets
+  (PowerShell, cmd, Git Bash, Python) to other programs.
 - **Updates that leave running servers alone.** llama.cpp releases install
   side by side with a changelog of what changed since your build. ROCm
   runtimes install the same way from AMD's release and nightly channels,
@@ -71,7 +84,8 @@ welcome, and a report that includes your card, driver version and the
 - **Benchmarks.** Serial and concurrent decode sweeps against a running
   server, stored per profile as its baseline.
 - **Nearly everything the GUI does, the `fidim` CLI does too.** The live
-  slot text and the profile editor are GUI only; profiles are plain JSON.
+  slot text, the profile editor and the chat are GUI only; profiles are
+  plain JSON.
 
 ## Requirements
 
@@ -124,8 +138,9 @@ each release changed.
    **Save & load**. The Running tab shows it come up.
 
 Everything lives under `~\.fidim`: `config.json`, `profiles\*.json`,
-run state and logs under `runs\`, and the router preset. All of it is plain
-JSON you can edit by hand.
+run state and logs under `runs\`, the router preset, and saved chats under
+`chats\` (with per-profile chat defaults in `chat\presets.json`). All of it
+is plain JSON you can edit by hand.
 
 For gated Hugging Face repos (Gemma, Llama), the app sends a token from
 `HF_TOKEN`, the file `HF_TOKEN_PATH` names, or the token in Settings. To
@@ -265,14 +280,26 @@ These came from real failures on real hardware and are deliberate:
   hour without a token, so answers are cached; `github_token` in
   `config.json` (or `GITHUB_TOKEN`) raises that to 5000, and a token GitHub
   rejects is dropped after one request instead of failing every lookup.
+- **The chat streams from the app, not from the page.** A reply is
+  untrusted text shown in a window that can start and stop servers, so the
+  page never talks to a server itself: the Rust side does, for runs Llama
+  FIDIM started only, and passes the stream over a per-request channel.
+  Replies are rendered as markdown with raw HTML off, sanitized again, and
+  shown under a content security policy; links open in your browser only
+  when you choose Open.
+- **Stop on a DiffusionGemma reply frees the chat, not the GPU.** The
+  runner cannot abandon a request halfway, so it finishes the reply in the
+  background and the next message queues behind it. A request stopped
+  while still queued is skipped: fidim-dg checks a queued request's
+  connection four times a second.
 
 ## Layout
 
 ```
 crates/fidim-core   discovery, GGUF headers, devices, VRAM estimate, pre-flight,
                     launch, supervision, router, live view, updates, ROCm runtimes,
-                    the DiffusionGemma server, the Hugging Face Hub client and
-                    resumable downloads
+                    the DiffusionGemma server, the Hugging Face Hub client,
+                    resumable downloads and the chat's streaming client
 crates/fidim-cli    the fidim and fidim-dg binaries
 ui/                 Tauri 2 + Svelte 5 desktop app
 scripts/            install.ps1, build-from-tag.bat (source builds of a release),
@@ -281,7 +308,7 @@ scripts/            install.ps1, build-from-tag.bat (source builds of a release)
 packaging/          dg-overlay: the DiffusionGemma runner patch, and the scripts and
                     workflow that build it as an overlay for each Unsloth release
 fixtures/           captured --list-devices / hipInfo / WMI output, Hugging Face and
-                    GitHub API responses, a GGUF header prefix, an overlay
+                    GitHub API responses, server responses, a GGUF header prefix, an overlay
                     descriptor and llama.cpp table excerpts, used by tests
 ```
 

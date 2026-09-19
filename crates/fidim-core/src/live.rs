@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::supervise::http_get;
+use crate::supervise::http_get_auth;
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -199,14 +199,20 @@ pub struct LiveSample {
     pub error: Option<String>,
 }
 
-fn query(path: &str, model: Option<&str>) -> String {
+/// A path on a server, or on one model behind a router. `autoload=false`:
+/// a poll must never load a model. The router's list may say "loaded" and
+/// an agent's request evict it a moment later; with the router's default
+/// (autoload on) a `?model=` GET would then load it again, on GPUs other
+/// work is using. With it off the router answers an error instead.
+pub(crate) fn query(path: &str, model: Option<&str>) -> String {
     match model {
-        Some(m) => format!("{path}?model={}", urlencode(m)),
+        Some(m) => format!("{path}?model={}&autoload=false", urlencode(m)),
         None => path.to_string(),
     }
 }
 
-fn urlencode(s: &str) -> String {
+/// Percent-encode a query value (router model ids carry `/` and `:`).
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -219,10 +225,15 @@ fn urlencode(s: &str) -> String {
 
 /// One poll of a server (or one model behind a router).
 pub fn sample(host: &str, port: u16, model: Option<&str>) -> LiveSample {
+    sample_with_key(host, port, model, None)
+}
+
+/// `sample` for a server that requires an API key (`chat::api_key`).
+pub fn sample_with_key(host: &str, port: u16, model: Option<&str>, api_key: Option<&str>) -> LiveSample {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let mut out = LiveSample { model: model.map(str::to_string), sampled_unix_ms: now, slots: vec![], phase: "idle".into(), metrics: BTreeMap::new(), error: None };
     let t = Duration::from_secs(3);
-    match http_get(host, port, &query("/slots", model), t) {
+    match http_get_auth(host, port, &query("/slots", model), t, api_key) {
         Ok((200, body)) => match parse_slots(&body) {
             Ok(s) => out.slots = s,
             Err(e) => out.error = Some(format!("slots: {e}")),
@@ -230,7 +241,7 @@ pub fn sample(host: &str, port: u16, model: Option<&str>) -> LiveSample {
         Ok((code, _)) => out.error = Some(format!("/slots HTTP {code}")),
         Err(e) => out.error = Some(format!("/slots: {e}")),
     }
-    if let Ok((200, body)) = http_get(host, port, &query("/metrics", model), t) {
+    if let Ok((200, body)) = http_get_auth(host, port, &query("/metrics", model), t, api_key) {
         out.metrics = parse_metrics(&body);
     }
     out.phase = if out.slots.iter().any(|s| s.phase == "decode") {
@@ -304,7 +315,7 @@ mod tests {
 
     #[test]
     fn router_query_is_encoded() {
-        assert_eq!(query("/slots", Some("unsloth/x:Q4")), "/slots?model=unsloth%2Fx%3AQ4");
+        assert_eq!(query("/slots", Some("unsloth/x:Q4")), "/slots?model=unsloth%2Fx%3AQ4&autoload=false");
         assert_eq!(query("/slots", None), "/slots");
     }
 }

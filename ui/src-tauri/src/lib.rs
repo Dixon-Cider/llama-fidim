@@ -7,14 +7,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use fidim_core::chat::{self, store as chat_store};
 use fidim_core::config::Config;
 use fidim_core::devices::Device;
 use fidim_core::launch::{self, PrepareInputs};
 use fidim_core::platform::{Platform, WindowsPlatform};
-use fidim_core::profile::{self, Profile};
+use fidim_core::profile::{self, Engine, Profile};
 use fidim_core::supervise;
 use fidim_core::update::{self, PromoteScope};
 use fidim_core::{bench, discovery, export, preflight};
+use tauri::ipc::Channel;
 use tauri::Emitter;
 
 /// Cached slow inputs for live pre-flight (device enumeration ~2-4s, build
@@ -35,7 +37,12 @@ struct AppState {
     /// STA COM for WebView2, and CoInitializeEx(MTA) on it fails with
     /// RPC_E_CHANGED_MODE (observed live).
     cache: Arc<Mutex<UiCache>>,
+    /// Chat streams in flight, by the id the web view gave each, so Stop
+    /// (and a reload's cancel-all) can reach them.
+    chats: ChatStreams,
 }
+
+type ChatStreams = Arc<Mutex<HashMap<String, Arc<chat::Cancel>>>>;
 
 const DEVICE_TTL: Duration = Duration::from_secs(15);
 
@@ -966,21 +973,35 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                 *cards.entry(k).or_insert(0.0) += u.percent;
             }
         }
+        // A server started with an API key answers /slots and /metrics
+        // only with it; Copy endpoint tells other programs they need one.
+        let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
+        let member = |id: &str| profiles.iter().find(|p| fidim_core::router::model_id(p) == id);
         let runs: Vec<serde_json::Value> = supervise::reattach(&cfg.runs_dir)
             .into_iter()
             .map(|r| {
                 let mut samples = Vec::new();
+                let mut keyed_models = Vec::new();
+                let profile = profiles.iter().find(|p| p.id == r.state.profile_id);
                 if r.alive {
                     if r.state.profile_id == fidim_core::router::ROUTER_ID {
                         if let Ok(ms) = fidim_core::router::models(&r.state.host, r.state.port) {
+                            for m in &ms {
+                                if member(&m.id).is_some_and(chat::requires_api_key) {
+                                    keyed_models.push(m.id.clone());
+                                }
+                            }
                             for m in ms.iter().filter(|m| m.status == "loaded") {
-                                samples.push(fidim_core::live::sample(&r.state.host, r.state.port, Some(&m.id)));
+                                let key = member(&m.id).and_then(chat::api_key);
+                                samples.push(fidim_core::live::sample_with_key(&r.state.host, r.state.port, Some(&m.id), key.as_deref()));
                             }
                         }
                     } else {
-                        samples.push(fidim_core::live::sample(&r.state.host, r.state.port, None));
+                        let key = profile.and_then(chat::api_key);
+                        samples.push(fidim_core::live::sample_with_key(&r.state.host, r.state.port, None, key.as_deref()));
                     }
                 }
+                let has_api_key = r.state.profile_id != fidim_core::router::ROUTER_ID && profile.is_some_and(chat::requires_api_key);
                 // The router's model instances are child processes; their
                 // VRAM and GPU time belong to the router run.
                 let mut pids = vec![r.state.pid];
@@ -1000,6 +1021,8 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                     "samples": samples,
                     "resident": resident,
                     "gpu_busy_percent": if busy <= 0.0 { 0.0 } else { busy.min(100.0) },
+                    "has_api_key": has_api_key,
+                    "keyed_models": keyed_models,
                 })
             })
             .collect();
@@ -1031,6 +1054,233 @@ async fn dg_frames(host: String, port: u16) -> Result<serde_json::Value, String>
         }
     })
     .await
+}
+
+// ------------------------------------------------------------------- chat ----
+
+/// Which server a chat talks to: a run Llama FIDIM started, and a model
+/// when the run is the router. The web view never sends an address: Rust
+/// resolves host, port and any API key from the run and its profile, so
+/// script in the page cannot aim a request anywhere else.
+#[derive(serde::Deserialize)]
+struct ChatTarget {
+    run: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+struct ResolvedTarget {
+    host: String,
+    port: u16,
+    engine: Engine,
+    /// The model id the server expects.
+    model: String,
+    api_key: Option<String>,
+    router: bool,
+}
+
+fn resolve_target(cfg: &Config, t: &ChatTarget) -> Result<ResolvedTarget, String> {
+    let run = supervise::reattach(&cfg.runs_dir)
+        .into_iter()
+        .find(|r| r.alive && r.state.profile_id == t.run)
+        .ok_or_else(|| format!("{} is not running", t.run))?;
+    let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
+    let s = &run.state;
+    let host = chat::connect_host(&s.host).to_string();
+    if s.profile_id == fidim_core::router::ROUTER_ID {
+        let model = t.model.clone().filter(|m| !m.trim().is_empty()).ok_or("pick a model on the router")?;
+        let member = profiles.iter().find(|p| fidim_core::router::model_id(p) == model);
+        Ok(ResolvedTarget {
+            host,
+            port: s.port,
+            engine: Engine::LlamaServer,
+            api_key: member.and_then(chat::api_key),
+            model,
+            router: true,
+        })
+    } else {
+        let profile = profiles.iter().find(|p| p.id == s.profile_id);
+        Ok(ResolvedTarget {
+            host,
+            port: s.port,
+            engine: s.engine,
+            model: s.alias.clone(),
+            api_key: profile.and_then(chat::api_key),
+            router: false,
+        })
+    }
+}
+
+/// Removes a stream's cancel handle however the command ends, but never a
+/// newer stream that reused the id.
+struct StreamGuard {
+    streams: ChatStreams,
+    id: String,
+    cancel: Arc<chat::Cancel>,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let mut m = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        if m.get(&self.id).is_some_and(|c| Arc::ptr_eq(c, &self.cancel)) {
+            m.remove(&self.id);
+        }
+    }
+}
+
+/// Stream one reply. Events go to `on_event` in order and always end with
+/// done, error or cancelled; the return value summarises the same. Only the
+/// shape of a stream is logged, never its text.
+#[tauri::command]
+async fn chat_send(
+    state: tauri::State<'_, AppState>,
+    stream_id: String,
+    target: ChatTarget,
+    body: serde_json::Value,
+    on_event: Channel<chat::ChatEvent>,
+) -> Result<serde_json::Value, String> {
+    let cancel = Arc::new(chat::Cancel::new());
+    {
+        let mut m = state.chats.lock().unwrap_or_else(|e| e.into_inner());
+        if m.contains_key(&stream_id) {
+            return Err(format!("chat stream {stream_id} is already running"));
+        }
+        m.insert(stream_id.clone(), cancel.clone());
+    }
+    let guard = StreamGuard { streams: state.chats.clone(), id: stream_id, cancel: cancel.clone() };
+    blocking(move || {
+        let _guard = guard;
+        let cfg = cfg()?;
+        let t = resolve_target(&cfg, &target)?;
+        let n_msgs = body.get("messages").and_then(|m| m.as_array()).map_or(0, Vec::len);
+        let body = chat::request_body(&body, &t.model, t.engine).map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        let sum = chat::stream_chat(&t.host, t.port, &body, t.api_key.as_deref(), &cancel, chat::DEFAULT_IDLE, &mut |ev| {
+            // A reloaded web view no longer listens; the stream still ends
+            // on its own, and a reload cancels every stream at boot.
+            let _ = on_event.send(ev);
+        });
+        let outcome = if sum.cancelled {
+            "stopped".to_string()
+        } else if sum.error.is_some() {
+            format!("error {}", sum.status.map_or("-".into(), |s| s.to_string()))
+        } else {
+            format!("finish={}", sum.finish_reason.as_deref().unwrap_or("-"))
+        };
+        let _ = ui_log(format!(
+            "chat {}{} messages={n_msgs} -> {outcome} in {} ms",
+            target.run,
+            if t.router { format!("/{}", t.model) } else { String::new() },
+            started.elapsed().as_millis()
+        ));
+        serde_json::to_value(sum).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Stop one stream. False when it had already ended.
+#[tauri::command]
+fn chat_cancel(state: tauri::State<'_, AppState>, stream_id: String) -> bool {
+    let m = state.chats.lock().unwrap_or_else(|e| e.into_inner());
+    match m.get(&stream_id) {
+        Some(c) => {
+            c.cancel();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Stop every stream: the web view calls this once at boot, so a reload
+/// does not leave replies streaming to nobody.
+#[tauri::command]
+fn chat_cancel_all(state: tauri::State<'_, AppState>) -> usize {
+    let m = state.chats.lock().unwrap_or_else(|e| e.into_inner());
+    m.values().for_each(|c| c.cancel());
+    m.len()
+}
+
+/// Everything the chat can talk to right now.
+#[tauri::command]
+async fn chat_targets() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let cfg = cfg()?;
+        let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
+        let runs = supervise::reattach(&cfg.runs_dir);
+        serde_json::to_value(chat::targets(&runs, &profiles)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// A target's server-side facts: context, default sampler, capabilities.
+/// A router model that is not loaded is not asked; one evicted between the
+/// check and the question gets an error, not a load (`autoload=false`).
+#[tauri::command]
+async fn chat_props(target: ChatTarget) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let t = resolve_target(&cfg, &target)?;
+        if t.router {
+            let status = fidim_core::router::models(&t.host, t.port)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|m| m.id == t.model)
+                .map(|m| m.status)
+                .unwrap_or_else(|| "unknown".into());
+            if status != "loaded" {
+                return Ok(serde_json::json!({ "loaded": false, "status": status }));
+            }
+        }
+        let mut v = chat::props(&t.host, t.port, t.engine, t.router.then_some(t.model.as_str()), t.api_key.as_deref())
+            .map_err(|e| e.to_string())?;
+        v["loaded"] = true.into();
+        Ok(v)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn chat_list() -> Result<serde_json::Value, String> {
+    blocking(|| serde_json::to_value(chat_store::list(&chat_store::chats_dir())).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn chat_load(id: String) -> Result<serde_json::Value, String> {
+    blocking(move || chat_store::load(&chat_store::chats_dir(), &id).map_err(|e| e.to_string())).await
+}
+
+/// Save a conversation; false (nothing written) when Settings has saving off.
+#[tauri::command]
+async fn chat_save(conv: serde_json::Value) -> Result<bool, String> {
+    blocking(move || {
+        if !cfg()?.save_chats {
+            return Ok(false);
+        }
+        chat_store::save(&chat_store::chats_dir(), &conv).map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn chat_delete(id: String) -> Result<bool, String> {
+    blocking(move || chat_store::delete(&chat_store::chats_dir(), &id).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn chat_delete_all() -> Result<usize, String> {
+    blocking(|| chat_store::delete_all(&chat_store::chats_dir()).map_err(|e| e.to_string())).await
+}
+
+/// Per-profile chat defaults (system prompt, sampler overrides, thinking).
+#[tauri::command]
+async fn chat_presets_get() -> Result<serde_json::Value, String> {
+    blocking(|| Ok(chat_store::load_presets(&chat_store::presets_path()))).await
+}
+
+#[tauri::command]
+async fn chat_presets_save(presets: serde_json::Value) -> Result<(), String> {
+    blocking(move || chat_store::save_presets(&chat_store::presets_path(), &presets).map_err(|e| e.to_string())).await
 }
 
 // ------------------------------------------------------------ rocm runtimes ----
@@ -1086,8 +1336,12 @@ async fn rocm_remove(version: String) -> Result<(), String> {
 
 pub fn run() {
     tauri::Builder::default()
+        // Links in chat replies open in the browser only through our own
+        // Open action; the plugin's click interception stays off.
+        .plugin(tauri_plugin_opener::Builder::new().open_js_links_on_click(false).build())
         .manage(AppState {
             cache: Arc::new(Mutex::new(UiCache { devices: None, build_probes: HashMap::new(), scan: None })),
+            chats: Arc::new(Mutex::new(HashMap::new())),
         })
         .invoke_handler(tauri::generate_handler![
             scan,
@@ -1135,6 +1389,18 @@ pub fn run() {
             rocm_available,
             rocm_install,
             rocm_remove,
+            chat_send,
+            chat_cancel,
+            chat_cancel_all,
+            chat_targets,
+            chat_props,
+            chat_list,
+            chat_load,
+            chat_save,
+            chat_delete,
+            chat_delete_all,
+            chat_presets_get,
+            chat_presets_save,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Llama FIDIM UI");
