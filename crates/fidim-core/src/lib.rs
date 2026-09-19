@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod error;
 pub mod estimate;
 pub mod export;
+pub mod fetch;
 pub mod gguf;
 pub mod hf;
 pub mod hub;

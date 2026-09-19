@@ -51,6 +51,14 @@ pub enum Error {
     #[error("{message}")]
     Http { kind: HttpErrorKind, message: String },
 
+    /// A download finished but is not the file that was asked for.
+    #[error("{path}: {detail}")]
+    Integrity { path: PathBuf, detail: String },
+
+    /// The caller's cancel flag was raised. Partial work is kept for a resume.
+    #[error("cancelled")]
+    Cancelled,
+
     /// An argument that cannot name anything real (a malformed repo id).
     #[error("{0}")]
     InvalidInput(String),

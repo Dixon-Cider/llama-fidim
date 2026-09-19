@@ -890,6 +890,12 @@ pub(crate) fn content_range(v: &str) -> Option<(u64, Option<u64>)> {
     Some((first, total.trim().parse().ok()))
 }
 
+/// The total size in a `Content-Range` header, including the
+/// `bytes */<size>` form a 416 answer carries.
+pub(crate) fn content_range_total(v: &str) -> Option<u64> {
+    v.trim().strip_prefix("bytes")?.rsplit_once('/')?.1.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     //! Fixtures are live responses captured 2026-09-18 from
@@ -1181,6 +1187,10 @@ mod tests {
         assert_eq!(content_range("bytes 0-65535/5592219008"), Some((0, Some(5_592_219_008))));
         assert_eq!(content_range("bytes 100-199/*"), Some((100, None)));
         assert_eq!(content_range("items 0-1/2"), None);
+        assert_eq!(content_range("bytes */4096"), None);
+        assert_eq!(content_range_total("bytes */4096"), Some(4096));
+        assert_eq!(content_range_total("bytes 0-1/77"), Some(77));
+        assert_eq!(content_range_total("bytes 0-1/*"), None);
     }
 
     // ------------------------------------------------ against a local server
