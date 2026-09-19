@@ -124,6 +124,11 @@ if /i "%FIDIM_STOP_AFTER%"=="worktree" ( call :cleanup & echo === BUILD_EXIT 0 s
 REM Before upstream b5269 the three targets were examples.
 set "EXAMPLES=OFF"
 if not exist "%WT%\tools\server\CMakeLists.txt" set "EXAMPLES=ON"
+REM A tree with DiffusionGemma (ggml-org/llama.cpp#24423) keeps its runner
+REM under examples; build it too, so the build can serve diffusion profiles.
+set "DG_TARGET="
+if exist "%WT%\examples\diffusion-gemma-server\CMakeLists.txt" set "EXAMPLES=ON"
+if exist "%WT%\examples\diffusion-gemma-server\CMakeLists.txt" set "DG_TARGET=llama-diffusion-gemma-visual-server"
 
 echo === STEP configure (HIP, %GPUS%, Release, examples %EXAMPLES%)
 REM vcvars64 runs vswhere by name; without the installer folder on PATH it
@@ -160,8 +165,8 @@ if defined OLD_HIPBLAS (
   exit /b 76
 )
 
-echo === STEP build llama-server llama-quantize llama-tokenize
-"%FIDIM_CMAKE%" --build "%WT%\build" --target llama-server llama-quantize llama-tokenize -j
+echo === STEP build llama-server llama-quantize llama-tokenize %DG_TARGET%
+"%FIDIM_CMAKE%" --build "%WT%\build" --target llama-server llama-quantize llama-tokenize %DG_TARGET% -j
 if errorlevel 1 ( echo BUILD_FAILED & call :cleanup & exit /b 74 )
 
 echo === STEP copy %OUT%
@@ -172,6 +177,9 @@ copy /y "%WT%\build\bin\*.dll" "%OUT%\bin\" >nul
 if errorlevel 1 ( echo COPY_FAILED & call :cleanup & exit /b 75 )
 mkdir "%OUT%\source\src" "%OUT%\source\ggml\include" 2>nul
 for %%f in (src\llama-arch.cpp src\llama-vocab.cpp src\llama.cpp ggml\include\ggml.h) do if exist "%WT%\%%f" copy /y "%WT%\%%f" "%OUT%\source\%%f" >nul
+REM A tree that carries Llama FIDIM's runner patch says so in fidim-patch.json
+REM ({name, base_commit, features}); it becomes the build's manifest patch.
+if exist "%WT%\fidim-patch.json" copy /y "%WT%\fidim-patch.json" "%OUT%\source\fidim-patch.json" >nul
 
 call :cleanup
 echo === BUILD_EXIT 0 (%REF% @ %SHA%, out %OUT%)

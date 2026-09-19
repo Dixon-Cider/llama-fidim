@@ -1741,6 +1741,9 @@ pub fn build_from_ref(
         // The tables of exactly what was compiled, for compat::probe_build.
         let source_copy = staging.join("source");
         let caps = crate::compat::caps_from_dir(&source_copy).ok();
+        // A tree carrying Llama FIDIM's runner patch (the fidim-diffusion
+        // branch) declares it, so the build is sized and labelled as patched.
+        let patch = read_source_patch(&source_copy.join("fidim-patch.json"));
         let _ = std::fs::remove_dir_all(&source_copy);
         write_manifest(
             &staging,
@@ -1752,6 +1755,7 @@ pub fn build_from_ref(
                 gfx_target: Some(gpus.clone()),
                 git: Some(src.git_source()),
                 caps,
+                patch,
                 ..Default::default()
             },
         )?;
@@ -1772,12 +1776,44 @@ pub fn build_from_ref(
     installed?;
 
     say("verify", "verifying: --version and --list-devices (no model load)".into());
-    let verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
+    let mut verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
+    verify.runner_present = dir.join("bin").join(RUNNER_EXE).is_file();
     if let Some(mut m) = read_manifest(&dir) {
         m.verify = verify.clone();
         write_manifest(&dir, &m)?;
     }
     Ok(InstallReport { tag: name, dir, source: "git-ref".into(), skipped_existing: false, verify })
+}
+
+/// The runner patch a source tree declares in `fidim-patch.json`
+/// (`{name, base_commit, features}`), read leniently: a missing or
+/// malformed file means an unpatched build, never a failed one.
+fn read_source_patch(path: &Path) -> Option<crate::discovery::BuildPatch> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let patch: crate::discovery::BuildPatch = serde_json::from_str(&text).ok()?;
+    (!patch.features.is_empty() || !patch.name.trim().is_empty()).then_some(patch)
+}
+
+#[cfg(test)]
+mod source_patch_tests {
+    use super::*;
+
+    #[test]
+    fn a_tree_declares_its_runner_patch() {
+        let dir = std::env::temp_dir().join(format!("fidim-source-patch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("fidim-patch.json");
+        assert!(read_source_patch(&p).is_none(), "no file: unpatched");
+        std::fs::write(&p, r#"{"name":"dgpatch5","features":["dg-pkv-f16","dg-fa-pad"]}"#).unwrap();
+        let patch = read_source_patch(&p).unwrap();
+        assert_eq!(patch.name, "dgpatch5");
+        assert!(patch.has("dg-fa-pad"));
+        for junk in ["not json", "{}", r#"{"features":"not a list"}"#] {
+            std::fs::write(&p, junk).unwrap();
+            assert!(read_source_patch(&p).is_none(), "{junk}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // --------------------------------------------------------- unsloth install ----
