@@ -7,8 +7,31 @@
   import CountUp from "../components/CountUp.svelte";
   import Skeleton from "../components/Skeleton.svelte";
   import DiffusionCanvas from "../components/DiffusionCanvas.svelte";
+  import EndpointCard from "../components/chat/EndpointCard.svelte";
+  import { endpointFor } from "../lib/endpoint.js";
+  import { copyText } from "../lib/clipboard.js";
+  import { openTarget } from "../lib/chat.svelte.js";
+
+  let { go = () => {} } = $props();
 
   let data = $state({ runs: [], cards: [] });
+
+  // Chat with a server, or hand its endpoint to another program. Copy
+  // endpoint copies the base URL at once and shows the model id and
+  // snippets beside it.
+  function chatWith(run, model = null) {
+    openTarget(run, model);
+    go("chat");
+  }
+  let endpointOpen = $state(null);   // { key, copied }
+  async function copyEndpoint(key, state, model = null) {
+    if (endpointOpen?.key === key) {
+      endpointOpen = null;
+      return;
+    }
+    const ok = await copyText(endpointFor(state, model).baseUrl);
+    endpointOpen = { key, copied: ok ? "url" : "failed" };
+  }
   let loaded = $state(false);   // first poll landed: skeletons give way to content
   let error = $state("");
   // Dismiss with a 3-second undo: the row leaves at once, the state file
@@ -240,9 +263,18 @@
         <span><b class="num">{uptime(r.state.started_unix)}</b> up</span>
         <span class="mono">pid {r.state.pid} · :{r.state.port} · {r.state.alias}</span>
       </div>
+      {#if r.alive && r.state.profile_id !== "router"}
+        <button class="btn" onclick={() => chatWith(r.state.profile_id)} title="Open a chat with this server">Chat</button>
+        <button class="btn" class:primary={endpointOpen?.key === r.state.profile_id} onclick={() => copyEndpoint(r.state.profile_id, r.state)} title="Copy the OpenAI base URL; the model id and snippets show below">Copy endpoint</button>
+      {/if}
       {#if r.alive}<button class="btn danger" onclick={() => stop(r.state.profile_id)}>Stop</button>
       {:else}<button class="btn" onclick={() => dismiss(r.state.profile_id)} title="forget this run; the log file stays">Dismiss</button>{/if}
     </header>
+    {#if endpointOpen?.key === r.state.profile_id}
+      <div class="endpoint-pop" transition:slide={leave}>
+        <EndpointCard endpoint={endpointFor(r.state)} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
+      </div>
+    {/if}
 
     {#each row.samples as s, si (key(r, s))}
       {@const k = key(r, s)}
@@ -259,7 +291,18 @@
           {#if s.slots.some((x) => x.loop_hint)}<span class="chip block live" title="a slot is repeating the same fragment back-to-back; click it to see the text">looping</span>{/if}
           <div class="slot-count"><b class="num">{busySlots}</b><span class="faint"> of {s.slots.length} slots busy</span></div>
           {#if s.error}<div class="err">{s.error}</div>{/if}
+          {#if s.model && r.alive}
+            <div class="row-actions">
+              <button class="btn small" onclick={() => chatWith(r.state.profile_id, s.model)} title="Open a chat with this model through the router">Chat</button>
+              <button class="btn small" class:primary={endpointOpen?.key === k} onclick={() => copyEndpoint(k, r.state, s.model)} title="Copy the router's OpenAI base URL; the model id and snippets show below">Copy endpoint</button>
+            </div>
+          {/if}
         </div>
+        {#if endpointOpen?.key === k}
+          <div class="endpoint-pop in-model" transition:slide={leave}>
+            <EndpointCard endpoint={endpointFor(r.state, s.model)} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
+          </div>
+        {/if}
 
         <div class="stats">
           {#if dg}
@@ -405,6 +448,9 @@
   .facts { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; color: var(--ink-muted); font-size: 12.5px; margin-left: auto; }
   .facts b { color: var(--ink); font-weight: 600; }
   .facts .mono { font-size: 11.5px; color: var(--ink-faint); }
+  .endpoint-pop { padding: 14px 18px; border-bottom: 1px solid var(--rule); background: var(--ground-inset); }
+  .endpoint-pop.in-model { grid-column: 1 / -1; border: 1px solid var(--rule-strong); border-radius: 6px; padding: 12px 14px; }
+  .row-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
 
   .model {
     display: grid; grid-template-columns: 200px 1fr 280px; grid-template-areas: "ident stats spark" "slots slots slots";
