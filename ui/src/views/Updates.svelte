@@ -42,6 +42,53 @@
   // renders under the button that started it.
   let logOwner = $state("upstream");
 
+  // Llama FIDIM itself
+  let app = $state(null);          // app_update_check result
+  let appChecking = $state(false);
+  let appBusy = $state("");        // "" | "stage" | "build" | "apply"
+  let appStaged = $state(null);    // Staged set of the last stage/build this session
+  let appError = $state("");
+  let appConfirm = $state(null);   // the Staged set awaiting a yes
+  let appSource = $state("");      // the checkout path field
+  let appRestarting = $state(false);
+  const appNotes = $derived((app?.latest?.notes ?? "").split("\n").filter((l) => l.trim()).slice(0, 40));
+
+  async function appCheck() {
+    appChecking = true; appError = "";
+    try {
+      app = await api("app_update_check");
+      appSource = app.source_dir ?? "";
+    } catch (e) { appError = String(e); }
+    appChecking = false;
+  }
+
+  // Download and verify a release, or build the checkout; nothing is replaced yet.
+  async function appStage(source) {
+    appBusy = source ? "build" : "stage"; appError = ""; log = []; logOwner = "app"; appStaged = null; appConfirm = null;
+    try {
+      appStaged = await api("app_update_stage", { tag: source ? null : (app?.latest?.tag ?? null), source });
+      appConfirm = appStaged;
+    } catch (e) { appError = String(e); }
+    appBusy = "";
+  }
+
+  // The app closes here; the updater replaces the files and reopens it.
+  async function appApply(staged) {
+    appBusy = "apply"; appError = ""; appConfirm = null;
+    try {
+      await api("app_update_apply", { stage: staged.dir });
+      appRestarting = true;
+    } catch (e) { appError = String(e); appBusy = ""; }
+  }
+
+  async function appSaveSource() {
+    appError = "";
+    try {
+      const r = await api("app_update_set_source", { dir: appSource.trim() || null });
+      if (app) app = { ...app, source_dir: r.source_dir, source_ok: r.source_ok };
+    } catch (e) { appError = String(e); }
+  }
+
   onEvent("update-progress", (line) => {
     log = [...log.slice(-400), line];
   }).then((u) => (unlisten = u));
@@ -192,6 +239,7 @@
   }
   const day = (iso) => (iso ? String(iso).slice(0, 10) : "");
 
+  appCheck();
   doCheck();
   loadHistory();
   loadRuntimes();
@@ -199,12 +247,103 @@
 
 <h1>
   Updates
-  <span class="sub">llama.cpp releases and ROCm runtimes, installed side by side. Nothing here starts a server.</span>
+  <span class="sub">Llama FIDIM itself, llama.cpp releases and ROCm runtimes. Nothing here starts a server.</span>
 </h1>
-<p class="lede">
-  Each build gets its own folder and is never modified. Promote moves profiles onto it and remembers
-  the old build, so rollback is one click.
-</p>
+
+<div class="card">
+  <div class="sec">
+    Llama FIDIM
+    <span class="faint">this app, its CLI and the DiffusionGemma server, replaced in place</span>
+    {#if appError}<span class="chip block shake">{appError}</span>{/if}
+    <span style="margin-left: auto; display: flex; gap: 8px; align-items: center;">
+      <button class="btn" onclick={appCheck} disabled={appChecking || !!appBusy} title="Ask GitHub for the newest release of Llama FIDIM. Nothing is downloaded.">
+        {appChecking ? "Checking…" : "Check for updates"}
+      </button>
+      {#if app?.latest}
+        <button class="btn primary" onclick={() => appStage(false)} disabled={!!appBusy || appRestarting || !app.update_available}
+          title={app.update_available ? `Download ${app.latest.zip.name}, check its SHA-256, then close and reopen the app on ${app.latest.tag}.` : (app.note ?? "")}>
+          {appBusy === "stage" ? "Downloading…" : app.update_available ? `Update to ${app.latest.tag}` : "Up to date"}
+        </button>
+      {/if}
+    </span>
+  </div>
+
+  {#if appRestarting}
+    <div class="chip accent" style="margin-bottom: 8px;">Restarting… the app closes now and reopens on the new version.</div>
+  {/if}
+
+  {#if app}
+    <table class="grid">
+      <tbody>
+        <tr><th>This build</th>
+          <td class="mono">v{app.current.long}</td>
+          <td class="path" colspan="2">{app.current.install_dir}{#if !app.current.in_install_folder} <span class="chip warn nodot">not the install folder</span>{/if}</td></tr>
+        <tr><th>Newest release</th>
+          {#if app.latest}
+            <td class="mono">{app.latest.tag}</td>
+            <td class="faint">{day(app.latest.published_at)} · {(app.latest.zip.size / 1048576).toFixed(1)} MB{app.latest.sha256 ? " · SHA-256 published" : ""}</td>
+            <td>{#if app.update_available}<span class="chip warn">update available</span>{:else}<span class="chip pass">{app.note ?? "up to date"}</span>{/if}</td>
+          {:else}
+            <td colspan="3" class="faint">{app.note ?? "none"}</td>
+          {/if}</tr>
+        <tr><th>Checkout</th>
+          <td colspan="3">
+            <span style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+              <input class="mono" style="flex: 1; min-width: 320px;" placeholder="folder of a Llama FIDIM checkout, for building from source" bind:value={appSource} onblur={appSaveSource} onkeydown={(e) => e.key === "Enter" && appSaveSource()} disabled={!!appBusy} />
+              {#if app.source_dir}
+                {#if app.source_ok}<span class="chip pass">checkout</span>{:else}<span class="chip block">not a Llama FIDIM checkout</span>{/if}
+              {/if}
+              <button class="btn" onclick={() => appStage(true)} disabled={!!appBusy || appRestarting || !app.source_ok}
+                title="cargo build --release, then pnpm tauri build, in that folder; then close and reopen the app on what it built. A few minutes.">
+                {appBusy === "build" ? "Building…" : "Build & install from checkout"}
+              </button>
+            </span>
+          </td></tr>
+      </tbody>
+    </table>
+    {#if appNotes.length && app.update_available}
+      <div class="sec" style="margin: 12px 0 4px;">What {app.latest.tag} changes <a class="faint" href={app.latest.html_url} target="_blank" rel="noreferrer">release page</a></div>
+      <div class="notes">{#each appNotes as l}<div>{l}</div>{/each}</div>
+    {/if}
+  {/if}
+
+  {#if appConfirm}
+    <div class="confirm" transition:slide={leave}>
+      <div>
+        <b>{appConfirm.version}</b> is staged{appConfirm.tag ? ` from ${appConfirm.tag}` : appConfirm.checkout ? ` from ${appConfirm.checkout}` : ""}.
+        Installing closes the app, replaces its files in <span class="mono">{app?.current.install_dir}</span> and reopens it. Running servers are not touched.
+      </div>
+      <div class="toolbar" style="margin: 8px 0 0;">
+        <button class="btn primary" onclick={() => appApply(appConfirm)} disabled={!!appBusy}>{appBusy === "apply" ? "Closing…" : "Install and restart"}</button>
+        <button class="btn" onclick={() => (appConfirm = null)} disabled={!!appBusy}>Not now</button>
+      </div>
+    </div>
+  {/if}
+
+  {#if app?.staged?.length && !appConfirm}
+    <div class="faint small" style="margin-top: 8px;">
+      Staged earlier: {#each app.staged as st, i}{i ? ", " : ""}<button class="link" onclick={() => (appConfirm = st)} disabled={!!appBusy}>{st.version}</button>{/each}
+    </div>
+  {/if}
+
+  {#if app?.history?.length}
+    <details style="margin-top: 10px;">
+      <summary class="faint small">{app.history.length} update{app.history.length === 1 ? "" : "s"} applied</summary>
+      <table class="grid" style="margin-top: 6px;">
+        <tbody>
+          {#each app.history as h}
+            <tr><td class="mono faint">{when(h.at_unix)}</td><td class="mono">{h.from} → {h.to}</td><td><span class="chip plain">{h.source}</span></td>
+              <td>{#if h.ok}<span class="chip pass">ok</span>{:else}<span class="chip block">{h.detail}</span>{/if}</td></tr>
+          {/each}
+        </tbody>
+      </table>
+    </details>
+  {/if}
+</div>
+
+{@render logCard(logOwner === "app" && !!(appBusy || log.length), !!appBusy)}
+
+<h2>llama.cpp builds <span class="sub">Each build gets its own folder and is never modified. Promote moves profiles onto it and remembers the old build, so rollback is one click.</span></h2>
 
 <div class="toolbar">
   <button class="btn" onclick={doCheck} disabled={checking || installing}>
@@ -283,7 +422,7 @@
   {/if}
 {/snippet}
 
-{@render logCard(logOwner !== "unsloth" && !!(installing || rocmBusy || log.length), !!(installing || rocmBusy))}
+{@render logCard(logOwner !== "unsloth" && logOwner !== "app" && !!(installing || rocmBusy || log.length), !!(installing || rocmBusy))}
 
 {#if install}
   <div class="card">
@@ -609,6 +748,10 @@
 </div>
 
 <style>
+  .notes { font-size: 12.5px; color: var(--ink-muted); max-height: 220px; overflow: auto; padding: 6px 10px; border: 1px solid var(--rule); border-radius: 6px; white-space: pre-wrap; }
+  .confirm { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--ground-lift); font-size: 13px; }
+  button.link { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-decoration: underline; }
+  button.link:disabled { color: var(--ink-faint); cursor: default; }
   .changes { display: flex; flex-direction: column; }
   .change { display: grid; grid-template-columns: 80px 92px 1fr; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--rule); font-size: 13px; align-items: baseline; }
   .change:last-child { border-bottom: none; }

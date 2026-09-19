@@ -940,6 +940,76 @@ fn app_version() -> serde_json::Value {
     fidim_core::build_info::json()
 }
 
+// ------------------------------------------------------- updating the app ----
+
+/// This build against the newest release of Llama FIDIM, plus the checkout
+/// configured for source builds and any sets staged earlier. Network.
+#[tauri::command]
+async fn app_update_check() -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let c = fidim_core::selfupdate::check(&cfg).map_err(|e| e.to_string())?;
+        serde_json::to_value(c).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Download and verify a release (`tag`, or the newest), or with `source`
+/// build the configured checkout, into a staged folder. Progress lines
+/// stream as `update-progress`. Replaces nothing.
+#[tauri::command]
+async fn app_update_stage(app: tauri::AppHandle, tag: Option<String>, source: bool) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        use fidim_core::selfupdate as su;
+        let cfg = cfg()?;
+        let mut progress = |line: String| {
+            let _ = app.emit("update-progress", line);
+        };
+        let staged = if source {
+            let dir = cfg.fidim_source.clone().ok_or("set the checkout folder first")?;
+            su::stage_from_checkout(&dir, &mut progress)
+        } else {
+            let rel = match &tag {
+                Some(t) => su::app_release_by_tag(t),
+                None => su::latest_app_release().and_then(|r| r.ok_or_else(|| fidim_core::Error::Update(format!("{} has no release with a Windows zip", su::REPO)))),
+            }
+            .map_err(|e| e.to_string())?;
+            su::stage_release(&rel, &mut progress)
+        }
+        .map_err(|e| e.to_string())?;
+        serde_json::to_value(staged).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Start the detached updater for a staged set, then quit: it waits for
+/// this process to exit, replaces the installed files and reopens the app.
+/// Servers keep running; they are not this process's children in any job.
+#[tauri::command]
+async fn app_update_apply(app: tauri::AppHandle, stage: std::path::PathBuf) -> Result<serde_json::Value, String> {
+    use fidim_core::selfupdate as su;
+    let current = su::current().map_err(|e| e.to_string())?;
+    let pid = su::spawn_apply(&stage, &current.install_dir, Some(std::process::id()), true).map_err(|e| e.to_string())?;
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        // Long enough for the web view to paint its "restarting" state.
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        handle.exit(0);
+    });
+    Ok(serde_json::json!({ "updater_pid": pid, "install_dir": current.install_dir, "log": su::updates_dir().join("apply.log") }))
+}
+
+/// Remember the checkout to build the app from (`config.fidim_source`).
+#[tauri::command]
+fn app_update_set_source(state: tauri::State<'_, AppState>, dir: Option<std::path::PathBuf>) -> Result<serde_json::Value, String> {
+    let mut c = cfg()?;
+    c.fidim_source = dir.filter(|d| !d.as_os_str().is_empty());
+    c.save(&Config::config_path()).map_err(|e| e.to_string())?;
+    invalidate_build_caches(&state.cache);
+    let ok = c.fidim_source.as_deref().is_some_and(fidim_core::selfupdate::is_checkout);
+    Ok(serde_json::json!({ "source_dir": c.fidim_source, "source_ok": ok }))
+}
+
 /// Append a line from the web view to `~/.fidim/ui.log` — the only way
 /// a failure inside the GUI becomes visible outside it.
 #[tauri::command]
@@ -1714,6 +1784,10 @@ pub fn run() {
             save_config,
             ui_log,
             app_version,
+            app_update_check,
+            app_update_stage,
+            app_update_apply,
+            app_update_set_source,
             router_get,
             router_save,
             router_ini,

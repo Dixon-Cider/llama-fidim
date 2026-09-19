@@ -52,6 +52,10 @@ pub struct Config {
     /// build root, which on this machine IS the checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llama_cpp_source: Option<PathBuf>,
+    /// A checkout of Llama FIDIM itself, for updating the app from source
+    /// (the Updates tab and `fidim self-update install --source`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidim_source: Option<PathBuf>,
     /// Script invoked as `<script> <checkout> <tag> <output dir>` to build a
     /// tag from source with the local HIP toolchain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +240,7 @@ impl Config {
             runs_dir: dir.join("runs"),
             install_root: None,
             llama_cpp_source: None,
+            fidim_source: None,
             source_build_script: None,
             hf_token: None,
             hf_use_cli_token: false,

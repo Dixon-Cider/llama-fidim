@@ -25,6 +25,52 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum SelfUpdateCmd {
+    /// Compare this build with the newest release of Llama FIDIM. Downloads nothing.
+    Check,
+    /// Get the newest release (or --tag), check its SHA-256, then replace the
+    /// installed files and reopen the desktop app. With --source, build a
+    /// checkout instead and install what it built.
+    Install {
+        /// A release tag, e.g. v0.3.0 (default: the newest with a Windows zip).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Build from a checkout of this repository (cargo, then pnpm tauri
+        /// build) instead of downloading a release.
+        #[arg(long)]
+        source: bool,
+        /// With --source: the checkout (default: config.fidim_source).
+        #[arg(long, value_name = "DIR")]
+        source_dir: Option<PathBuf>,
+        /// Download or build and verify only; print the staged folder and
+        /// replace nothing.
+        #[arg(long)]
+        stage_only: bool,
+        /// Leave the desktop app closed afterwards.
+        #[arg(long)]
+        no_relaunch: bool,
+        /// Install into this folder (default: the folder this fidim.exe runs from).
+        #[arg(long, value_name = "DIR")]
+        install_dir: Option<PathBuf>,
+    },
+    /// Replace the installed files from a staged folder. Install starts this
+    /// from the staged copy of fidim.exe; not for use by hand.
+    #[command(hide = true)]
+    Apply {
+        #[arg(long)]
+        stage: PathBuf,
+        #[arg(long)]
+        install_dir: PathBuf,
+        /// Wait for this process to exit first (the copy that started the update).
+        #[arg(long)]
+        wait_pid: Option<u32>,
+        /// Reopen the desktop app when done.
+        #[arg(long)]
+        relaunch: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum RouterCmd {
     /// Show the router config and rendered preset file.
     Show,
@@ -230,6 +276,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: models::ModelsCmd,
     },
+    /// Update Llama FIDIM itself (the CLI, the DiffusionGemma server and the
+    /// desktop app) in the folder they run from, from a GitHub release or a
+    /// checkout of this repository.
+    SelfUpdate {
+        #[command(subcommand)]
+        cmd: SelfUpdateCmd,
+    },
     /// Check the toolchain a source build needs: Visual Studio C++ tools, git,
     /// CMake, Ninja, the HIP SDK, and a test compile for the GPU target.
     Toolchain {
@@ -345,6 +398,7 @@ fn main() -> anyhow::Result<()> {
             cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag, &channel, gfx, overlay, base_zip)
         }
         Cmd::Toolchain { gfx } => cmd_toolchain(&cfg, cli.json, gfx),
+        Cmd::SelfUpdate { cmd } => cmd_self_update(&cfg, cli.json, cmd),
         Cmd::Models { cmd } => models::cmd_models(&cfg, cli.json, cmd),
     }
 }
@@ -353,6 +407,94 @@ fn main() -> anyhow::Result<()> {
 /// card names.
 fn detect_gpu_targets(cfg: &Config) -> Option<String> {
     fidim_core::wizard::machine_gpu_targets(cfg)
+}
+
+fn cmd_self_update(cfg: &Config, json: bool, cmd: SelfUpdateCmd) -> anyhow::Result<()> {
+    use fidim_core::selfupdate as su;
+    match cmd {
+        SelfUpdateCmd::Check => {
+            let c = su::check(cfg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&c)?);
+                return Ok(());
+            }
+            println!("this build : {}  ({})", c.current.long, c.current.install_dir.display());
+            match &c.latest {
+                Some(l) => println!("newest     : {}  published {}  {}", l.tag, l.published_at.get(..10).unwrap_or(&l.published_at), l.html_url),
+                None => println!("newest     : (no release with a Windows zip)"),
+            }
+            if c.update_available {
+                println!("update available: run `fidim self-update install`");
+            } else if let Some(n) = &c.note {
+                println!("{n}");
+            }
+            match (&c.source_dir, c.source_ok) {
+                (Some(d), true) => println!("checkout   : {}  (`fidim self-update install --source` builds it)", d.display()),
+                (Some(d), false) => println!("checkout   : {} is not a checkout of Llama FIDIM", d.display()),
+                (None, _) => {}
+            }
+            for s in &c.staged {
+                println!("staged     : {}  {}", s.version, s.dir.display());
+            }
+            if let Some(h) = c.history.first() {
+                println!("last update: {} -> {} ({}){}", h.from, h.to, h.source, if h.ok { "" } else { " FAILED" });
+            }
+        }
+        SelfUpdateCmd::Install { tag, source, source_dir, stage_only, no_relaunch, install_dir } => {
+            let current = su::current()?;
+            let install_dir = install_dir.unwrap_or_else(|| current.install_dir.clone());
+            let mut progress = |line: String| println!("{line}");
+            let staged = if source {
+                let dir = source_dir
+                    .or_else(|| cfg.fidim_source.clone())
+                    .context("no checkout to build: pass --source-dir or set config.fidim_source")?;
+                su::stage_from_checkout(&dir, &mut progress)?
+            } else {
+                let rel = match &tag {
+                    Some(t) => su::app_release_by_tag(t)?,
+                    None => su::latest_app_release()?.context(format!("{} has no release with a Windows zip", su::REPO))?,
+                };
+                if tag.is_none() && !su::check(cfg)?.update_available {
+                    println!("note: {} is not newer than this build ({}); installing it anyway", rel.tag, current.long);
+                }
+                su::stage_release(&rel, &mut progress)?
+            };
+            if stage_only {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&staged)?);
+                } else {
+                    println!("staged {} in {}  (nothing replaced)", staged.version, staged.dir.display());
+                }
+                return Ok(());
+            }
+            let pid = su::spawn_apply(&staged.dir, &install_dir, Some(std::process::id()), !no_relaunch)?;
+            let log = su::updates_dir().join("apply.log");
+            if json {
+                println!("{}", serde_json::json!({ "staged": staged, "install_dir": install_dir, "updater_pid": pid, "log": log }));
+            } else {
+                println!(
+                    "updater started (pid {pid}); it replaces {} with {} as soon as this process exits{}. Log: {}",
+                    install_dir.display(),
+                    staged.version,
+                    if no_relaunch { "" } else { ", then reopens the desktop app" },
+                    log.display()
+                );
+            }
+        }
+        SelfUpdateCmd::Apply { stage, install_dir, wait_pid, relaunch } => {
+            let mut log = |line: String| {
+                println!("{line}");
+                su::append_log(&line);
+            };
+            let r = su::apply(&stage, &install_dir, wait_pid, relaunch, &mut log)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("installed {} over {} in {}", r.to, r.from, r.install_dir.display());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_toolchain(cfg: &Config, json: bool, gfx: Option<String>) -> anyhow::Result<()> {

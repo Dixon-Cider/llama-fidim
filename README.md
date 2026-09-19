@@ -136,6 +136,12 @@ that `fidim.exe` on your user PATH, `fidim path remove` takes it off, and
 `fidim path status` shows where things stand. Terminals opened afterwards
 see the change. The installer leaves PATH alone.
 
+**Updating.** The Updates tab opens with Llama FIDIM itself: the build
+you run, the newest release, and an Update button that downloads the
+release zip, checks its SHA-256, closes the app, replaces the three
+programs in place and reopens it. Servers keep running. From a terminal,
+`fidim self-update check` and `fidim self-update install`.
+
 **From source.** Build and install from the repo:
 
 ```
@@ -147,7 +153,9 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 The script checks for the build tools, builds the CLI and the GUI, installs
 them into `%LOCALAPPDATA%\Llama FIDIM`, the installer's folder, and creates
 a Start Menu entry. Add `-AddToPath` to make `fidim` available in every
-shell. Re-run it after pulling changes.
+shell. After that first install, the Updates tab rebuilds and reinstalls
+the checkout you name there (or `fidim self-update install --source`), so
+the script is only needed once.
 
 **Moving from the old folder.** The script used to install into
 `%LOCALAPPDATA%\Programs\LlamaFIDIM`. The script and the installer both

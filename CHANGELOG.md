@@ -15,6 +15,18 @@ build with uncommitted changes.
 
 ### Added
 
+- **Update the app from the app.** The Updates tab opens with Llama FIDIM
+  itself: which build this is, the newest release on GitHub with its notes,
+  and an Update button that downloads the release zip, checks it against
+  the published SHA-256, closes the app, replaces `fidim.exe`,
+  `fidim-dg.exe` and `llama-fidim.exe` in place and reopens it. A file a
+  running server still holds (a diffusion server's `fidim-dg.exe`) is moved
+  aside and that server keeps running; llama-server processes are never
+  touched. The same card builds and installs a checkout of this repository
+  when Settings names one (`fidim_source`), which is what
+  `scripts\install.ps1` used to be for. `fidim self-update check` and
+  `fidim self-update install [--tag vX.Y.Z | --source]` do the same from a
+  terminal. Updates and what they replaced are listed in a history.
 - **Get a model.** A Models tab finds a model on Hugging Face (search, or
   paste a repo or a link to one of its files), lists its files by quant
   with each one's size, estimated VRAM, whether it fits one card or a

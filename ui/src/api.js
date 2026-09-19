@@ -815,6 +815,19 @@ async function mock(cmd, args) {
       return { latest: { tag: "b10819", published_at: "2026-09-05" }, update_available: false, behind: 0, already_installed: true, newest_installed: { version: "b10819", path: "C:\\llama.cpp\\b10819-rocm" }, install_dir: "C:\\llama.cpp\\b10819-rocm", assets: [{ name: "llama-b10819-bin-win-cpu-x64.zip", size: 21e6 }], asset_error: null };
     case "update_history":
       return [];
+    case "app_update_check":
+      return {
+        current: { version: "0.2.0", long: "0.2.0+3 (fe51863 2026-09-19)", commit: "fe51863", commits_ahead: 3, modified: false, install_dir: "C:\\Users\\paul\\AppData\\Local\\Llama FIDIM", exe: "C:\\Users\\paul\\AppData\\Local\\Llama FIDIM\\llama-fidim.exe", in_install_folder: true },
+        latest: { tag: "v0.2.0", version: "0.2.0", published_at: "2026-09-18T20:31:47Z", html_url: "https://github.com/Dixon-Cider/llama-fidim/releases/tag/v0.2.0", notes: "### Added\n- Get a model.\n### Fixed\n- fidim scan named quantizations after the wrong table.", zip: { name: "llama-fidim-v0.2.0-win-x64.zip", url: "", size: 9586045 }, sha256: { name: "llama-fidim-v0.2.0-win-x64.zip.sha256", url: "", size: 97 } },
+        update_available: false, note: "this build is past the v0.2.0 release; nothing newer is published",
+        source_dir: "C:\\src\\llamactl", source_ok: true, staged: [], history: [],
+      };
+    case "app_update_stage":
+      return { dir: "C:\\Users\\paul\\.fidim\\app-updates\\checkout-fe51863\\stage", source: args.source ? "checkout" : "release", tag: args.source ? null : "v0.2.0", checkout: args.source ? "C:\\src\\llamactl" : null, version: "fidim 0.2.0+4 (abc1234 2026-09-19)", staged_unix: Math.floor(Date.now() / 1000) };
+    case "app_update_apply":
+      return { updater_pid: 4242, install_dir: "C:\\Users\\paul\\AppData\\Local\\Llama FIDIM", log: "C:\\Users\\paul\\.fidim\\app-updates\\apply.log" };
+    case "app_update_set_source":
+      return { source_dir: args.dir, source_ok: !!args.dir };
     case "unsloth_check": {
       const tag = args.tag ?? MOCK_UNSLOTH_TAG;
       const gfx = args.gfx || "gfx120X";
