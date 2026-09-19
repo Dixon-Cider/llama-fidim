@@ -31,6 +31,12 @@ build with uncommitted changes.
 
 ### Changed
 
+- **Move diffusion profiles onto it** on the Updates tab now lists the
+  profiles that would move, the patched runner build each would leave, and
+  why the others stay, and moves only the ones listed once you confirm. Its
+  tooltip no longer says profiles on a patched runner build never move: they
+  move onto a build whose patch has every feature of theirs, such as a
+  dgpatch4 profile onto dgpatch5.
 - The patched runner's profiler and split-count switches (`DG_PROFILE`,
   `DG_SC_SPLITK`, `DG_SC_SPLITK_CHECK`) are treated as test hooks: never
   passed to the runner, and flagged when a profile sets one.

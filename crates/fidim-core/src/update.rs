@@ -1463,6 +1463,60 @@ pub fn promote_skip_reason(p: &Profile, to_dir: &Path, t: &PromoteTarget, scope:
     }
 }
 
+/// The profiles a promotion onto `to_dir` moves, and (id, reason) for the
+/// ones it leaves alone.
+fn promotion_plan(cfg: &Config, to_dir: &Path, scope: &PromoteScope) -> Result<(Vec<Profile>, Vec<(String, String)>)> {
+    let target = promote_target(to_dir);
+    if !target.has_llama_server && !target.has_runner {
+        return Err(upd(format!("{} has neither bin/llama-server.exe nor bin/{RUNNER_EXE}", to_dir.display())));
+    }
+    let mut moving = Vec::new();
+    let mut skipped = Vec::new();
+    for p in Profile::load_all(&cfg.profile_dir)? {
+        match promote_skip_reason(&p, to_dir, &target, scope) {
+            Some(why) => skipped.push((p.id.clone(), why)),
+            None => moving.push(p),
+        }
+    }
+    Ok((moving, skipped))
+}
+
+/// A profile a promotion would move.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromoteMove {
+    pub profile_id: String,
+    /// The build it is on now.
+    pub from: BuildSnap,
+    /// The runner patch that build carries (`dgpatch4`), if any: the
+    /// profile then moves from one patched runner to another, which the
+    /// promotion allows when the target's patch has every feature of it.
+    pub from_patch: Option<String>,
+}
+
+/// What a promotion would do, computed without changing anything.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromotePreview {
+    pub moves: Vec<PromoteMove>,
+    /// (profile id, reason) for profiles it would leave alone.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// The profiles `promote` would move onto `to_dir` with `scope`, and why the
+/// others stay, so the choice can be shown before anything moves. Passing
+/// the moves' ids back as `PromoteScope::Ids` moves exactly those.
+pub fn promote_preview(cfg: &Config, to_dir: &Path, scope: &PromoteScope) -> Result<PromotePreview> {
+    let (moving, skipped) = promotion_plan(cfg, to_dir, scope)?;
+    let moves = moving
+        .into_iter()
+        .map(|p| PromoteMove {
+            from_patch: discovery::read_build_meta(&p.build.path).patch.map(|b| b.label().to_string()),
+            from: BuildSnap { path: p.build.path.clone(), version: p.build.version.clone() },
+            profile_id: p.id,
+        })
+        .collect();
+    Ok(PromotePreview { moves, skipped })
+}
+
 /// Re-point profiles onto `to_dir`. Old build directories are never touched,
 /// so rollback is a metadata operation. Baselines stay on the profile: the
 /// fingerprint includes the build version, so the next bench records fresh
@@ -1473,19 +1527,11 @@ pub fn promote(
     to_version: Option<String>,
     scope: PromoteScope,
 ) -> Result<PromoteReport> {
-    let target = promote_target(to_dir);
-    if !target.has_llama_server && !target.has_runner {
-        return Err(upd(format!("{} has neither bin/llama-server.exe nor bin/{RUNNER_EXE}", to_dir.display())));
-    }
+    let (moving, skipped) = promotion_plan(cfg, to_dir, &scope)?;
     let to = BuildSnap { path: to_dir.to_path_buf(), version: to_version };
     let mut entries = Vec::new();
-    let mut skipped = Vec::new();
-    for mut p in Profile::load_all(&cfg.profile_dir)? {
+    for mut p in moving {
         let id = p.id.clone();
-        if let Some(why) = promote_skip_reason(&p, to_dir, &target, &scope) {
-            skipped.push((id, why));
-            continue;
-        }
         let from = BuildSnap { path: p.build.path.clone(), version: p.build.version.clone() };
         p.build.path = to.path.clone();
         p.build.version = to.version.clone();
@@ -1928,6 +1974,80 @@ mod tests {
         };
         assert_eq!(skip(&on_patch, Path::new(r"C:\b\other-dgpatch"), &superset, &all), None);
         assert_eq!(skip(&dg, &patched_dir, &promote_target(&patched_dir), &all), None, "moving onto a patch is fine");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The preview the Updates view confirms before moving diffusion
+    /// profiles: which move (and off which patch), which stay, nothing written.
+    #[test]
+    fn promote_preview_lists_the_moves_and_writes_nothing() {
+        let root = std::env::temp_dir().join(format!("fidim-promote-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        const FEATURES: &str = r#"["dg-pkv-f16","dg-swa-ring","dg-fa-pad","dg-fa-turn-sizing","dg-step-fail-err","dg-frame-special","dg-prefill-reuse","dg-sc-splitk"]"#;
+        let build = |name: &str, patch: Option<&str>| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::write(dir.join("bin").join("llama-server.exe"), b"").unwrap();
+            std::fs::write(dir.join("bin").join(RUNNER_EXE), b"").unwrap();
+            let patch = patch.map(|n| format!(r#","patch":{{"name":"{n}","features":{FEATURES}}}"#)).unwrap_or_default();
+            std::fs::write(
+                dir.join(MANIFEST_NAME),
+                format!(
+                    r#"{{"tag":"{name}","source":"unsloth-overlay","installed_at_unix":1,"assets":[],"verify":{{"version":null,"commit":null,"devices":[],"hip_ok":false,"detail":""}},"channel":"unsloth","bundled_runtime":true{patch}}}"#
+                ),
+            )
+            .unwrap();
+            dir
+        };
+        let dgpatch4 = build("b11027-mix-3e83366-unsloth-dgpatch4", Some("dgpatch4"));
+        let plain = build("b11027-mix-3e83366-unsloth", None);
+        let overlay = build("b11030-mix-5ff778e-unsloth-dgpatch5", Some("dgpatch5"));
+
+        let mut cfg = Config::default_for_machine();
+        cfg.profile_dir = root.join("profiles");
+        std::fs::create_dir_all(&cfg.profile_dir).unwrap();
+        let mut pinned = test_profile("dg-pinned", Some("diffusion-gemma"), &dgpatch4.to_string_lossy());
+        pinned.extra.insert("build_pinned".into(), serde_json::Value::Bool(true));
+        for p in [
+            test_profile("dg-26b", Some("diffusion-gemma"), &dgpatch4.to_string_lossy()),
+            test_profile("dg-plain", Some("diffusion-gemma"), &plain.to_string_lossy()),
+            test_profile("worker", None, r"C:\b\b10819-rocm"),
+            pinned,
+        ] {
+            p.save(&cfg.profile_dir.join(format!("{}.json", p.id))).unwrap();
+        }
+        let before: Vec<String> = ["dg-26b", "dg-plain", "worker", "dg-pinned"]
+            .iter()
+            .map(|id| std::fs::read_to_string(cfg.profile_dir.join(format!("{id}.json"))).unwrap())
+            .collect();
+
+        // Onto the dgpatch5 overlay: the dgpatch4 profile moves (every one of
+        // its features is there), and says so; so does the plain one.
+        let pv = promote_preview(&cfg, &overlay, &PromoteScope::All).unwrap();
+        let moves: Vec<(&str, Option<&str>)> =
+            pv.moves.iter().map(|m| (m.profile_id.as_str(), m.from_patch.as_deref())).collect();
+        assert_eq!(moves, [("dg-26b", Some("dgpatch4")), ("dg-plain", None)]);
+        assert_eq!(pv.moves[0].from.path, dgpatch4);
+        let skipped: std::collections::BTreeMap<&str, &str> = pv.skipped.iter().map(|(i, w)| (i.as_str(), w.as_str())).collect();
+        assert_eq!(skipped.get("worker"), Some(&"Unsloth fork build: pick it in the editor if wanted"));
+        assert_eq!(skipped.get("dg-pinned"), Some(&"pinned (build_pinned = true)"));
+
+        // Onto the plain build the dgpatch4 profile stays, and only the ids
+        // confirmed are in scope.
+        let pv = promote_preview(&cfg, &plain, &PromoteScope::All).unwrap();
+        assert!(pv.moves.is_empty(), "{:?}", pv.moves);
+        assert!(pv.skipped.iter().any(|(i, w)| i == "dg-26b" && w.contains("on a patched runner build (dgpatch4)")));
+        let pv = promote_preview(&cfg, &overlay, &PromoteScope::Ids(vec!["dg-plain".into()])).unwrap();
+        assert_eq!(pv.moves.iter().map(|m| m.profile_id.as_str()).collect::<Vec<_>>(), ["dg-plain"]);
+        assert!(pv.skipped.iter().any(|(i, w)| i == "dg-26b" && w == "out of scope"));
+
+        // A folder that is no build is an error, as for promote itself.
+        assert!(promote_preview(&cfg, &root.join("nothing"), &PromoteScope::All).is_err());
+        let after: Vec<String> = ["dg-26b", "dg-plain", "worker", "dg-pinned"]
+            .iter()
+            .map(|id| std::fs::read_to_string(cfg.profile_dir.join(format!("{id}.json"))).unwrap())
+            .collect();
+        assert_eq!(before, after, "a preview writes nothing");
         std::fs::remove_dir_all(root).ok();
     }
 

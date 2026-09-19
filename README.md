@@ -167,7 +167,10 @@ model.
   `dg-fa-turn-sizing`), flash attention runs on the GPU and the runner sizes
   by its per-request working set: 65,536 tokens on a 32 GB card. Promotion
   never moves a diffusion profile onto a build that lacks its patch's
-  features.
+  features; onto one that has them all it does (a dgpatch4 profile onto
+  dgpatch5). **Move diffusion profiles onto it** on the Updates tab first
+  lists the profiles that would move, and off which patch, and moves only
+  those you confirm.
 - **The runner patch, installed for you.** Where an overlay is published for
   an Unsloth release, **Install with FIDIM runner patch** on the Updates tab
   (or `fidim update --channel unsloth --install --overlay`) installs that

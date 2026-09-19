@@ -551,11 +551,24 @@ async function mock(cmd, args) {
         },
       };
     }
-    case "unsloth_promote":
+    case "unsloth_promote_preview": {
+      // The diffusion profile sits on the locally patched build: onto the
+      // dgpatch5 overlay it moves (every feature is there), onto a plain
+      // build it stays.
+      const patched = MOCK_BUILDS.find((b) => b.patch);
+      const fork = [["worker-pool", "Unsloth fork build: pick it in the editor if wanted"], ["qwen-split", "Unsloth fork build: pick it in the editor if wanted"]];
+      if (/-dgpatch5$/.test(args.toPath)) {
+        return { moves: [{ profile_id: "dg-26b", from: { path: patched.path, version: patched.version }, from_patch: patched.patch.name }], skipped: fork };
+      }
+      return { moves: [], skipped: [["dg-26b", `on a patched runner build (${patched.patch.name}) whose features the target lacks (${patched.patch.features.join(", ")}); pick the new build in the editor if wanted`], ...fork] };
+    }
+    case "unsloth_promote": {
+      const ids = args.ids ?? ["dg-26b"];
       return {
-        batch: { at_unix: Math.floor(Date.now() / 1000), entries: [{ profile_id: "dg-26b", from: { path: MOCK_BUILDS[1].path, version: "b11027" }, to: { path: args.toPath, version: args.toVersion } }] },
+        batch: { at_unix: Math.floor(Date.now() / 1000), entries: ids.map((id) => ({ profile_id: id, from: { path: MOCK_BUILDS[1].path, version: "b11027" }, to: { path: args.toPath, version: args.toVersion } })) },
         skipped: [["worker-pool", "Unsloth fork build: pick it in the editor if wanted"], ["qwen-split", "Unsloth fork build: pick it in the editor if wanted"]],
       };
+    }
     case "rocm_families":
       return ["gfx103X-all", "gfx110X-all", "gfx1151", "gfx120X-all"];
     case "rocm_available":
