@@ -9,6 +9,34 @@ use crate::{Error, Result};
 
 pub struct WindowsPlatform;
 
+static CTRL_C_FLAG: std::sync::OnceLock<&'static std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+
+/// See `platform::cancel_on_ctrl_c`.
+pub fn cancel_on_ctrl_c(flag: &'static std::sync::atomic::AtomicBool) -> bool {
+    use windows::Win32::Foundation::{BOOL, FALSE, TRUE};
+    use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+    unsafe extern "system" fn handler(kind: u32) -> BOOL {
+        use std::sync::atomic::Ordering;
+        if kind != CTRL_C_EVENT && kind != CTRL_BREAK_EVENT {
+            return FALSE;
+        }
+        match CTRL_C_FLAG.get() {
+            // The first press asks the job to stop; a second one is not
+            // handled, and Windows ends the process.
+            Some(f) if !f.swap(true, Ordering::SeqCst) => {
+                eprintln!("\nstopping... (press Ctrl+C again to quit at once)");
+                TRUE
+            }
+            _ => FALSE,
+        }
+    }
+    if CTRL_C_FLAG.set(flag).is_err() && !CTRL_C_FLAG.get().is_some_and(|f| std::ptr::eq(*f, flag)) {
+        return false;
+    }
+    unsafe { SetConsoleCtrlHandler(Some(handler), true).is_ok() }
+}
+
 /// Every process below `root` in the parent tree (children, grandchildren...),
 /// from one Toolhelp snapshot, minus children of a reused pid (see
 /// `descendants_in`). The router's model instances are its children, and

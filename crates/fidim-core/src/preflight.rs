@@ -925,8 +925,8 @@ fn check_build_knows_model(ctx: &LaunchContext) -> Option<CheckResult> {
                 })
                 .collect();
             Outcome::Block(format!(
-                "build {tag} does not know {}: llama-server would stop at load with \"{}\". Run the model wizard \
-                 (`fidim models get`) to get a build that loads it",
+                "build {tag} does not know {}: llama-server would stop at load with \"{}\". Get a build that \
+                 loads it from the Models tab (Get a model), or with `fidim models get <repo>`",
                 describe_missing(&bs.needs, missing),
                 errors.join("\", \"")
             ))
@@ -1086,7 +1086,7 @@ mod tests {
             Outcome::Block(m) => {
                 assert!(m.contains("build b does not know architecture 'k2-horizon' and pre-tokenizer 'k2-horizon'"), "{m}");
                 assert!(m.contains("\"unknown model architecture: 'k2-horizon'\", \"unknown pre-tokenizer type: 'k2-horizon'\""), "{m}");
-                assert!(m.contains("fidim models get"), "{m}");
+                assert!(m.contains("Models tab") && m.contains("fidim models get"), "{m}");
             }
             o => panic!("{o:?}"),
         }
