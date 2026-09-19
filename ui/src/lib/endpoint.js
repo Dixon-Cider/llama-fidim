@@ -20,14 +20,33 @@ export function isLoopback(host) {
   return h === "localhost" || h === "::1" || /^127\./.test(h);
 }
 
+/// The shells the snippets are written for, in the order the card offers
+/// them. On Windows `curl` in PowerShell 5.1 is Invoke-WebRequest, and cmd
+/// has neither `\` continuations nor single quotes, so each gets its own.
+export const SHELLS = [
+  ["powershell", "PowerShell"],
+  ["cmd", "cmd"],
+  ["bash", "Git Bash / WSL"],
+];
+
+// Quoting. PowerShell and bash: single quotes, nothing inside expands.
+// cmd: double quotes, and curl.exe reads `\"` as a quote (the C runtime's
+// rule, which also doubles the backslashes before one).
+const psq = (s) => `'${String(s).replace(/'/g, "''")}'`;
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const cmdq = (s) => `"${String(s).replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, "$1$1")}"`;
+
 /// `run` is a run state ({host, port, alias}); `model` a router model id.
-/// `hasKey`: the profile sets --api-key (the key itself never reaches here).
+/// `hasKey`: the profile requires an API key (the key itself never reaches here).
 export function endpointFor(run, model = null, hasKey = false) {
   const baseUrl = `http://${hostPort(run.host, run.port)}/v1`;
+  const url = `${baseUrl}/chat/completions`;
   const modelId = model ?? run.alias;
-  const key = hasKey ? "<the profile's --api-key>" : "sk-no-key";
+  const key = hasKey ? "<the profile's API key>" : "sk-no-key";
   const body = JSON.stringify({ model: modelId, stream: true, messages: [{ role: "user", content: "Hello" }] });
-  const auth = hasKey ? ` \\\n  -H "Authorization: Bearer ${key}"` : "";
+  const hs = ["Content-Type: application/json", ...(hasKey ? [`Authorization: Bearer ${key}`] : [])];
+  // -g: curl would read an IPv6 host's brackets as a URL pattern.
+  const args = (q) => [`-N${url.includes("[") ? " -g" : ""} ${q(url)}`, ...hs.map((h) => `-H ${q(h)}`)];
   return {
     baseUrl,
     modelId,
@@ -35,7 +54,18 @@ export function endpointFor(run, model = null, hasKey = false) {
     loopback: isLoopback(run.host),
     wildcard: ["0.0.0.0", "::", "[::]"].includes(String(run.host ?? "").trim()),
     hasKey,
-    curl: `curl -N ${baseUrl}/chat/completions \\\n  -H "Content-Type: application/json"${auth} \\\n  -d '${body}'`,
+    // curl.exe, never PowerShell's curl alias; the body goes in on stdin,
+    // since PowerShell 5.1 mangles quotes in a native command's arguments.
+    curl: {
+      powershell: `${psq(body)} | curl.exe ${args(psq).join(" ")} -d '@-'`,
+      cmd: `curl.exe ${args(cmdq).join(" ")} -d ${cmdq(body)}`,
+      bash: [`curl ${args(shq)[0]}`, ...args(shq).slice(1), `-d ${shq(body)}`].join(" \\\n  "),
+    },
+    env: {
+      powershell: `$env:OPENAI_BASE_URL = ${psq(baseUrl)}\n$env:OPENAI_API_KEY = ${psq(key)}`,
+      cmd: `set "OPENAI_BASE_URL=${baseUrl}"\nset "OPENAI_API_KEY=${key}"`,
+      bash: `export OPENAI_BASE_URL=${shq(baseUrl)}\nexport OPENAI_API_KEY=${shq(key)}`,
+    },
     python: [
       "from openai import OpenAI",
       "",
@@ -49,6 +79,5 @@ export function endpointFor(run, model = null, hasKey = false) {
       `    if chunk.choices:`,
       `        print(chunk.choices[0].delta.content or "", end="", flush=True)`,
     ].join("\n"),
-    env: `OPENAI_BASE_URL=${baseUrl}\nOPENAI_API_KEY=${key}`,
   };
 }
