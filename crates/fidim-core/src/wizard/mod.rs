@@ -636,6 +636,22 @@ fn doctor_cache() -> &'static Mutex<DoctorAnswers> {
 }
 const DOCTOR_TTL: Duration = Duration::from_secs(600);
 
+/// The installed builds, as last scanned: every build's `--version` runs in
+/// a scan (about 0.3 s each), and a search, an inspect and a plan each want
+/// the list. Kept a minute, for the same roots; `forget_builds` drops it
+/// when a build is added.
+type BuildScan = (Instant, Vec<PathBuf>, Option<PathBuf>, Vec<Build>);
+fn builds_cache() -> &'static Mutex<Option<BuildScan>> {
+    static CACHE: OnceLock<Mutex<Option<BuildScan>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+const BUILDS_TTL: Duration = Duration::from_secs(60);
+
+/// Scan the builds afresh next time (one was installed or removed).
+pub fn forget_builds() {
+    *builds_cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// The build `--list-devices` runs from: the newest upstream release that
 /// runs, else any that runs, else the first (as the CLI and the GUI pick it).
 pub fn enumeration_build(builds: &[Build]) -> Option<&Build> {
@@ -704,7 +720,16 @@ impl Env for LiveEnv {
         hub::auth_check(&self.cfg, repo)
     }
     fn builds(&self) -> Vec<Build> {
-        discovery::scan_builds(&self.cfg.build_roots_effective(), self.cfg.rocm_bin.as_deref())
+        let roots = self.cfg.build_roots_effective();
+        let rocm = self.cfg.rocm_bin.clone();
+        if let Some((at, r, rb, builds)) = builds_cache().lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if at.elapsed() < BUILDS_TTL && *r == roots && *rb == rocm {
+                return builds.clone();
+            }
+        }
+        let builds = discovery::scan_builds(&roots, rocm.as_deref());
+        *builds_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), roots, rocm, builds.clone()));
+        builds
     }
     fn devices(&self) -> Result<Vec<Device>> {
         if let Some(d) = &self.devices {
@@ -769,11 +794,15 @@ impl Env for LiveEnv {
     }
     fn install_upstream(&self, tag: &str, progress: &mut dyn FnMut(String)) -> Result<InstallReport> {
         let release = update::release_by_tag(tag)?;
-        update::install_prebuilt(&self.cfg, &release, progress)
+        let r = update::install_prebuilt(&self.cfg, &release, progress);
+        forget_builds();
+        r
     }
     fn install_unsloth(&self, tag: &str, gfx: &str, progress: &mut dyn FnMut(String)) -> Result<InstallReport> {
         let release = update::unsloth_release_by_tag(tag)?;
-        update::install_unsloth(&self.cfg, &release, gfx, progress)
+        let r = update::install_unsloth(&self.cfg, &release, gfx, progress);
+        forget_builds();
+        r
     }
     fn build_source(
         &self,
@@ -782,7 +811,9 @@ impl Env for LiveEnv {
         progress: &mut dyn FnMut(BuildProgress),
         cancel: &AtomicBool,
     ) -> Result<InstallReport> {
-        update::build_from_ref(&self.cfg, src, gpu_targets, progress, cancel)
+        let r = update::build_from_ref(&self.cfg, src, gpu_targets, progress, cancel);
+        forget_builds();
+        r
     }
     fn save_profile(&self, p: &Profile) -> Result<PathBuf> {
         save_new_profile(&self.cfg.profile_dir, p)
@@ -882,6 +913,14 @@ fn verdicts(env: &dyn Env, needs: &ModelNeeds, builds: &[Build]) -> Vec<BuildVer
 /// The best build that certainly loads the model (verdicts come sorted).
 fn best_usable(v: &[BuildVerdict]) -> Option<&BuildVerdict> {
     v.iter().find(|b| !b.broken && b.support.is_yes())
+}
+
+/// `p` is `root` or inside it, compared as Windows does: without case,
+/// either separator.
+fn under(p: &Path, root: &Path) -> bool {
+    let norm = |x: &Path| x.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let (p, root) = (norm(p), norm(root));
+    p == root || p.starts_with(&format!("{root}\\"))
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -1734,7 +1773,7 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
     let total_bytes: u64 = dests.iter().map(|(_, s)| s).sum();
     let rel: Vec<PathBuf> = dests.iter().map(|(d, _)| d.strip_prefix(&dest_root).map(Path::to_path_buf).unwrap_or_else(|_| d.clone())).collect();
     notes.extend(crate::disk::check_destination(&dest_root, &rel, download_bytes, engine.is_diffusion()).into_iter().map(Note::from));
-    if !cfg.model_roots.iter().any(|r| dest_root.starts_with(r) || same_path(r, &dest_root)) {
+    if !cfg.model_roots.iter().any(|r| under(&dest_root, r)) {
         notes.push(Note::new(
             Level::Warning,
             "dest-not-scanned",

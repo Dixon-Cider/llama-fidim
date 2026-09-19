@@ -946,6 +946,13 @@ fn needs_of_a_local_file_and_a_repo() {
 }
 
 #[test]
+fn folders_compare_as_windows_does() {
+    assert!(under(Path::new(r"E:\Models\sub"), Path::new(r"e:\models")));
+    assert!(under(Path::new("E:/models"), Path::new(r"E:\models\")));
+    assert!(!under(Path::new(r"E:\models2"), Path::new(r"E:\models")));
+}
+
+#[test]
 fn model_folders_can_be_added() {
     let root = tmp("roots");
     let mut cfg = Config::default_for_machine();

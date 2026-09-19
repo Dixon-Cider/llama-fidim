@@ -127,6 +127,7 @@ fn cached_devices(
 /// Forget everything derived from the installed builds, so a build that
 /// was just installed shows up in the pickers without waiting for a TTL.
 fn invalidate_build_caches(cache: &Arc<Mutex<UiCache>>) {
+    fidim_core::wizard::forget_builds();
     let mut c = cache.lock().unwrap();
     c.scan = None;
     c.devices = None;
