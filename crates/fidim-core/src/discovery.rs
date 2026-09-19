@@ -21,6 +21,61 @@ pub enum Channel {
     Upstream,
     /// unslothai/llama.cpp's fork, which carries the DiffusionGemma runner.
     Unsloth,
+    /// Compiled by FIDIM from a git ref that is not a release: a fork's
+    /// branch, an upstream pull request or any commit (`update::build_from_ref`).
+    /// Its `--version` build number is that ref's own history count, so it
+    /// never ranks against upstream releases.
+    Git,
+    /// A channel a newer FIDIM wrote. Never treated as upstream.
+    #[serde(other)]
+    Other,
+}
+
+impl Channel {
+    /// Short name for tables (`upstream`, `unsloth`, `git`, `other`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Upstream => "upstream",
+            Channel::Unsloth => "unsloth",
+            Channel::Git => "git",
+            Channel::Other => "other",
+        }
+    }
+}
+
+/// The git ref a `Channel::Git` build was compiled from, as its manifest
+/// records it. `--version` of such a build reports the ref's own history
+/// count as a build number; this is what names it instead.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GitSource {
+    /// URL the ref was fetched from, e.g. `https://github.com/ifm-ai/llama.cpp`.
+    #[serde(default)]
+    pub remote: String,
+    /// What was fetched: a branch, `pull/<n>/head`, a tag or a commit.
+    #[serde(default)]
+    pub git_ref: String,
+    /// The full commit that was built (checked against what the fetch got).
+    #[serde(default)]
+    pub commit: String,
+    /// Short human name, e.g. `ifm-ai K2Horizon fork`.
+    #[serde(default)]
+    pub label: String,
+}
+
+impl GitSource {
+    /// `ifm-ai K2Horizon fork @42adf01`.
+    pub fn display(&self) -> String {
+        let short: String = self.commit.chars().take(7).collect();
+        let label = if self.label.trim().is_empty() { self.git_ref.as_str() } else { self.label.trim() };
+        if short.is_empty() { label.to_string() } else { format!("{label} @{short}") }
+    }
+}
+
+/// serde `deserialize_with` for a manifest's `git`: a malformed block reads
+/// as none instead of failing the whole manifest.
+pub fn lenient_git<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<GitSource>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// The DiffusionGemma runner, beside `llama-server.exe` in a build's `bin`.
@@ -91,6 +146,8 @@ pub struct BuildMeta {
     pub bundled_runtime: bool,
     pub release_tag: Option<String>,
     pub patch: Option<BuildPatch>,
+    /// Set on `Channel::Git` builds.
+    pub git: Option<GitSource>,
 }
 
 impl BuildMeta {
@@ -114,6 +171,8 @@ struct ManifestLite {
     /// plain upstream one; it just reads as unpatched.
     #[serde(default, deserialize_with = "lenient_patch")]
     patch: Option<BuildPatch>,
+    #[serde(default, deserialize_with = "lenient_git")]
+    git: Option<GitSource>,
 }
 
 /// Read a build's channel metadata. No manifest, or one that does not parse,
@@ -128,6 +187,7 @@ pub fn read_build_meta(dir: &Path) -> BuildMeta {
             bundled_runtime: m.bundled_runtime,
             release_tag: m.release_tag,
             patch: m.patch,
+            git: m.git,
         },
         Err(_) => BuildMeta::default(),
     }
@@ -155,6 +215,9 @@ pub struct Build {
     pub patch: Option<BuildPatch>,
     /// `bin/<RUNNER_EXE>` when present: this build can run diffusion profiles.
     pub runner_exe: Option<PathBuf>,
+    /// From the manifest only: the git ref a `Channel::Git` build was
+    /// compiled from. Its `display()` is the build's name in tables.
+    pub git: Option<GitSource>,
 }
 
 /// Scan each root and its immediate subdirectories for `bin/llama-server.exe`.
@@ -200,6 +263,7 @@ fn probe_build(dir: &Path, exe: &Path, rocm_bin: Option<&Path>) -> Build {
         release_tag: meta.release_tag,
         patch: meta.patch,
         runner_exe: runner.is_file().then_some(runner),
+        git: meta.git,
     };
     // A bundled build is probed exactly as it launches: with nothing on PATH.
     let rocm_bin = if build.bundled_runtime { None } else { rocm_bin };
@@ -628,6 +692,42 @@ mod tests {
         assert_eq!(BuildPatch { features: vec![dg_feature::FA_PAD.into()], ..Default::default() }.label(), "patched");
         std::fs::write(dir.join(crate::update::MANIFEST_NAME), manifest("")).unwrap();
         assert!(read_build_meta(&dir).patch.is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A build compiled from a git ref: channel `git` and its source, shown
+    /// by its label. A channel from a newer FIDIM reads as `other`, never as
+    /// upstream, and a malformed `git` block only drops the label.
+    #[test]
+    fn git_build_meta() {
+        let root = std::env::temp_dir().join(format!("fidim-disc-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("ifm-ai-K2Horizon-fork-42adf019-src");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin").join("llama-server.exe"), b"").unwrap();
+        let manifest = |channel: &str, git: &str| {
+            format!(
+                r#"{{"tag":"t","source":"git-ref","installed_at_unix":1,"assets":[],
+                    "verify":{{"version":"b10676","commit":null,"devices":[],"hip_ok":true,"detail":""}},
+                    "channel":"{channel}","git":{git}}}"#
+            )
+        };
+        let git = r#"{"remote":"https://github.com/ifm-ai/llama.cpp","git_ref":"model/K2Horizon","commit":"42adf019f76013dac873b5b43950d54d5ab27216","label":"ifm-ai K2Horizon fork"}"#;
+        std::fs::write(dir.join(crate::update::MANIFEST_NAME), manifest("git", git)).unwrap();
+        let m = read_build_meta(&dir);
+        assert_eq!(m.channel, Channel::Git);
+        assert_eq!(m.git.as_ref().unwrap().display(), "ifm-ai K2Horizon fork @42adf01");
+        let b = scan_builds(&[root.clone()], None).remove(0);
+        assert_eq!((b.channel, b.git.as_ref().unwrap().git_ref.as_str()), (Channel::Git, "model/K2Horizon"));
+        assert_eq!(serde_json::to_value(&b).unwrap()["channel"], "git");
+
+        std::fs::write(dir.join(crate::update::MANIFEST_NAME), manifest("custom", git)).unwrap();
+        assert_eq!(read_build_meta(&dir).channel, Channel::Other);
+        std::fs::write(dir.join(crate::update::MANIFEST_NAME), manifest("git", "[1,2]")).unwrap();
+        let m = read_build_meta(&dir);
+        assert_eq!(m.channel, Channel::Git, "a bad git block keeps the channel");
+        assert!(m.git.is_none());
+        assert_eq!(Channel::Git.as_str(), "git");
         std::fs::remove_dir_all(root).ok();
     }
 

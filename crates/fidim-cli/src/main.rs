@@ -647,9 +647,10 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
             .as_deref()
             .map(|e| format!("  [BROKEN: {e}]"))
             .unwrap_or_default();
-        let channel = match b.channel {
-            discovery::Channel::Upstream => "",
-            discovery::Channel::Unsloth => "  [unsloth]",
+        let channel = match (b.channel, &b.git) {
+            (discovery::Channel::Upstream, _) => String::new(),
+            (discovery::Channel::Git, Some(g)) => format!("  [git: {}]", g.display()),
+            (c, _) => format!("  [{}]", c.as_str()),
         };
         let dg = if b.runner_exe.is_some() { " +dg" } else { "" };
         let patch = b

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::devices;
-use crate::discovery::{self, Build, BuildPatch, Channel, RUNNER_EXE};
+use crate::discovery::{self, Build, BuildPatch, Channel, GitSource, RUNNER_EXE};
 use crate::launch::run_capture;
 use crate::profile::{Engine, Profile};
 use crate::{Error, Result};
@@ -529,10 +529,11 @@ pub fn verify_build(exe: &Path, rocm_bin: Option<&Path>) -> Verify {
 
 // ----------------------------------------------------------------- install ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub tag: String,
-    /// `prebuilt`, `source` or `unsloth-prebuilt`.
+    /// `prebuilt`, `source` (a release tag), `git-ref` (any other git ref)
+    /// or `unsloth-prebuilt`.
     pub source: String,
     pub installed_at_unix: u64,
     pub assets: Vec<String>,
@@ -556,6 +557,12 @@ pub struct Manifest {
     /// malformed block reads as none.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "discovery::lenient_patch")]
     pub patch: Option<BuildPatch>,
+    /// What a `Channel::Git` build was compiled from.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "discovery::lenient_git")]
+    pub git: Option<GitSource>,
+    /// Fields a newer FIDIM wrote, kept through every re-verify rewrite.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -737,6 +744,7 @@ pub fn install_prebuilt(
                 asset_sha256: None,
                 gfx_target: None,
                 patch: None,
+                ..Default::default()
             });
         let new_shims: Vec<String> = shims.into_iter().filter(|s| !m.assets.contains(s)).collect();
         m.assets.extend(new_shims);
@@ -798,6 +806,7 @@ pub fn install_prebuilt(
             asset_sha256: None,
             gfx_target: None,
             patch: None,
+            ..Default::default()
         },
     )?;
     Ok(InstallReport { tag: release.tag.clone(), dir, source: "prebuilt".into(), skipped_existing: false, verify })
@@ -893,6 +902,7 @@ pub fn build_from_source(
             asset_sha256: None,
             gfx_target: None,
             patch: None,
+            ..Default::default()
         },
     )?;
     Ok(InstallReport { tag: tag.into(), dir, source: "source".into(), skipped_existing: false, verify })
@@ -1073,6 +1083,7 @@ fn stage_unsloth(zip: &Path, tmp: &Path, final_dir: &Path, meta: &UnslothMeta) -
             asset_sha256: meta.sha256.clone(),
             gfx_target: Some(meta.gfx.clone()),
             patch: None,
+            ..Default::default()
         },
     )?;
     if let Some(parent) = final_dir.parent() {
@@ -1134,6 +1145,7 @@ pub fn install_unsloth(
             asset_sha256: None,
             gfx_target: None,
             patch: None,
+            ..Default::default()
         });
         m.verify = verify.clone();
         write_manifest(&dir, &m)?;
@@ -1389,6 +1401,9 @@ pub fn promote_skip_reason(p: &Profile, to_dir: &Path, t: &PromoteTarget, scope:
         Engine::LlamaServer if t.channel == Channel::Unsloth => {
             Some("Unsloth fork build: pick it in the editor if wanted".into())
         }
+        Engine::LlamaServer if t.channel != Channel::Upstream => {
+            Some("built from a git ref (a fork, a pull request or a commit): pick it in the editor if wanted".into())
+        }
         Engine::DiffusionGemma if !t.has_runner => Some("target build has no diffusion runner".into()),
         // A patched runner's profile (FA on, a context only the patch can
         // hold) would break on a runner without those features: never swap
@@ -1553,6 +1568,7 @@ mod tests {
             release_tag: None,
             patch: None,
             runner_exe: None,
+            git: None,
         }];
         let c = check_against(&cfg, &builds, parse_release(RELEASE_JSON).unwrap()).unwrap();
         assert_eq!(c.behind, Some(952));
@@ -1753,6 +1769,7 @@ mod tests {
             release_tag: (channel == Channel::Unsloth).then(|| tag.trim_end_matches("-unsloth").to_string()),
             patch: None,
             runner_exe: None,
+            git: None,
         }
     }
 
