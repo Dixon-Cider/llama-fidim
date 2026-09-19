@@ -303,8 +303,11 @@ fn attempt(
             });
         }
         Err(ureq::Error::Status(status, resp)) => {
+            // A redirect took the request to another host (a CDN): its 403
+            // is an expired signature, not a refusal.
+            let redirected = host_of(resp.get_url()) != host_of(&req.url);
             let error = hub::response_error(status, resp, what, ctx.repo.as_deref(), req.token.is_some());
-            return retry_or_fail(error);
+            return retry_or_fail(error, redirected);
         }
         Err(ureq::Error::Transport(t)) => {
             return Ok(Attempt::Retry { wait: None, error: hub::network_error(what, t) });
@@ -379,23 +382,29 @@ fn attempt(
 }
 
 /// Which failures are worth another attempt: the network, rate limits,
-/// server errors, timeouts, and a 403 from a CDN (an expired signed URL,
-/// which the next attempt re-resolves). A gated or missing repo or file is
-/// not.
-fn retry_or_fail(error: Error) -> Result<Attempt> {
+/// server errors, timeouts, and a 403 from the host a redirect led to (an
+/// expired signed CDN URL, which the next attempt re-resolves). A gated or
+/// missing repo or file, or a 403 from the URL's own host, is not.
+fn retry_or_fail(error: Error, redirected: bool) -> Result<Attempt> {
     let wait = match &error {
         Error::Http { kind: HttpErrorKind::Network, .. } => None,
         Error::Http { kind: HttpErrorKind::RateLimited { retry_after_secs }, .. } => {
             Some(retry_after_secs.map(Duration::from_secs).unwrap_or(MAX_BACKOFF).min(MAX_RATE_LIMIT_WAIT))
         }
         Error::Http { kind: HttpErrorKind::Status { status }, .. }
-            if *status >= 500 || *status == 408 || *status == 403 =>
+            if *status >= 500 || *status == 408 || (*status == 403 && redirected) =>
         {
             None
         }
         _ => return Err(error),
     };
     Ok(Attempt::Retry { wait, error })
+}
+
+/// `host[:port]` of a URL, lowercased.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase()
 }
 
 fn check_size(req: &FetchReq, size: u64, part: &Path) -> Result<()> {
@@ -826,6 +835,23 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(srv.requests().len(), 1, "a gated repo is not retried");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A 403 from the URL's own host is a refusal; only one from the host a
+    /// redirect led to (an expired signed URL) is retried.
+    #[test]
+    fn a_403_from_the_origin_is_not_retried() {
+        let data = payload(100);
+        let srv = Server::start("127.0.0.1", |_| Resp::new(403, "Forbidden")).unwrap();
+        let dir = tmp("forbidden");
+        match download_resumable(&req_for(format!("{}/f", srv.base), &data), &dir.join("m.gguf"), &mut quiet(), &AtomicBool::new(false)) {
+            Err(Error::Http { kind: HttpErrorKind::Status { status: 403 }, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(srv.requests().len(), 1);
+        assert_eq!(host_of("https://us.aws.cdn.hf.co/x?y=1"), "us.aws.cdn.hf.co");
+        assert_eq!(host_of("http://127.0.0.1:8080/o/r"), "127.0.0.1:8080");
         std::fs::remove_dir_all(dir).ok();
     }
 
