@@ -24,6 +24,7 @@ pub mod router;
 pub mod runtime;
 pub mod supervise;
 pub mod update;
+pub mod user_path;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
