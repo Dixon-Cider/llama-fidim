@@ -533,6 +533,38 @@ fn print_promote(json: bool, r: &fidim_core::update::PromoteReport, to_dir: &std
     Ok(())
 }
 
+/// The line `fidim update --channel unsloth` ends a check with (no
+/// --install, no --promote): what would work next. `--install` is suggested
+/// for the published overlay only when one is published.
+fn unsloth_next_step(c: &fidim_core::update::UnslothCheck, overlay: Option<&fidim_core::overlay::OverlaySource>) -> String {
+    use fidim_core::overlay::OverlaySource;
+    let installed = if overlay.is_some() { c.overlay_installed } else { c.already_installed };
+    if installed {
+        return "installed. --promote moves diffusion profiles onto it.".into();
+    }
+    match overlay {
+        Some(OverlaySource::Published) if !c.overlay_available => {
+            let patch = &c.overlay_patch;
+            match &c.overlay_error {
+                Some(e) => format!(
+                    "the {patch} overlay for {} is unavailable ({e}); --overlay-from <folder> installs one built locally.",
+                    c.latest.tag
+                ),
+                None => format!(
+                    "no {patch} overlay is published for {} in {}: build one with packaging/dg-overlay and pass \
+                     --overlay-from <folder>, or pick a --tag that has one.",
+                    c.latest.tag, c.overlay_repo
+                ),
+            }
+        }
+        Some(_) => "run with --install to fetch it and lay the runner patch over it.".into(),
+        None => format!(
+            "run with --install to fetch it (--gfx picks another GPU target{}).",
+            if c.overlay_available { ", --overlay adds the runner patch" } else { "" }
+        ),
+    }
+}
+
 /// What `--overlay`, `--overlay-from` and `--base-zip` asked for.
 struct UnslothOverlay {
     source: Option<fidim_core::overlay::OverlaySource>,
@@ -615,15 +647,8 @@ fn cmd_update_unsloth(
     if !install && !promote {
         if json {
             println!("{}", serde_json::to_string_pretty(&c)?);
-        } else if target_installed {
-            println!("installed. --promote moves diffusion profiles onto it.");
-        } else if patched {
-            println!("run with --install to fetch it and lay the runner patch over it.");
         } else {
-            println!(
-                "run with --install to fetch it (--gfx picks another GPU target{}).",
-                if c.overlay_available { ", --overlay adds the runner patch" } else { "" }
-            );
+            println!("{}", unsloth_next_step(&c, overlay.source.as_ref()));
         }
         return Ok(());
     }
@@ -1551,4 +1576,64 @@ fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
     }
     if rows.is_empty() { println!("nothing running"); }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fidim_core::overlay::{self as ov, OverlayLookup, OverlaySource};
+    use fidim_core::update;
+
+    const TAG: &str = "b11030-mix-5ff778e";
+
+    fn release(json_assets: &str, tag: &str) -> update::Release {
+        update::parse_release(&format!(
+            r#"{{"tag_name":"{tag}","published_at":"2026-09-18T15:36:14Z","html_url":"","assets":[{json_assets}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn unsloth_hint_offers_install_only_for_an_overlay_that_exists() {
+        let mut cfg = Config::default_for_machine();
+        let root = std::env::temp_dir().join(format!("fidim-cli-hint-{}", std::process::id()));
+        cfg.install_root = Some(root.clone());
+        let z = "0".repeat(64);
+        let latest = release(
+            &format!(r#"{{"name":"app-{TAG}-windows-x64-rocm-gfx120X.zip","browser_download_url":"https://x/b","size":1,"digest":"sha256:{z}"}}"#),
+            TAG,
+        );
+        let mut c = update::check_unsloth_against(&cfg, &[], latest, "gfx120X").unwrap();
+        let published = OverlaySource::Published;
+        let local = OverlaySource::Local(PathBuf::from(r"C:\dgo\out"));
+
+        // Nothing published: say so and point at --overlay-from, not --install.
+        ov::apply_lookup(&mut c, OverlayLookup::Missing);
+        let h = unsloth_next_step(&c, Some(&published));
+        assert!(h.contains("no dgpatch5 overlay is published for b11030-mix-5ff778e in Dixon-Cider/fidim-dg-overlay"), "{h}");
+        assert!(h.contains("--overlay-from") && !h.contains("--install"), "{h}");
+        assert!(!unsloth_next_step(&c, None).contains("--overlay"), "the plain build does not offer it either");
+        // The lookup failed: the reason, not advice that cannot work.
+        ov::apply_lookup(&mut c, OverlayLookup::Failed("GitHub API: rate limited".into()));
+        let h = unsloth_next_step(&c, Some(&published));
+        assert!(h.contains("unavailable (GitHub API: rate limited)") && !h.contains("--install"), "{h}");
+        // A local overlay installs whatever is published.
+        assert_eq!(unsloth_next_step(&c, Some(&local)), "run with --install to fetch it and lay the runner patch over it.");
+
+        // Published: --install for the patched build, --overlay offered for the plain one.
+        let overlay_release = release(
+            &format!(
+                r#"{{"name":"fidim-dg-overlay-{TAG}-windows-x64.zip","browser_download_url":"https://x/o","size":1,"digest":"sha256:{z}"}},
+                   {{"name":"fidim-overlay.json","browser_download_url":"https://x/d","size":1,"digest":"sha256:{z}"}}"#
+            ),
+            &format!("dgpatch5-{TAG}"),
+        );
+        ov::apply_lookup(&mut c, OverlayLookup::Found(overlay_release));
+        assert_eq!(unsloth_next_step(&c, Some(&published)), "run with --install to fetch it and lay the runner patch over it.");
+        assert!(unsloth_next_step(&c, None).contains("--overlay adds the runner patch"));
+        c.overlay_installed = true;
+        assert!(unsloth_next_step(&c, Some(&published)).starts_with("installed."));
+        assert!(unsloth_next_step(&c, None).starts_with("run with --install"), "the plain build is not installed");
+        std::fs::remove_dir_all(root).ok();
+    }
 }
