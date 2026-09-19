@@ -111,7 +111,7 @@
   const faWorks = $derived(hasFeature(selectedBuild, "dg-fa-pad"));
   const faTurnSizing = $derived(faWorks && hasFeature(selectedBuild, "dg-fa-turn-sizing"));
   // A patched runner's test hooks never reach it (the helper strips them).
-  const DG_TEST_HOOK_ENV = ["DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_RING_POISON", "DG_DUMP_LOGITS", "DG_EXIT_AFTER_DUMP"];
+  const DG_TEST_HOOK_ENV = ["DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_RING_POISON", "DG_DUMP_LOGITS", "DG_EXIT_AFTER_DUMP", "DG_PROFILE", "DG_SC_SPLITK", "DG_SC_SPLITK_CHECK"];
   const faSized = $derived(hasFeature(selectedBuild, "dg-fa-pad") && hasFeature(selectedBuild, "dg-fa-turn-sizing") && !!draft?.diffusion?.flash_attn);
   // Env keys FIDIM composes for every diffusion run (profile::DG_OWNED_ENV):
   // validate refuses them, and the editor has no env field to clear them.
