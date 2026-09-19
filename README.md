@@ -58,10 +58,12 @@ welcome, and a report that includes your card, driver version and the
   reply shows its block denoising beside the text and can be replayed
   afterwards. Each conversation can override the system prompt, thinking
   and sampler (every field shows the server's own default), and a profile
-  can keep those as the default for new chats. Conversations are saved on
-  this PC as plain JSON; Settings turns that off. **Copy endpoint** in
-  Running hands the OpenAI base URL, model id and ready-to-paste snippets
-  to other programs.
+  can keep those as the default for new chats. A profile's API key
+  (`--api-key`, `--api-key-file` or their environment variables) is sent
+  by the app; the page never holds it. Conversations are saved on this PC
+  as plain JSON; Settings turns that off. **Copy endpoint** in Running
+  hands the OpenAI base URL, model id and ready-to-paste snippets
+  (PowerShell, cmd, Git Bash, Python) to other programs.
 - **Updates that leave running servers alone.** llama.cpp releases install
   side by side with a changelog of what changed since your build. ROCm
   runtimes install the same way from AMD's release and nightly channels,
@@ -235,7 +237,8 @@ These came from real failures on real hardware and are deliberate:
 - **Stop on a DiffusionGemma reply frees the chat, not the GPU.** The
   runner cannot abandon a request halfway, so it finishes the reply in the
   background and the next message queues behind it. A request stopped
-  while still queued is skipped.
+  while still queued is skipped: fidim-dg checks a queued request's
+  connection four times a second.
 
 ## Layout
 

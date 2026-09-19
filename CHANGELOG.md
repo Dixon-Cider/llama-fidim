@@ -20,7 +20,9 @@ build with uncommitted changes.
   message) or a DiffusionGemma run. Replies stream with their reasoning in
   a fold, prefill progress, live decode speed, draft acceptance and a
   context gauge; Stop frees a llama-server slot at once. Messages can be
-  copied, regenerated, edited and resent, or deleted.
+  copied, regenerated, edited and resent, or deleted. The app sends a
+  profile's API key itself, from `--api-key`, `--api-key-file` or their
+  environment variables.
 - A DiffusionGemma reply shows its block denoising beside the text while
   it streams, including its place in the queue, and can be replayed step
   by step afterwards.
@@ -31,7 +33,8 @@ build with uncommitted changes.
 - Conversations are saved on this PC under `~\.fidim\chats` and can be
   deleted one by one or all at once; a Settings switch turns saving off.
 - **Copy endpoint** in Running, for every server and router model: the
-  OpenAI base URL, the model id, and curl, Python and environment snippets.
+  OpenAI base URL, the model id, and curl and environment snippets for
+  PowerShell, cmd or Git Bash, plus Python.
 - fidim-dg names the job in a streamed reply with an SSE comment,
   `: dg task <id>`, matching `/slots` and `/frames`. OpenAI clients skip
   comments.
@@ -44,6 +47,17 @@ build with uncommitted changes.
 - Health checks, readiness and the live view reach a server bound to
   0.0.0.0 over loopback; connecting to the wildcard address fails on
   Windows.
+
+### Fixed
+
+- fidim-dg skips a queued streamed request within a quarter second of its
+  client leaving. It used to notice only when a keep-alive comment failed
+  to write, 2 to 4 s later, and could run the abandoned reply on the GPU.
+- The live view never loads a router model: its per-model polls ask with
+  `autoload=false`, so a model evicted between the router's list and the
+  poll is reported, not loaded again.
+- The live view shows slots and metrics of a server started with an API
+  key; it sends the profile's key.
 
 ## [0.2.0] - 2026-09-18
 
