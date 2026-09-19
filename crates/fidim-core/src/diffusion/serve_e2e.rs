@@ -299,6 +299,12 @@ fn streamed_chat_event_order() {
     ] {
         assert!(head_l.contains(h), "missing {h} in {head}");
     }
+    // The job's task id, once, as a comment after the role chunk and
+    // before any text: `data:` events are unchanged for OpenAI clients.
+    let raw = String::from_utf8(dechunk(&body)).unwrap();
+    assert_eq!(raw.matches(": dg task ").count(), 1, "{raw}");
+    let task_at = raw.find(": dg task 1\n\n").expect("dg task comment");
+    assert!(raw.find("\"role\"").unwrap() < task_at && task_at < raw.find("thinking").unwrap(), "{raw}");
     let events = sse_data(&dechunk(&body));
     assert_eq!(events.len(), 6, "{events:?}");
     let ev: Vec<Value> = events[..5].iter().map(|e| serde_json::from_str(e).unwrap()).collect();
@@ -432,6 +438,10 @@ fn queued_stream_gets_headers_and_comments() {
     let mut raw = head.into_bytes();
     raw.extend_from_slice(&rest);
     let (_, body) = split_response(&raw);
+    // Queued first, then this job's task id once it starts.
+    let text = String::from_utf8(dechunk(&body)).unwrap();
+    let (queued, task) = (text.find(": queued 1").unwrap(), text.find(": dg task 2\n\n").expect("dg task comment"));
+    assert!(queued < task && text.matches(": dg task ").count() == 1, "{text}");
     let events = sse_data(&dechunk(&body));
     assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
     let content: String = events
@@ -938,5 +948,253 @@ fn tool_calls_are_parsed_when_tools_are_offered() {
     let v: Value = serde_json::from_str(&body).unwrap();
     assert!(v["choices"][0]["message"]["content"].as_str().unwrap().contains("<|tool_call>call:get_weather"));
     assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    assert_eq!(srv.stop(), 0);
+}
+
+// ------------------------------------------------------- the chat client ----
+// FIDIM's own chat client (`chat::stream_chat`) against fidim-dg: the queue
+// and task comments, a reply arriving one committed block at a time, errors
+// before and during the stream, and Stop while queued or running.
+
+use crate::chat::{self, ChatEvent, StreamSummary};
+
+fn chat_request(content: &str) -> Value {
+    chat::request_body(&chat_body(content, json!({})), "dg-e2e", crate::profile::Engine::DiffusionGemma).unwrap()
+}
+
+/// Stream one chat with `on` seeing each event as it arrives.
+fn chat_stream(
+    port: u16,
+    content: &str,
+    cancel: &chat::Cancel,
+    mut on: impl FnMut(&ChatEvent),
+) -> (Vec<ChatEvent>, StreamSummary) {
+    let mut evs = Vec::new();
+    let sum = chat::stream_chat("127.0.0.1", port, &chat_request(content), None, cancel, chat::DEFAULT_IDLE, &mut |e| {
+        on(&e);
+        evs.push(e);
+    });
+    (evs, sum)
+}
+
+fn content_of(evs: &[ChatEvent]) -> Vec<String> {
+    evs.iter()
+        .filter_map(|e| match e {
+            ChatEvent::Delta { content: Some(c), .. } => Some(c.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn chat_client_gets_the_task_and_one_burst_per_block() {
+    let gate = Gate::default();
+    let g = gate.clone();
+    let srv = start_fake(|_| {}, move |cx| {
+        cx.ready(12288);
+        while cx.next_request().is_some() {
+            cx.line("F 0 0 48 \"x\"");
+            cx.line("C 0 \"The first block. \"");
+            g.wait();
+            cx.line("F 1 0 48 \"y\"");
+            cx.line("C 1 \"The first block. The second block.\"");
+            cx.stats(9, 512, 2);
+            cx.line("DONE");
+        }
+    });
+    srv.wait_status("/health", 200);
+    let mut first_seen = false;
+    let (evs, sum) = chat_stream(srv.port(), "hi", &chat::Cancel::new(), |e| {
+        if matches!(e, ChatEvent::Delta { .. }) && !first_seen {
+            // The second block commits only after the first reached us.
+            first_seen = true;
+            gate.open();
+        }
+    });
+    assert_eq!(evs[0], ChatEvent::Open { status: 200 });
+    assert_eq!(evs[1], ChatEvent::Task { id_task: 1 }, "{evs:#?}");
+    assert_eq!(content_of(&evs), ["The first block. ", "The second block."], "one delta per committed block");
+    match evs.last().unwrap() {
+        ChatEvent::Done { finish_reason, timings, usage, model } => {
+            assert_eq!(finish_reason.as_deref(), Some("stop"));
+            assert_eq!(model.as_deref(), Some("dg-e2e"));
+            let t = timings.as_ref().unwrap();
+            assert_eq!((t["diffusion"].as_bool(), t["diffusion_blocks"].as_u64()), (Some(true), Some(2)));
+            assert!(t["diffusion_seed"].is_i64());
+            assert_eq!(usage.as_ref().unwrap()["prompt_tokens"], 9);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sum.id_task, Some(1));
+    assert_eq!(sum.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(srv.stop(), 0);
+}
+
+#[test]
+fn chat_client_sees_its_place_in_the_queue_then_its_task() {
+    let gate = Gate::default();
+    let g = gate.clone();
+    let srv = start_fake(|_| {}, move |cx| {
+        cx.ready(12288);
+        let mut n = 0;
+        while cx.next_request().is_some() {
+            if n == 0 {
+                g.wait();
+            }
+            cx.reply(&format!("answer {n}"));
+            n += 1;
+        }
+    });
+    srv.wait_status("/health", 200);
+    let port = srv.port();
+    let first = std::thread::spawn(move || post(port, &chat_body("one", json!({}))));
+    srv.wait_metric("requests_processing", 1.0);
+    let (evs, sum) = chat_stream(port, "two", &chat::Cancel::new(), |e| {
+        if matches!(e, ChatEvent::Queued { .. }) {
+            gate.open();
+        }
+    });
+    assert_eq!(first.join().unwrap().0, 200);
+    let queued = evs.iter().position(|e| *e == ChatEvent::Queued { position: 1 }).expect("queued 1");
+    let task = evs.iter().position(|e| *e == ChatEvent::Task { id_task: 2 }).expect("task 2");
+    assert!(queued < task, "{evs:#?}");
+    assert_eq!(content_of(&evs).concat(), "answer 1");
+    assert!(matches!(evs.last(), Some(ChatEvent::Done { .. })));
+    assert_eq!(sum.id_task, Some(2));
+    assert_eq!(srv.stop(), 0);
+}
+
+#[test]
+fn chat_client_error_paths() {
+    let srv = start_fake(|_| {}, |cx| {
+        cx.ready(12288);
+        let mut n = 0;
+        while cx.next_request().is_some() {
+            if n == 0 {
+                // Fails before anything streamed: a plain HTTP 500.
+                cx.line("ERR gen");
+                cx.line("DONE");
+            } else {
+                // Fails after a block was sent: an error event in the stream.
+                cx.line("F 0 0 48 \"x\"");
+                cx.line("C 0 \"partial answer\"");
+                cx.line("ERR gen");
+                cx.line("DONE");
+            }
+            n += 1;
+        }
+    });
+    srv.wait_status("/health", 200);
+    let (evs, sum) = chat_stream(srv.port(), "one", &chat::Cancel::new(), |_| {});
+    assert_eq!(
+        evs,
+        vec![ChatEvent::Error {
+            status: Some(500),
+            message: "diffusion prefill or a denoise step failed on block 0 (see log)".into()
+        }]
+    );
+    assert_eq!(sum.status, Some(500));
+
+    let (evs, _) = chat_stream(srv.port(), "two", &chat::Cancel::new(), |_| {});
+    assert_eq!(content_of(&evs), ["partial answer"]);
+    assert!(evs.contains(&ChatEvent::Task { id_task: 2 }));
+    assert!(
+        matches!(evs.last(), Some(ChatEvent::Error { status: Some(500), message }) if message.contains("denoise step failed")),
+        "{evs:#?}"
+    );
+    assert_eq!(evs.iter().filter(|e| matches!(e, ChatEvent::Error { .. } | ChatEvent::Done { .. })).count(), 1);
+    assert_eq!(srv.stop(), 0);
+}
+
+/// Stop on a request still in the queue: the client is free at once, and
+/// fidim-dg skips the job when it reaches it (it notices the closed
+/// connection at its next queue comment, within two keep-alive intervals).
+#[test]
+fn chat_client_cancel_while_queued_skips_the_job() {
+    let gate = Gate::default();
+    let g = gate.clone();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let o = order.clone();
+    let srv = start_fake(|_| {}, move |cx| {
+        cx.ready(12288);
+        while let Some(r) = cx.next_request() {
+            let who = r.body["messages"][0]["content"].as_str().unwrap_or("?").to_string();
+            o.lock().unwrap().push(who.clone());
+            if who == "A" {
+                g.wait();
+            }
+            cx.reply(&who);
+        }
+    });
+    srv.wait_status("/health", 200);
+    let port = srv.port();
+    let a = std::thread::spawn(move || post(port, &chat_body("A", json!({}))));
+    srv.wait_metric("requests_processing", 1.0);
+    let cancel = Arc::new(chat::Cancel::new());
+    let c = cancel.clone();
+    let mut cancelled_at = None;
+    let (evs, sum) = chat_stream(port, "B", &cancel, |e| {
+        if matches!(e, ChatEvent::Queued { .. }) && cancelled_at.is_none() {
+            cancelled_at = Some(Instant::now());
+            c.cancel();
+        }
+    });
+    let back = cancelled_at.expect("the request was queued").elapsed();
+    assert!(back < Duration::from_secs(1), "Stop took {back:?}");
+    assert_eq!(evs.last(), Some(&ChatEvent::Cancelled));
+    assert!(sum.cancelled && sum.id_task.is_none());
+    // Let fidim-dg's keep-alive writes find the closed connection.
+    std::thread::sleep(Duration::from_millis(4500));
+    gate.open();
+    assert_eq!(a.join().unwrap().0, 200);
+    let (status, body) = post(port, &chat_body("C", json!({})));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(*order.lock().unwrap(), ["A", "C"], "the cancelled request never reached the runner");
+    assert_eq!(srv.stop(), 0);
+}
+
+/// Stop on a running request ends the stream at once. The runner has no
+/// mid-request cancel, so the job finishes unseen; the next request is
+/// served after it.
+#[test]
+fn chat_client_cancel_while_running_ends_the_stream() {
+    let gate = Gate::default();
+    let g = gate.clone();
+    let srv = start_fake(|_| {}, move |cx| {
+        cx.ready(12288);
+        let mut n = 0;
+        while cx.next_request().is_some() {
+            if n == 0 {
+                cx.line("F 0 0 48 \"x\"");
+                cx.line("C 0 \"first block\"");
+                g.wait();
+                cx.line("F 1 0 48 \"y\"");
+                cx.line("C 1 \"first block, second block\"");
+                cx.stats(5, 512, 2);
+                cx.line("DONE");
+            } else {
+                cx.reply("next one");
+            }
+            n += 1;
+        }
+    });
+    srv.wait_status("/health", 200);
+    let cancel = Arc::new(chat::Cancel::new());
+    let c = cancel.clone();
+    let mut cancelled_at = None;
+    let (evs, sum) = chat_stream(srv.port(), "one", &cancel, |e| {
+        if matches!(e, ChatEvent::Delta { .. }) && cancelled_at.is_none() {
+            cancelled_at = Some(Instant::now());
+            c.cancel();
+        }
+    });
+    assert!(cancelled_at.unwrap().elapsed() < Duration::from_secs(1));
+    assert_eq!(content_of(&evs), ["first block"], "what arrived before Stop is kept");
+    assert_eq!(evs.last(), Some(&ChatEvent::Cancelled));
+    assert_eq!(sum.id_task, Some(1));
+    gate.open();
+    let (evs, sum) = chat_stream(srv.port(), "two", &chat::Cancel::new(), |_| {});
+    assert_eq!(content_of(&evs).concat(), "next one");
+    assert_eq!(sum.id_task, Some(2));
     assert_eq!(srv.stop(), 0);
 }

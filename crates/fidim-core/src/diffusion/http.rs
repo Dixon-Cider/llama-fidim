@@ -863,8 +863,12 @@ fn stream_body(
     let chunk = |delta: Value| chat_chunk(&meta, delta, None, None).to_string();
     sse.start()?;
     sse.data(&chunk(json!({ "role": "assistant", "content": null })))?;
-    if sum.id_task.is_none() && q.behind {
-        sse.comment(&format!("queued {}", queue_position(ctx, q.ticket)))?;
+    // `: dg task <id>` names the job, so a client can match its own request
+    // in /slots and /frames. A comment: OpenAI clients skip it.
+    match sum.id_task {
+        Some(id) => sse.comment(&format!("dg task {id}"))?,
+        None if q.behind => sse.comment(&format!("queued {}", queue_position(ctx, q.ticket)))?,
+        None => {}
     }
     let mut last_write = Instant::now();
     let mut pending = first;
@@ -894,7 +898,11 @@ fn stream_body(
             },
         };
         match ev {
-            EngineEvent::Started { id_task, seed } => sum.started(id_task, seed, t_enq),
+            EngineEvent::Started { id_task, seed } => {
+                sum.started(id_task, seed, t_enq);
+                sse.comment(&format!("dg task {id_task}"))?;
+                last_write = Instant::now();
+            }
             EngineEvent::Restarted { seed } => {
                 shaper.reset();
                 text.clear();
