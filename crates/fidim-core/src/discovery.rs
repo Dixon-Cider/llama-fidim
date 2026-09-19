@@ -51,7 +51,9 @@ pub struct GitSource {
     /// URL the ref was fetched from, e.g. `https://github.com/ifm-ai/llama.cpp`.
     #[serde(default)]
     pub remote: String,
-    /// What was fetched: a branch, `pull/<n>/head`, a tag or a commit.
+    /// What was fetched: the full name of a branch, tag or ref
+    /// (`refs/heads/model/K2Horizon`, `refs/pull/<n>/head`), or the commit.
+    /// Builds before full names were recorded hold the short name.
     #[serde(default)]
     pub git_ref: String,
     /// The full commit that was built (checked against what the fetch got).
@@ -63,10 +65,13 @@ pub struct GitSource {
 }
 
 impl GitSource {
-    /// `ifm-ai K2Horizon fork @42adf01`.
+    /// `ifm-ai K2Horizon fork @42adf01`; without a label, the ref's short
+    /// name (`model/K2Horizon @42adf01`).
     pub fn display(&self) -> String {
         let short: String = self.commit.chars().take(7).collect();
-        let label = if self.label.trim().is_empty() { self.git_ref.as_str() } else { self.label.trim() };
+        let r = self.git_ref.as_str();
+        let short_ref = r.strip_prefix("refs/heads/").or_else(|| r.strip_prefix("refs/tags/")).unwrap_or(r);
+        let label = if self.label.trim().is_empty() { short_ref } else { self.label.trim() };
         if short.is_empty() { label.to_string() } else { format!("{label} @{short}") }
     }
 }

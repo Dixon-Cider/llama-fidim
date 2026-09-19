@@ -167,7 +167,9 @@ enum Cmd {
         /// https://github.com/ifm-ai/llama.cpp (runs that repository's code).
         #[arg(long)]
         remote: Option<String>,
-        /// With --remote: a branch, a tag, pull/<n>/head, or a full commit.
+        /// With --remote: a branch, a tag, pull/<n>/head, or a full commit (a
+        /// name that is both a branch and a tag means the branch; write
+        /// refs/tags/<name> for the tag).
         #[arg(long = "ref", value_name = "REF")]
         git_ref: Option<String>,
         /// With --remote: a name for the build (default from the remote and ref,
@@ -345,8 +347,9 @@ fn cmd_update_ref(
     use std::sync::atomic::AtomicBool;
 
     let remote = remote.trim().trim_end_matches('/').to_string();
-    let git_ref = git_ref.trim().trim_start_matches("refs/heads/").to_string();
-    let sha = update::pin_ref(&remote, &git_ref)?;
+    // The full ref name (refs/heads/..., refs/tags/...), so the build
+    // fetches exactly what was pinned.
+    let (git_ref, sha) = update::pin_ref(&remote, git_ref.trim())?;
     let label = label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
     let src = SourceRef {
         label: label.unwrap_or_else(|| SourceRef::default_label(&remote, &git_ref)),

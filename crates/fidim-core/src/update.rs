@@ -951,9 +951,10 @@ pub struct SourceRef {
     pub label: String,
 }
 
-/// `pull/<n>/head` -> n.
+/// `pull/<n>/head` or `refs/pull/<n>/head` -> n.
 pub fn pull_number(git_ref: &str) -> Option<u32> {
-    git_ref.strip_prefix("pull/")?.strip_suffix("/head")?.parse().ok()
+    let r = git_ref.strip_prefix("refs/").unwrap_or(git_ref);
+    r.strip_prefix("pull/")?.strip_suffix("/head")?.parse().ok()
 }
 
 fn is_full_sha(s: &str) -> bool {
@@ -1099,23 +1100,35 @@ fn gfx_from_name(name: &str) -> Option<&'static str> {
     table.iter().find(|(keys, _)| keys.iter().any(|k| n.contains(k))).map(|(_, g)| *g)
 }
 
-/// The commit `git_ref` points at in `remote_url` (`git ls-remote`, no API
-/// quota). A full commit is its own answer; an abbreviated one cannot be
-/// looked up this way.
-pub fn pin_ref(remote_url: &str, git_ref: &str) -> Result<String> {
-    if is_full_sha(git_ref) {
-        return Ok(git_ref.to_ascii_lowercase());
-    }
-    if git_ref.len() >= 7 && git_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(upd(format!("`{git_ref}` looks like an abbreviated commit: give all 40 digits")));
-    }
-    SourceRef { remote_url: remote_url.into(), git_ref: git_ref.into(), sha: "0".repeat(40), label: String::new() }
-        .validate()?;
-    let mut cmd = Command::new("git");
-    cmd.args(["ls-remote", "--", remote_url, git_ref])
-        .env("GIT_TERMINAL_PROMPT", "0")
+/// `git` for anything that may reach a remote: no credential helper and no
+/// password prompt, so a missing or private repository fails at once
+/// instead of opening a sign-in window. Git for Windows configures Git
+/// Credential Manager system-wide, and `GIT_TERMINAL_PROMPT=0` stops
+/// neither a helper nor `GIT_ASKPASS`. The `-c` options also reach the git
+/// processes git starts itself (a partial clone's lazy fetches).
+pub(crate) fn git_command() -> Command {
+    let mut c = Command::new("git");
+    c.args(["-c", "credential.helper=", "-c", "core.askPass="]);
+    no_git_prompts(&mut c);
+    c
+}
+
+/// The environment half of `git_command`, for the build script (which
+/// adds the `-c` options to each git call itself).
+fn no_git_prompts(c: &mut Command) {
+    c.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
         .stdin(Stdio::null());
-    crate::launch::hide_console(&mut cmd);
+    crate::launch::hide_console(c);
+}
+
+/// `git ls-remote <remote_url> <git_ref>`: every ref whose name ends in
+/// `git_ref`, with its commit.
+fn ls_remote(remote_url: &str, git_ref: &str) -> Result<String> {
+    let mut cmd = git_command();
+    cmd.args(["ls-remote", "--", remote_url, git_ref]);
     let out = cmd.output().map_err(|e| upd(format!("git ls-remote: {e} (is git installed and on PATH?)")))?;
     if !out.status.success() {
         return Err(upd(format!(
@@ -1123,24 +1136,86 @@ pub fn pin_ref(remote_url: &str, git_ref: &str) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    pick_ls_remote(&String::from_utf8_lossy(&out.stdout), git_ref)
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The commit `git_ref` points at in `remote_url` (`git ls-remote`, no API
+/// quota), with the ref's full name: `(refs/heads/model/K2Horizon, <sha>)`.
+/// Build that full name: git fetches a bare name that is both a branch and
+/// a tag as the tag, while this prefers the branch. A full commit is its own
+/// answer; an abbreviated one cannot be looked up this way.
+pub fn pin_ref(remote_url: &str, git_ref: &str) -> Result<(String, String)> {
+    if is_full_sha(git_ref) {
+        let sha = git_ref.to_ascii_lowercase();
+        return Ok((sha.clone(), sha));
+    }
+    if git_ref.len() >= 7 && git_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(upd(format!("`{git_ref}` looks like an abbreviated commit: give all 40 digits")));
+    }
+    SourceRef { remote_url: remote_url.into(), git_ref: git_ref.into(), sha: "0".repeat(40), label: String::new() }
+        .validate()?;
+    pick_ls_remote(&ls_remote(remote_url, git_ref)?, git_ref)
         .ok_or_else(|| upd(format!("{remote_url} has no branch, tag or ref named `{git_ref}`")))
 }
 
-/// The commit for `git_ref` in `git ls-remote` output: a branch first, then
-/// a tag (peeled to its commit), then any ref with that exact name.
-pub fn pick_ls_remote(text: &str, git_ref: &str) -> Option<String> {
+/// The refs in `git ls-remote` output that `git_ref` can name, preferred
+/// first, each with its commit (an annotated tag peeled to the commit it
+/// tags): a full `refs/...` name only itself, any other name its branch,
+/// its tag, then `refs/<name>` (`pull/27752/head`).
+fn ls_remote_candidates(text: &str, git_ref: &str) -> Vec<(String, String)> {
     let refs: Vec<(&str, &str)> = text
         .lines()
         .filter_map(|l| l.trim().split_once('\t'))
         .filter(|(sha, _)| is_full_sha(sha))
         .collect();
-    let find = |name: &str| refs.iter().find(|(_, r)| *r == name).map(|(s, _)| s.to_ascii_lowercase());
-    let r = git_ref.strip_prefix("refs/").unwrap_or(git_ref);
-    find(&format!("refs/heads/{r}"))
-        .or_else(|| find(&format!("refs/tags/{r}^{{}}")))
-        .or_else(|| find(&format!("refs/tags/{r}")))
-        .or_else(|| find(&format!("refs/{r}")))
+    let commit_of = |name: &str| {
+        let peeled = format!("{name}^{{}}");
+        refs.iter()
+            .find(|(_, r)| *r == peeled)
+            .or_else(|| refs.iter().find(|(_, r)| *r == name))
+            .map(|(s, _)| s.to_ascii_lowercase())
+    };
+    let names = if git_ref.starts_with("refs/") {
+        vec![git_ref.to_string()]
+    } else {
+        vec![format!("refs/heads/{git_ref}"), format!("refs/tags/{git_ref}"), format!("refs/{git_ref}")]
+    };
+    names.into_iter().filter_map(|n| commit_of(&n).map(|c| (n, c))).collect()
+}
+
+/// `(full ref name, commit)` for `git_ref` in `git ls-remote` output: a
+/// branch first, then a tag (peeled to its commit), then any ref with that
+/// exact name.
+pub fn pick_ls_remote(text: &str, git_ref: &str) -> Option<(String, String)> {
+    ls_remote_candidates(text, git_ref).into_iter().next()
+}
+
+/// The full name of the ref `src.git_ref` names that still points at
+/// `src.sha`, from `git ls-remote` output: what the build script fetches.
+fn qualified_ref_in(text: &str, src: &SourceRef) -> Result<String> {
+    let found = ls_remote_candidates(text, &src.git_ref);
+    if let Some((name, _)) = found.iter().find(|(_, c)| c.eq_ignore_ascii_case(&src.sha)) {
+        return Ok(name.clone());
+    }
+    match found.first() {
+        Some((name, c)) => Err(upd(format!(
+            "{name} in {} now points at {}, not the pinned {}: the ref moved; resolve it again",
+            src.remote_url,
+            c.get(..12).unwrap_or(c),
+            src.sha.get(..12).unwrap_or(&src.sha)
+        ))),
+        None => Err(upd(format!("{} has no branch, tag or ref named `{}` any more", src.remote_url, src.git_ref))),
+    }
+}
+
+/// What the build script fetches for `src`: the commit itself, a full ref
+/// name as given, or the full name of the branch, tag or ref that still
+/// points at the pinned commit (one `git ls-remote`).
+fn fetch_ref_for(src: &SourceRef) -> Result<String> {
+    if is_full_sha(&src.git_ref) || src.git_ref.starts_with("refs/") {
+        return Ok(src.git_ref.clone());
+    }
+    qualified_ref_in(&ls_remote(&src.remote_url, &src.git_ref)?, src)
 }
 
 /// One progress report from a source build.
@@ -1184,6 +1259,10 @@ fn script_exit_meaning(code: i32) -> &'static str {
         73 => "CMake configure failed",
         74 => "compiling failed",
         75 => "copying the binaries out failed",
+        76 => {
+            "this llama.cpp predates upstream b5872 (July 2025): its HIP code uses hipBLAS types the ROCm 7 HIP SDK \
+             no longer has; build a newer ref"
+        }
         _ => "the build script failed",
     }
 }
@@ -1209,55 +1288,131 @@ pub fn source_checkout_dir() -> PathBuf {
     Config::config_dir().join("src").join("llama.cpp")
 }
 
-/// Holds `.wt-<sha8>.lock` while a build of that commit runs.
+/// `<checkout>/../.source-build.lock`: one source build at a time. Builds
+/// share the clone (a first clone, fetches, worktrees) and each runs a
+/// compiler job per core.
+fn source_build_lock_path(checkout: &Path) -> PathBuf {
+    checkout.parent().unwrap_or(checkout).join(".source-build.lock")
+}
+
+/// Locks this process holds, so a second build on another thread (the GUI
+/// runs builds in one process) is refused like one from another process.
+fn locks_held_here() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// A lock file holding the owner's pid, created atomically. A file left by
+/// a process that is gone (or by this process's pid in an earlier life) is
+/// taken over.
 struct BuildLock(PathBuf);
 
 impl BuildLock {
-    fn take(path: &Path) -> Result<Self> {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(pid) = text.trim().parse::<u32>() {
-                if pid != std::process::id() && crate::supervise::process_alive(pid) {
-                    return Err(upd(format!(
-                        "a build of this commit is already running (pid {pid}); wait for it or cancel it"
-                    )));
+    fn take(path: &Path, what: &str) -> Result<Self> {
+        let me = std::process::id();
+        for _ in 0..3 {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(mut f) => {
+                    let _ = f.write_all(me.to_string().as_bytes());
+                    locks_held_here().lock().unwrap_or_else(|p| p.into_inner()).insert(path.to_path_buf());
+                    return Ok(BuildLock(path.to_path_buf()));
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let owner = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse::<u32>().ok());
+                    let held = match owner {
+                        Some(pid) if pid == me => locks_held_here().lock().unwrap_or_else(|p| p.into_inner()).contains(path),
+                        Some(pid) => crate::supervise::process_alive(pid),
+                        // Being written right now, or garbage: a moment decides.
+                        None => {
+                            std::thread::sleep(Duration::from_millis(200));
+                            std::fs::read_to_string(path).ok().is_some_and(|t| !t.trim().is_empty())
+                        }
+                    };
+                    if held {
+                        let pid = owner.map(|p| format!(" (pid {p})")).unwrap_or_default();
+                        return Err(upd(format!("{what} is already running{pid}; wait for it or cancel it")));
+                    }
+                    let _ = std::fs::remove_file(path);
+                }
+                Err(e) => return Err(Error::io(path, e)),
             }
         }
-        std::fs::write(path, std::process::id().to_string()).map_err(|e| Error::io(path, e))?;
-        Ok(BuildLock(path.to_path_buf()))
+        Err(upd(format!("could not take the lock {}", path.display())))
     }
 }
 
 impl Drop for BuildLock {
     fn drop(&mut self) {
+        locks_held_here().lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0);
         let _ = std::fs::remove_file(&self.0);
     }
 }
 
-/// Remove a build's worktree (and the build tree inside it) and its
-/// staging directory. Files a killed compiler held can take a moment to
-/// be released, hence the retries.
-fn cleanup_ref_build(checkout: &Path, worktree: &Path, staging: &Path) {
+/// Remove a directory tree, retrying while files a killed process held are
+/// released. True when it is gone.
+fn remove_tree(dir: &Path) -> bool {
+    for attempt in 0..6 {
+        if !dir.exists() || std::fs::remove_dir_all(dir).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250 * (attempt + 1)));
+    }
+    !dir.exists()
+}
+
+/// FIDIM's clone is usable when it has a commit at HEAD. A clone killed
+/// before it finished (a cancel during the first build's clone step, with
+/// versions that cloned in place) is a `.git` with no commits; a fetch into
+/// that offers the server nothing it has, so the server sends every version
+/// of every file of the fork's history. Such a clone is removed so the
+/// script clones afresh. Call with the source-build lock held.
+fn repair_checkout(checkout: &Path) -> Result<()> {
+    if !checkout.exists() {
+        return Ok(());
+    }
+    let broken = if checkout.join(".git").exists() {
+        let mut c = git_command();
+        c.arg("-C").arg(checkout).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+        c.stdout(Stdio::null()).stderr(Stdio::null());
+        // git not running at all says nothing about the clone.
+        matches!(c.status(), Ok(s) if !s.success())
+    } else {
+        // Not a clone: left by an interrupted removal. Only FIDIM writes here.
+        true
+    };
+    if broken && !remove_tree(checkout) {
+        return Err(upd(format!(
+            "{} is an incomplete clone and could not be removed; delete it and build again",
+            checkout.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove a build's worktree (and the build tree inside it), its staging
+/// directory and the ref its commit was fetched into.
+fn cleanup_ref_build(checkout: &Path, worktree: &Path, staging: &Path, sha: &str) {
     let git = |args: &[&std::ffi::OsStr]| {
-        let mut c = Command::new("git");
-        c.arg("-C").arg(checkout).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        crate::launch::hide_console(&mut c);
+        let mut c = git_command();
+        c.arg("-C").arg(checkout).args(args).stdout(Stdio::null()).stderr(Stdio::null());
         let _ = c.status();
     };
-    if worktree.exists() && checkout.join(".git").exists() {
+    let is_clone = checkout.join(".git").exists();
+    if worktree.exists() && is_clone {
         git(&["worktree".as_ref(), "remove".as_ref(), "--force".as_ref(), worktree.as_os_str()]);
     }
     for dir in [worktree, staging] {
-        for attempt in 0..6 {
-            if !dir.exists() || std::fs::remove_dir_all(dir).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(250 * (attempt + 1)));
-        }
+        remove_tree(dir);
     }
-    if checkout.join(".git").exists() {
+    if is_clone {
         git(&["worktree".as_ref(), "prune".as_ref()]);
+        git(&["update-ref".as_ref(), "-d".as_ref(), pin_ref_name(sha).as_ref()]);
     }
+}
+
+/// The ref the build script fetches a commit into (`refs/fidim/<sha>`).
+fn pin_ref_name(sha: &str) -> String {
+    format!("refs/fidim/{}", sha.to_ascii_lowercase())
 }
 
 /// Stream a child's stdout and stderr, split on `\n` and `\r`, into one
@@ -1319,6 +1474,8 @@ impl ScriptLog {
             || t.contains(" error LNK")
             || t.ends_with("_FAILED")
             || t.starts_with("SHA_MISMATCH")
+            || t.starts_with("PRE_ROCM7_TREE")
+            || t.starts_with("NOT_A_CLONE")
             || t.starts_with("NO_");
         if looks_like_error && self.errors.len() < ERROR_LINES && !self.errors.iter().any(|e| e == line) {
             self.errors.push(line.to_string());
@@ -1418,13 +1575,17 @@ fn run_build_script(
 /// loading a model.
 ///
 /// Uses one FIDIM-owned partial clone of upstream (`source_checkout_dir`,
-/// never the user's own checkouts): fetches `src.git_ref` from
-/// `src.remote_url`, refuses unless it resolves to `src.sha`, builds a
-/// detached worktree of that commit with CMake + Ninja (HIP via the HIP SDK
-/// clang, targets llama-server, llama-quantize and llama-tokenize), copies
-/// `bin` out, and removes the worktree and build tree. The toolchain doctor
-/// runs first, so a known compiler clash stops the build in seconds, not
-/// minutes. `cancel` kills the whole process tree and cleans up.
+/// never the user's own checkouts), one build at a time: fetches
+/// `src.git_ref` from `src.remote_url` by its full name (the branch, tag
+/// or ref that still points at `src.sha`, so a branch and a tag of the same
+/// name cannot be confused), refuses unless it resolves to `src.sha`,
+/// builds a detached worktree of that commit with CMake + Ninja (HIP via
+/// the HIP SDK clang, targets llama-server, llama-quantize and
+/// llama-tokenize), copies `bin` out, and removes the worktree and build
+/// tree. The toolchain doctor runs first, so a known compiler clash stops
+/// the build in seconds, not minutes. `cancel` kills the whole process tree
+/// and cleans up. Git never asks for credentials: a missing or private
+/// repository fails at once.
 ///
 /// Fork and pull-request code is whatever its author wrote: callers ask the
 /// user before building one.
@@ -1474,14 +1635,22 @@ pub fn build_from_ref(
 
     let checkout = source_checkout_dir();
     let src_root = checkout.parent().map(Path::to_path_buf).unwrap_or_else(|| Config::config_dir().join("src"));
+    std::fs::create_dir_all(&src_root).map_err(|e| Error::io(&src_root, e))?;
+    // One build at a time: builds share the clone, and each compiles with
+    // every core.
+    let _lock = BuildLock::take(&source_build_lock_path(&checkout), "a llama.cpp source build")?;
+    repair_checkout(&checkout)?;
+    // Fetch the ref by its full name, and only while it still points at the
+    // pinned commit.
+    say("fetch", format!("checking that {} still points at {}", src.git_ref, &src.sha[..12]));
+    src.git_ref = fetch_ref_for(&src)?;
     let script = materialize_script(&src_root)?;
     let worktree = src_root.join(format!(".wt-{}", src.sha8()));
-    let _lock = BuildLock::take(&src_root.join(format!(".wt-{}.lock", src.sha8())))?;
     let parent = dir.parent().ok_or_else(|| upd("install dir has no parent"))?.to_path_buf();
     std::fs::create_dir_all(&parent).map_err(|e| Error::io(&parent, e))?;
     // Dot-prefixed, so a scan never offers a half-copied build.
     let staging = parent.join(format!(".fidim-tmp-src-{}", src.sha8()));
-    cleanup_ref_build(&checkout, &worktree, &staging);
+    cleanup_ref_build(&checkout, &worktree, &staging, &src.sha);
 
     let mut cmd = Command::new(&script);
     cmd.arg(&checkout)
@@ -1491,22 +1660,20 @@ pub fn build_from_ref(
         .arg(&staging)
         .arg(&gpus)
         .env("FIDIM_WORKTREE", &worktree)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env_remove("FIDIM_STOP_AFTER");
+    no_git_prompts(&mut cmd);
     tc.apply_env(&mut cmd);
     say("clone", format!("building {name} for {gpus} with {}", script.display()));
     let mut log = ScriptLog::default();
     let status = match run_build_script(cmd, "clone", progress, cancel, &mut log)? {
         ScriptEnd::Exited(s) => s,
         ScriptEnd::Cancelled => {
-            cleanup_ref_build(&checkout, &worktree, &staging);
+            cleanup_ref_build(&checkout, &worktree, &staging, &src.sha);
             return Err(upd(format!("build of {name} cancelled; its worktree and staging files were removed")));
         }
     };
     if !status.success() {
-        cleanup_ref_build(&checkout, &worktree, &staging);
+        cleanup_ref_build(&checkout, &worktree, &staging, &src.sha);
         let code = status.code().unwrap_or(-1);
         return Err(upd(format!(
             "building {name} failed: {} (exit {code}). {}",
@@ -1550,7 +1717,7 @@ pub fn build_from_ref(
             }
         }
     })();
-    cleanup_ref_build(&checkout, &worktree, &staging);
+    cleanup_ref_build(&checkout, &worktree, &staging, &src.sha);
     installed?;
 
     say("verify", "verifying: --version and --list-devices (no model load)".into());
@@ -2782,15 +2949,47 @@ mod tests {
             e = "e".repeat(40),
             f = "f".repeat(40)
         );
-        assert_eq!(pick_ls_remote(&out, "model/K2Horizon").as_deref(), Some(K2_SHA), "a branch beats a tag");
-        assert_eq!(pick_ls_remote(&out, "refs/heads/model/K2Horizon").as_deref(), Some(K2_SHA));
-        assert_eq!(pick_ls_remote(&out, "v1"), Some("d".repeat(40)), "an annotated tag, peeled to its commit");
-        assert_eq!(pick_ls_remote(&out, "pull/27752/head"), Some("e".repeat(40)));
-        assert_eq!(pick_ls_remote(&out, "K2Horizon"), None, "no suffix guessing");
+        let pick = |r: &str| pick_ls_remote(&out, r);
+        let pair = |name: &str, sha: &str| Some((name.to_string(), sha.to_string()));
+        // The full name comes back with the commit: the build fetches that
+        // name, because git fetches a bare `model/K2Horizon` as the tag.
+        assert_eq!(pick("model/K2Horizon"), pair("refs/heads/model/K2Horizon", K2_SHA), "a branch beats a tag");
+        assert_eq!(pick("refs/heads/model/K2Horizon"), pair("refs/heads/model/K2Horizon", K2_SHA));
+        assert_eq!(pick("refs/tags/model/K2Horizon"), pair("refs/tags/model/K2Horizon", &"f".repeat(40)), "a full name is exact");
+        assert_eq!(pick("v1"), pair("refs/tags/v1", &"d".repeat(40)), "an annotated tag, peeled to its commit");
+        assert_eq!(pick("refs/tags/v1"), pair("refs/tags/v1", &"d".repeat(40)), "peeled when named in full too");
+        assert_eq!(pick("tags/v1"), pair("refs/tags/v1", &"d".repeat(40)));
+        assert_eq!(pick("pull/27752/head"), pair("refs/pull/27752/head", &"e".repeat(40)));
+        assert_eq!(pick("K2Horizon"), None, "no suffix guessing");
         assert_eq!(pick_ls_remote("garbage\tline\n", "main"), None);
-        assert_eq!(pin_ref("https://github.com/ifm-ai/llama.cpp", &K2_SHA.to_uppercase()).unwrap(), K2_SHA);
+
+        // At build time: the name that still points at the pinned commit.
+        let src = |git_ref: &str, sha: &str| SourceRef { git_ref: git_ref.into(), sha: sha.into(), ..k2_ref() };
+        assert_eq!(qualified_ref_in(&out, &src("model/K2Horizon", K2_SHA)).unwrap(), "refs/heads/model/K2Horizon");
+        // A plan resolved through the API may have pinned the tag's commit.
+        let f = "f".repeat(40);
+        assert_eq!(qualified_ref_in(&out, &src("model/K2Horizon", &f)).unwrap(), "refs/tags/model/K2Horizon");
+        assert_eq!(qualified_ref_in(&out, &src("v1", &"d".repeat(40))).unwrap(), "refs/tags/v1");
+        assert_eq!(qualified_ref_in(&out, &src("pull/27752/head", &"e".repeat(40))).unwrap(), "refs/pull/27752/head");
+        let moved = qualified_ref_in(&out, &src("main", &"b".repeat(40))).unwrap_err().to_string();
+        assert!(moved.contains("refs/heads/main") && moved.contains("moved") && moved.contains("aaaaaaaaaaaa"), "{moved}");
+        let gone = qualified_ref_in(&out, &src("feature/x", K2_SHA)).unwrap_err().to_string();
+        assert!(gone.contains("no branch, tag or ref named `feature/x`"), "{gone}");
+        // A commit or a full name needs no lookup.
+        assert_eq!(fetch_ref_for(&src(K2_SHA, K2_SHA)).unwrap(), K2_SHA);
+        assert_eq!(fetch_ref_for(&src("refs/heads/model/K2Horizon", K2_SHA)).unwrap(), "refs/heads/model/K2Horizon");
+
+        assert_eq!(
+            pin_ref("https://github.com/ifm-ai/llama.cpp", &K2_SHA.to_uppercase()).unwrap(),
+            (K2_SHA.to_string(), K2_SHA.to_string())
+        );
         assert!(pin_ref("https://github.com/ifm-ai/llama.cpp", "42adf019").unwrap_err().to_string().contains("40 digits"));
         assert!(pin_ref("https://github.com/ifm-ai/llama.cpp", "-x").is_err(), "validated before git runs");
+        assert_eq!(pull_number("refs/pull/27752/head"), Some(27752));
+        assert_eq!(SourceRef::default_label("https://github.com/ggml-org/llama.cpp", "refs/pull/27752/head"), "PR #27752");
+        assert_eq!(SourceRef::default_label("https://github.com/ifm-ai/llama.cpp", "refs/heads/model/K2Horizon"), "ifm-ai K2Horizon fork");
+        let g = GitSource { label: String::new(), ..src("refs/heads/model/K2Horizon", K2_SHA).git_source() };
+        assert_eq!(g.display(), "model/K2Horizon @42adf01");
     }
 
     #[test]
@@ -2810,7 +3009,19 @@ mod tests {
         let p = materialize_script(&dir).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.starts_with("@echo off\r\n") && !text.contains("\r\r") && text.lines().count() > 50);
-        assert!(text.contains("worktree add --quiet --detach") && text.contains("FETCH_HEAD^{commit}"));
+        assert!(text.contains("worktree add --quiet --detach") && text.contains("\"+%REF%:%PIN%\""));
+        let code: Vec<&str> = text.lines().filter(|l| !l.trim_start().starts_with("REM")).collect();
+        assert!(!code.iter().any(|l| l.contains("FETCH_HEAD")), "concurrent fetches share FETCH_HEAD");
+        // Flags that configure trees from every era (see the script's notes),
+        // and no credential prompts from any git call.
+        assert!(text.contains("-DLLAMA_BUILD_EXAMPLES=%EXAMPLES%") && text.contains("-DLLAMA_CURL=OFF"));
+        assert!(text.contains(r#"set GIT=git -c "credential.helper=" -c "core.askPass=""#));
+        // A git command run bare (not through %GIT%); a local rev-parse
+        // reaches no remote.
+        let git_call = regex::Regex::new(r#"(?:^|[(&|'])\s*git\s"#).unwrap();
+        let bare_git = code.iter().filter(|l| !l.contains("rev-parse") && git_call.is_match(l)).collect::<Vec<_>>();
+        assert!(bare_git.is_empty(), "git without %GIT%: {bare_git:?}");
+        assert!(script_exit_meaning(76).contains("b5872"));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -2888,6 +3099,312 @@ mod tests {
         assert!(!dir.join("late.txt").exists(), "the background grandchild survived the cancel");
         assert!(!log.tail.iter().any(|l| l.contains("never")));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `git -C dir args` for test fixtures, with an identity and no signing.
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A small "upstream" with one commit on master, and a "fork" of it
+    /// with a branch `model/X` one commit ahead, a lightweight tag of the
+    /// same name at upstream's commit, and an annotated tag `v1` at the
+    /// branch. Returns (upstream, fork, upstream commit, branch commit).
+    fn git_fixture(root: &Path) -> (PathBuf, PathBuf, String, String) {
+        let up = root.join("up");
+        std::fs::create_dir_all(&up).unwrap();
+        git_in(&up, &["init", "-q", "-b", "master"]);
+        std::fs::write(up.join("a.txt"), "upstream\n").unwrap();
+        git_in(&up, &["add", "a.txt"]);
+        git_in(&up, &["commit", "-q", "-m", "upstream"]);
+        let u1 = git_in(&up, &["rev-parse", "HEAD"]);
+        let fork = root.join("fork");
+        git_in(root, &["clone", "-q", up.to_str().unwrap(), fork.to_str().unwrap()]);
+        git_in(&fork, &["checkout", "-q", "-b", "model/X"]);
+        std::fs::write(fork.join("b.txt"), "fork\n").unwrap();
+        git_in(&fork, &["add", "b.txt"]);
+        git_in(&fork, &["commit", "-q", "-m", "fork"]);
+        let f1 = git_in(&fork, &["rev-parse", "HEAD"]);
+        git_in(&fork, &["tag", "model/X", &u1]);
+        git_in(&fork, &["tag", "-a", "v1", "-m", "v1", &f1]);
+        (up, fork, u1, f1)
+    }
+
+    /// Stand-ins the script's toolchain checks accept (it only tests that
+    /// they exist before the worktree step).
+    fn fake_toolchain(root: &Path) -> PathBuf {
+        let tc = root.join("tc");
+        let vs = tc.join("vs").join("VC").join("Auxiliary").join("Build");
+        std::fs::create_dir_all(&vs).unwrap();
+        std::fs::write(vs.join("vcvars64.bat"), "@exit /b 0\r\n").unwrap();
+        std::fs::create_dir_all(tc.join("clang")).unwrap();
+        std::fs::write(tc.join("clang").join("clang++.exe"), b"").unwrap();
+        std::fs::write(tc.join("cmake.exe"), b"").unwrap();
+        tc
+    }
+
+    /// Run the real build script up to the worktree step against local
+    /// repositories: (exit code, output lines).
+    fn run_script_to_worktree(root: &Path, checkout: &Path, up: &Path, remote: &Path, git_ref: &str, sha: &str) -> (i32, Vec<String>) {
+        let script = materialize_script(&root.join("script")).unwrap();
+        let tc = root.join("tc");
+        let mut cmd = Command::new(&script);
+        cmd.arg(checkout)
+            .arg(remote)
+            .arg(git_ref)
+            .arg(sha)
+            .arg(root.join("out"))
+            .arg("gfx1201")
+            .env("FIDIM_VS", tc.join("vs"))
+            .env("FIDIM_CMAKE", tc.join("cmake.exe"))
+            .env("FIDIM_CLANG_DIR", tc.join("clang"))
+            .env("FIDIM_UPSTREAM", up)
+            .env("FIDIM_STOP_AFTER", "worktree")
+            .env("FIDIM_WORKTREE", root.join(format!(".wt-{}", &sha[..8])))
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        no_git_prompts(&mut cmd);
+        let mut lines = Vec::new();
+        let mut log = ScriptLog::default();
+        let end = run_build_script(cmd, "clone", &mut |p| lines.push(p.line), &AtomicBool::new(false), &mut log).unwrap();
+        match end {
+            ScriptEnd::Exited(s) => (s.code().unwrap_or(-1), lines),
+            ScriptEnd::Cancelled => panic!("cancelled"),
+        }
+    }
+
+    /// The script's git steps for real: an atomic first clone, the ref
+    /// fetched into a ref of its own and checked against the pin, a branch
+    /// and a tag of the same name kept apart by their full names, and
+    /// everything it made removed again.
+    #[test]
+    fn build_script_git_steps() {
+        let root = std::env::temp_dir().join(format!("fidim-gitsteps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (up, fork, u1, f1) = git_fixture(&root);
+        fake_toolchain(&root);
+        let checkout = root.join("src").join("llama.cpp");
+        // Leftovers of a killed clone beside the checkout do not matter.
+        std::fs::create_dir_all(root.join("src").join("llama.cpp.part").join("junk")).unwrap();
+
+        let (code, lines) = run_script_to_worktree(&root, &checkout, &up, &fork, "refs/heads/model/X", &f1);
+        assert_eq!(code, 0, "{lines:#?}");
+        assert!(checkout.join(".git").is_dir() && !root.join("src").join("llama.cpp.part").exists());
+        assert_eq!(git_in(&checkout, &["rev-parse", "HEAD"]), u1, "a clone of upstream");
+        assert!(!root.join(format!(".wt-{}", &f1[..8])).exists(), "worktree removed");
+        assert_eq!(git_in(&checkout, &["for-each-ref", "refs/fidim"]), "", "the pin ref is removed");
+
+        // The bare name is both a branch and a tag: git fetches the tag, so
+        // a build of the pinned branch commit must name the branch in full.
+        let (code, lines) = run_script_to_worktree(&root, &checkout, &up, &fork, "model/X", &f1);
+        assert_eq!(code, 70, "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("SHA_MISMATCH") && l.contains(&u1)), "{lines:#?}");
+        // An annotated tag is compared as the commit it tags.
+        let (code, lines) = run_script_to_worktree(&root, &checkout, &up, &fork, "refs/tags/v1", &f1);
+        assert_eq!(code, 0, "{lines:#?}");
+        // The commit itself.
+        let (code, lines) = run_script_to_worktree(&root, &checkout, &up, &fork, &f1, &f1);
+        assert_eq!(code, 0, "{lines:#?}");
+
+        // A directory that is not a clone is never cloned into or over.
+        let stray = root.join("stray").join("llama.cpp");
+        std::fs::create_dir_all(&stray).unwrap();
+        let (code, lines) = run_script_to_worktree(&root, &stray, &up, &fork, "refs/heads/model/X", &f1);
+        assert_eq!(code, 67, "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("NOT_A_CLONE")), "{lines:#?}");
+        // A clone that fails leaves nothing behind, and says so in its code.
+        let fresh = root.join("fresh").join("llama.cpp");
+        let (code, lines) = run_script_to_worktree(&root, &fresh, &root.join("no-such-upstream"), &fork, "refs/heads/model/X", &f1);
+        assert_eq!(code, 67, "{lines:#?}");
+        assert!(!fresh.exists() && !root.join("fresh").join("llama.cpp.part").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The build script's CMake flags against real upstream trees from
+    /// several eras, up to configure: examples-era targets (before b5269),
+    /// the libcurl default (b5064 to b7736), today's layout, and the stop
+    /// for trees too old for a ROCm 7 hipBLAS. Needs the toolchain and a
+    /// full llama.cpp clone with its release tags in FIDIM_TEST_LLAMA_REPO;
+    /// nothing is downloaded or compiled (the checkout borrows that clone's
+    /// objects and only reads from it). Run by hand:
+    /// `cargo test -p fidim-core build_script_configures_every_era -- --ignored`.
+    #[test]
+    #[ignore]
+    fn build_script_configures_every_era() {
+        let Some(repo) = std::env::var_os("FIDIM_TEST_LLAMA_REPO").map(PathBuf::from) else {
+            eprintln!("FIDIM_TEST_LLAMA_REPO is not set: skipped");
+            return;
+        };
+        let tc = crate::toolchain::detect(&Config::default_for_machine());
+        let rocm = tc.rocm.clone().expect("a HIP SDK");
+        let sdk_is_rocm7 = !std::fs::read_to_string(rocm.join("include").join("hipblas").join("hipblas.h"))
+            .unwrap_or_default()
+            .contains("hipblasDatatype_t");
+        let root = std::env::temp_dir().join(format!("fidim-eras-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let checkout = root.join("src").join("llama.cpp");
+        git_in(&root, &["clone", "-q", "--shared", "--no-checkout", repo.to_str().unwrap(), checkout.to_str().unwrap()]);
+        let script = materialize_script(&root.join("src")).unwrap();
+        let mut cases = vec![
+            ("b5200", Some("configure"), 0, "examples ON"),
+            ("b6000", Some("configure"), 0, "examples OFF"),
+            ("b10984", Some("configure"), 0, "examples OFF"),
+        ];
+        if sdk_is_rocm7 {
+            cases.push(("b5200", None, 76, "PRE_ROCM7_TREE"));
+        }
+        for (tag, stop, want, marker) in cases {
+            let Ok(sha) = std::panic::catch_unwind(|| git_in(&repo, &["rev-parse", &format!("{tag}^{{commit}}")])) else {
+                eprintln!("{tag} is not in the clone: skipped");
+                continue;
+            };
+            let mut cmd = Command::new(&script);
+            cmd.arg(&checkout)
+                .arg(&repo)
+                .arg(format!("refs/tags/{tag}"))
+                .arg(&sha)
+                .arg(root.join("out"))
+                .arg("gfx1201")
+                .env("FIDIM_WORKTREE", root.join("src").join(format!(".wt-{}", &sha[..8])))
+                .env_remove("FIDIM_STOP_AFTER");
+            if let Some(s) = stop {
+                cmd.env("FIDIM_STOP_AFTER", s);
+            }
+            no_git_prompts(&mut cmd);
+            tc.apply_env(&mut cmd);
+            let started = std::time::Instant::now();
+            let mut lines = Vec::new();
+            let mut log = ScriptLog::default();
+            let end = run_build_script(cmd, "clone", &mut |p| lines.push(p.line), &AtomicBool::new(false), &mut log).unwrap();
+            let ScriptEnd::Exited(s) = end else { panic!("cancelled") };
+            eprintln!("{tag} stop={stop:?}: exit {:?} in {:.0} s", s.code(), started.elapsed().as_secs_f64());
+            assert_eq!(s.code(), Some(want), "{tag}: {}", log.report());
+            assert!(lines.iter().any(|l| l.contains(marker)), "{tag}: no `{marker}` in\n{}", log.report());
+            if want == 0 {
+                assert!(lines.iter().any(|l| l.contains("Build files have been written")), "{tag}: {}", log.report());
+                assert!(!lines.iter().any(|l| l.contains("Could NOT find CURL")), "{tag}");
+            }
+            assert!(!root.join("src").join(format!(".wt-{}", &sha[..8])).exists(), "{tag}: worktree left behind");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A clone killed before its first commit is removed before the next
+    /// build; a healthy one is kept.
+    #[test]
+    fn broken_clone_is_repaired() {
+        let root = std::env::temp_dir().join(format!("fidim-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (up, _, _, _) = git_fixture(&root);
+        repair_checkout(&root.join("missing")).unwrap();
+        // What a killed `git clone --filter=blob:none` leaves: a repository
+        // with the partial-clone config and no commits.
+        let broken = root.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        git_in(&broken, &["init", "-q"]);
+        git_in(&broken, &["config", "remote.origin.promisor", "true"]);
+        repair_checkout(&broken).unwrap();
+        assert!(!broken.exists());
+        // An interrupted removal: not a repository at all.
+        let husk = root.join("husk");
+        std::fs::create_dir_all(husk.join("objects")).unwrap();
+        repair_checkout(&husk).unwrap();
+        assert!(!husk.exists());
+        let healthy = root.join("healthy");
+        git_in(&root, &["clone", "-q", "--no-checkout", up.to_str().unwrap(), healthy.to_str().unwrap()]);
+        repair_checkout(&healthy).unwrap();
+        assert!(healthy.join(".git").is_dir());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// One source build at a time, across processes and across threads of
+    /// one process; a lock left by a process that is gone is taken over.
+    #[test]
+    fn source_build_lock_is_exclusive() {
+        let root = std::env::temp_dir().join(format!("fidim-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = source_build_lock_path(&root.join("llama.cpp"));
+        assert_eq!(path, root.join(".source-build.lock"));
+        let held = BuildLock::take(&path, "a llama.cpp source build").unwrap();
+        let again = std::thread::scope(|s| s.spawn(|| BuildLock::take(&path, "a llama.cpp source build").map(|_| ())).join().unwrap());
+        assert!(again.unwrap_err().to_string().contains("a llama.cpp source build is already running"));
+        drop(held);
+        assert!(!path.exists());
+        // Another live process holds it.
+        let mut other = Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1 >nul"]).stdout(Stdio::null()).spawn().unwrap();
+        std::fs::write(&path, other.id().to_string()).unwrap();
+        let e = BuildLock::take(&path, "a llama.cpp source build").map(|_| ()).unwrap_err().to_string();
+        assert!(e.contains(&format!("pid {}", other.id())), "{e}");
+        other.kill().ok();
+        other.wait().ok();
+        // Gone now: taken over. So is our own pid from an earlier life.
+        let taken = BuildLock::take(&path, "x").unwrap();
+        drop(taken);
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        let taken = BuildLock::take(&path, "x").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
+        drop(taken);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A repository that answers 401 gets no credential helper and no
+    /// prompt from FIDIM's git: it fails at once. Without the override the
+    /// configured helper runs (Git for Windows configures Git Credential
+    /// Manager, which can open a sign-in window).
+    #[test]
+    fn git_never_asks_for_credentials() {
+        let root = std::env::temp_dir().join(format!("fidim-cred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/someone/llama.cpp", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"x\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let marker = root.join("helper-ran.txt");
+        let global = root.join("gitconfig");
+        let marker_sh = marker.to_string_lossy().replace('\\', "/");
+        std::fs::write(&global, format!("[credential]\n\thelper = \"!f() {{ echo ran >> '{marker_sh}'; }}; f\"\n")).unwrap();
+        let run = |mut c: Command| {
+            c.args(["ls-remote", "--", &url, "main"])
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GCM_INTERACTIVE", "never")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            c.output().unwrap()
+        };
+        let plain = run(Command::new("git"));
+        assert!(!plain.status.success());
+        assert!(marker.exists(), "the control run should reach the helper");
+        std::fs::remove_file(&marker).unwrap();
+        let ours = run(git_command());
+        assert!(!ours.status.success());
+        assert!(!marker.exists(), "git_command must not run a credential helper");
+        assert!(String::from_utf8_lossy(&ours.stderr).contains("terminal prompts disabled"), "{}", String::from_utf8_lossy(&ours.stderr));
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// The paths of `build_from_ref` that finish before the toolchain is
