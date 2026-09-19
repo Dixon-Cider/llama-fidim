@@ -13,6 +13,34 @@ build with uncommitted changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Builds of any git ref.** `fidim update --source --remote <url> --ref
+  <branch|pull/N/head|commit>` compiles a llama.cpp fork's branch, an
+  upstream pull request or any commit for this machine's GPU. The commit
+  is pinned first and checked after the fetch; the build runs in FIDIM's
+  own clone under `~/.fidim/src`, never in your checkouts; stopping it
+  (Ctrl+C) stops every process it started; and the result is labelled by
+  where it came from (`ifm-ai K2Horizon fork @42adf01`) and never ranked
+  or promoted as an upstream release.
+- **Toolchain doctor.** `fidim toolchain` checks Visual Studio's C++ tools,
+  git, CMake, Ninja and the HIP SDK, and compiles a test file to catch the
+  MSVC `<cmath>` clash with HIP clang (llama.cpp#22570) before a build
+  spends minutes finding it. Every source build runs it first.
+- **Which build can load a model.** The core can now tell whether a build
+  knows a model's architecture, pre-tokenizer and tensor types, from the
+  tables in its `llama.dll` or from llama.cpp's source at any commit, and
+  plan how to get one that does: an installed build, the newest upstream
+  release, an Unsloth mix, an upstream pull request, or a fork the model
+  card links. The model wizard builds on this.
+- **Pre-flight check 16.** A launch on a build that does not know the
+  model's architecture is blocked before llama-server fails with "unknown
+  model architecture"; a pre-tokenizer or tensor type it could not confirm
+  is a warning.
+- `github_token` in `config.json` (or `GITHUB_TOKEN`) for GitHub API
+  lookups; without one, answers are cached to stay within 60 requests an
+  hour.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added
