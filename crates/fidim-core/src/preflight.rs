@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::compat::{describe_missing, Missing, ModelNeeds, Support};
 use crate::devices::Device;
 use crate::estimate::{DgRunner, DiffusionSizing, VramEstimate};
 use crate::gguf::GgufHeader;
@@ -109,6 +110,14 @@ pub struct DiffusionPreflight {
     pub runner: DgRunner,
 }
 
+/// What the build can load, next to what the model needs (check 16), from
+/// `compat::probe_build`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildSupport {
+    pub needs: ModelNeeds,
+    pub support: Support,
+}
+
 /// A live run on one of this launch's cards (check 14).
 #[derive(Debug, Clone, Serialize)]
 pub struct CoResident {
@@ -162,6 +171,11 @@ pub struct LaunchContext {
     /// Live runs on this launch's cards, except one on this profile's port
     /// (launch takes that one over).
     pub co_resident: Vec<CoResident>,
+    /// Whether the build knows the model's architecture, pre-tokenizer and
+    /// tensor types. None = not probed (header unreadable, the binary did
+    /// not run, or the engine does not match the model: checks 1 and 13
+    /// speak for those).
+    pub build_support: Option<BuildSupport>,
 }
 
 pub fn run_all(ctx: &LaunchContext) -> Vec<CheckResult> {
@@ -190,6 +204,10 @@ pub fn run_all(ctx: &LaunchContext) -> Vec<CheckResult> {
     }
     if diffusion {
         out.push(check_diffusion_context(ctx));
+    }
+    // Only a build that may not load the model gets a sixteenth line.
+    if let Some(r) = check_build_knows_model(ctx) {
+        out.push(r);
     }
     out
 }
@@ -881,6 +899,51 @@ fn check_diffusion_context(ctx: &LaunchContext) -> CheckResult {
     CheckResult { id: "diffusion-context", spec_number: 15, title: "Diffusion context budget", outcome }
 }
 
+/// Check 16: the build knows the model's architecture (and pre-tokenizer
+/// and tensor types). Present only when the probe says No or Unknown. The
+/// probe reads the architecture table out of `llama.dll`, where a missing
+/// name is certain, so No Blocks; Unknown (a pre-tokenizer it could not
+/// find, a tensor type it could not check) only Warns.
+fn check_build_knows_model(ctx: &LaunchContext) -> Option<CheckResult> {
+    let bs = ctx.build_support.as_ref()?;
+    let tag = ctx
+        .profile
+        .build
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ctx.profile.build.path.display().to_string());
+    let outcome = match &bs.support {
+        Support::Yes => return None,
+        Support::No { missing } => {
+            let errors: Vec<String> = missing
+                .iter()
+                .map(|m| match m {
+                    Missing::Arch => format!("unknown model architecture: '{}'", bs.needs.arch),
+                    Missing::TokenizerPre(p) => format!("unknown pre-tokenizer type: '{p}'"),
+                    Missing::TensorType(t) => format!("tensor has invalid ggml type {t}"),
+                })
+                .collect();
+            Outcome::Block(format!(
+                "build {tag} does not know {}: llama-server would stop at load with \"{}\". Run the model wizard \
+                 (`fidim models get`) to get a build that loads it",
+                describe_missing(&bs.needs, missing),
+                errors.join("\", \"")
+            ))
+        }
+        Support::Unknown(why) => Outcome::Warn(format!(
+            "could not confirm that build {tag} loads architecture '{}': {why}",
+            bs.needs.arch
+        )),
+    };
+    Some(CheckResult {
+        id: "build-knows-model",
+        spec_number: 16,
+        title: "Build knows the model architecture",
+        outcome,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,6 +1039,7 @@ mod tests {
             model_facts: None,
             diffusion: None,
             co_resident: vec![],
+            build_support: None,
         }
     }
 
@@ -999,6 +1063,58 @@ mod tests {
         let results = run_all(&healthy_ctx());
         assert_eq!(results.len(), 12);
         assert!(!any_block(&results), "{results:?}");
+    }
+
+    /// Check 16 appears only when the build may not load the model: a
+    /// definite No Blocks with the way out, Unknown only Warns.
+    #[test]
+    fn build_knows_model_check() {
+        let needs = ModelNeeds::new("k2-horizon", Some("k2-horizon".into()), None, Engine::LlamaServer);
+        let mut ctx = healthy_ctx();
+        ctx.build_support = Some(BuildSupport { needs: needs.clone(), support: Support::Yes });
+        assert_eq!(run_all(&ctx).len(), 12, "a build that knows the model adds nothing");
+
+        ctx.build_support = Some(BuildSupport {
+            needs: needs.clone(),
+            support: Support::No { missing: vec![Missing::Arch, Missing::TokenizerPre("k2-horizon".into())] },
+        });
+        let results = run_all(&ctx);
+        assert_eq!(results.len(), 13);
+        let c = results.last().unwrap();
+        assert_eq!((c.id, c.spec_number, c.title), ("build-knows-model", 16, "Build knows the model architecture"));
+        match &c.outcome {
+            Outcome::Block(m) => {
+                assert!(m.contains("build b does not know architecture 'k2-horizon' and pre-tokenizer 'k2-horizon'"), "{m}");
+                assert!(m.contains("\"unknown model architecture: 'k2-horizon'\", \"unknown pre-tokenizer type: 'k2-horizon'\""), "{m}");
+                assert!(m.contains("fidim models get"), "{m}");
+            }
+            o => panic!("{o:?}"),
+        }
+        assert!(any_block(&results));
+
+        let types = Support::No { missing: vec![Missing::TensorType(101)] };
+        ctx.build_support = Some(BuildSupport { needs: ModelNeeds { max_type_id: Some(101), ..needs.clone() }, support: types });
+        assert!(matches!(outcome_of(&run_all(&ctx), "build-knows-model"), Outcome::Block(m) if m.contains("invalid ggml type 101")));
+
+        ctx.build_support = Some(BuildSupport {
+            needs: needs.clone(),
+            support: Support::Unknown("pre-tokenizer 'x' was not found in llama.dll".into()),
+        });
+        match outcome_of(&run_all(&ctx), "build-knows-model") {
+            Outcome::Warn(m) => assert!(m.contains("could not confirm that build b loads architecture 'k2-horizon'") && m.contains("'x'"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        assert!(!any_block(&run_all(&ctx)));
+
+        // After the diffusion checks, never in their place.
+        let mut dg = healthy_diffusion_ctx();
+        dg.build_support = Some(BuildSupport {
+            needs: ModelNeeds::new("diffusion-gemma", None, None, Engine::DiffusionGemma),
+            support: Support::Unknown("x".into()),
+        });
+        let r = run_all(&dg);
+        assert_eq!(r.len(), 15);
+        assert_eq!(r.iter().map(|c| c.spec_number).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16]);
     }
 
     fn estimate_of(bytes: u64) -> crate::estimate::VramEstimate {
