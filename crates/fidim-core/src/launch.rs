@@ -543,8 +543,8 @@ pub fn prepare_with_inputs(
     }
 
     // VRAM estimate (check 6), and what the header says about the engine
-    // the model needs (check 13).
-    let header = gguf::read_header(&profile.model.path).ok();
+    // the model needs (check 13). A split model's weights are every shard.
+    let header = crate::discovery::read_model_header(&profile.model.path).ok();
     let model_facts = header.as_ref().map(ModelFacts::from_header);
     let mut sizing: Option<DiffusionSizing> = None;
     let estimate: Option<VramEstimate> = match &header {

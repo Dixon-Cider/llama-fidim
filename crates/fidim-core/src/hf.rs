@@ -148,7 +148,8 @@ fn base_model_via_api(cfg: &Config, repo: &str) -> Result<Vec<String>> {
 
 /// Creator defaults for a GGUF on disk. Candidate repos, in order: the base
 /// model named in the GGUF header, the quant repo named in the header, the
-/// repo implied by the `<root>/<owner>/<repo>/` folder layout, and finally
+/// repo its folder's `fidim-source.json` names (a FIDIM download), the repo
+/// implied by the `<root>/<owner>/<repo>/` folder layout, and finally
 /// whatever `base_model` those quant repos declare on their model card.
 pub fn creator_defaults(cfg: &Config, model_path: &Path) -> Result<CreatorDefaults> {
     let header = gguf::read_header(model_path)?;
@@ -178,11 +179,13 @@ pub fn creator_defaults(cfg: &Config, model_path: &Path) -> Result<CreatorDefaul
     };
     push(header.source_repo.clone(), &mut candidates);
     push(header.quant_repo.clone(), &mut candidates);
+    // The repo FIDIM downloaded it from, then the folder layout.
+    push(crate::discovery::model_source(model_path).map(|s| s.repo), &mut candidates);
     push(repo_from_layout(&cfg.model_roots, model_path), &mut candidates);
     if candidates.is_empty() {
         return Err(Error::Update(
-            "no Hugging Face repo could be inferred: the GGUF carries no general.base_model / general.source keys \
-             and the file is not under <model root>/<owner>/<repo>/"
+            "no Hugging Face repo could be inferred: the GGUF carries no general.base_model / general.source keys, \
+             no fidim-source.json names one, and the file is not under <model root>/<owner>/<repo>/"
                 .into(),
         ));
     }

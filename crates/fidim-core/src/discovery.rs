@@ -255,10 +255,14 @@ pub fn parse_version_output(text: &str) -> Option<(String, String)> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Model {
+    /// The file llama.cpp is given: the file, or the first shard of a split
+    /// model.
     pub path: PathBuf,
+    /// Bytes on disk, every shard included.
     pub file_size: u64,
     /// Modified time (unix seconds) — feeds the cold-cache heuristic (R-08).
     pub modified_unix: Option<u64>,
+    /// Read from `path`; for a split model `file_size` is the whole set's.
     pub header: Option<GgufHeader>,
     pub header_error: Option<String>,
     /// The engine this model needs, from its header (llama-server when the
@@ -269,6 +273,24 @@ pub struct Model {
     /// Paired speculative-decoding draft models (R-02): `MTP/` subdirectory
     /// contents or `*mtp*.gguf` siblings.
     pub draft_candidates: Vec<PathBuf>,
+    /// Every shard of a split model (`-00001-of-0000N.gguf` ...), in order;
+    /// empty for a single file.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shards: Vec<PathBuf>,
+    /// Where FIDIM downloaded it from (its folder's `fidim-source.json`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<ModelSource>,
+}
+
+/// A model's origin on the Hugging Face Hub, from the sidecar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelSource {
+    pub repo: String,
+    /// The commit it was downloaded at.
+    pub commit: String,
+    /// Its path in the repo (the local copy has the last part as its name).
+    pub path: String,
+    pub sha256: Option<String>,
 }
 
 /// Every auxiliary file seen under the roots, wherever it sits. The picker
@@ -290,6 +312,10 @@ pub struct AuxFiles {
 /// - a draft or projector anywhere under the roots whose name carries the
 ///   same model name as a model (quant suffix aside) is offered to it too,
 ///   after the siblings. Publishers ship MTP heads in their own repos.
+///
+/// The shards of a split model (`<name>-00001-of-0000N.gguf` ...) are one
+/// model. Importance matrices (`*imatrix*`) are not models, and a download
+/// in progress (`*.gguf.part`) is not a `.gguf` at all.
 pub fn scan_models(roots: &[PathBuf]) -> Vec<Model> {
     scan_models_and_aux(roots).0
 }
@@ -307,7 +333,7 @@ pub fn scan_models_and_aux(roots: &[PathBuf]) -> (Vec<Model>, AuxFiles) {
                 let p = e.path();
                 if p.is_dir() {
                     subdirs.push(p);
-                } else if is_gguf(&p) {
+                } else if is_gguf(&p) && !is_imatrix(&p) {
                     ggufs.push(p);
                 }
             }
@@ -327,8 +353,9 @@ pub fn scan_models_and_aux(roots: &[PathBuf]) -> (Vec<Model>, AuxFiles) {
             }
             all.mmproj.extend(mmproj.iter().cloned());
             all.drafts.extend(drafts.iter().cloned());
-            for path in main {
-                models.push(load_model(path, &mmproj, &drafts));
+            let sidecar = if main.is_empty() { None } else { read_source_sidecar(&dir) };
+            for files in group_split_sets(main) {
+                models.push(load_model(files, &mmproj, &drafts, sidecar.as_ref()));
             }
             // Recurse, but MTP/ contents are drafts, not standalone models.
             stack.extend(
@@ -340,7 +367,7 @@ pub fn scan_models_and_aux(roots: &[PathBuf]) -> (Vec<Model>, AuxFiles) {
     }
     // Second pass: name-matched drafts and projectors from anywhere.
     for m in &mut models {
-        let stem = stem_lower(&m.path);
+        let stem = model_stem(m);
         for d in &all.drafts {
             if !m.draft_candidates.contains(d) && names_match(&stem, &stem_lower(d)) {
                 m.draft_candidates.push(d.clone());
@@ -358,6 +385,17 @@ pub fn scan_models_and_aux(roots: &[PathBuf]) -> (Vec<Model>, AuxFiles) {
     all.mmproj.sort();
     all.mmproj.dedup();
     (models, all)
+}
+
+/// The name a model pairs by: its stem, or a split model's name before the
+/// shard number.
+fn model_stem(m: &Model) -> String {
+    if !m.shards.is_empty() {
+        if let Some((prefix, _, _)) = m.path.file_name().and_then(|n| n.to_str()).and_then(gguf::split_name) {
+            return prefix.to_lowercase();
+        }
+    }
+    stem_lower(&m.path)
 }
 
 /// `gemma-4-e4b-it-q8_0` and `mtp-gemma-4-e4b-it-q8_0` name the same model:
@@ -412,19 +450,89 @@ fn is_aux(p: &Path) -> bool {
     stem.starts_with("mmproj") || stem.contains("mtp")
 }
 
-fn load_model(path: PathBuf, mmproj: &[PathBuf], drafts: &[PathBuf]) -> Model {
-    let meta = std::fs::metadata(&path).ok();
-    let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let modified_unix = meta
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
-    let (header, header_error) = match gguf::read_header(&path) {
-        Ok(h) => (Some(h), None),
-        Err(e) => (None, Some(e.to_string())),
+fn is_imatrix(p: &Path) -> bool {
+    p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains("imatrix"))
+}
+
+/// One model's files: a single GGUF, or the shards of a split set found in
+/// one folder. `problem` is set when shards are missing.
+struct ModelFiles {
+    path: PathBuf,
+    shards: Vec<PathBuf>,
+    problem: Option<String>,
+}
+
+/// Group a folder's model files, gathering each split set's shards.
+fn group_split_sets(files: Vec<PathBuf>) -> Vec<ModelFiles> {
+    let mut out = Vec::new();
+    // (lowercase prefix, count) -> (number, path)
+    let mut sets: std::collections::BTreeMap<(String, u32), Vec<(u32, PathBuf)>> = Default::default();
+    for p in files {
+        let split = p.file_name().and_then(|n| n.to_str()).and_then(gguf::split_name).map(|(prefix, no, count)| {
+            ((prefix.to_lowercase(), count), no)
+        });
+        match split {
+            Some((key, no)) => sets.entry(key).or_default().push((no, p)),
+            None => out.push(ModelFiles { path: p, shards: Vec::new(), problem: None }),
+        }
+    }
+    for ((_, count), mut parts) in sets {
+        parts.sort_by_key(|(no, _)| *no);
+        let numbers: Vec<u32> = parts.iter().map(|(no, _)| *no).collect();
+        let problem = (numbers != (1..=count).collect::<Vec<_>>()).then(|| {
+            let present = numbers.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+            format!("split model incomplete: parts {present} of {count} are here, and llama.cpp needs all of them")
+        });
+        let shards: Vec<PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
+        out.push(ModelFiles { path: shards[0].clone(), shards, problem });
+    }
+    out
+}
+
+/// Every shard of the split set whose first shard is `first`, by name, in
+/// order. None when `first` is not a `-00001-of-0000N.gguf` file.
+pub fn split_shards(first: &Path) -> Option<Vec<PathBuf>> {
+    let name = first.file_name()?.to_str()?;
+    let (prefix, no, count) = gguf::split_name(name)?;
+    if no != 1 {
+        return None;
+    }
+    let ext = &name[name.len() - ".gguf".len()..];
+    Some((1..=count).map(|i| first.with_file_name(format!("{prefix}-{i:05}-of-{count:05}{ext}"))).collect())
+}
+
+/// A model's header with `file_size` covering the whole model: for the
+/// first shard of a split set, the size of every shard present. The VRAM
+/// estimate takes the weights from `file_size`.
+pub fn read_model_header(path: &Path) -> Result<GgufHeader> {
+    let mut h = gguf::read_header(path)?;
+    if let Some(shards) = split_shards(path) {
+        h.file_size = shards.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    }
+    Ok(h)
+}
+
+fn load_model(files: ModelFiles, mmproj: &[PathBuf], drafts: &[PathBuf], sidecar: Option<&SourceSidecar>) -> Model {
+    let all = if files.shards.is_empty() { std::slice::from_ref(&files.path) } else { &files.shards[..] };
+    let metas: Vec<std::fs::Metadata> = all.iter().filter_map(|p| std::fs::metadata(p).ok()).collect();
+    let file_size = metas.iter().map(|m| m.len()).sum();
+    let modified_unix = metas
+        .iter()
+        .filter_map(|m| m.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .max();
+    let (header, header_error) = match (&files.problem, gguf::read_header(&files.path)) {
+        (Some(problem), _) => (None, Some(problem.clone())),
+        (None, Ok(mut h)) => {
+            h.file_size = file_size;
+            (Some(h), None)
+        }
+        (None, Err(e)) => (None, Some(e.to_string())),
     };
+    let source = sidecar.and_then(|s| s.source_of(&files.path));
     Model {
-        path,
+        path: files.path,
         file_size,
         modified_unix,
         engine: header.as_ref().map(|h| h.engine()).unwrap_or_default(),
@@ -432,7 +540,106 @@ fn load_model(path: PathBuf, mmproj: &[PathBuf], drafts: &[PathBuf]) -> Model {
         header_error,
         mmproj_candidates: mmproj.to_vec(),
         draft_candidates: drafts.to_vec(),
+        shards: files.shards,
+        source,
     }
+}
+
+// --------------------------------------------------------------- sidecar ----
+
+/// Written beside downloaded models: which repo and commit each file came
+/// from and its SHA-256, so provenance survives a folder layout that does
+/// not name the repo and the GGUF naming none (K2 Horizon's do not).
+pub const SOURCE_SIDECAR: &str = "fidim-source.json";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceSidecar {
+    pub repo: String,
+    /// The commit of the latest download into this folder.
+    pub sha: String,
+    pub files: Vec<SourceFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceFile {
+    /// Path in the repo; the local file has its last part as its name.
+    pub path: String,
+    pub size: u64,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// The commit this file was downloaded at, when files of one folder
+    /// came from different commits (else the sidecar's `sha`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
+impl SourceFile {
+    fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+}
+
+impl SourceSidecar {
+    /// The entry for a local file, matched by file name.
+    pub fn source_of(&self, local: &Path) -> Option<ModelSource> {
+        let name = local.file_name()?.to_string_lossy();
+        let f = self.files.iter().find(|f| f.name().eq_ignore_ascii_case(&name))?;
+        Some(ModelSource {
+            repo: self.repo.clone(),
+            commit: f.commit.clone().unwrap_or_else(|| self.sha.clone()),
+            path: f.path.clone(),
+            sha256: f.sha256.clone(),
+        })
+    }
+}
+
+/// The sidecar in `dir`, if there is a readable one.
+pub fn read_source_sidecar(dir: &Path) -> Option<SourceSidecar> {
+    serde_json::from_str(&std::fs::read_to_string(dir.join(SOURCE_SIDECAR)).ok()?).ok()
+}
+
+/// Where the model at `path` came from, from its folder's sidecar.
+pub fn model_source(path: &Path) -> Option<ModelSource> {
+    read_source_sidecar(path.parent()?)?.source_of(path)
+}
+
+/// Record that `files` of `repo` at commit `sha` were downloaded into
+/// `dir`. Entries for other files of the same repo are kept (one folder
+/// collects several quants over time); a sidecar naming another repo is
+/// replaced. Written to a temporary file and renamed, so a reader never
+/// sees half of it.
+pub fn write_source_sidecar(dir: &Path, repo: &str, sha: &str, files: &[crate::hub::RepoFile]) -> Result<()> {
+    let mut kept: Vec<SourceFile> = match read_source_sidecar(dir) {
+        Some(old) if old.repo == repo => {
+            let old_sha = old.sha.clone();
+            old.files
+                .into_iter()
+                .filter(|f| !files.iter().any(|n| n.name().eq_ignore_ascii_case(f.name())))
+                // Pin each kept entry to the commit it came from.
+                .map(|f| SourceFile { commit: f.commit.or_else(|| Some(old_sha.clone())), ..f })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    kept.extend(files.iter().map(|f| SourceFile {
+        path: f.path.clone(),
+        size: f.size,
+        sha256: f.sha256.clone(),
+        commit: None,
+    }));
+    // An entry at the sidecar's own commit does not repeat it.
+    for f in &mut kept {
+        if f.commit.as_deref() == Some(sha) {
+            f.commit = None;
+        }
+    }
+    kept.sort_by(|a, b| a.path.cmp(&b.path));
+    let sidecar = SourceSidecar { repo: repo.to_string(), sha: sha.to_string(), files: kept };
+    std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    let path = dir.join(SOURCE_SIDECAR);
+    let tmp = dir.join(format!("{SOURCE_SIDECAR}.tmp"));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&sidecar)?).map_err(|e| Error::io(&tmp, e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))
 }
 
 #[cfg(test)]
@@ -674,5 +881,112 @@ mod tests {
         let dg = models.iter().find(|m| m.engine == Engine::DiffusionGemma).unwrap();
         assert_eq!(serde_json::to_value(dg).unwrap()["engine"], "diffusion-gemma");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A split model is one model at its first shard, sized as the whole
+    /// set; a set with a part missing says so; importance matrices and
+    /// downloads in progress are not models.
+    #[test]
+    fn split_sets_imatrix_and_partial_downloads() {
+        let root = std::env::temp_dir().join(format!("fidim-disc-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("unsloth").join("gemma-4-26B-A4B-it-GGUF");
+        let elsewhere = root.join("other");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let first = tiny_gguf("gemma4", None);
+        std::fs::write(dir.join("gemma-4-26B-A4B-it-BF16-00001-of-00002.gguf"), &first).unwrap();
+        std::fs::write(dir.join("gemma-4-26B-A4B-it-BF16-00002-of-00002.gguf"), vec![7u8; 5000]).unwrap();
+        std::fs::write(dir.join("gemma-4-26B-A4B-it-Q8_0-00001-of-00003.gguf"), &first).unwrap();
+        std::fs::write(dir.join("gemma-4-26B-A4B-it-Q8_0-00003-of-00003.gguf"), vec![7u8; 10]).unwrap();
+        std::fs::write(dir.join("gemma-4-26B-A4B-it-Q4_K_M.gguf"), &first).unwrap();
+        std::fs::write(dir.join("gemma-4-26B-A4B-it-Q6_K.gguf.part"), &first).unwrap();
+        std::fs::write(dir.join("k2_horizon_7b_combined.imatrix.gguf"), &first).unwrap();
+        std::fs::write(elsewhere.join("mmproj-gemma-4-26B-A4B-it-F16.gguf"), &first).unwrap();
+
+        let (models, aux) = scan_models_and_aux(&[root.clone()]);
+        let names: Vec<String> =
+            models.iter().map(|m| m.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            names,
+            [
+                "gemma-4-26B-A4B-it-BF16-00001-of-00002.gguf",
+                "gemma-4-26B-A4B-it-Q4_K_M.gguf",
+                "gemma-4-26B-A4B-it-Q8_0-00001-of-00003.gguf"
+            ]
+        );
+        let split = &models[0];
+        assert_eq!(split.shards.len(), 2);
+        assert!(split.shards[1].ends_with("gemma-4-26B-A4B-it-BF16-00002-of-00002.gguf"));
+        assert_eq!(split.file_size, first.len() as u64 + 5000);
+        let h = split.header.as_ref().unwrap();
+        assert_eq!(h.file_size, split.file_size, "the estimate sees every shard");
+        assert_eq!(h.architecture.as_deref(), Some("gemma4"));
+        assert!(
+            split.mmproj_candidates.iter().any(|p| p.ends_with("mmproj-gemma-4-26B-A4B-it-F16.gguf")),
+            "a split model pairs by its name before the shard number"
+        );
+        assert_eq!(aux.mmproj.len(), 1);
+
+        let single = &models[1];
+        assert!(single.shards.is_empty());
+        let json = serde_json::to_value(single).unwrap();
+        assert!(json.get("shards").is_none() && json.get("source").is_none(), "unchanged shape for plain files");
+
+        let broken = &models[2];
+        assert!(broken.header.is_none());
+        let err = broken.header_error.as_deref().unwrap();
+        assert!(err.contains("parts 1, 3 of 3"), "{err}");
+
+        // The launch path sizes a split model the same way.
+        let h = read_model_header(&split.path).unwrap();
+        assert_eq!(h.file_size, split.file_size);
+        assert_eq!(read_model_header(&single.path).unwrap().file_size, first.len() as u64);
+        assert_eq!(split_shards(&split.shards[1]), None, "only the first shard names the set");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn source_sidecar_round_trip() {
+        use crate::hub::RepoFile;
+        let root = std::env::temp_dir().join(format!("fidim-disc-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("IFM").join("K2-Horizon-7B-GGUF");
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("K2-Horizon-7B-Q4_K_M.gguf");
+        std::fs::write(&model, tiny_gguf("k2-horizon", None)).unwrap();
+        let q4 = RepoFile { path: "K2-Horizon-7B-Q4_K_M.gguf".into(), size: 5, sha256: Some("aa".repeat(32)) };
+        write_source_sidecar(&dir, "ngquocvinh/K2-Horizon-7B-GGUF", "sha1", std::slice::from_ref(&q4)).unwrap();
+        assert!(!dir.join(format!("{SOURCE_SIDECAR}.tmp")).exists());
+
+        let models = scan_models(&[root.clone()]);
+        let src = models[0].source.as_ref().unwrap();
+        assert_eq!(src.repo, "ngquocvinh/K2-Horizon-7B-GGUF");
+        assert_eq!(src.commit, "sha1");
+        assert_eq!(src.sha256.as_deref(), q4.sha256.as_deref());
+        assert_eq!(model_source(&model).as_ref(), Some(src));
+
+        // A later download at a newer commit keeps the earlier entry, pinned
+        // to the commit it came from; a subfolder path matches by file name.
+        let bf16 = RepoFile { path: "BF16/K2-Horizon-7B-BF16.gguf".into(), size: 9, sha256: None };
+        write_source_sidecar(&dir, "ngquocvinh/K2-Horizon-7B-GGUF", "sha2", std::slice::from_ref(&bf16)).unwrap();
+        let s = read_source_sidecar(&dir).unwrap();
+        assert_eq!(s.sha, "sha2");
+        assert_eq!(s.files.len(), 2);
+        assert_eq!(s.source_of(&model).unwrap().commit, "sha1");
+        let b = s.source_of(&dir.join("k2-horizon-7b-bf16.gguf")).unwrap();
+        assert_eq!((b.commit.as_str(), b.path.as_str()), ("sha2", "BF16/K2-Horizon-7B-BF16.gguf"));
+        // Downloading the same file again at the new commit re-pins it.
+        write_source_sidecar(&dir, "ngquocvinh/K2-Horizon-7B-GGUF", "sha2", &[q4.clone()]).unwrap();
+        let s = read_source_sidecar(&dir).unwrap();
+        assert!(s.files.iter().all(|f| f.commit.is_none()), "{s:?}");
+        // Another repo's download replaces the record.
+        write_source_sidecar(&dir, "IFM/K2-Horizon-7B-GGUF", "sha3", &[q4]).unwrap();
+        let s = read_source_sidecar(&dir).unwrap();
+        assert_eq!((s.repo.as_str(), s.files.len()), ("IFM/K2-Horizon-7B-GGUF", 1));
+        // A damaged sidecar is ignored, not fatal.
+        std::fs::write(dir.join(SOURCE_SIDECAR), "{not json").unwrap();
+        assert!(scan_models(&[root.clone()])[0].source.is_none());
+        std::fs::remove_dir_all(root).ok();
     }
 }
