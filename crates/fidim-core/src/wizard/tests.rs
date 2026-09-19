@@ -688,6 +688,19 @@ fn plan_for_k2_builds_the_fork_with_consent() {
 }
 
 #[test]
+fn a_source_build_without_a_gpu_target_says_how_to_give_one() {
+    let mut f = Fake::k2("plan-no-gfx");
+    f.inputs.gfx = String::new();
+    let cfg = f.cfg();
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    let plan = plan_with(&f, &cfg, &view, &PlanRequest::default()).unwrap();
+    assert!(plan.blocked);
+    let note = plan.notes.iter().find(|n| n.code == "no-gpu-target").unwrap();
+    assert!(note.message.contains("fidim models get <repo> --gfx gfx1201") && note.message.contains("Settings"), "{}", note.message);
+    assert!(!f.calls().iter().any(|c| c.starts_with("doctor")), "no toolchain check without a target");
+}
+
+#[test]
 fn plan_choices_skip_install_and_alternatives() {
     let f = Fake::k2("plan-choices");
     let cfg = f.cfg();

@@ -40,6 +40,10 @@ pub enum ModelsCmd {
         /// A branch, tag or commit (default: the main branch).
         #[arg(long)]
         rev: Option<String>,
+        /// GPU target(s) a source build in the plan is for, e.g. gfx1201
+        /// (default: what ROCm's hipInfo or the card names say).
+        #[arg(long)]
+        gfx: Option<String>,
     },
     /// What a model needs from a llama.cpp build (architecture,
     /// pre-tokenizer, tensor types), which installed builds have it, and
@@ -47,6 +51,9 @@ pub enum ModelsCmd {
     Needs {
         /// A local .gguf file, or owner/name, or a huggingface.co link.
         target: String,
+        /// GPU target(s) a source build in the plan is for, e.g. gfx1201.
+        #[arg(long)]
+        gfx: Option<String>,
     },
     /// Download a model, and the build it needs, then create a profile.
     /// Prints the plan and asks first; nothing is launched.
@@ -88,19 +95,30 @@ pub enum ModelsCmd {
         /// The profile's context (default: what fits one card, at most 32768).
         #[arg(long)]
         ctx: Option<u64>,
+        /// GPU target(s) to compile for when the plan builds a pull request
+        /// or a fork, e.g. gfx1201 (default: what ROCm's hipInfo or the card
+        /// names say).
+        #[arg(long)]
+        gfx: Option<String>,
     },
 }
 
 pub fn cmd_models(cfg: &Config, json: bool, cmd: ModelsCmd) -> anyhow::Result<()> {
     match cmd {
         ModelsCmd::Search { query, limit, all, sort } => search(cfg, json, &query, limit, all, &sort),
-        ModelsCmd::Show { repo, rev } => show(cfg, json, &repo, rev.as_deref()),
-        ModelsCmd::Needs { target } => needs(cfg, json, &target),
-        ModelsCmd::Get { repo, rev, quant, file, mmproj, draft, dest, build, allow_fork, yes, no_profile, ctx } => {
-            let opts = GetOpts { quant, file, mmproj, draft, dest, build, allow_fork, yes, no_profile, ctx };
+        ModelsCmd::Show { repo, rev, gfx } => show(cfg, json, &repo, rev.as_deref(), gfx),
+        ModelsCmd::Needs { target, gfx } => needs(cfg, json, &target, gfx),
+        ModelsCmd::Get { repo, rev, quant, file, mmproj, draft, dest, build, allow_fork, yes, no_profile, ctx, gfx } => {
+            let opts = GetOpts { quant, file, mmproj, draft, dest, build, allow_fork, yes, no_profile, ctx, gfx };
             get(cfg, json, &repo, rev.as_deref(), opts)
         }
     }
+}
+
+/// The machine for the wizard, with the GPU target the user gave (checked).
+fn env(cfg: &Config, gfx: Option<String>) -> anyhow::Result<wizard::LiveEnv> {
+    let gfx = gfx.map(|g| fidim_core::update::normalize_gpu_targets(&g)).transpose()?;
+    Ok(wizard::LiveEnv { gfx, ..wizard::LiveEnv::new(cfg.clone()) })
 }
 
 // ---------------------------------------------------------------- format ----
@@ -268,8 +286,8 @@ fn fits_table(fits: &[ChoiceFit], recommended: Option<&str>, labels: &[(String, 
     }
 }
 
-fn show(cfg: &Config, json: bool, repo: &str, rev: Option<&str>) -> anyhow::Result<()> {
-    let view = wizard::inspect(cfg, repo, rev)?;
+fn show(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, gfx: Option<String>) -> anyhow::Result<()> {
+    let view = wizard::inspect_with(&env(cfg, gfx)?, cfg, repo, rev)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&view)?);
         return Ok(());
@@ -344,8 +362,8 @@ fn show(cfg: &Config, json: bool, repo: &str, rev: Option<&str>) -> anyhow::Resu
 
 // ----------------------------------------------------------------- needs ----
 
-fn needs(cfg: &Config, json: bool, target: &str) -> anyhow::Result<()> {
-    let r = wizard::needs(cfg, target)?;
+fn needs(cfg: &Config, json: bool, target: &str, gfx: Option<String>) -> anyhow::Result<()> {
+    let r = wizard::needs_with(&env(cfg, gfx)?, cfg, target)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&r)?);
         return Ok(());
@@ -385,6 +403,7 @@ struct GetOpts {
     yes: bool,
     no_profile: bool,
     ctx: Option<u64>,
+    gfx: Option<String>,
 }
 
 /// `--build auto|none|<dir>`.
@@ -466,7 +485,8 @@ fn ask(question: &str) -> anyhow::Result<bool> {
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> anyhow::Result<()> {
-    let view = wizard::inspect(cfg, repo, rev)?;
+    let mut env = env(cfg, o.gfx.clone())?;
+    let view = wizard::inspect_with(&env, cfg, repo, rev)?;
     if view.kind != RepoKind::Gguf {
         let why = view.notes.iter().find(|n| n.level == Level::Error).map(|n| n.message.clone()).unwrap_or_default();
         let alts: Vec<&str> = view.derivatives.iter().take(5).map(|d| d.id.as_str()).collect();
@@ -508,7 +528,9 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
         profile: !o.no_profile,
         ctx: o.ctx,
     };
-    let plan = wizard::plan(cfg, &view, &req)?;
+    // The cards inspect saw, so the plan's estimate is the view's.
+    env.devices = Some(view.devices.clone()).filter(|d| !d.is_empty());
+    let plan = wizard::plan_with(&env, cfg, &view, &req)?;
     if json && !o.yes {
         // A dry run: the plan, nothing done.
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -725,6 +747,14 @@ mod tests {
         assert_eq!(build_choice(""), BuildChoice::Auto);
         assert_eq!(build_choice("none"), BuildChoice::Skip);
         assert_eq!(build_choice(r"C:\b\b10984-rocm"), BuildChoice::Installed(PathBuf::from(r"C:\b\b10984-rocm")));
+    }
+
+    #[test]
+    fn gpu_targets_given_are_checked() {
+        let cfg = Config::default_for_machine();
+        assert_eq!(env(&cfg, Some("GFX1201, gfx1100".into())).unwrap().gfx.as_deref(), Some("gfx1201,gfx1100"));
+        assert!(env(&cfg, Some("gfx1201 && calc".into())).is_err());
+        assert_eq!(env(&cfg, None).unwrap().gfx, None);
     }
 
     #[test]

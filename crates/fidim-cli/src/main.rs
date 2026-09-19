@@ -1874,9 +1874,10 @@ mod tests {
             _ => panic!("not models search"),
         }
         match parse(&["models", "show", "https://huggingface.co/IFM/K2-Horizon-7B-GGUF", "--rev", "main"]).unwrap().command {
-            Cmd::Models { cmd: ModelsCmd::Show { repo, rev } } => {
+            Cmd::Models { cmd: ModelsCmd::Show { repo, rev, gfx } } => {
                 assert_eq!(repo, "https://huggingface.co/IFM/K2-Horizon-7B-GGUF");
                 assert_eq!(rev.as_deref(), Some("main"));
+                assert_eq!(gfx, None);
             }
             _ => panic!("not models show"),
         }
@@ -1886,19 +1887,19 @@ mod tests {
         ));
         let get = parse(&[
             "models", "get", "ngquocvinh/K2-Horizon-7B-GGUF", "--quant", "Q4_K_M", "--mmproj", "--draft", "mtp.gguf",
-            "--dest", r"D:\m", "--build", "none", "--allow-fork", "--yes", "--ctx", "65536",
+            "--dest", r"D:\m", "--build", "none", "--allow-fork", "--yes", "--ctx", "65536", "--gfx", "gfx1201",
         ])
         .unwrap();
         let dbg = format!("{:?}", match get.command { Cmd::Models { cmd } => cmd, _ => panic!("not models get") });
         for want in [
             "quant: Some(\"Q4_K_M\")", "mmproj: Some(\"auto\")", "draft: Some(\"mtp.gguf\")", "build: \"none\"",
-            "allow_fork: true", "yes: true", "ctx: Some(65536)", "no_profile: false", "file: None",
+            "allow_fork: true", "yes: true", "ctx: Some(65536)", "no_profile: false", "file: None", "gfx: Some(\"gfx1201\")",
         ] {
             assert!(dbg.contains(want), "{want} in {dbg}");
         }
         // Defaults: the recommendation, no extras, auto build, and it asks.
         let dbg = format!("{:?}", match parse(&["models", "get", "a/b"]).unwrap().command { Cmd::Models { cmd } => cmd, _ => unreachable!() });
-        for want in ["quant: None", "mmproj: None", "draft: None", "build: \"auto\"", "allow_fork: false", "yes: false"] {
+        for want in ["quant: None", "mmproj: None", "draft: None", "build: \"auto\"", "allow_fork: false", "yes: false", "gfx: None"] {
             assert!(dbg.contains(want), "{want} in {dbg}");
         }
         // One file choice at a time; a repo is required.

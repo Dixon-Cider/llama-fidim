@@ -760,7 +760,7 @@ impl Env for LiveEnv {
         Ok(Vec::new())
     }
     fn gpu_targets(&self) -> Option<String> {
-        machine_gpu_targets(&self.cfg)
+        self.gfx.clone().or_else(|| machine_gpu_targets(&self.cfg))
     }
     fn busy_cards(&self) -> Vec<String> {
         crate::supervise::reattach(&self.cfg.runs_dir)
@@ -1737,7 +1737,10 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
                 notes.push(Note::new(
                     Level::Error,
                     "no-gpu-target",
-                    "this machine's GPU target is unknown, so a source build cannot start (the CLI takes --gfx)",
+                    "this machine's GPU target is unknown (ROCm's hipInfo was not found and the card names are not \
+                     known ones), so a source build cannot start: point Settings > fallback runtime folder at a HIP \
+                     SDK bin folder (hipInfo.exe is read from there), or give the target on the command line: \
+                     `fidim models get <repo> --gfx gfx1201`",
                 ));
             } else {
                 let first = gpu_targets.split(',').next().unwrap_or("").trim().to_string();
