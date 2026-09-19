@@ -3,6 +3,7 @@
   import { inTauri } from "./api.js";
   import Devices from "./views/Devices.svelte";
   import Profiles from "./views/Profiles.svelte";
+  import Models from "./views/Models.svelte";
   import Running from "./views/Running.svelte";
   import Benchmarks from "./views/Benchmarks.svelte";
   import Logs from "./views/Logs.svelte";
@@ -21,6 +22,7 @@
       { id: "running", label: "Running", component: Running },
       { id: "chat", label: "Chat", component: Chat },
       { id: "profiles", label: "Profiles", component: Profiles },
+      { id: "models", label: "Models", component: Models },
       { id: "router", label: "Router", component: Router },
     ]},
     { label: "inspect", views: [
@@ -124,14 +126,14 @@
     </div>
   </nav>
   <main class="view">
-    {#if setup && (!setup.models || !setup.builds) && active !== "settings" && active !== "updates"}
+    {#if setup && (!setup.models || !setup.builds) && active !== "settings" && active !== "updates" && active !== "models"}
       <div class="card notice" style="border-color: var(--accent-line);">
         <span class="chip accent">first run</span>
         <span>
           {#if !setup.models && !setup.builds}No models or llama.cpp builds found yet.
           {:else if !setup.models}No models found yet.
           {:else}No llama.cpp build found yet.{/if}
-          {#if !setup.models}Add a model folder in <button class="link" onclick={() => (active = "settings")}>Settings</button>.{/if}
+          {#if !setup.models}Get one from Hugging Face in <button class="link" onclick={() => (active = "models")}>Models</button>, or add a model folder in <button class="link" onclick={() => (active = "settings")}>Settings</button>.{/if}
           {#if !setup.builds}Install a build from <button class="link" onclick={() => (active = "updates")}>Updates</button>.{/if}
         </span>
       </div>

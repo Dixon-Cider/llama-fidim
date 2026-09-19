@@ -34,7 +34,9 @@
     integrated_name_patterns: "Device names containing any of these count as integrated graphics.",
     allow_integrated: "Let profiles bind integrated graphics. Off, pre-flight blocks it, because next to a discrete card an iGPU is a trap: it runs at a fraction of the speed and never errors. On an APU-only machine, or a Strix Halo with up to 96 GB of shared memory, turn this on.",
     keep_alive: "Off by default. VRAM eviction on idle comes from the PCIe Link State Power Management power setting; pre-flight check 12 warns when it is not Off. If it cannot be Off, a 1-token request every N seconds keeps the GPU awake. Profiles can override.",
-    hf_token: "Hugging Face token, used only to read generation_config.json from gated repos. HF_TOKEN in the environment wins.",
+    hf_token: "Hugging Face token, for gated repos (Gemma, Llama): the Models tab's downloads and the creator defaults. Read access is enough. HF_TOKEN in the environment wins.",
+    hf_use_cli_token: "When no other token is set, use the one `huggingface-cli login` (or `hf auth login`) saved in your user folder. Off by default: that file belongs to another tool.",
+    github_token: "GitHub token for the model wizard's build lookups (releases, pull requests, forks linked from model cards). Optional: without one GitHub allows 60 requests an hour, and answers are cached. Any read-only token works; GITHUB_TOKEN in the environment is used when this is empty.",
     save_chats: "On, each Chat conversation is kept on this PC as a plain JSON file in the tool's chats folder, and listed in the Chat tab. Off, conversations last only until the app closes; files saved earlier stay until you delete them.",
   };
 
@@ -81,11 +83,12 @@
     out.build_roots = clean(out.build_roots);
     out.model_roots = clean(out.model_roots);
     out.integrated_name_patterns = clean(out.integrated_name_patterns);
-    for (const k of ["rocm_bin", "install_root", "llama_cpp_source", "source_build_script", "hf_token", "default_runtime", "rocm_family"])
+    for (const k of ["rocm_bin", "install_root", "llama_cpp_source", "source_build_script", "hf_token", "github_token", "default_runtime", "rocm_family"])
       if (out[k] === "" || out[k] === undefined) out[k] = null;
     out.keep_alive_seconds = Math.max(0, Math.round(Number(out.keep_alive_seconds) || 0));
     out.allow_integrated = !!out.allow_integrated;
     out.save_chats = out.save_chats !== false;
+    out.hf_use_cli_token = !!out.hf_use_cli_token;
     if (out.default_runtime === "default") out.default_runtime = null;
     let manual = [];
     if (manualRuntimesText.trim()) manual = JSON.parse(manualRuntimesText);
@@ -227,7 +230,7 @@
   </section>
 
   <section class="card">
-    <div class="sec">Source builds and Hugging Face</div>
+    <div class="sec">Source builds, Hugging Face and GitHub <span class="faint">for Updates and the Models tab</span></div>
     <div class="formgrid">
       <label class="field" style="grid-column: span 3;" title={HINTS.llama_cpp_source}>
         <span class="k">llama.cpp checkout</span>
@@ -240,6 +243,14 @@
       <label class="field" style="grid-column: span 3;" title={HINTS.hf_token}>
         <span class="k">Hugging Face token (gated repos only)</span>
         <input type="password" bind:value={cfg.hf_token} oninput={touch} placeholder="hf_…" autocomplete="off" />
+      </label>
+      <label class="field" style="grid-column: span 3;" title={HINTS.hf_use_cli_token}>
+        <span class="k">Hugging Face CLI login</span>
+        <span><input type="checkbox" checked={!!cfg.hf_use_cli_token} onchange={(e) => { cfg.hf_use_cli_token = e.target.checked; touch(); }} /> use the token huggingface-cli saved when none is set here</span>
+      </label>
+      <label class="field" style="grid-column: span 3;" title={HINTS.github_token}>
+        <span class="k">GitHub token (build lookups, optional)</span>
+        <input type="password" bind:value={cfg.github_token} oninput={touch} placeholder="github_pat_… or ghp_…" autocomplete="off" />
       </label>
     </div>
   </section>

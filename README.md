@@ -81,6 +81,19 @@ welcome, and a report that includes your card, driver version and the
   from before b5872 (July 2025) do not compile with the ROCm 7 HIP SDK:
   the plan says so and puts them last, and the build stops right after
   configure with that reason.
+- **Get a model.** The Models tab searches Hugging Face (or opens a pasted
+  repo or file link), shows each file of a repo with its estimated VRAM,
+  whether it fits one card or a split over two and the longest context
+  that fits, and recommends one. It checks which installed build knows the
+  model's architecture and, when none does, finds one to install or build:
+  the newest upstream release, an Unsloth build, an upstream pull request,
+  or a fork the model card links, shown with its commit and newest commits
+  and built only after you tick the consent box. Then it downloads (resumable,
+  SHA-256 checked, into `<model folder>\<owner>\<repo>`, with the free space
+  checked again as it starts) and saves a profile with its pre-flight. A
+  draft goes in as what it is: an MTP head, a DFlash draft or a draft model
+  (EAGLE3 and DSpark heads are listed, not offered: profiles cannot run them
+  yet). It never loads the model on its own.
 - **Benchmarks.** Serial and concurrent decode sweeps against a running
   server, stored per profile as its baseline.
 - **Nearly everything the GUI does, the `fidim` CLI does too.** The live
@@ -161,7 +174,8 @@ each release changed.
 ## First run
 
 1. Open **Settings** and add your model folder. If LM Studio is installed,
-   its download folder is already there.
+   its download folder is already there. No models yet? **Models** gets one
+   from Hugging Face once a build is installed (step 2).
 2. Open **Updates**. If no ROCm runtime is listed, install one from the ROCm
    section and press **Make default**. Then install the latest llama.cpp
    build; its verification needs a runtime to load the HIP backend.
@@ -175,8 +189,11 @@ is plain JSON you can edit by hand.
 
 For gated Hugging Face repos (Gemma, Llama), the app sends a token from
 `HF_TOKEN`, the file `HF_TOKEN_PATH` names, or the token in Settings. To
-use the one `huggingface-cli login` saved, set `"hf_use_cli_token": true`
-in `config.json`.
+use the one `huggingface-cli login` saved, tick **Hugging Face CLI login**
+in Settings (`"hf_use_cli_token": true` in `config.json`). Looking up
+builds for a model asks GitHub, which allows 60 requests an hour without a
+token; answers are cached, and a read-only token in Settings (or
+`GITHUB_TOKEN`) raises the limit.
 
 ## The CLI
 
@@ -199,6 +216,15 @@ fidim update --channel unsloth [--install] [--overlay]
 fidim update --source --remote <url> --ref <branch|pull/N/head|commit>
                            compile any llama.cpp git ref (a fork's branch, a pull
                            request) for this machine's GPU; --gfx, --label optional
+fidim models search <words>
+                           GGUF repos on Hugging Face, and whether a build knows them
+fidim models show <repo>   a repo's files, what fits the cards, which build loads it
+fidim models needs <gguf|repo>
+                           what a model needs from a build, and who has it
+fidim models get <repo> [--quant Q] [--mmproj] [--draft] [--dest DIR]
+                           download it (and the build it needs) and make a profile;
+                           asks first, --allow-fork for a fork's code, --gfx for a
+                           source build's GPU target, never launches
 fidim toolchain            check Visual Studio, git, CMake, Ninja and the HIP SDK
                            for source builds, with a test compile
 fidim rocm list|install    ROCm runtimes from AMD's channels

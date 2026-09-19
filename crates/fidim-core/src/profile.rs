@@ -438,6 +438,249 @@ impl Profile {
     }
 }
 
+// --------------------------------------------------------------- factory ----
+
+/// The first port a new profile gets; the ones below are left to
+/// hand-made profiles and the router (the GUI's New starts here too).
+pub const FIRST_NEW_PORT: u16 = 9710;
+/// A new llama-server profile's context when the user picks none and the
+/// estimate allows more.
+pub const NEW_PROFILE_CTX: u64 = 32_768;
+
+/// What `new_for_model` takes beyond the model and build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewProfileOpts {
+    /// The context the user picked; None = the estimate's, capped at
+    /// `NEW_PROFILE_CTX`. Always capped at the model's trained context.
+    #[serde(default)]
+    pub ctx: Option<u64>,
+    /// Largest context that fits one card (`catalog::ChoiceFit::max_ctx_one_card`).
+    #[serde(default)]
+    pub fit_ctx: Option<u64>,
+    /// Layer-split over the two largest cards: the model does not fit one.
+    #[serde(default)]
+    pub split: bool,
+    /// A projector to pair; None = the first found beside the model.
+    #[serde(default)]
+    pub mmproj: Option<PathBuf>,
+    /// A draft or MTP head to decode speculatively with.
+    #[serde(default)]
+    pub draft: Option<PathBuf>,
+    /// The speculative mode for `draft` when the caller knows it (the
+    /// wizard reads it from the file's path in its repo, whose `MTP/`
+    /// folder the download flattens away); None = from the file name
+    /// (`draft_mode_of`).
+    #[serde(default)]
+    pub draft_mode: Option<String>,
+    /// Stable keys of cards a running server holds: a new profile goes on
+    /// an idle card when there is one.
+    #[serde(default)]
+    pub busy_cards: Vec<String>,
+    /// Ports running servers listen on, besides the profiles' own.
+    #[serde(default)]
+    pub taken_ports: Vec<u16>,
+    /// Display name; None = the model's file name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Free text for `notes`, e.g. where the model came from.
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// The speculative mode a draft file is for, from its path in a repo (or
+/// its file name): `dflash` for a DFlash draft, `mtp` for an MTP head
+/// (`mtp` in the name, or in an `MTP/` folder), `draft` for a separate
+/// small model. None for the heads llama-server runs with spec types a
+/// profile cannot name yet (EAGLE3: `draft-eagle3`, DSpark:
+/// `draft-dspark`): as `draft` they would be loaded as a standalone model,
+/// which they are not. Only the file name and folder names equal to `mtp`
+/// count, never a folder that merely contains the letters.
+pub fn draft_mode_of(path: &str) -> Option<&'static str> {
+    let segs: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let name = segs.last().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    let in_mtp_dir = segs.iter().rev().skip(1).any(|d| d.eq_ignore_ascii_case("mtp"));
+    if name.starts_with("eagle") || name.contains("eagle3") || name.contains("dspark") {
+        None
+    } else if name.contains("dflash") {
+        Some("dflash")
+    } else if in_mtp_dir || name.contains("mtp") {
+        Some("mtp")
+    } else {
+        Some("draft")
+    }
+}
+
+/// What the head `draft_mode_of` refuses is, for a message.
+pub fn unsupported_draft_kind(path: &str) -> &'static str {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+    if name.contains("dspark") { "a DSpark head" } else { "an EAGLE3 head" }
+}
+
+/// `K2-Horizon-7B-Q4_K_M` -> `k2-horizon-7b-q4-k-m`: lowercase letters,
+/// digits and single dashes, at most 48 characters.
+pub fn slug(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    let out: String = out.trim_end_matches('-').chars().take(48).collect();
+    let out = out.trim_end_matches('-').to_string();
+    if out.is_empty() { "model".into() } else { out }
+}
+
+/// A new profile for `model` on `build`, as the Profiles editor's New then
+/// a model pick would make it (same defaults: f16 KV, flash attention on,
+/// -b 2048 / -ub 512, one slot, the first projector found beside the
+/// model; a diffusion model gets the editor's diffusion defaults), with
+/// what the editor leaves to the user filled in:
+/// - an id from the model's file name, unique among `existing` (case
+///   ignored, as file names are), used as the alias too;
+/// - the first free port from `FIRST_NEW_PORT` up that no profile and no
+///   running server uses;
+/// - the context from the estimate, capped at `NEW_PROFILE_CTX` unless
+///   the user picked one, and at the model's trained context;
+/// - every layer on the GPU, the output layer included (-ngl above the
+///   block count);
+/// - an idle discrete card (the first discrete card when all are busy),
+///   or the two largest layer-split when the model needs both.
+///
+/// llama-server always gets `--jinja` from the launch path, so the
+/// model's chat template applies without a flag here.
+pub fn new_for_model(
+    cfg: &crate::config::Config,
+    model: &crate::discovery::Model,
+    build: &crate::discovery::Build,
+    devices: &[crate::devices::Device],
+    existing: &[Profile],
+    opts: &NewProfileOpts,
+) -> Profile {
+    use crate::discovery::dg_feature;
+
+    let h = model.header.as_ref();
+    let file_name = model.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = crate::gguf::split_name(&file_name)
+        .map(|(prefix, _, _)| prefix.to_string())
+        .unwrap_or_else(|| file_name.strip_suffix(".gguf").or_else(|| file_name.strip_suffix(".GGUF")).unwrap_or(&file_name).to_string());
+
+    // A unique id: the slug, then -2, -3, ...
+    let base_id = slug(&stem);
+    let taken_id = |id: &str| existing.iter().any(|p| p.id.eq_ignore_ascii_case(id));
+    let mut id = base_id.clone();
+    let mut n = 2;
+    while taken_id(&id) {
+        id = format!("{base_id}-{n}");
+        n += 1;
+    }
+
+    let mut port = FIRST_NEW_PORT;
+    while existing.iter().any(|p| p.server.port == port) || opts.taken_ports.contains(&port) {
+        port = port.saturating_add(1);
+        if port == u16::MAX {
+            break;
+        }
+    }
+
+    let engine = model.engine;
+    let diffusion = engine.is_diffusion();
+
+    // Cards: discrete ones, or every one when integrated graphics may be
+    // bound and there is no discrete card.
+    let mut cards: Vec<&crate::devices::Device> = devices.iter().filter(|d| !d.integrated).collect();
+    if cards.is_empty() && cfg.allow_integrated {
+        cards = devices.iter().collect();
+    }
+    let one = |k: &str| DeviceRef { key: k.to_string(), split_fraction: None, resolved_index_last_launch: None };
+    let (device_refs, split_mode) = if opts.split && !diffusion && cards.len() >= 2 {
+        let mut by_size = cards.clone();
+        by_size.sort_by(|a, b| b.total_mib.cmp(&a.total_mib).then_with(|| b.free_mib.cmp(&a.free_mib)));
+        (vec![one(&by_size[0].stable_key), one(&by_size[1].stable_key)], Some(SplitMode::Layer))
+    } else {
+        let pick = cards.iter().find(|d| !opts.busy_cards.contains(&d.stable_key)).or(cards.first());
+        (pick.map(|d| vec![one(&d.stable_key)]).unwrap_or_default(), None)
+    };
+
+    let model_ctx = h.and_then(|h| h.context_length).filter(|c| *c > 0);
+    let ctx_total = if diffusion {
+        // MAXTOK 0: the runner sizes its context to the card at load.
+        0
+    } else {
+        let want = opts.ctx.filter(|c| *c > 0).unwrap_or_else(|| {
+            opts.fit_ctx.filter(|c| *c > 0).map_or(NEW_PROFILE_CTX, |f| f.min(NEW_PROFILE_CTX))
+        });
+        let capped = model_ctx.map_or(want, |m| want.min(m));
+        // Whole 256-token steps, as the editor's slider moves.
+        if capped >= 512 { capped / 256 * 256 } else { capped.max(1) }
+    };
+    let block_count = h.and_then(|h| h.block_count).unwrap_or(0);
+    let n_gpu_layers = u32::try_from(block_count + 1).unwrap_or(u32::MAX).max(99);
+
+    let mmproj = if diffusion { None } else { opts.mmproj.clone().or_else(|| model.mmproj_candidates.first().cloned()) };
+    let (draft, speculative) = match (&opts.draft, diffusion) {
+        (Some(d), false) => {
+            // The file name only: the folders above are the model's, and a
+            // repo named "...mtp..." says nothing about this file.
+            let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mode = opts.draft_mode.clone().or_else(|| draft_mode_of(&name).map(String::from));
+            match mode {
+                Some(mode) => (
+                    Some(DraftRef { path: d.clone(), enabled: true }),
+                    Some(Speculative { mode, n_max: None, n_min: None, p_min: None }),
+                ),
+                // A head no mode runs: kept in the profile, switched off.
+                None => (Some(DraftRef { path: d.clone(), enabled: false }), None),
+            }
+        }
+        _ => (None, None),
+    };
+    let diffusion_cfg = diffusion.then(|| DiffusionCfg {
+        // Flash attention follows the build, as a build pick does in the editor.
+        flash_attn: build.patch.as_ref().is_some_and(|p| p.has(dg_feature::FA_PAD)),
+        ..DiffusionCfg::default()
+    });
+
+    Profile {
+        schema: SCHEMA_VERSION,
+        engine,
+        name: opts.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| stem.clone()),
+        build: BuildRef { path: build.path.clone(), version: build.version.clone() },
+        model: ModelRef { path: model.path.clone(), mmproj, draft },
+        devices: device_refs,
+        split_mode,
+        main_device: 0,
+        rocm_runtime: None,
+        keep_alive_seconds: None,
+        server: ServerCfg { port, alias: id.clone(), host: default_host() },
+        runtime: Runtime {
+            n_gpu_layers,
+            ctx_total,
+            slots: default_slots(),
+            kv_type_k: default_kv_type(),
+            kv_type_v: default_kv_type(),
+            flash_attn: default_flash_attn(),
+            batch_logical: default_batch_logical(),
+            batch_physical: default_batch_physical(),
+            cont_batching: true,
+            kv_unified: false,
+            cache_reuse: None,
+            threads: None,
+            extra_flags: Vec::new(),
+        },
+        sampling: Sampling::default(),
+        speculative,
+        diffusion: diffusion_cfg,
+        chat: Chat::default(),
+        env: BTreeMap::new(),
+        baseline: None,
+        notes: opts.notes.clone().unwrap_or_default(),
+        extra: serde_json::Map::new(),
+        id,
+    }
+}
+
 // ----------------------------------------------------------- validation ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1306,5 +1549,255 @@ mod tests {
         .unwrap();
         assert!(Profile::load(&path).is_err());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---------------------------------------------------------- factory ----
+
+    mod factory {
+        use super::super::*;
+        use crate::config::Config;
+        use crate::devices::Device;
+        use crate::discovery::{Build, Channel, Model};
+
+        fn card(key: &str, total_mib: u64, integrated: bool) -> Device {
+            serde_json::from_value(serde_json::json!({
+                "stable_key": key, "name": "card", "hip_index": 0, "backend": "ROCm",
+                "total_mib": total_mib, "free_mib": total_mib, "integrated": integrated, "bus_number": 3,
+                "driver_version": null, "display": null, "luid_low": null, "correlation_assumed": false
+            }))
+            .unwrap()
+        }
+
+        fn cards() -> Vec<Device> {
+            vec![card("pci:a:bus03", 32624, false), card("pci:igpu:bus19", 12381, true), card("pci:a:bus08", 32624, false)]
+        }
+
+        fn model(file: &str, arch: &str, ctx: u64, blocks: u64) -> Model {
+            let canvas = if arch == "diffusion-gemma" { Some(256) } else { None };
+            let header: crate::gguf::GgufHeader = serde_json::from_value(serde_json::json!({
+                "path": file, "file_size": 1, "gguf_version": 3, "tensor_count": 0, "architecture": arch,
+                "block_count": blocks, "context_length": ctx, "diffusion_canvas_length": canvas,
+                "metadata": {}
+            }))
+            .unwrap();
+            Model {
+                path: PathBuf::from(file),
+                file_size: 1,
+                modified_unix: None,
+                engine: header.engine(),
+                header: Some(header),
+                header_error: None,
+                mmproj_candidates: vec![PathBuf::from(r"E:\m\mmproj-F16.gguf")],
+                draft_candidates: vec![],
+                shards: vec![],
+                source: None,
+            }
+        }
+
+        fn build(tag: &str) -> Build {
+            let path = PathBuf::from(format!(r"C:\b\{tag}"));
+            Build {
+                server_exe: path.join("bin").join("llama-server.exe"),
+                path,
+                tag: tag.into(),
+                version: Some("b10984".into()),
+                commit: None,
+                version_error: None,
+                channel: Channel::Upstream,
+                bundled_runtime: false,
+                release_tag: None,
+                patch: None,
+                runner_exe: None,
+                git: None,
+            }
+        }
+
+        fn cfg() -> Config {
+            Config::default_for_machine()
+        }
+
+        #[test]
+        fn a_new_profile_mirrors_the_editors_defaults() {
+            let m = model(r"E:\m\IFM\K2-Horizon-7B-GGUF\K2-Horizon-7B-Q4_K_M.gguf", "k2-horizon", 524_288, 36);
+            let p = new_for_model(&cfg(), &m, &build("b10984-rocm"), &cards(), &[], &NewProfileOpts::default());
+            assert_eq!(p.id, "k2-horizon-7b-q4-k-m");
+            assert_eq!(p.server.alias, p.id);
+            assert_eq!(p.name, "K2-Horizon-7B-Q4_K_M");
+            assert_eq!(p.server.port, FIRST_NEW_PORT);
+            assert_eq!(p.engine, Engine::LlamaServer);
+            assert_eq!((p.build.path.clone(), p.build.version.as_deref()), (PathBuf::from(r"C:\b\b10984-rocm"), Some("b10984")));
+            assert_eq!(p.devices.len(), 1);
+            assert_eq!(p.devices[0].key, "pci:a:bus03", "the first discrete card, never the iGPU");
+            assert_eq!(p.split_mode, None);
+            let r = &p.runtime;
+            assert_eq!(r.ctx_total, NEW_PROFILE_CTX);
+            assert_eq!((r.kv_type_k.as_str(), r.kv_type_v.as_str(), r.flash_attn.as_str()), ("f16", "f16", "on"));
+            assert_eq!((r.batch_logical, r.batch_physical, r.slots), (2048, 512, 1));
+            assert!(r.cont_batching && !r.kv_unified);
+            assert_eq!(r.n_gpu_layers, 99);
+            assert_eq!(p.model.mmproj.as_deref(), Some(Path::new(r"E:\m\mmproj-F16.gguf")), "the first projector beside it");
+            assert!(p.model.draft.is_none() && p.speculative.is_none() && p.diffusion.is_none());
+            assert!(validate(&p).is_empty(), "{:?}", validate(&p));
+            // It saves and loads like any profile.
+            let back: Profile = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+            assert_eq!(back.id, p.id);
+        }
+
+        #[test]
+        fn ids_and_ports_are_unique() {
+            let m = model(r"E:\m\a\K2-Horizon-7B-Q4_K_M.gguf", "k2-horizon", 524_288, 36);
+            let b = build("b");
+            let mut existing: Vec<Profile> = Vec::new();
+            let opts = NewProfileOpts { taken_ports: vec![9711], ..Default::default() };
+            for _ in 0..3 {
+                let p = new_for_model(&cfg(), &m, &b, &cards(), &existing, &opts);
+                existing.push(p);
+            }
+            let ids: Vec<&str> = existing.iter().map(|p| p.id.as_str()).collect();
+            assert_eq!(ids, ["k2-horizon-7b-q4-k-m", "k2-horizon-7b-q4-k-m-2", "k2-horizon-7b-q4-k-m-3"]);
+            let ports: Vec<u16> = existing.iter().map(|p| p.server.port).collect();
+            assert_eq!(ports, [9710, 9712, 9713], "9711 belongs to a running server");
+            // Case does not make an id new (Windows file names ignore it).
+            let mut shouting = existing[0].clone();
+            shouting.id = "K2-HORIZON-7B-Q4-K-M-4".into();
+            existing.push(shouting);
+            assert_eq!(new_for_model(&cfg(), &m, &b, &cards(), &existing, &opts).id, "k2-horizon-7b-q4-k-m-5");
+            // A split model is named by its set, not its first shard.
+            let split = model(r"E:\m\g\gemma-4-26B-A4B-it-BF16-00001-of-00002.gguf", "gemma4", 262_144, 30);
+            assert_eq!(new_for_model(&cfg(), &split, &b, &cards(), &[], &opts).id, "gemma-4-26b-a4b-it-bf16");
+            assert_eq!(slug("...\u{dc}n\u{ef}code \u{2603} name!!"), "n-code-name");
+            assert_eq!(slug("---"), "model");
+            assert_eq!(slug(&"x".repeat(80)).len(), 48);
+        }
+
+        #[test]
+        fn context_from_the_estimate_capped() {
+            let m = model(r"E:\m\a\small.gguf", "llama", 131_072, 32);
+            let b = build("b");
+            let ctx = |opts: NewProfileOpts| new_for_model(&cfg(), &m, &b, &cards(), &[], &opts).runtime.ctx_total;
+            assert_eq!(ctx(NewProfileOpts { fit_ctx: Some(200_704), ..Default::default() }), 32_768, "capped at 32K");
+            assert_eq!(ctx(NewProfileOpts { fit_ctx: Some(20_480), ..Default::default() }), 20_480, "what fits");
+            assert_eq!(ctx(NewProfileOpts { ctx: Some(65_536), fit_ctx: Some(20_480), ..Default::default() }), 65_536, "the user's pick");
+            assert_eq!(ctx(NewProfileOpts { ctx: Some(1_000_000), ..Default::default() }), 131_072, "never past the trained context");
+            assert_eq!(ctx(NewProfileOpts { ctx: Some(10_000), ..Default::default() }), 9_984, "whole 256-token steps");
+            let tiny = model(r"E:\m\a\tiny.gguf", "llama", 2048, 12);
+            assert_eq!(new_for_model(&cfg(), &tiny, &b, &cards(), &[], &NewProfileOpts::default()).runtime.ctx_total, 2048);
+            // More than 98 blocks: -ngl still covers the output layer.
+            let deep = model(r"E:\m\a\deep.gguf", "llama", 8192, 120);
+            assert_eq!(new_for_model(&cfg(), &deep, &b, &cards(), &[], &NewProfileOpts::default()).runtime.n_gpu_layers, 121);
+        }
+
+        #[test]
+        fn cards_idle_split_and_integrated() {
+            let m = model(r"E:\m\a\m-Q8_0.gguf", "llama", 131_072, 32);
+            let b = build("b");
+            let busy = NewProfileOpts { busy_cards: vec!["pci:a:bus03".into()], ..Default::default() };
+            let p = new_for_model(&cfg(), &m, &b, &cards(), &[], &busy);
+            assert_eq!(p.devices[0].key, "pci:a:bus08", "an idle card first");
+            let all_busy = NewProfileOpts { busy_cards: vec!["pci:a:bus03".into(), "pci:a:bus08".into()], ..Default::default() };
+            assert_eq!(new_for_model(&cfg(), &m, &b, &cards(), &[], &all_busy).devices[0].key, "pci:a:bus03");
+            let mut big = cards();
+            big[2].total_mib = 49_152;
+            let p = new_for_model(&cfg(), &m, &b, &big, &[], &NewProfileOpts { split: true, ..Default::default() });
+            let keys: Vec<&str> = p.devices.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!(keys, ["pci:a:bus08", "pci:a:bus03"], "the two largest, largest (main) first");
+            assert_eq!(p.split_mode, Some(SplitMode::Layer));
+            assert!(validate(&p).is_empty(), "{:?}", validate(&p));
+            // An APU-only machine: the iGPU only when allowed.
+            let apu = vec![card("pci:igpu:bus19", 98_304, true)];
+            assert!(new_for_model(&cfg(), &m, &b, &apu, &[], &NewProfileOpts::default()).devices.is_empty());
+            let mut allow = cfg();
+            allow.allow_integrated = true;
+            assert_eq!(new_for_model(&allow, &m, &b, &apu, &[], &NewProfileOpts::default()).devices.len(), 1);
+        }
+
+        #[test]
+        fn drafts_and_projectors() {
+            let m = model(r"E:\m\g\gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf", "gemma4", 262_144, 30);
+            let b = build("b");
+            let opts = NewProfileOpts {
+                mmproj: Some(PathBuf::from(r"E:\m\g\mmproj-BF16.gguf")),
+                draft: Some(PathBuf::from(r"E:\m\g\mtp-gemma-4-26B-A4B-it.gguf")),
+                ..Default::default()
+            };
+            let p = new_for_model(&cfg(), &m, &b, &cards(), &[], &opts);
+            assert_eq!(p.model.mmproj.as_deref(), Some(Path::new(r"E:\m\g\mmproj-BF16.gguf")), "the one asked for");
+            let d = p.model.draft.as_ref().unwrap();
+            assert!(d.enabled);
+            assert_eq!(p.speculative.as_ref().unwrap().mode, "mtp");
+            assert_eq!(p.speculative_effective().spec_type(), Some("draft-mtp"));
+            let plain = NewProfileOpts { draft: Some(PathBuf::from(r"E:\m\g\small-draft.gguf")), ..Default::default() };
+            let p = new_for_model(&cfg(), &m, &b, &cards(), &[], &plain);
+            assert_eq!(p.speculative.as_ref().unwrap().mode, "draft");
+            assert!(validate(&p).is_empty(), "{:?}", validate(&p));
+            let with = |draft: &str, mode: Option<&str>| {
+                let opts = NewProfileOpts { draft: Some(PathBuf::from(draft)), draft_mode: mode.map(String::from), ..Default::default() };
+                new_for_model(&cfg(), &m, &b, &cards(), &[], &opts)
+            };
+            // A folder named for MTP holds a plain draft: the file decides.
+            let p = with(r"E:\m\someone\qwen3-mtp-drafts\draft-qwen3-0.6b-Q8_0.gguf", None);
+            assert_eq!(p.speculative.as_ref().unwrap().mode, "draft");
+            // DFlash drafts get their own spec type.
+            let p = with(r"E:\m\g\dflash-gpt-oss-20b-Q8_0.gguf", None);
+            assert_eq!(p.speculative_effective().spec_type(), Some("draft-dflash"));
+            assert!(validate(&p).is_empty(), "{:?}", validate(&p));
+            // An EAGLE3 head is not a draft model: kept, switched off.
+            for head in [r"E:\m\g\eagle3-gpt-oss-20b-Q8_0.gguf", r"E:\m\g\dspark-qwen3-8b.gguf"] {
+                let p = with(head, None);
+                assert!(p.speculative.is_none(), "{head}");
+                assert!(!p.model.draft.as_ref().unwrap().enabled, "{head}");
+                assert_eq!(p.speculative_effective().spec_type(), None, "{head}");
+            }
+            // The caller's mode wins (an MTP/ folder flattened away).
+            let p = with(r"E:\m\g\gemma-4-26B-A4B-it-Q8_0-head.gguf", Some("mtp"));
+            assert_eq!(p.speculative.as_ref().unwrap().mode, "mtp");
+        }
+
+        #[test]
+        fn draft_modes_by_name() {
+            for (path, mode) in [
+                ("MTP/gemma-4-26B-A4B-it-Q8_0.gguf", Some("mtp")),
+                ("mtp-gemma-4-26B-A4B-it.gguf", Some("mtp")),
+                (r"E:\m\u\g\MTP\mtp-x.gguf", Some("mtp")),
+                ("draft-qwen3-0.6b-Q8_0.gguf", Some("draft")),
+                ("mtp-things/draft-qwen3.gguf", Some("draft")),
+                ("dflash-qwen3-8b-Q8_0.gguf", Some("dflash")),
+                ("Qwen3-8B-DFlash-b16.gguf", Some("dflash")),
+                ("eagle3-gpt-oss-20b-Q8_0.gguf", None),
+                ("EAGLE3/llama-3.1-8b-eagle3-f16.gguf", None),
+                ("dspark-qwen3-8b.gguf", None),
+            ] {
+                assert_eq!(draft_mode_of(path), mode, "{path}");
+            }
+            assert_eq!(unsupported_draft_kind("eagle3-x.gguf"), "an EAGLE3 head");
+            assert_eq!(unsupported_draft_kind("x/dspark-x.gguf"), "a DSpark head");
+        }
+
+        #[test]
+        fn a_diffusion_model_gets_the_diffusion_engine() {
+            let m = model(r"E:\m\u\diffusiongemma-26B-A4B-it-Q4_K_M.gguf", "diffusion-gemma", 262_144, 30);
+            let mut b = build("b11027-mix-unsloth");
+            b.channel = Channel::Unsloth;
+            let opts = NewProfileOpts {
+                busy_cards: vec!["pci:a:bus03".into()],
+                draft: Some(PathBuf::from(r"E:\m\u\mtp.gguf")),
+                split: true,
+                fit_ctx: Some(65_536),
+                ..Default::default()
+            };
+            let p = new_for_model(&cfg(), &m, &b, &cards(), &[], &opts);
+            assert_eq!(p.engine, Engine::DiffusionGemma);
+            assert_eq!(p.runtime.ctx_total, 0, "MAXTOK auto");
+            assert_eq!(p.devices.len(), 1, "one card, never a split");
+            assert_eq!(p.devices[0].key, "pci:a:bus08", "an idle card");
+            assert!(p.model.mmproj.is_none() && p.model.draft.is_none() && p.speculative.is_none());
+            let dg = p.diffusion.as_ref().unwrap();
+            assert!(dg.hipblaslt_safeguard && !dg.flash_attn);
+            assert_eq!(dg.default_max_tokens, 2048);
+            assert!(!validate(&p).iter().any(|f| f.severity == Severity::Error), "{:?}", validate(&p));
+            // A runner that pads keys for flash attention gets it on.
+            b.patch = Some(crate::discovery::BuildPatch { name: "dgpatch".into(), features: vec!["dg-fa-pad".into()], ..Default::default() });
+            assert!(new_for_model(&cfg(), &m, &b, &cards(), &[], &opts).diffusion.unwrap().flash_attn);
+        }
     }
 }

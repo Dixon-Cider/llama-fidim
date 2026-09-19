@@ -12,6 +12,8 @@ use fidim_core::profile::{self, Profile};
 use fidim_core::supervise::{self, Health};
 use fidim_core::{export, gguf};
 
+mod models;
+
 #[derive(Parser)]
 #[command(name = "fidim", version = fidim_core::build_info::LONG, about = "llama.cpp build/config manager")]
 struct Cli {
@@ -221,6 +223,13 @@ enum Cmd {
         #[arg(long, value_name = "ZIP")]
         base_zip: Option<PathBuf>,
     },
+    /// Get a model from Hugging Face: search, look at a repo (its files,
+    /// what fits the cards, which build loads it), then download it and the
+    /// build it needs and create a profile. Never launches a model.
+    Models {
+        #[command(subcommand)]
+        cmd: models::ModelsCmd,
+    },
     /// Check the toolchain a source build needs: Visual Studio C++ tools, git,
     /// CMake, Ninja, the HIP SDK, and a test compile for the GPU target.
     Toolchain {
@@ -336,20 +345,14 @@ fn main() -> anyhow::Result<()> {
             cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag, &channel, gfx, overlay, base_zip)
         }
         Cmd::Toolchain { gfx } => cmd_toolchain(&cfg, cli.json, gfx),
+        Cmd::Models { cmd } => models::cmd_models(&cfg, cli.json, cmd),
     }
 }
 
 /// The GPU target(s) of this machine's discrete cards: hipInfo, else the
 /// card names.
 fn detect_gpu_targets(cfg: &Config) -> Option<String> {
-    let hipinfo = cfg
-        .rocm_bin
-        .as_ref()
-        .map(|b| b.join("hipInfo.exe"))
-        .filter(|p| p.is_file())
-        .and_then(|exe| launch::run_capture(&exe, &[], cfg.rocm_bin.as_deref()).ok());
-    let names: Vec<String> = WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect();
-    fidim_core::update::default_gpu_targets(hipinfo.as_deref(), &names)
+    fidim_core::wizard::machine_gpu_targets(cfg)
 }
 
 fn cmd_toolchain(cfg: &Config, json: bool, gfx: Option<String>) -> anyhow::Result<()> {
@@ -1854,6 +1857,56 @@ mod tests {
     use fidim_core::update;
 
     const TAG: &str = "b11030-mix-5ff778e";
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("fidim").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn models_commands_parse() {
+        use models::ModelsCmd;
+        let cli = parse(&["models", "search", "K2-Horizon", "--limit", "5", "--json"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Cmd::Models { cmd: ModelsCmd::Search { query, limit, all, sort } } => {
+                assert_eq!((query.as_str(), limit, all, sort.as_str()), ("K2-Horizon", 5, false, "downloads"));
+            }
+            _ => panic!("not models search"),
+        }
+        match parse(&["models", "show", "https://huggingface.co/IFM/K2-Horizon-7B-GGUF", "--rev", "main"]).unwrap().command {
+            Cmd::Models { cmd: ModelsCmd::Show { repo, rev, gfx } } => {
+                assert_eq!(repo, "https://huggingface.co/IFM/K2-Horizon-7B-GGUF");
+                assert_eq!(rev.as_deref(), Some("main"));
+                assert_eq!(gfx, None);
+            }
+            _ => panic!("not models show"),
+        }
+        assert!(matches!(
+            parse(&["models", "needs", r"E:\models\x.gguf"]).unwrap().command,
+            Cmd::Models { cmd: ModelsCmd::Needs { .. } }
+        ));
+        let get = parse(&[
+            "models", "get", "ngquocvinh/K2-Horizon-7B-GGUF", "--quant", "Q4_K_M", "--mmproj", "--draft", "mtp.gguf",
+            "--dest", r"D:\m", "--build", "none", "--allow-fork", "--yes", "--ctx", "65536", "--gfx", "gfx1201",
+        ])
+        .unwrap();
+        let dbg = format!("{:?}", match get.command { Cmd::Models { cmd } => cmd, _ => panic!("not models get") });
+        for want in [
+            "quant: Some(\"Q4_K_M\")", "mmproj: Some(\"auto\")", "draft: Some(\"mtp.gguf\")", "build: \"none\"",
+            "allow_fork: true", "yes: true", "ctx: Some(65536)", "no_profile: false", "file: None", "gfx: Some(\"gfx1201\")",
+        ] {
+            assert!(dbg.contains(want), "{want} in {dbg}");
+        }
+        // Defaults: the recommendation, no extras, auto build, and it asks.
+        let dbg = format!("{:?}", match parse(&["models", "get", "a/b"]).unwrap().command { Cmd::Models { cmd } => cmd, _ => unreachable!() });
+        for want in ["quant: None", "mmproj: None", "draft: None", "build: \"auto\"", "allow_fork: false", "yes: false", "gfx: None"] {
+            assert!(dbg.contains(want), "{want} in {dbg}");
+        }
+        // One file choice at a time; a repo is required.
+        assert!(parse(&["models", "get", "a/b", "--quant", "Q4_K_M", "--file", "x.gguf"]).is_err());
+        assert!(parse(&["models", "get"]).is_err());
+        assert!(parse(&["models", "show"]).is_err());
+    }
 
     fn release(json_assets: &str, tag: &str) -> update::Release {
         update::parse_release(&format!(

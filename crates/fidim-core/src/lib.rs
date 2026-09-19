@@ -33,6 +33,7 @@ pub mod supervise;
 pub mod toolchain;
 pub mod update;
 pub mod user_path;
+pub mod wizard;
 
 #[cfg(test)]
 mod test_http;

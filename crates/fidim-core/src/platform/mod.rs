@@ -138,6 +138,22 @@ pub fn descendants_in(root: u32, pairs: &[(u32, u32)], created: &dyn Fn(u32) -> 
     out
 }
 
+/// Raise `flag` on the first Ctrl+C (or Ctrl+Break) in this console instead
+/// of ending the process, so a long job (a download, a build) stops at its
+/// next check and keeps what it has; a second press ends the process as
+/// usual. False when the handler could not be installed (no console).
+pub fn cancel_on_ctrl_c(flag: &'static std::sync::atomic::AtomicBool) -> bool {
+    #[cfg(windows)]
+    {
+        windows_impl::cancel_on_ctrl_c(flag)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = flag;
+        false
+    }
+}
+
 /// Per-adapter GPU memory summed over `pids`, one entry per LUID. An error
 /// for the first pid (the run's own) means the counters are unavailable and
 /// is returned; a descendant that exits mid-query is skipped.

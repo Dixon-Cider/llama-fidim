@@ -40,6 +40,107 @@ struct AppState {
     /// Chat streams in flight, by the id the web view gave each, so Stop
     /// (and a reload's cancel-all) can reach them.
     chats: ChatStreams,
+    /// Model wizard jobs, running and finished, so the Models view can
+    /// come back to one after navigating away.
+    wizard: WizardJobs,
+    /// The repo views and plans the wizard made, by id: the web view gets
+    /// copies to draw and sends back only the id, so what runs is exactly
+    /// what the core planned (its consent flags, sources, sizes and
+    /// hashes), never an edited copy.
+    wizard_made: Arc<Mutex<WizardMade>>,
+}
+
+type WizardJobs = Arc<Mutex<HashMap<String, WizardJob>>>;
+
+/// Views and plans kept for the web view to refer to. A few are enough:
+/// each view is one opened repo, each plan one set of picks.
+#[derive(Default)]
+struct WizardMade {
+    next: u64,
+    views: Kept<fidim_core::wizard::RepoView>,
+    plans: Kept<fidim_core::wizard::WizardPlan>,
+}
+
+const WIZARD_KEEP: usize = 16;
+
+impl WizardMade {
+    fn id(&mut self, prefix: &str) -> String {
+        self.next += 1;
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        format!("{prefix}{t:x}-{}", self.next)
+    }
+    fn keep_view(&mut self, v: fidim_core::wizard::RepoView) -> String {
+        let id = self.id("v");
+        self.views.keep(id.clone(), v);
+        id
+    }
+    fn keep_plan(&mut self, p: fidim_core::wizard::WizardPlan) -> String {
+        let id = self.id("p");
+        self.plans.keep(id.clone(), p);
+        id
+    }
+    fn view(&self, id: &str) -> Option<&fidim_core::wizard::RepoView> {
+        self.views.get(id)
+    }
+    fn plan(&self, id: &str) -> Option<&fidim_core::wizard::WizardPlan> {
+        self.plans.get(id)
+    }
+}
+
+/// The newest `WIZARD_KEEP` values by id; older ones are dropped.
+struct Kept<T>(std::collections::VecDeque<(String, T)>);
+
+impl<T> Default for Kept<T> {
+    fn default() -> Self {
+        Kept(std::collections::VecDeque::new())
+    }
+}
+
+impl<T> Kept<T> {
+    fn keep(&mut self, id: String, v: T) {
+        self.0.push_back((id, v));
+        while self.0.len() > WIZARD_KEEP {
+            self.0.pop_front();
+        }
+    }
+    fn get(&self, id: &str) -> Option<&T> {
+        self.0.iter().find(|(k, _)| k == id).map(|(_, v)| v)
+    }
+}
+
+/// `value` (a view or a plan as JSON) with the id the web view refers to it by.
+fn with_id(value: impl serde::Serialize, key: &str, id: &str) -> Result<serde_json::Value, String> {
+    let mut v = serde_json::to_value(value).map_err(|e| e.to_string())?;
+    v[key] = id.into();
+    Ok(v)
+}
+
+/// One wizard run: its plan, the latest state of each step (rebuilt from
+/// the same events the view gets), and how it ended.
+struct WizardJob {
+    plan: fidim_core::wizard::WizardPlan,
+    /// The id of the plan it runs; a job keeps its plan reachable by it
+    /// for a resume after the web view reloaded.
+    plan_id: String,
+    progress: fidim_core::wizard::JobProgress,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    started_unix: u64,
+    consent: bool,
+    finished: Option<serde_json::Value>,
+}
+
+impl WizardJob {
+    fn snapshot(&self, id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "job": id,
+            "plan": with_id(&self.plan, "plan_id", &self.plan_id).unwrap_or_default(),
+            "progress": self.progress,
+            "started_unix": self.started_unix,
+            "consent": self.consent,
+            "cancelling": self.cancel.load(std::sync::atomic::Ordering::Relaxed) && self.finished.is_none(),
+            "finished": self.finished,
+        })
+    }
 }
 
 type ChatStreams = Arc<Mutex<HashMap<String, Arc<chat::Cancel>>>>;
@@ -97,6 +198,7 @@ fn cached_devices(
 /// Forget everything derived from the installed builds, so a build that
 /// was just installed shows up in the pickers without waiting for a TTL.
 fn invalidate_build_caches(cache: &Arc<Mutex<UiCache>>) {
+    fidim_core::wizard::forget_builds();
     let mut c = cache.lock().unwrap();
     c.scan = None;
     c.devices = None;
@@ -1283,6 +1385,240 @@ async fn chat_presets_save(presets: serde_json::Value) -> Result<(), String> {
     blocking(move || chat_store::save_presets(&chat_store::presets_path(), &presets).map_err(|e| e.to_string())).await
 }
 
+// ----------------------------------------------------------------- wizard ----
+
+/// Hugging Face search, each hit marked with whether an installed build
+/// knows its architecture.
+#[tauri::command]
+async fn hub_search(query: String, limit: Option<u32>, all: Option<bool>) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let q = fidim_core::hub::SearchQuery {
+            text: query,
+            limit: limit.unwrap_or(30),
+            gguf_only: !all.unwrap_or(false),
+            ..Default::default()
+        };
+        let hits = fidim_core::wizard::search(&cfg, &q).map_err(|e| e.to_string())?;
+        serde_json::to_value(hits).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// A repo's files, the fit of each on these cards, and which build loads
+/// it (or the plan for one). Header range reads only; nothing downloads.
+/// The view comes with a `view_id` for `wizard_plan`.
+#[tauri::command]
+async fn wizard_inspect(
+    state: tauri::State<'_, AppState>,
+    input: String,
+    rev: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
+    let made = state.wizard_made.clone();
+    blocking(move || {
+        let cfg = cfg()?;
+        let env = fidim_core::wizard::LiveEnv::with_devices(cfg.clone(), cached_devices(&cache, &cfg, false).ok());
+        let view = fidim_core::wizard::inspect_with(&env, &cfg, &input, rev.as_deref()).map_err(|e| e.to_string())?;
+        let _ = ui_log(format!(
+            "wizard inspect {} @ {}: {:?}, {} choices, usable={}",
+            view.repo,
+            view.sha.get(..7).unwrap_or(&view.sha),
+            view.kind,
+            view.catalog.choices.len(),
+            view.usable_build.is_some()
+        ));
+        let id = made.lock().unwrap_or_else(|e| e.into_inner()).keep_view(view.clone());
+        with_id(&view, "view_id", &id)
+    })
+    .await
+}
+
+/// The exact steps for a choice of the view `view_id` (from
+/// `wizard_inspect`): build or install, downloads, the profile. The plan
+/// comes with a `plan_id` for `wizard_start`.
+#[tauri::command]
+async fn wizard_plan(
+    state: tauri::State<'_, AppState>,
+    view_id: String,
+    request: fidim_core::wizard::PlanRequest,
+) -> Result<serde_json::Value, String> {
+    let made = state.wizard_made.clone();
+    blocking(move || {
+        let cfg = cfg()?;
+        let view = made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .view(&view_id)
+            .cloned()
+            .ok_or("this repo's page is out of date: open the repo again")?;
+        let plan = fidim_core::wizard::plan(&cfg, &view, &request).map_err(|e| e.to_string())?;
+        let id = made.lock().unwrap_or_else(|e| e.into_inner()).keep_plan(plan.clone());
+        with_id(&plan, "plan_id", &id)
+    })
+    .await
+}
+
+/// Start the plan `plan_id` (from `wizard_plan`, or the plan of an earlier
+/// job) on its own thread; progress arrives as `wizard-progress` events and
+/// the end as `wizard-done`. The job outlives the view that started it
+/// (`wizard_jobs` finds it again). A plan that needs consent is refused
+/// here, before anything runs, unless `consent` is true.
+#[tauri::command]
+fn wizard_start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    plan_id: String,
+    consent: bool,
+) -> Result<String, String> {
+    // The core's own copy: the web view names a plan, it never supplies one.
+    let plan = {
+        let made = state.wizard_made.lock().unwrap_or_else(|e| e.into_inner());
+        let jobs = state.wizard.lock().unwrap_or_else(|e| e.into_inner());
+        made.plan(&plan_id)
+            .or_else(|| jobs.values().find(|j| j.plan_id == plan_id).map(|j| &j.plan))
+            .cloned()
+            .ok_or("this plan is out of date: plan it again")?
+    };
+    fidim_core::wizard::check_runnable(&plan, consent).map_err(|e| e.to_string())?;
+    let jobs = state.wizard.clone();
+    let cache = state.cache.clone();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let id = {
+        let mut m = jobs.lock().unwrap_or_else(|e| e.into_inner());
+        // Two jobs never write the same file.
+        let mine = plan.download_dests();
+        for (other, job) in m.iter().filter(|(_, j)| j.finished.is_none()) {
+            let theirs = job.plan.download_dests();
+            if let Some((d, _)) = mine.iter().find(|(d, _)| theirs.iter().any(|(t, _)| t == d)) {
+                return Err(format!("job {other} is already downloading {}", d.display()));
+            }
+        }
+        let started_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let id = format!("w{started_unix}-{}", m.len() + 1);
+        m.insert(
+            id.clone(),
+            WizardJob {
+                progress: fidim_core::wizard::JobProgress::new(&plan),
+                plan: plan.clone(),
+                plan_id: plan_id.clone(),
+                cancel: cancel.clone(),
+                started_unix,
+                consent,
+                finished: None,
+            },
+        );
+        id
+    };
+    let _ = ui_log(format!("wizard start {id}: {} {} ({} steps, consent={consent})", plan.repo, plan.choice.label, plan.steps.len()));
+    let job = id.clone();
+    std::thread::spawn(move || {
+        let outcome = (|| -> Result<fidim_core::wizard::WizardResult, String> {
+            let cfg = cfg()?;
+            let devices = cached_devices(&cache, &cfg, false).ok();
+            fidim_core::wizard::run(
+                &cfg,
+                devices,
+                &plan,
+                consent,
+                &mut |e| {
+                    if let Some(j) = jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&job) {
+                        j.progress.apply(e);
+                    }
+                    let mut payload = serde_json::to_value(e).unwrap_or_default();
+                    payload["job"] = job.clone().into();
+                    let _ = app.emit("wizard-progress", payload);
+                },
+                &cancel,
+            )
+            .map_err(|e| e.to_string())
+        })();
+        // A download or a build changes what the pickers should list.
+        invalidate_build_caches(&cache);
+        let done = match &outcome {
+            Ok(r) => serde_json::json!({ "job": job, "ok": true, "result": r }),
+            Err(e) => serde_json::json!({ "job": job, "ok": false, "error": e }),
+        };
+        let _ = ui_log(format!(
+            "wizard {job} {}",
+            match &outcome {
+                Ok(r) => format!("done: profile {}", r.profile.as_ref().map(|p| p.id.as_str()).unwrap_or("none")),
+                Err(e) => format!("failed: {e}"),
+            }
+        ));
+        if let Some(j) = jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&job) {
+            j.finished = Some(done.clone());
+        }
+        let _ = app.emit("wizard-done", done);
+    });
+    Ok(id)
+}
+
+/// Ask a job to stop: a download keeps its `.part` for a resume, a build
+/// stops its compilers and cleans up. False when it had already ended.
+#[tauri::command]
+fn wizard_cancel(state: tauri::State<'_, AppState>, job: String) -> bool {
+    let m = state.wizard.lock().unwrap_or_else(|e| e.into_inner());
+    match m.get(&job) {
+        Some(j) if j.finished.is_none() => {
+            j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Every job this session, oldest first, with its plan and progress.
+#[tauri::command]
+fn wizard_jobs(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    let m = state.wizard.lock().unwrap_or_else(|e| e.into_inner());
+    let mut jobs: Vec<(&String, &WizardJob)> = m.iter().collect();
+    jobs.sort_by_key(|(id, j)| (j.started_unix, (*id).clone()));
+    serde_json::Value::Array(jobs.into_iter().map(|(id, j)| j.snapshot(id)).collect())
+}
+
+/// Drop a finished job from the list.
+#[tauri::command]
+fn wizard_forget(state: tauri::State<'_, AppState>, job: String) -> bool {
+    let mut m = state.wizard.lock().unwrap_or_else(|e| e.into_inner());
+    if m.get(&job).is_some_and(|j| j.finished.is_some()) {
+        m.remove(&job);
+        true
+    } else {
+        false
+    }
+}
+
+/// The model folders with the space left on each drive.
+#[tauri::command]
+async fn wizard_roots() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let cfg = cfg()?;
+        serde_json::to_value(fidim_core::wizard::model_roots(&cfg)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Add a model folder (created if missing) to the configuration, so a
+/// download there is found by the scan.
+#[tauri::command]
+async fn wizard_add_root(state: tauri::State<'_, AppState>, path: String) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
+    blocking(move || {
+        let mut cfg = cfg()?;
+        if fidim_core::wizard::add_model_root(&mut cfg, std::path::Path::new(&path)).map_err(|e| e.to_string())? {
+            cfg.save(&Config::config_path()).map_err(|e| e.to_string())?;
+            invalidate_build_caches(&cache);
+            let _ = ui_log(format!("wizard: added model folder {path}"));
+        }
+        serde_json::to_value(fidim_core::wizard::model_roots(&cfg)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 // ------------------------------------------------------------ rocm runtimes ----
 
 #[tauri::command]
@@ -1342,6 +1678,8 @@ pub fn run() {
         .manage(AppState {
             cache: Arc::new(Mutex::new(UiCache { devices: None, build_probes: HashMap::new(), scan: None })),
             chats: Arc::new(Mutex::new(HashMap::new())),
+            wizard: Arc::new(Mutex::new(HashMap::new())),
+            wizard_made: Arc::new(Mutex::new(WizardMade::default())),
         })
         .invoke_handler(tauri::generate_handler![
             scan,
@@ -1401,7 +1739,37 @@ pub fn run() {
             chat_delete_all,
             chat_presets_get,
             chat_presets_save,
+            hub_search,
+            wizard_inspect,
+            wizard_plan,
+            wizard_start,
+            wizard_cancel,
+            wizard_jobs,
+            wizard_forget,
+            wizard_roots,
+            wizard_add_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Llama FIDIM UI");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wizard_keeps_the_newest_by_id() {
+        let mut made = WizardMade::default();
+        let (a, b) = (made.id("p"), made.id("p"));
+        assert_ne!(a, b, "ids never repeat");
+        let mut kept: Kept<u32> = Kept::default();
+        for n in 0..(WIZARD_KEEP as u32 + 3) {
+            kept.keep(format!("p{n}"), n);
+        }
+        assert_eq!(kept.get("p0"), None, "the oldest are dropped");
+        assert_eq!(kept.get("p2"), None);
+        assert_eq!(kept.get("p3"), Some(&3));
+        assert_eq!(kept.get(&format!("p{}", WIZARD_KEEP + 2)), Some(&(WIZARD_KEEP as u32 + 2)));
+        assert_eq!(kept.get("nope"), None);
+    }
 }
