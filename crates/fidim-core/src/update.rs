@@ -43,7 +43,7 @@ const USER_AGENT: &str = concat!("llama-fidim/", env!("CARGO_PKG_VERSION"));
 /// Manifest written into every build directory this module creates.
 pub const MANIFEST_NAME: &str = "fidim-build.json";
 
-fn upd(msg: impl Into<String>) -> Error {
+pub(crate) fn upd(msg: impl Into<String>) -> Error {
     Error::Update(msg.into())
 }
 
@@ -124,13 +124,24 @@ fn agent() -> ureq::Agent {
 }
 
 fn get_json(url: &str) -> Result<String> {
-    agent()
+    get_json_opt(url)?.ok_or_else(|| upd(format!("GitHub API {url}: 404 Not Found")))
+}
+
+/// `get_json`, with a 404 as None: a release that does not exist is an
+/// answer, not an error.
+pub(crate) fn get_json_opt(url: &str) -> Result<Option<String>> {
+    let resp = match agent()
         .get(url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| upd(format!("GitHub API {url}: {e}")))?
-        .into_string()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(e) => return Err(upd(format!("GitHub API {url}: {e}"))),
+    };
+    resp.into_string()
+        .map(Some)
         .map_err(|e| upd(format!("GitHub API {url}: reading body: {e}")))
 }
 
@@ -568,16 +579,16 @@ pub struct InstallReport {
     pub verify: Verify,
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn write_manifest(dir: &Path, m: &Manifest) -> Result<()> {
+pub(crate) fn write_manifest(dir: &Path, m: &Manifest) -> Result<()> {
     let p = dir.join(MANIFEST_NAME);
     std::fs::write(&p, serde_json::to_string_pretty(m)?).map_err(|e| Error::io(&p, e))
 }
 
-fn download(asset: &Asset, to: &Path, progress: &mut dyn FnMut(String)) -> Result<()> {
+pub(crate) fn download(asset: &Asset, to: &Path, progress: &mut dyn FnMut(String)) -> Result<()> {
     download_url(&asset.url, &asset.name, to, progress).map(|_| ())
 }
 
@@ -904,7 +915,7 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-fn read_manifest(dir: &Path) -> Option<Manifest> {
+pub(crate) fn read_manifest(dir: &Path) -> Option<Manifest> {
     serde_json::from_str(&std::fs::read_to_string(manifest_path(dir)).ok()?).ok()
 }
 
@@ -1026,6 +1037,35 @@ pub fn install_unsloth_from_zip(zip: &Path, tmp: &Path, final_dir: &Path, meta: 
 }
 
 fn stage_unsloth(zip: &Path, tmp: &Path, final_dir: &Path, meta: &UnslothMeta) -> Result<PathBuf> {
+    stage_unsloth_base(zip, tmp, final_dir, &meta.asset_name)?;
+    // Before the move, or 500 MB of zip would live on inside the build.
+    let _ = std::fs::remove_file(zip);
+    finish_unsloth_stage(
+        tmp,
+        final_dir,
+        &Manifest {
+            tag: meta.tag.clone(),
+            source: "unsloth-prebuilt".into(),
+            installed_at_unix: now_unix(),
+            // Never a `shim:` entry: retire_build_shims renames exactly those,
+            // and a bundle's own hipblas.dll must stay where it is.
+            assets: vec![meta.asset_name.clone()],
+            verify: Verify::default(),
+            channel: Some(Channel::Unsloth),
+            bundled_runtime: true,
+            release_tag: Some(meta.tag.clone()),
+            asset_sha256: meta.sha256.clone(),
+            gfx_target: Some(meta.gfx.clone()),
+            patch: None,
+        },
+    )
+}
+
+/// The part every fork install shares: refuse an existing `final_dir` or a
+/// path too deep for the zip, unpack the zip into `tmp/bin`, and require the
+/// runner and llama-server at its top level. Returns `tmp/bin`. The caller
+/// removes `tmp` on failure.
+pub(crate) fn stage_unsloth_base(zip: &Path, tmp: &Path, final_dir: &Path, asset_name: &str) -> Result<PathBuf> {
     if final_dir.exists() {
         return Err(upd(format!(
             "{} already exists but holds no complete build; remove it and install again",
@@ -1049,32 +1089,16 @@ fn stage_unsloth(zip: &Path, tmp: &Path, final_dir: &Path, meta: &UnslothMeta) -
     extract_into(zip, &bin)?;
     for need in [RUNNER_EXE, "llama-server.exe"] {
         if !bin.join(need).is_file() {
-            return Err(upd(format!(
-                "{} has no {need} at its top level: the fork's Windows layout changed",
-                meta.asset_name
-            )));
+            return Err(upd(format!("{asset_name} has no {need} at its top level: the fork's Windows layout changed")));
         }
     }
-    // Before the move, or 500 MB of zip would live on inside the build.
-    let _ = std::fs::remove_file(zip);
-    write_manifest(
-        tmp,
-        &Manifest {
-            tag: meta.tag.clone(),
-            source: "unsloth-prebuilt".into(),
-            installed_at_unix: now_unix(),
-            // Never a `shim:` entry: retire_build_shims renames exactly those,
-            // and a bundle's own hipblas.dll must stay where it is.
-            assets: vec![meta.asset_name.clone()],
-            verify: Verify::default(),
-            channel: Some(Channel::Unsloth),
-            bundled_runtime: true,
-            release_tag: Some(meta.tag.clone()),
-            asset_sha256: meta.sha256.clone(),
-            gfx_target: Some(meta.gfx.clone()),
-            patch: None,
-        },
-    )?;
+    Ok(bin)
+}
+
+/// Write the manifest into `tmp` and move `tmp` into place as `final_dir`,
+/// which only ever appears complete.
+pub(crate) fn finish_unsloth_stage(tmp: &Path, final_dir: &Path, manifest: &Manifest) -> Result<PathBuf> {
+    write_manifest(tmp, manifest)?;
     if let Some(parent) = final_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
