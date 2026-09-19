@@ -414,7 +414,7 @@ const mockRouterTarget = (model, extra) => ({
 
 const MOCK_CHAT_TARGETS = [
   mockRouterTarget("gemma4", { label: MOCK_PROFILE.name, profile_id: "worker-pool", slots_busy: 2, slots_total: 8, sampling: MOCK_PROFILE.sampling, model_path: MOCK_PROFILE.model.path }),
-  mockRouterTarget("dd", { slots_busy: 1, slots_total: 2, n_ctx: 65536, enable_thinking: false }),
+  mockRouterTarget("dd", { slots_busy: 1, slots_total: 2, n_ctx: 65536, enable_thinking: false, has_api_key: true }),
   mockRouterTarget("bonsai"),
   mockRouterTarget("qwen-split", { label: MOCK_SPLIT_PROFILE.name, profile_id: "qwen-split", status: "unloaded", slots_busy: null, slots_total: null, n_ctx: null, model_path: MOCK_SPLIT_PROFILE.model.path }),
   {
@@ -681,6 +681,9 @@ async function mock(cmd, args) {
         ],
         resident: [{ card: MOCK_DEVICES[0].device.stable_key, dedicated_bytes: 26.2e9, committed_bytes: 26.2e9 }, { card: MOCK_DEVICES[2].device.stable_key, dedicated_bytes: 13.1e9, committed_bytes: 13.1e9 }],
         gpu_busy_percent: 67,
+        // dd's profile sets --api-key: its Endpoint card says clients need one.
+        has_api_key: false,
+        keyed_models: ["dd"],
       };
       // A standalone DiffusionGemma run (fidim-dg): committed blocks, then the
       // current block's draft sharpening step by step.
@@ -690,8 +693,10 @@ async function mock(cmd, args) {
         samples: [dgSample],
         resident: [{ card: MOCK_DEVICES[2].device.stable_key, dedicated_bytes: 19.7e9, committed_bytes: 19.7e9 }],
         gpu_busy_percent: 88,
+        has_api_key: false,
+        keyed_models: [],
       };
-      const runCrashed = { run: { ...MOCK_RUN, alive: false, health: "dead", crashed: true }, samples: [], resident: [], gpu_busy_percent: 0 };
+      const runCrashed = { run: { ...MOCK_RUN, alive: false, health: "dead", crashed: true }, samples: [], resident: [], gpu_busy_percent: 0, has_api_key: false, keyed_models: [] };
       return { runs: [runRouter, runDiffusion, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
     }
     case "app_version":

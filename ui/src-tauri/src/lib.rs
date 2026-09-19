@@ -950,21 +950,35 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                 *cards.entry(k).or_insert(0.0) += u.percent;
             }
         }
+        // A server started with an API key answers /slots and /metrics
+        // only with it; Copy endpoint tells other programs they need one.
+        let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
+        let member = |id: &str| profiles.iter().find(|p| fidim_core::router::model_id(p) == id);
         let runs: Vec<serde_json::Value> = supervise::reattach(&cfg.runs_dir)
             .into_iter()
             .map(|r| {
                 let mut samples = Vec::new();
+                let mut keyed_models = Vec::new();
+                let profile = profiles.iter().find(|p| p.id == r.state.profile_id);
                 if r.alive {
                     if r.state.profile_id == fidim_core::router::ROUTER_ID {
                         if let Ok(ms) = fidim_core::router::models(&r.state.host, r.state.port) {
+                            for m in &ms {
+                                if member(&m.id).is_some_and(chat::requires_api_key) {
+                                    keyed_models.push(m.id.clone());
+                                }
+                            }
                             for m in ms.iter().filter(|m| m.status == "loaded") {
-                                samples.push(fidim_core::live::sample(&r.state.host, r.state.port, Some(&m.id)));
+                                let key = member(&m.id).and_then(chat::api_key);
+                                samples.push(fidim_core::live::sample_with_key(&r.state.host, r.state.port, Some(&m.id), key.as_deref()));
                             }
                         }
                     } else {
-                        samples.push(fidim_core::live::sample(&r.state.host, r.state.port, None));
+                        let key = profile.and_then(chat::api_key);
+                        samples.push(fidim_core::live::sample_with_key(&r.state.host, r.state.port, None, key.as_deref()));
                     }
                 }
+                let has_api_key = r.state.profile_id != fidim_core::router::ROUTER_ID && profile.is_some_and(chat::requires_api_key);
                 // The router's model instances are child processes; their
                 // VRAM and GPU time belong to the router run.
                 let mut pids = vec![r.state.pid];
@@ -984,6 +998,8 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                     "samples": samples,
                     "resident": resident,
                     "gpu_busy_percent": if busy <= 0.0 { 0.0 } else { busy.min(100.0) },
+                    "has_api_key": has_api_key,
+                    "keyed_models": keyed_models,
                 })
             })
             .collect();
@@ -1174,7 +1190,8 @@ async fn chat_targets() -> Result<serde_json::Value, String> {
 }
 
 /// A target's server-side facts: context, default sampler, capabilities.
-/// A router model that is not loaded is not asked (asking could load it).
+/// A router model that is not loaded is not asked; one evicted between the
+/// check and the question gets an error, not a load (`autoload=false`).
 #[tauri::command]
 async fn chat_props(target: ChatTarget) -> Result<serde_json::Value, String> {
     blocking(move || {
@@ -1191,7 +1208,8 @@ async fn chat_props(target: ChatTarget) -> Result<serde_json::Value, String> {
                 return Ok(serde_json::json!({ "loaded": false, "status": status }));
             }
         }
-        let mut v = chat::props(&t.host, t.port, t.engine, t.router.then_some(t.model.as_str())).map_err(|e| e.to_string())?;
+        let mut v = chat::props(&t.host, t.port, t.engine, t.router.then_some(t.model.as_str()), t.api_key.as_deref())
+            .map_err(|e| e.to_string())?;
         v["loaded"] = true.into();
         Ok(v)
     })

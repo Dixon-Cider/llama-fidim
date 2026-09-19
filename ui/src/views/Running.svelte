@@ -272,7 +272,7 @@
     </header>
     {#if endpointOpen?.key === r.state.profile_id}
       <div class="endpoint-pop" transition:slide={leave}>
-        <EndpointCard endpoint={endpointFor(r.state)} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
+        <EndpointCard endpoint={endpointFor(r.state, null, !!row.has_api_key)} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
       </div>
     {/if}
 
@@ -300,7 +300,7 @@
         </div>
         {#if endpointOpen?.key === k}
           <div class="endpoint-pop in-model" transition:slide={leave}>
-            <EndpointCard endpoint={endpointFor(r.state, s.model)} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
+            <EndpointCard endpoint={endpointFor(r.state, s.model, !!row.keyed_models?.includes(s.model))} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
           </div>
         {/if}
 

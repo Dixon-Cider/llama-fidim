@@ -197,6 +197,20 @@ pub fn spawn(
 /// Minimal HTTP/1.1 GET — avoids an async client dependency for what is a
 /// localhost status poll. Returns (status code, body).
 pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<(u16, String)> {
+    http_get_auth(host, port, path, timeout, None)
+}
+
+/// `http_get` with a bearer token: a llama-server started with `--api-key`
+/// answers 401 on everything but `/health` without one.
+pub fn http_get_auth(host: &str, port: u16, path: &str, timeout: Duration, bearer: Option<&str>) -> Result<(u16, String)> {
+    let auth = match bearer {
+        // A control character would end the header line.
+        Some(k) if k.chars().any(char::is_control) => {
+            return Err(Error::Config("the API key contains a control character".into()));
+        }
+        Some(k) => format!("Authorization: Bearer {k}\r\n"),
+        None => String::new(),
+    };
     // A server bound to 0.0.0.0 is reached over loopback; IPv6 in brackets.
     let addr = crate::chat::host_port(host, port);
     let stream = TcpStream::connect_timeout(
@@ -209,7 +223,7 @@ pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     let mut stream = stream;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n");
     stream
         .write_all(req.as_bytes())
         .map_err(|e| Error::Platform(format!("send {addr}: {e}")))?;

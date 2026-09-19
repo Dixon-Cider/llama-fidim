@@ -187,6 +187,90 @@ fn api_key_from_flags_or_env() {
     // fidim-dg has no key.
     let p = profile(json!({ "engine": "diffusion-gemma", "env": { "LLAMA_API_KEY": "k" } }));
     assert_eq!(api_key(&p), None);
+    assert!(!requires_api_key(&p));
+}
+
+/// llama-server splits `--api-key` on commas (CSV quoting) and reads
+/// `--api-key-file` one key per line; any one key authenticates, so the
+/// chat sends the first usable one, never the list.
+#[test]
+fn api_key_lists_and_key_files() {
+    let flags = |f: Value| profile(json!({ "runtime": { "ctx_total": 1, "extra_flags": f } }));
+    assert_eq!(api_key(&flags(json!(["--api-key", "gw-key,local-key"]))).as_deref(), Some("gw-key"));
+    assert_eq!(api_key(&flags(json!(["--api-key=,second"]))).as_deref(), Some("second"), "an empty field is no key");
+    assert_eq!(api_key(&flags(json!(["--api-key", "\"a,b\",c"]))).as_deref(), Some("a,b"), "quoted commas stay");
+    assert_eq!(api_key(&flags(json!(["--api-key", "\"say \"\"hi\"\"\""]))).as_deref(), Some("say \"hi\""));
+    assert_eq!(api_key(&flags(json!(["--api-key", "k\u{7},ok"]))).as_deref(), Some("ok"), "an unusable key is skipped");
+    let p = profile(json!({ "env": { "LLAMA_API_KEY": "e1,e2" } }));
+    assert_eq!(api_key(&p).as_deref(), Some("e1"));
+
+    let dir = std::env::temp_dir().join(format!("fidim-chat-keys-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("keys.txt");
+    std::fs::write(&file, "# clients\r\n\r\nfile-key-1\r\nfile-key-2\r\n").unwrap();
+    let path = file.to_string_lossy().into_owned();
+    for p in [
+        flags(json!(["--api-key-file", &path])),
+        flags(json!([format!("--api-key-file={path}")])),
+        profile(json!({ "env": { "LLAMA_ARG_API_KEY_FILE": &path } })),
+    ] {
+        assert_eq!(api_key(&p).as_deref(), Some("file-key-1"), "{:?}", p.runtime.extra_flags);
+        assert!(requires_api_key(&p));
+    }
+    // A key on the command line comes first; the file is the fallback.
+    assert_eq!(api_key(&flags(json!(["--api-key-file", &path, "--api-key", "cli"]))).as_deref(), Some("cli"));
+    // A file that cannot be read gives no key, but the server still wants one.
+    let missing = flags(json!(["--api-key-file", dir.join("nope.txt").to_string_lossy()]));
+    assert_eq!(api_key(&missing), None);
+    assert!(requires_api_key(&missing));
+    assert!(!requires_api_key(&profile(json!({}))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/props` and the target poll carry the key (a keyed llama-server
+/// answers 401 on everything but /health without it) and ask a router
+/// model with `autoload=false` (a poll must never load a model).
+#[test]
+fn props_and_polls_send_the_key_and_never_autoload() {
+    let (port, h) = serve(|mut s, req| {
+        assert!(req.starts_with("GET /props?model=unsloth%2Fx%3AQ4&autoload=false HTTP/1.1\r\n"), "{req}");
+        assert!(req.contains("\r\nAuthorization: Bearer sk-local\r\n"), "{req}");
+        s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{PROPS}", PROPS.len()).as_bytes()).unwrap();
+    });
+    let p = props("127.0.0.1", port, Engine::LlamaServer, Some("unsloth/x:Q4"), Some("sk-local")).unwrap();
+    h.join().unwrap();
+    assert_eq!(p["n_ctx"], 65536);
+
+    // Without the key: the 401 is reported, not read as props.
+    let (port, h) = serve(|mut s, req| {
+        assert!(req.starts_with("GET /props HTTP/1.1\r\n") && !req.contains("Authorization"), "{req}");
+        let b = r#"{"error":{"code":401,"message":"Invalid API Key","type":"authentication_error"}}"#;
+        s.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{b}", b.len()).as_bytes()).unwrap();
+    });
+    let e = props("127.0.0.1", port, Engine::LlamaServer, None, None).unwrap_err().to_string();
+    h.join().unwrap();
+    assert!(e.contains("401") && e.contains("Invalid API Key"), "{e}");
+
+    // The target poll: /slots then /metrics, both keyed and never loading.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let h = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for body in [r#"[{"id":0,"n_ctx":32768,"is_processing":false}]"#, "llamacpp:tokens_predicted_total 7\n"] {
+            let (mut s, _) = l.accept().unwrap();
+            let req = read_request(&mut s);
+            seen.push(req.lines().next().unwrap_or("").to_string());
+            assert!(req.contains("\r\nAuthorization: Bearer sk-local\r\n"), "{req}");
+            s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        }
+        seen
+    });
+    let sample = crate::live::sample_with_key("127.0.0.1", port, Some("m"), Some("sk-local"));
+    let seen = h.join().unwrap();
+    assert_eq!(seen, ["GET /slots?model=m&autoload=false HTTP/1.1", "GET /metrics?model=m&autoload=false HTTP/1.1"]);
+    assert_eq!((sample.error, sample.slots.len(), sample.metrics.get("tokens_predicted_total")), (None, 1, Some(&7.0)));
+    // A key that would break the header line is refused before connecting.
+    assert!(crate::supervise::http_get_auth("127.0.0.1", 9, "/slots", Duration::from_secs(1), Some("k\r\nX: 1")).is_err());
 }
 
 #[test]
@@ -334,6 +418,9 @@ fn targets_describe_runs_and_router_models() {
     assert_eq!(t.enable_thinking, Some(false));
     assert_eq!(t.sampling.as_ref().and_then(|s| s.temperature), Some(1.0));
     assert!(t.has_api_key);
+    // A key file counts as a key the server requires, even one this side cannot read.
+    let pf = profile(json!({ "runtime": { "ctx_total": 1, "extra_flags": ["--api-key-file", "Z:/nowhere/keys.txt"] } }));
+    assert!(target_for(&state, Some(&pf), None, "loaded", None).has_api_key);
     assert_eq!(t.label, "Worker pool");
     // The JSON the GUI reads: engine in kebab case, never the key itself.
     let v = serde_json::to_value(&t).unwrap();

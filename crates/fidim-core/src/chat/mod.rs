@@ -96,24 +96,89 @@ pub fn is_loopback(host: &str) -> bool {
     h.eq_ignore_ascii_case("localhost") || h.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// The `--api-key` a llama-server profile sets (as a flag or through
-/// `LLAMA_API_KEY`), so the chat can authenticate without JS ever holding it.
-/// A value with control characters is ignored: it goes into a header line.
-pub fn api_key(p: &Profile) -> Option<String> {
+/// Where a llama-server profile's API keys come from. llama-server accepts
+/// every key from every source, so any one of them authenticates.
+#[derive(Debug, Default, PartialEq)]
+struct KeySources {
+    /// `--api-key` values and `LLAMA_API_KEY`: comma-separated lists.
+    lists: Vec<String>,
+    /// `--api-key-file` and `LLAMA_ARG_API_KEY_FILE`: one key per line.
+    files: Vec<String>,
+}
+
+fn key_sources(p: &Profile) -> KeySources {
+    let mut ks = KeySources::default();
     if !p.engine.is_llama_server() {
-        return None;
+        return ks;
     }
-    let usable = |v: &String| !v.is_empty() && !v.chars().any(char::is_control);
     let flags = &p.runtime.extra_flags;
     for (i, f) in flags.iter().enumerate() {
-        if let Some(v) = f.strip_prefix("--api-key=") {
-            return Some(v.to_string()).filter(usable);
-        }
-        if f == "--api-key" {
-            return flags.get(i + 1).cloned().filter(usable);
+        let next = || flags.get(i + 1).cloned();
+        match f.as_str() {
+            "--api-key" => ks.lists.extend(next()),
+            "--api-key-file" => ks.files.extend(next()),
+            _ => {
+                if let Some(v) = f.strip_prefix("--api-key=") {
+                    ks.lists.push(v.to_string());
+                } else if let Some(v) = f.strip_prefix("--api-key-file=") {
+                    ks.files.push(v.to_string());
+                }
+            }
         }
     }
-    p.env.iter().find(|(k, _)| k.eq_ignore_ascii_case("LLAMA_API_KEY")).map(|(_, v)| v.clone()).filter(usable)
+    let env = |name: &str| p.env.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone());
+    ks.lists.extend(env("LLAMA_API_KEY").filter(|v| !v.is_empty()));
+    ks.files.extend(env("LLAMA_ARG_API_KEY_FILE").filter(|v| !v.is_empty()));
+    ks
+}
+
+/// llama.cpp's `parse_csv_row`: split on commas outside double quotes; `""`
+/// inside quotes is one quote.
+fn csv_fields(s: &str) -> Vec<String> {
+    let (mut out, mut field, mut quoted) = (Vec::new(), String::new(), false);
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '"' if quoted && it.peek() == Some(&'"') => {
+                field.push('"');
+                it.next();
+            }
+            '"' if quoted => quoted = false,
+            '"' if field.is_empty() => quoted = true,
+            ',' if !quoted => out.push(std::mem::take(&mut field)),
+            c => field.push(c),
+        }
+    }
+    out.push(field);
+    out
+}
+
+/// The keys in a key file as llama-server reads it: one per line, blank
+/// lines and lines starting with `#` skipped. A relative path is taken from
+/// this process's folder, as the server takes it from its own.
+fn file_keys(path: &str) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    // The server reads the file in text mode: CRLF is a line end.
+    text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string).collect()
+}
+
+/// Whether a llama-server profile requires an API key: it sets
+/// `--api-key`, `--api-key-file` or their environment variables. Other
+/// programs then need the key too (the Endpoint card says so).
+pub fn requires_api_key(p: &Profile) -> bool {
+    key_sources(p) != KeySources::default()
+}
+
+/// A key the chat can send to a llama-server profile that requires one, so
+/// JS never holds it: the first usable one from `--api-key` (a
+/// comma-separated list), `LLAMA_API_KEY`, then the key files. A key with
+/// control characters is skipped: it goes into a header line.
+pub fn api_key(p: &Profile) -> Option<String> {
+    let usable = |v: &String| !v.is_empty() && !v.chars().any(char::is_control);
+    let ks = key_sources(p);
+    let listed = ks.lists.iter().flat_map(|l| csv_fields(l));
+    let filed = ks.files.iter().flat_map(|f| file_keys(f));
+    listed.chain(filed).find(usable)
 }
 
 // ---------------------------------------------------------------- request ----
@@ -843,20 +908,14 @@ pub fn parse_dg_models(v: &Value) -> Value {
     })
 }
 
-/// Fetch the props of a target. `model` names a router model; the caller
-/// makes sure it is loaded (a `?model=` request may otherwise load it).
-pub fn props(host: &str, port: u16, engine: Engine, model: Option<&str>) -> Result<Value> {
+/// Fetch the props of a target. `model` names a router model, asked with
+/// `autoload=false` so the question never loads it; `api_key` is the
+/// profile's (`api_key`): a keyed llama-server answers 401 without it.
+pub fn props(host: &str, port: u16, engine: Engine, model: Option<&str>, api_key: Option<&str>) -> Result<Value> {
     let host = connect_host(host);
     let t = Duration::from_secs(5);
-    let path = if engine.is_diffusion() {
-        "/v1/models".to_string()
-    } else {
-        match model {
-            Some(m) => format!("/props?model={}", crate::live::urlencode(m)),
-            None => "/props".into(),
-        }
-    };
-    let (code, body) = crate::supervise::http_get(host, port, &path, t)?;
+    let path = if engine.is_diffusion() { "/v1/models".to_string() } else { crate::live::query("/props", model) };
+    let (code, body) = crate::supervise::http_get_auth(host, port, &path, t, api_key)?;
     if code != 200 {
         return Err(Error::Platform(format!("{path} answered {code}: {}", error_message(code, &body))));
     }
@@ -937,13 +996,14 @@ pub fn target_for(
         enable_thinking: profile.and_then(|p| p.chat.enable_thinking),
         diffusion: profile.filter(|p| p.engine.is_diffusion()).map(Profile::diffusion_effective),
         model_path: profile.map(|p| p.model.path.clone()),
-        has_api_key: profile.and_then(api_key).is_some(),
+        has_api_key: profile.is_some_and(requires_api_key),
     }
 }
 
 /// Every chat target among the live runs: one per standalone server, one
 /// per router model (loaded or not; the router loads one on first use).
-/// Polls each: the router's model list and `/slots` of what is loaded.
+/// Polls each: the router's model list and `/slots` of what is loaded
+/// (with the profile's API key, and never loading a model).
 pub fn targets(runs: &[AttachedRun], profiles: &[Profile]) -> Vec<Target> {
     let mut out = Vec::new();
     for r in runs.iter().filter(|r| r.alive) {
@@ -953,12 +1013,15 @@ pub fn targets(runs: &[AttachedRun], profiles: &[Profile]) -> Vec<Target> {
             let Ok(models) = crate::router::models(host, s.port) else { continue };
             for m in models {
                 let member = profiles.iter().find(|p| crate::router::model_id(p) == m.id);
-                let sample = (m.status == "loaded").then(|| crate::live::sample(host, s.port, Some(&m.id)));
+                let key = member.and_then(api_key);
+                let sample =
+                    (m.status == "loaded").then(|| crate::live::sample_with_key(host, s.port, Some(&m.id), key.as_deref()));
                 out.push(target_for(s, member, Some(&m.id), &m.status, sample.as_ref()));
             }
         } else {
             let profile = profiles.iter().find(|p| p.id == s.profile_id);
-            let sample = crate::live::sample(host, s.port, None);
+            let key = profile.and_then(api_key);
+            let sample = crate::live::sample_with_key(host, s.port, None, key.as_deref());
             out.push(target_for(s, profile, None, "loaded", Some(&sample)));
         }
     }
