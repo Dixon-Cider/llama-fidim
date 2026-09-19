@@ -79,6 +79,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RocmCmd,
     },
+    /// Put the folder holding this fidim.exe on your user PATH (or take it
+    /// off), so `fidim` works in every new terminal.
+    Path {
+        /// The folder to act on instead (an absolute path; it need not exist).
+        #[arg(long, global = true)]
+        dir: Option<PathBuf>,
+        #[command(subcommand)]
+        cmd: PathCmd,
+    },
     /// The model author's published sampling defaults (Hugging Face generation_config.json).
     CreatorDefaults { model_path: PathBuf },
     /// Parse one GGUF header and report what the scanner would see (and how long it took).
@@ -223,6 +232,11 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // PATH edits need no config: they work before the first run and with a
+    // config that no longer parses.
+    if let Cmd::Path { dir, cmd } = &cli.command {
+        return cmd_path(dir.as_deref(), cmd, cli.json);
+    }
     let cfg = Config::load_or_init().context("loading Llama FIDIM config")?;
     let platform = WindowsPlatform;
     match cli.command {
@@ -287,6 +301,7 @@ fn main() -> anyhow::Result<()> {
             cmd_bench(&cfg, &platform, &profile_id, concurrency, tokens, warmups, no_save)
         }
         Cmd::Rocm { cmd } => cmd_rocm(&cfg, cli.json, cmd),
+        Cmd::Path { .. } => unreachable!("handled before the config loads"),
         Cmd::Update { install, source, remote, git_ref, label, promote, all, rollback, tag, channel, gfx, overlay, overlay_from, base_zip } => {
             if let Some(remote) = remote {
                 if !source {
@@ -303,7 +318,9 @@ fn main() -> anyhow::Result<()> {
                     || base_zip.is_some()
                 {
                     bail!(
-                        "--remote builds one git ref; it does not combine with --install, --promote, --all,                          --rollback, --tag, --channel, --overlay, --overlay-from or --base-zip (a git build is never                          promoted: pick it in the profile editor)"
+                        "--remote builds one git ref; it does not combine with --install, --promote, --all, \
+                         --rollback, --tag, --channel, --overlay, --overlay-from or --base-zip (a git build is never \
+                         promoted: pick it in the profile editor)"
                     );
                 }
                 let git_ref = git_ref.context("--remote needs --ref <branch|pull/N/head|commit>")?;
@@ -526,6 +543,84 @@ fn cmd_runtimes(cfg: &Config, json: bool) -> anyhow::Result<()> {
         );
     }
     println!("\nselect per profile with \"rocm_runtime\": \"<name>\"; change the default with config.default_runtime.");
+    Ok(())
+}
+
+// ------------------------------------------------------------------ path ----
+
+#[derive(Subcommand, Debug)]
+enum PathCmd {
+    /// Add this folder to the end of the user PATH.
+    Add,
+    /// Take this folder off the user PATH.
+    Remove,
+    /// Whether this folder is on PATH, and which other fidim.exe a terminal could find.
+    Status,
+}
+
+/// `fidim path`: the folder is the one holding the running fidim.exe, so an
+/// installed copy puts its own folder on PATH. `--dir` names another one;
+/// install.ps1 uses it to take a retired install folder off PATH.
+fn cmd_path(dir: Option<&std::path::Path>, cmd: &PathCmd, json: bool) -> anyhow::Result<()> {
+    use fidim_core::user_path::{self, Change};
+    let dir = match dir {
+        Some(d) if d.is_absolute() => d.to_path_buf(),
+        Some(d) => bail!("--dir needs an absolute path, not {}", d.display()),
+        None => user_path::this_dir()?,
+    };
+    let change = match cmd {
+        PathCmd::Status => None,
+        PathCmd::Add => Some(user_path::add(&dir)?),
+        PathCmd::Remove => Some(user_path::remove(&dir)?),
+    };
+    let notified = change.is_some_and(Change::changed) && user_path::notify_changed();
+    let status = user_path::status(&dir)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "change": change, "notified": notified, "status": status }))?
+        );
+        return Ok(());
+    }
+    match change {
+        Some(Change::Added) => println!("added {} to the user PATH", dir.display()),
+        Some(Change::AlreadyThere) => println!("{} is already on the user PATH", dir.display()),
+        Some(Change::Removed(n)) => {
+            println!("removed {} from the user PATH{}", dir.display(), if n > 1 { format!(" ({n} entries)") } else { String::new() })
+        }
+        Some(Change::NotThere) => println!("{} is not on the user PATH; nothing to remove", dir.display()),
+        None => {}
+    }
+    if change.is_some_and(Change::changed) {
+        if notified {
+            println!("  new terminals see the change; terminals already open keep their old PATH");
+        } else {
+            println!("  running programs were not told (the broadcast failed); sign out and back in to pick it up");
+        }
+    }
+    if change.is_none() {
+        let yes_no = |b: bool| if b { "yes" } else { "no" };
+        println!("folder      {}", status.dir.display());
+        println!("user PATH   {:<4} ({}, {} of {} characters)", yes_no(status.user), user_path::USER_PATH_KEY, status.user_chars, user_path::MAX_CHARS);
+        println!("system PATH {}", yes_no(status.system));
+        println!(
+            "this shell  {}{}",
+            yes_no(status.this_shell),
+            if status.this_shell != (status.user || status.system) { "   (a new terminal differs)" } else { "" }
+        );
+    }
+    if status.system && matches!(change, Some(Change::Removed(_) | Change::NotThere)) {
+        println!("  note: the system PATH also lists it; only an administrator can change that one");
+    }
+    for o in &status.others {
+        println!(
+            "  {} {} ({} PATH) also holds fidim.exe{}",
+            if o.first { "!!" } else { "  " },
+            o.dir.display(),
+            o.from,
+            if o.first { " and is found first: `fidim` in a new terminal runs that copy" } else { "" }
+        );
+    }
     Ok(())
 }
 

@@ -91,6 +91,26 @@ build with uncommitted changes.
 - fidim-dg names the job in a streamed reply with an SSE comment,
   `: dg task <id>`, matching `/slots` and `/frames`. OpenAI clients skip
   comments.
+- **Installer.** Releases include `llama-fidim-vX.Y.Z-win-x64-setup.exe`
+  next to the zip: a per-user installer that needs no administrator
+  rights, installs into `%LOCALAPPDATA%\Llama FIDIM` with a Start Menu
+  entry, and uninstalls from Settings > Apps. Installing, upgrading and
+  uninstalling leave a running DiffusionGemma server or keep-alive helper
+  running, and never touch `~\.fidim`. Declining to close the app stops
+  them before anything has changed. It also retires the old
+  `%LOCALAPPDATA%\Programs\LlamaFIDIM` install that `install.ps1` made.
+- `fidim path add|remove|status`: put the folder holding `fidim.exe` on the
+  user PATH, take it off, or see what a new terminal would find. A long
+  PATH is never cut short, and its registry type and other entries stay as
+  they were.
+- `fidim.exe` and `fidim-dg.exe` carry version details (product,
+  publisher, description, version) and the app icon.
+- Release signing through Azure Artifact Signing, off until the repository
+  is set up for it ([docs/signing.md](docs/signing.md)). Every release run
+  now tests the installer: it installs it, upgrades to it from an older
+  build both ways an upgrade happens (silently over the old version, and
+  through the old version's uninstaller as the interactive installer
+  does), and uninstalls it.
 
 ### Changed
 
@@ -115,6 +135,13 @@ build with uncommitted changes.
 - Health checks, readiness and the live view reach a server bound to
   0.0.0.0 over loopback; connecting to the wildcard address fails on
   Windows.
+- `scripts\install.ps1` installs into `%LOCALAPPDATA%\Llama FIDIM`, the
+  installer's folder, and retires `%LOCALAPPDATA%\Programs\LlamaFIDIM`:
+  helpers running from there keep running, and a user PATH entry for it
+  moves to the new folder. Pin the taskbar icon again once. `-AddToPath`
+  now uses `fidim path add`, which keeps the PATH value's type.
+- The app's version details name Dixon-Cider as publisher (they said
+  "fca").
 
 ### Fixed
 

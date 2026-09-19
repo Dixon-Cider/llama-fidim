@@ -63,6 +63,9 @@ pub enum Error {
     #[error("{0}")]
     InvalidInput(String),
 
+    #[error("user PATH: {0}")]
+    UserPath(String),
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
