@@ -30,6 +30,8 @@ build with uncommitted changes.
 
 - A model split into several files (`-00001-of-00003.gguf` ...) is listed
   once, and its VRAM estimate counts every part, not just the first.
+  Pre-flight blocks a launch when a part is missing, instead of letting
+  llama-server fail at load.
 - Importance-matrix files (`*imatrix*.gguf`) are no longer listed as
   models.
 

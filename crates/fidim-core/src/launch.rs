@@ -484,25 +484,7 @@ pub fn prepare_with_inputs(
     let diffusion = profile.engine.is_diffusion();
     let meta = discovery::read_build_meta(&profile.build.path);
 
-    // File existence (check 2). The diffusion runner takes neither a
-    // projector nor a draft, so a stale path there does not matter.
-    let mut missing = Vec::new();
-    let mut check_file = |p: &Path| {
-        if !p.is_file() {
-            missing.push(p.to_string_lossy().into_owned());
-        }
-    };
-    check_file(&profile.model.path);
-    if !diffusion {
-        if let Some(mm) = &profile.model.mmproj {
-            check_file(mm);
-        }
-        if let Some(d) = &profile.model.draft {
-            if d.enabled {
-                check_file(&d.path);
-            }
-        }
-    }
+    let missing = missing_files(profile);
 
     // Device resolution (check 3).
     let mut resolved: Vec<ResolvedDevice> = Vec::new();
@@ -687,6 +669,20 @@ pub fn prepare_with_inputs(
         co_resident,
     };
     Ok(PreparedLaunch { context, plan, devices_now })
+}
+
+/// Files the launch needs that are not there (check 2): the model, every
+/// part of a split one (llama.cpp opens them all; one still downloading is
+/// only a `.part`), and for llama-server the projector and an enabled
+/// draft. The diffusion runner takes neither a projector nor a draft, so a
+/// stale path there does not matter.
+fn missing_files(profile: &Profile) -> Vec<String> {
+    let mut needed = discovery::split_shards(&profile.model.path).unwrap_or_else(|| vec![profile.model.path.clone()]);
+    if !profile.engine.is_diffusion() {
+        needed.extend(profile.model.mmproj.clone());
+        needed.extend(profile.model.draft.as_ref().filter(|d| d.enabled).map(|d| d.path.clone()));
+    }
+    needed.into_iter().filter(|p| !p.is_file()).map(|p| p.to_string_lossy().into_owned()).collect()
 }
 
 /// The llama-server VRAM estimate for a profile whose devices are resolved.
@@ -983,6 +979,36 @@ mod tests {
         assert!(cmd.contains("--split-mode layer"));
         assert!(cmd.contains("--tensor-split 0.600,0.400"));
         assert!(cmd.contains("--main-gpu 0"), "main-gpu is in REMAPPED space: {cmd}");
+    }
+
+    /// Check 2 wants every part of a split model: one deleted, or still a
+    /// `.part` from a cancelled download, blocks the launch instead of
+    /// failing at model load after the port was taken over.
+    #[test]
+    fn missing_files_counts_every_shard() {
+        let dir = std::env::temp_dir().join(format!("fidim-launch-shards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = |i: u32| format!("M-Q8_0-{i:05}-of-00003.gguf");
+        for i in [1, 3] {
+            std::fs::write(dir.join(name(i)), b"GGUF").unwrap();
+        }
+        std::fs::write(dir.join(format!("{}.part", name(2))), b"GGUF").unwrap();
+        let mut p = worker_profile();
+        p.model.path = dir.join(name(1));
+        let missing = missing_files(&p);
+        assert_eq!(missing, vec![dir.join(name(2)).to_string_lossy().into_owned()]);
+        std::fs::write(dir.join(name(2)), b"GGUF").unwrap();
+        assert!(missing_files(&p).is_empty());
+
+        // A single file, a projector, and a draft only when enabled.
+        p.model.path = dir.join("single.gguf");
+        p.model.mmproj = Some(dir.join("mmproj.gguf"));
+        p.model.draft = Some(serde_json::from_value(serde_json::json!({"path": dir.join("d.gguf"), "enabled": false})).unwrap());
+        let missing = missing_files(&p);
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(missing[0].ends_with("single.gguf") && missing[1].ends_with("mmproj.gguf"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
