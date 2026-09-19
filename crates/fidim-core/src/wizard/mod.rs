@@ -46,10 +46,16 @@ use crate::{Error, Result};
 mod tests;
 
 const GIB: f64 = (1u64 << 30) as f64;
-/// Free space a source build wants beside the install: its worktree and
-/// build tree at the peak (measured 0.5 GB for the K2 Horizon fork), plus
-/// the 0.1 GB it installs, with room to spare.
-const SOURCE_BUILD_BYTES: u64 = 1 << 30;
+/// Free space a source build wants where FIDIM keeps its llama.cpp clone
+/// (`update::source_checkout_dir`, under the config folder, usually on C:):
+/// the worktree and build tree at the peak (measured 0.5 GB for the K2
+/// Horizon fork, one GPU target), with room to spare.
+const SOURCE_SCRATCH_BYTES: u64 = 1 << 30;
+/// Below this much free there, a source build is not started: the measured
+/// peak, which would leave the drive full.
+const SOURCE_SCRATCH_MIN: u64 = 600 << 20;
+/// What a source build installs (0.1 GB), staged beside the install first.
+const SOURCE_INSTALL_BYTES: u64 = 256 << 20;
 /// A prebuilt install: the zips (up to ~0.5 GB) and what they unpack to
 /// (~0.9-1.1 GB).
 const PREBUILT_BYTES: u64 = 3 << 29;
@@ -610,6 +616,9 @@ pub trait Env {
     ) -> Result<InstallReport>;
     /// Save a new profile; an existing file of that id is never overwritten.
     fn save_profile(&self, p: &Profile) -> Result<PathBuf>;
+    /// Bytes free on the drive of `path` (see `disk::free_bytes`); None
+    /// when it cannot be told.
+    fn free_bytes(&self, path: &Path) -> Option<u64>;
 }
 
 /// The real machine: the Hub, GitHub, the installed builds, the GPUs.
@@ -831,6 +840,9 @@ impl Env for LiveEnv {
     }
     fn save_profile(&self, p: &Profile) -> Result<PathBuf> {
         save_new_profile(&self.cfg.profile_dir, p)
+    }
+    fn free_bytes(&self, path: &Path) -> Option<u64> {
+        crate::disk::free_bytes(path)
     }
 }
 
@@ -1641,6 +1653,79 @@ fn drive_of(p: &Path) -> Option<String> {
     }
 }
 
+/// Where a build step writes and about how much, one entry per drive:
+/// (a folder on it, bytes, what for). A source build's worktree and build
+/// tree sit beside FIDIM's llama.cpp clone (under the config folder,
+/// usually on C:), whatever the install folder is.
+fn build_space(ps: &PlanStep, install_dir: &Path) -> Vec<(PathBuf, u64, &'static str)> {
+    let parts: Vec<(PathBuf, u64, &'static str)> = match &ps.action {
+        PlanAction::BuildPr { .. } | PlanAction::BuildFork { .. } => vec![
+            (update::source_checkout_dir(), SOURCE_SCRATCH_BYTES, "the source checkout and build tree"),
+            (install_dir.to_path_buf(), SOURCE_INSTALL_BYTES, "the install"),
+        ],
+        _ => vec![(install_dir.to_path_buf(), PREBUILT_BYTES, "the zips and the install")],
+    };
+    let mut out: Vec<(PathBuf, u64, &'static str)> = Vec::new();
+    for (dir, bytes, what) in parts {
+        match out.iter_mut().find(|(d, _, _)| drive_of(d).is_some() && drive_of(d) == drive_of(&dir)) {
+            Some(e) => {
+                e.1 += bytes;
+                e.2 = "the source checkout, build tree and install";
+            }
+            None => out.push((dir, bytes, what)),
+        }
+    }
+    out
+}
+
+/// Refuse a download the drive has no room for now: the plan checked when
+/// it was made, and a plan can wait (on the Get step, at "Go ahead?")
+/// while other downloads fill the drive. `from`: the first step still to
+/// run; what the downloads from there still have to write, and 5%, must
+/// be free.
+fn check_download_room(env: &dyn Env, plan: &WizardPlan, from: usize) -> Result<()> {
+    let rest: Vec<(PathBuf, u64)> = plan.steps[from.min(plan.steps.len())..]
+        .iter()
+        .filter_map(|s| match &s.action {
+            StepAction::Download { dest, file, .. } => Some((dest.clone(), file.size)),
+            _ => None,
+        })
+        .collect();
+    let bytes = crate::disk::bytes_to_fetch(&rest);
+    if bytes == 0 {
+        return Ok(());
+    }
+    match env.free_bytes(&plan.dest_root) {
+        Some(free) if free < crate::disk::with_margin(bytes) => Err(Error::InvalidInput(format!(
+            "the downloads still need {} (plus 5%) and the drive holding {} has {} free now: make room there, \
+             or plan again with another model folder (finished and partial downloads are kept)",
+            gib(bytes),
+            plan.dest_root.display(),
+            gib(free)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a source build that would fill the drive of FIDIM's llama.cpp
+/// clone: less free there than the build's measured peak.
+fn check_build_room(env: &dyn Env, ps: &PlanStep) -> Result<()> {
+    if !matches!(ps.action, PlanAction::BuildPr { .. } | PlanAction::BuildFork { .. }) {
+        return Ok(());
+    }
+    let dir = update::source_checkout_dir();
+    match env.free_bytes(&dir) {
+        Some(free) if free < SOURCE_SCRATCH_MIN => Err(Error::InvalidInput(format!(
+            "a source build needs about {} of scratch space on the drive of {} and it has {} free: make room \
+             there first",
+            gib(SOURCE_SCRATCH_BYTES),
+            dir.display(),
+            gib(free)
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Turn a choice into exact steps (see the module notes).
 pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest) -> Result<WizardPlan> {
     if view.kind != RepoKind::Gguf {
@@ -1840,28 +1925,27 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
             format!("{} is gated and no Hugging Face token is set: the download will be refused", view.repo),
         ));
     }
-    // Room for the build itself, on its own drive (and beside the download
-    // when both share one).
+    // Room for the build itself, drive by drive: a source build's checkout
+    // and build tree beside FIDIM's llama.cpp clone, the install in the
+    // install folder (and the download too, on a drive they share).
     if let (Some(ps), Some(pb)) = (&pick.step, &pick.build) {
-        let need = match &ps.action {
-            PlanAction::BuildPr { .. } | PlanAction::BuildFork { .. } => SOURCE_BUILD_BYTES,
-            _ => PREBUILT_BYTES,
-        };
-        let same_drive = drive_of(&pb.path).is_some() && drive_of(&pb.path) == drive_of(&dest_root);
-        let need_there = need + if same_drive { download_bytes } else { 0 };
-        if let Some(free) = crate::disk::free_bytes(&pb.path) {
-            if free < need_there {
-                notes.push(Note::new(
-                    Level::Warning,
-                    "build-space",
-                    format!(
-                        "the build needs about {} on the drive of {} ({}free: {})",
-                        gib(need_there),
-                        pb.path.display(),
-                        if same_drive { "with the download, " } else { "" },
-                        gib(free)
-                    ),
-                ));
+        for (dir, need, what) in build_space(ps, &pb.path) {
+            let with_download = drive_of(&dir).is_some() && drive_of(&dir) == drive_of(&dest_root);
+            let need_there = need + if with_download { download_bytes } else { 0 };
+            if let Some(free) = env.free_bytes(&dir) {
+                if free < need_there {
+                    notes.push(Note::new(
+                        Level::Warning,
+                        "build-space",
+                        format!(
+                            "the build needs about {} on the drive of {} ({what}{}); it has {} free",
+                            gib(need_there),
+                            dir.display(),
+                            if with_download { ", with the download" } else { "" },
+                            gib(free)
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -2059,9 +2143,11 @@ pub fn run_with(
         profile_path: None,
         warnings: Vec::new(),
     };
-    // A gated or vanished repo fails here, before a build of minutes.
+    // A gated or vanished repo fails here, before a build of minutes; so
+    // does a drive that filled up since the plan was made.
     if plan.steps.iter().any(|s| matches!(s.action, StepAction::Download { .. })) {
         env.auth_check(&plan.repo)?;
+        check_download_room(env, plan, 0)?;
     }
     for (i, step) in plan.steps.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -2093,6 +2179,7 @@ fn run_step(
 ) -> Result<StepStatus> {
     match &step.action {
         StepAction::Build { plan: ps } => {
+            check_build_room(env, ps)?;
             let mut line = |stage: &str, text: String| {
                 progress(&WizardEvent { stage: Some(stage.into()), line: Some(text), ..WizardEvent::status(i, StepStatus::Running) })
             };
@@ -2129,6 +2216,9 @@ fn run_step(
             Ok(StepStatus::Done)
         }
         StepAction::Download { file, dest, .. } => {
+            // Again before each file: another program may have written to
+            // the drive while the build or the files before this ran.
+            check_download_room(env, plan, i)?;
             let name = file.name().to_string();
             env.download(
                 &plan.repo,

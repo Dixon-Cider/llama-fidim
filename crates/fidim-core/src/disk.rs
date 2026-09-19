@@ -36,6 +36,11 @@ fn free_bytes_at(_dir: &Path) -> Option<u64> {
     None
 }
 
+/// The free space a download of `bytes` asks for: the bytes and 5% more.
+pub fn with_margin(bytes: u64) -> u64 {
+    (bytes as f64 * (1.0 + FREE_MARGIN)).ceil() as u64
+}
+
 /// What a download of `files` (destination, size) still has to write:
 /// nothing for a file already in place, the rest of a `.part` being resumed.
 pub fn bytes_to_fetch(files: &[(PathBuf, u64)]) -> u64 {
@@ -94,7 +99,7 @@ pub fn check_destination(root: &Path, rel_paths: &[PathBuf], total_bytes: u64, d
         }
     }
 
-    let need = (total_bytes as f64 * (1.0 + FREE_MARGIN)).ceil() as u64;
+    let need = with_margin(total_bytes);
     match free_bytes(root) {
         Some(free) if free < need => out.push(Finding {
             severity: Severity::Error,

@@ -142,6 +142,8 @@ struct Fake {
     derivatives: Vec<RepoHit>,
     doctor_blocks: bool,
     auth_fails: bool,
+    /// Free space on every drive; None = unknown.
+    free: std::cell::Cell<Option<u64>>,
     calls: RefCell<Vec<String>>,
     saved: RefCell<Vec<Profile>>,
 }
@@ -167,6 +169,7 @@ impl Fake {
             derivatives: Vec::new(),
             doctor_blocks: false,
             auth_fails: false,
+            free: std::cell::Cell::new(None),
             calls: RefCell::new(Vec::new()),
             saved: RefCell::new(Vec::new()),
         }
@@ -343,6 +346,9 @@ impl Env for Fake {
         let path = save_new_profile(&self.cfg().profile_dir, p)?;
         self.saved.borrow_mut().push(p.clone());
         Ok(path)
+    }
+    fn free_bytes(&self, _path: &Path) -> Option<u64> {
+        self.free.get()
     }
 }
 
@@ -999,6 +1005,100 @@ fn run_stops_at_a_failure_and_on_cancel() {
     bad_sha.sha = "main".into();
     assert!(check_runnable(&bad_sha, true).is_err());
     std::fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn run_checks_the_room_on_the_drive_again() {
+    const GB: u64 = 1 << 30;
+    let f = Fake::k2("run-room");
+    let cfg = f.cfg();
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    // Planned with room: 50 GiB free for a 5.2 GiB file and the build.
+    f.free.set(Some(50 * GB));
+    let plan = plan_with(&f, &cfg, &view, &PlanRequest { choice: Some("Q4_K_M".into()), ..Default::default() }).unwrap();
+    assert!(!plan.notes.iter().any(|n| n.code == "build-space"), "{:?}", plan.notes);
+    // Then something else filled the drive: nothing starts, not even the build.
+    f.free.set(Some(3 * GB));
+    let before = f.calls().len();
+    let err = run_with(&f, &cfg, &plan, true, &mut |_| {}, &AtomicBool::new(false)).unwrap_err();
+    assert!(err.to_string().contains("5.2 GiB (plus 5%)") && err.to_string().contains("3.0 GiB free now"), "{err}");
+    let ran = &f.calls()[before..];
+    assert!(!ran.iter().any(|c| c.starts_with("build_source") || c.starts_with("download")), "{ran:?}");
+    // A drive too full for a source build's scratch space: the build step refuses.
+    let mut downloads_done = plan.clone();
+    for s in &mut downloads_done.steps {
+        if let StepAction::Download { dest, .. } = &s.action {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, b"already here").unwrap();
+        }
+    }
+    f.free.set(Some(100 << 20));
+    let mut events = Vec::new();
+    let err = run_with(&f, &cfg, &downloads_done, true, &mut |e| events.push(e.clone()), &AtomicBool::new(false)).unwrap_err();
+    assert!(err.to_string().contains("scratch space"), "{err}");
+    assert!(events.iter().any(|e| e.step == 0 && e.status == StepStatus::Failed));
+    assert!(!f.calls()[before..].iter().any(|c| c.starts_with("build_source")));
+    // Unknown free space: nothing to refuse on.
+    f.free.set(None);
+    assert!(run_with(&f, &cfg, &downloads_done, true, &mut |_| {}, &AtomicBool::new(false)).is_ok());
+    std::fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn a_download_that_no_longer_fits_stops_before_it_starts() {
+    let mut f = Fake::supported("run-room-files");
+    f.info = hub::parse_model_info(&fixture("hub/model-info-unsloth__gemma-4-26B-A4B-it-GGUF.json")).unwrap();
+    let cfg = f.cfg();
+    let view = inspect_with(&f, &cfg, "unsloth/gemma-4-26B-A4B-it-GGUF", None).unwrap();
+    let mmproj = view.catalog.mmproj[0].path.clone();
+    let plan = plan_with(&f, &cfg, &view, &PlanRequest { choice: Some("UD-Q4_K_XL".into()), mmproj: Some(mmproj), ..Default::default() }).unwrap();
+    let sizes: Vec<u64> = plan.download_dests().iter().map(|(_, s)| *s).collect();
+    // Room for both at the start; once the model is in place, what is left
+    // to fetch is the projector alone.
+    f.free.set(Some(sizes.iter().sum::<u64>() * 2));
+    let mut events = Vec::new();
+    let shrink = std::cell::Cell::new(false);
+    let r = run_with(
+        &f,
+        &cfg,
+        &plan,
+        false,
+        &mut |e| {
+            // The drive fills while the model downloads.
+            if e.step == 0 && e.status == StepStatus::Done && !shrink.get() {
+                shrink.set(true);
+                f.free.set(Some(sizes[1] / 2));
+            }
+            events.push(e.clone())
+        },
+        &AtomicBool::new(false),
+    );
+    let err = r.unwrap_err();
+    assert!(err.to_string().contains("free now"), "{err}");
+    let failed: Vec<usize> = events.iter().filter(|e| e.status == StepStatus::Failed).map(|e| e.step).collect();
+    assert_eq!(failed, vec![1], "the projector's step fails before it downloads; {events:?}");
+    assert_eq!(f.calls().iter().filter(|c| c.starts_with("download")).count(), 1, "the model only");
+    std::fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn a_source_build_counts_its_scratch_drive() {
+    let f = Fake::k2("plan-scratch");
+    let cfg = f.cfg();
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    f.free.set(Some(700 << 20));
+    let plan = plan_with(&f, &cfg, &view, &PlanRequest::default()).unwrap();
+    let space: Vec<&str> = plan.notes.iter().filter(|n| n.code == "build-space").map(|n| n.message.as_str()).collect();
+    let src = update::source_checkout_dir();
+    assert!(space.iter().any(|m| m.contains(&src.display().to_string()) && m.contains("source checkout")), "{space:?}");
+    // The parts of a build on one drive are counted together.
+    let ps = match &plan.steps[0].action {
+        StepAction::Build { plan } => plan.clone(),
+        o => panic!("{o:?}"),
+    };
+    let on_src_drive = build_space(&ps, &src.parent().unwrap().join("builds").join("x"));
+    assert_eq!(on_src_drive.len(), 1);
+    assert_eq!(on_src_drive[0].1, SOURCE_SCRATCH_BYTES + SOURCE_INSTALL_BYTES);
 }
 
 #[test]
