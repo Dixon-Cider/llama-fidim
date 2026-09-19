@@ -194,7 +194,7 @@
     {/if}
     {#if m.error}<div class="err">{m.error}</div>{/if}
     {#if m.stopped && dg}
-      <div class="note">Stopped. DiffusionGemma finishes the current reply in the background (the runner has no mid-request cancel); your next message will queue behind it.</div>
+      <div class="note">{"Stopped. A request still in the queue is dropped; one DiffusionGemma had started is finished in the background (the runner has no mid-request cancel), and your next message queues behind it."}</div>
     {/if}
     {#if showReplay && chat.frames[m.id]}
       <div class="replay">

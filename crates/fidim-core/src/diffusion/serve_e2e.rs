@@ -1143,10 +1143,11 @@ fn chat_client_cancel_while_queued_skips_the_job() {
     assert!(back < Duration::from_secs(1), "Stop took {back:?}");
     assert_eq!(evs.last(), Some(&ChatEvent::Cancelled));
     assert!(sum.cancelled && sum.id_task.is_none());
-    // fidim-dg learns the client left when a queue comment fails to write:
-    // the first after the close usually still goes out, the second fails.
-    // Comments go every 2 s (checked every 250 ms): wait past two of them.
-    std::thread::sleep(Duration::from_millis(6000));
+    // While a job is queued fidim-dg peeks at the connection every 250 ms,
+    // so it sees the close well before its first keep-alive comment (2 s;
+    // a write to a closed peer usually succeeds once, so waiting for a
+    // write to fail took up to two of them).
+    std::thread::sleep(Duration::from_millis(1000));
     gate.open();
     assert_eq!(a.join().unwrap().0, 200);
     let (status, body) = post(port, &chat_body("C", json!({})));
