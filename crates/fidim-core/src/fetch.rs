@@ -197,13 +197,18 @@ struct Part {
 
 impl Part {
     fn open(path: PathBuf) -> Result<Part> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| Error::io(&path, e))?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        // One writer at a time: a second download of the same file fails
+        // to open it (sharing violation) instead of interleaving bytes.
+        // Readers, such as a virus scanner, are still let in.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x1;
+            opts.share_mode(FILE_SHARE_READ);
+        }
+        let file = opts.open(&path).map_err(|e| Error::io(&path, e))?;
         let have = file.metadata().map_err(|e| Error::io(&path, e))?.len();
         Ok(Part { file, path, hasher: Sha256::new(), have, received: 0 })
     }
@@ -852,6 +857,25 @@ mod tests {
             download_resumable(&req, &dest, &mut quiet(), &AtomicBool::new(false)),
             Err(Error::Integrity { .. })
         ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Two downloads of one file do not interleave: the second cannot open
+    /// the `.part` while the first holds it.
+    #[cfg(windows)]
+    #[test]
+    fn one_writer_per_part() {
+        let dir = tmp("writers");
+        let dest = dir.join("m.gguf");
+        let held = Part::open(part_path(&dest)).unwrap();
+        let req = FetchReq { backoff: Duration::from_millis(1), ..FetchReq::new("http://127.0.0.1:9/never") };
+        match download_resumable(&req, &dest, &mut quiet(), &AtomicBool::new(false)) {
+            Err(Error::Io { path, .. }) => assert_eq!(path, part_path(&dest)),
+            other => panic!("{other:?}"),
+        }
+        // Readers are let in.
+        assert!(File::open(part_path(&dest)).is_ok());
+        drop(held);
         std::fs::remove_dir_all(dir).ok();
     }
 
