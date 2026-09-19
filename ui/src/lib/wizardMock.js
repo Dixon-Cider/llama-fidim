@@ -569,9 +569,12 @@ export function createWizardMock(ctx) {
       case "wizard_roots":
         return roots.map((x) => ({ ...x }));
       case "wizard_add_root": {
-        const path = String(args.path ?? "").trim().replace(/[\\/]+$/, "");
+        let path = String(args.path ?? "").trim().replace(/[\\/]+$/, "");
+        // As core: a drive's root keeps its separator (E: alone is not absolute).
+        if (/^[A-Za-z]:$/.test(path)) path = `${path.toUpperCase()}\\`;
         if (!/^[A-Za-z]:\\/.test(path)) throw `${args.path} is not an absolute folder path`;
-        if (!roots.some((x) => x.path.toLowerCase() === path.toLowerCase())) roots.push({ path, exists: true, free_bytes: 96.2 * GIB });
+        const key = (x) => x.replace(/[\\/]+$/, "").toLowerCase();
+        if (!roots.some((x) => key(x.path) === key(path))) roots.push({ path, exists: true, free_bytes: 96.2 * GIB });
         return roots.map((x) => ({ ...x }));
       }
       default:

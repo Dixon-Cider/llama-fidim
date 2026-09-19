@@ -1264,6 +1264,31 @@ fn model_folders_can_be_added() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A drive dedicated to models: `E:\` is a folder like any other (the
+/// separator was trimmed off, leaving `E:`, which is not absolute).
+#[cfg(windows)]
+#[test]
+fn a_drive_root_can_be_a_model_folder() {
+    // The temp folder's drive: one that exists here.
+    let drive = std::env::temp_dir().to_string_lossy()[..2].to_ascii_lowercase();
+    let mut cfg = Config::default_for_machine();
+    cfg.model_roots.clear();
+    assert!(add_model_root(&mut cfg, Path::new(&format!("{drive}\\"))).unwrap());
+    let upper = drive.to_ascii_uppercase();
+    assert_eq!(cfg.model_roots, vec![PathBuf::from(format!("{upper}\\"))]);
+    assert!(cfg.model_roots[0].is_absolute());
+    // The same drive, spelled otherwise: already there.
+    for spelled in [format!("{upper}/"), upper.clone(), format!(" {upper}\\\\ ")] {
+        assert!(!add_model_root(&mut cfg, Path::new(&spelled)).unwrap(), "{spelled}");
+    }
+    assert_eq!(cfg.model_roots.len(), 1);
+    // Downloads land in <drive>\<owner>\<repo>, which the scan counts as inside it.
+    let dest = catalog::dest_path(&cfg.model_roots[0], "IFM/K2-Horizon-7B-GGUF", "K2-Horizon-7B-Q4_K_M.gguf");
+    assert_eq!(dest, PathBuf::from(format!(r"{upper}\IFM\K2-Horizon-7B-GGUF\K2-Horizon-7B-Q4_K_M.gguf")));
+    assert!(under(&dest, &cfg.model_roots[0]));
+    assert!(add_model_root(&mut cfg, Path::new(r"\no-drive")).is_err(), "a path without its drive");
+}
+
 #[test]
 fn default_projector_and_draft() {
     let info = hub::parse_model_info(&fixture("hub/model-info-unsloth__gemma-4-26B-A4B-it-GGUF.json")).unwrap();

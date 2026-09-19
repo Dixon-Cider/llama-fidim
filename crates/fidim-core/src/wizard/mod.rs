@@ -1142,7 +1142,13 @@ fn root_infos(cfg: &Config) -> Vec<RootInfo> {
 /// where the scan finds them. False when it is already one.
 pub fn add_model_root(cfg: &mut Config, path: &Path) -> Result<bool> {
     let text = path.to_string_lossy();
-    let trimmed = PathBuf::from(text.trim().trim_end_matches(['\\', '/']));
+    let mut trimmed = PathBuf::from(text.trim().trim_end_matches(['\\', '/']));
+    // A drive's root keeps its separator: without it, `E:` names the
+    // drive's current folder, which is not absolute. `E:` typed alone
+    // means the drive too.
+    if bare_drive(&trimmed) {
+        trimmed = PathBuf::from(format!("{}\\", trimmed.to_string_lossy().to_ascii_uppercase()));
+    }
     if !trimmed.is_absolute() {
         return Err(Error::InvalidInput(format!("{} is not an absolute folder path", path.display())));
     }
@@ -1155,6 +1161,15 @@ pub fn add_model_root(cfg: &mut Config, path: &Path) -> Result<bool> {
     std::fs::create_dir_all(&trimmed).map_err(|e| Error::io(&trimmed, e))?;
     cfg.model_roots.push(trimmed);
     Ok(true)
+}
+
+/// `E:` and nothing more: a drive letter with its colon.
+fn bare_drive(p: &Path) -> bool {
+    let mut c = p.components();
+    match (c.next(), c.next()) {
+        (Some(std::path::Component::Prefix(pre)), None) => matches!(pre.kind(), std::path::Prefix::Disk(_)),
+        _ => false,
+    }
 }
 
 /// The model folders with the space left on each.

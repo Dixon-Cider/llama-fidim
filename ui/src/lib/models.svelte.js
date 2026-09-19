@@ -219,7 +219,10 @@ export async function addRoot(path) {
   wz.rootError = "";
   try {
     wz.roots = await api("wizard_add_root", { path: p });
-    const added = wz.roots.find((r) => r.path.toLowerCase() === p.replace(/[\\/]+$/, "").toLowerCase());
+    // Compared without case or trailing separators: core keeps `E:\` for a
+    // drive's root and trims them from any other folder.
+    const key = (x) => String(x).replace(/[\\/]+$/, "").toLowerCase();
+    const added = wz.roots.find((r) => key(r.path) === key(p));
     wz.rootBusy = false;
     if (added) setDest(added.path);
     return true;
