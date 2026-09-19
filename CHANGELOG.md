@@ -22,8 +22,10 @@ build with uncommitted changes.
   on the GPU, up to 65,536 tokens on a 32 GB card, prefill reuse across
   blocks) laid over it, as `<tag>-unsloth-dgpatch5`. Only the llama-level
   binaries are replaced; every file is checked against the overlay's
-  descriptor and the Unsloth zip it was built for. `--overlay-from` installs
-  a locally built overlay, `--base-zip` reuses a downloaded Unsloth zip.
+  descriptor and the Unsloth zip it was built for, and an install is refused
+  when that zip has a llama-level file the overlay does not replace.
+  `--overlay-from` installs a locally built overlay, `--base-zip` reuses a
+  downloaded Unsloth zip.
 - `packaging/dg-overlay`: the patch, and the scripts and workflow that build,
   gate, sign (when configured) and publish an overlay for an Unsloth release.
 

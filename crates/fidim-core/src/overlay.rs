@@ -146,6 +146,11 @@ fn is_plain_name(n: &str) -> bool {
     !n.is_empty() && n.len() <= 128 && !n.starts_with('.') && n.bytes().all(|c| c.is_ascii_alphanumeric() || b"._+-".contains(&c))
 }
 
+/// Llama-level files of the base zip the overlay leaves as Unsloth shipped
+/// them: llama-cvector-generator imports ggml-hip for its GPU path, which a
+/// build without HIP cannot reproduce (packaging/dg-overlay, $KeepBaseFiles).
+pub const KEEP_BASE_FILES: [&str; 1] = ["llama-cvector-generator.exe"];
+
 /// A binary the overlay may write into `bin`: llama-level only. ggml, the
 /// HIP backend and the ROCm runtime (amd*, hip*, roc*, origami*, lib*) stay
 /// Unsloth's.
@@ -290,6 +295,44 @@ fn open_zip(p: &Path) -> Result<zip::ZipArchive<File>> {
     zip::ZipArchive::new(f).map_err(|e| upd(format!("{}: {e}", p.display())))
 }
 
+/// The llama-level files at the top of the base zip (`names`: its entries)
+/// that the overlay does not replace. Each would stay Unsloth's clang build
+/// and bind by C++ name to the overlay's llama.dll and llama-common.dll,
+/// built by another compiler: the mix the overlay exists to avoid. The gate
+/// refuses such an overlay when it is built; this refuses installing one
+/// over a zip it was not gated against, whatever its descriptor says.
+pub fn base_files_not_replaced<'a>(names: impl IntoIterator<Item = &'a str>, d: &Descriptor) -> Vec<String> {
+    let replaced: BTreeSet<String> = d.files.iter().map(|f| f.name.to_ascii_lowercase()).collect();
+    let mut left: Vec<String> = names
+        .into_iter()
+        .filter(|n| !n.contains('/') && !n.contains('\\'))
+        .filter(|n| overlay_binary_allowed(n))
+        .filter(|n| !KEEP_BASE_FILES.iter().any(|k| k.eq_ignore_ascii_case(n)))
+        .filter(|n| !replaced.contains(&n.to_ascii_lowercase()))
+        .map(str::to_string)
+        .collect();
+    left.sort();
+    left.dedup();
+    left
+}
+
+/// The base zip against the overlay, before anything is unpacked: see
+/// `base_files_not_replaced`.
+fn check_base_file_set(base_zip: &Path, d: &Descriptor) -> Result<()> {
+    let z = open_zip(base_zip)?;
+    let left = base_files_not_replaced(z.file_names(), d);
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(upd(format!(
+        "the Unsloth zip has llama-level files the {} overlay does not replace ({}): they would run against the \
+         overlay's llama.dll, built by another compiler. The overlay was not built for this zip's file set; \
+         rebuild it (packaging/dg-overlay, the gate checks this)",
+        d.name,
+        left.join(", ")
+    )))
+}
+
 /// The overlay zip's entries against the descriptor, before anything is
 /// written: every entry an allowed file the descriptor lists, every listed
 /// file present once.
@@ -426,8 +469,10 @@ fn stage_overlay(
             return Err(upd(format!("{} is {sha}; {DESCRIPTOR_NAME} says {}", p.display(), d.patch.sha256)));
         }
     }
-    // A bad overlay zip fails here, before 500 MB of base is unpacked.
+    // A bad overlay zip, or one that leaves Unsloth's copy of a llama-level
+    // file in place, fails here, before 500 MB of base is unpacked.
     check_overlay_zip(overlay_zip, d)?;
+    check_base_file_set(base_zip, d)?;
     std::fs::create_dir_all(tmp).map_err(|e| Error::io(tmp, e))?;
     let bin = update::stage_unsloth_base(base_zip, tmp, final_dir, &meta.base_asset)?;
     let replaced = extract_overlay(overlay_zip, d, &bin, &tmp.join(LICENSES_DIR))?;
@@ -1103,6 +1148,45 @@ mod tests {
         let mut d = descriptor_for(OVERLAY, &fx.meta.base_sha256);
         d.files[0].sha256 = "abc".into();
         refused(&fx, &d, "has no sha256");
+    }
+
+    /// The top-level files of app-b11030-mix-5ff778e-windows-x64-rocm-gfx120X.zip.
+    const CAPTURED_BASE_TOP: &str = include_str!("../../../fixtures/unsloth-b11030-gfx120X-top-level.txt");
+
+    #[test]
+    fn every_llama_level_file_of_the_base_must_be_replaced() {
+        // The captured overlay replaces all of the captured base's, except
+        // the one kept on purpose.
+        let d = parse_descriptor(CAPTURED).unwrap();
+        assert!(base_files_not_replaced(CAPTURED_BASE_TOP.lines(), &d).is_empty());
+        assert!(CAPTURED_BASE_TOP.lines().any(|n| n == KEEP_BASE_FILES[0]));
+        // One it does not replace (a newer release's extra -impl.dll) is named.
+        let mut fewer = d.clone();
+        fewer.files.retain(|f| f.name != "llama-server-impl.dll");
+        assert_eq!(base_files_not_replaced(CAPTURED_BASE_TOP.lines(), &fewer), ["llama-server-impl.dll"]);
+        // Only top-level llama-level files count, by name in any case.
+        let d = descriptor_for(OVERLAY, &"0".repeat(64));
+        let names = ["LLAMA.DLL", "llama-server.exe", "Llama-CVector-Generator.exe", "ggml.dll", "amdhip64_7.dll",
+                     "rocblas/library/llama.dll", "llama-extra-impl.dll", "mtmd.dll", RUNNER_EXE, "llama-extra-impl.dll"];
+        assert_eq!(base_files_not_replaced(names, &d), ["llama-extra-impl.dll"]);
+    }
+
+    #[test]
+    fn a_base_zip_with_llama_files_the_overlay_leaves_alone_is_refused() {
+        // Checked before the base is unpacked, whatever the descriptor says.
+        let fx = fixture("fileset", OVERLAY);
+        let mut base = BASE.to_vec();
+        base.push(("llama-extra-impl.dll", b"unsloth impl"));
+        write_zip(&fx.base_zip, &base);
+        let meta = OverlayMeta { base_sha256: update::sha256_file(&fx.base_zip).unwrap(), ..fx.meta.clone() };
+        let d = descriptor_for(OVERLAY, &meta.base_sha256);
+        let text = serde_json::to_string_pretty(&d).unwrap();
+        let e = install_overlay_from_zips(&fx.base_zip, &fx.overlay_zip, &d, &text, Some(&fx.patch), &fx.tmp, &fx.fin, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not replace (llama-extra-impl.dll)"), "{e}");
+        assert!(!fx.tmp.exists() && !fx.fin.exists());
+        std::fs::remove_dir_all(&fx.root).ok();
     }
 
     #[test]
