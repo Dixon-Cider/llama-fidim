@@ -159,9 +159,21 @@ enum Cmd {
         /// Download + verify the prebuilt Windows ROCm build (latest, or --tag).
         #[arg(long)]
         install: bool,
-        /// Build from source with config.source_build_script instead of prebuilt.
+        /// Build from source with config.source_build_script instead of prebuilt;
+        /// with --remote/--ref, build any git ref (a fork, a pull request, a commit).
         #[arg(long)]
         source: bool,
+        /// With --source: the git remote to build from, e.g.
+        /// https://github.com/ifm-ai/llama.cpp (runs that repository's code).
+        #[arg(long)]
+        remote: Option<String>,
+        /// With --remote: a branch, a tag, pull/<n>/head, or a full commit.
+        #[arg(long = "ref", value_name = "REF")]
+        git_ref: Option<String>,
+        /// With --remote: a name for the build (default from the remote and ref,
+        /// e.g. "ifm-ai K2Horizon fork").
+        #[arg(long)]
+        label: Option<String>,
         /// Re-point profiles onto the installed build (default scope: profiles
         /// on the previous newest build; --all for every unpinned profile).
         #[arg(long)]
@@ -178,8 +190,16 @@ enum Cmd {
         /// the fork that carries the DiffusionGemma runner).
         #[arg(long, default_value = "upstream")]
         channel: String,
-        /// GPU target of the Unsloth zip (e.g. gfx120X, gfx1151); default:
-        /// config.rocm_family, else guessed from the cards.
+        /// GPU target of the Unsloth zip (e.g. gfx120X, gfx1151; default:
+        /// config.rocm_family, else guessed from the cards), or of a --remote
+        /// build (e.g. gfx1201; default: what hipInfo reports for the cards).
+        #[arg(long)]
+        gfx: Option<String>,
+    },
+    /// Check the toolchain a source build needs: Visual Studio C++ tools, git,
+    /// CMake, Ninja, the HIP SDK, and a test compile for the GPU target.
+    Toolchain {
+        /// GPU target for the test compile (default: what hipInfo reports).
         #[arg(long)]
         gfx: Option<String>,
     },
@@ -251,10 +271,152 @@ fn main() -> anyhow::Result<()> {
             cmd_bench(&cfg, &platform, &profile_id, concurrency, tokens, warmups, no_save)
         }
         Cmd::Rocm { cmd } => cmd_rocm(&cfg, cli.json, cmd),
-        Cmd::Update { install, source, promote, all, rollback, tag, channel, gfx } => {
+        Cmd::Update { install, source, remote, git_ref, label, promote, all, rollback, tag, channel, gfx } => {
+            if let Some(remote) = remote {
+                if !source {
+                    bail!("--remote builds from source: add --source");
+                }
+                if install || promote || all || rollback || tag.is_some() || channel != "upstream" {
+                    bail!(
+                        "--remote builds one git ref; it does not combine with --install, --promote, --all, \
+                         --rollback, --tag or --channel (a git build is never promoted: pick it in the profile editor)"
+                    );
+                }
+                let git_ref = git_ref.context("--remote needs --ref <branch|pull/N/head|commit>")?;
+                return cmd_update_ref(&cfg, cli.json, &remote, &git_ref, label, gfx);
+            }
+            if git_ref.is_some() || label.is_some() {
+                bail!("--ref and --label go with --source --remote <url>");
+            }
             cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag, &channel, gfx)
         }
+        Cmd::Toolchain { gfx } => cmd_toolchain(&cfg, cli.json, gfx),
     }
+}
+
+/// The GPU target(s) of this machine's discrete cards: hipInfo, else the
+/// card names.
+fn detect_gpu_targets(cfg: &Config) -> Option<String> {
+    let hipinfo = cfg
+        .rocm_bin
+        .as_ref()
+        .map(|b| b.join("hipInfo.exe"))
+        .filter(|p| p.is_file())
+        .and_then(|exe| launch::run_capture(&exe, &[], cfg.rocm_bin.as_deref()).ok());
+    let names: Vec<String> = WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect();
+    fidim_core::update::default_gpu_targets(hipinfo.as_deref(), &names)
+}
+
+fn cmd_toolchain(cfg: &Config, json: bool, gfx: Option<String>) -> anyhow::Result<()> {
+    let gfx = match gfx {
+        Some(g) => g,
+        None => detect_gpu_targets(cfg)
+            .and_then(|g| g.split(',').next().map(str::to_string))
+            .context("could not tell this machine's GPU target: pass --gfx (e.g. gfx1201)")?,
+    };
+    let tc = fidim_core::toolchain::detect(cfg);
+    let findings = fidim_core::toolchain::doctor_with(&tc, &gfx);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "gfx": gfx, "toolchain": tc, "findings": findings }))?);
+        return Ok(());
+    }
+    for f in &findings {
+        println!("{}", f.with_fix());
+    }
+    if findings.iter().any(|f| f.blocks()) {
+        bail!("the toolchain cannot build llama.cpp for {gfx} yet (see the fixes above)");
+    }
+    println!("\nready to build llama.cpp from source for {gfx} (`fidim update --source --remote <url> --ref <ref>`).");
+    Ok(())
+}
+
+/// `fidim update --source --remote <url> --ref <ref>`: pin the ref to a
+/// commit, then compile it into its own build directory. Nothing is
+/// promoted or launched.
+fn cmd_update_ref(
+    cfg: &Config,
+    json: bool,
+    remote: &str,
+    git_ref: &str,
+    label: Option<String>,
+    gfx: Option<String>,
+) -> anyhow::Result<()> {
+    use fidim_core::update::{self, SourceRef};
+    use std::sync::atomic::AtomicBool;
+
+    let remote = remote.trim().trim_end_matches('/').to_string();
+    let git_ref = git_ref.trim().trim_start_matches("refs/heads/").to_string();
+    let sha = update::pin_ref(&remote, &git_ref)?;
+    let label = label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
+    let src = SourceRef {
+        label: label.unwrap_or_else(|| SourceRef::default_label(&remote, &git_ref)),
+        remote_url: remote,
+        git_ref,
+        sha,
+    };
+    src.validate()?;
+    let gpus = match gfx {
+        Some(g) => g,
+        None => detect_gpu_targets(cfg).context("could not tell this machine's GPU target: pass --gfx (e.g. gfx1201)")?,
+    };
+    let gpus = update::normalize_gpu_targets(&gpus)?;
+    let dir = update::source_install_dir(cfg, &src)?;
+    if !json {
+        println!("building       : {}", src.git_source().display());
+        println!("from           : {} {} @ {}", src.remote_url, src.git_ref, src.sha);
+        println!("gpu targets    : {gpus}");
+        println!("install dir    : {}", dir.display());
+        println!("this compiles and later runs code from {}; nothing is launched here.", src.remote_url);
+    }
+    let cancel = AtomicBool::new(false);
+    let mut last_step = String::new();
+    let mut last_done = 0u32;
+    let mut progress = |p: update::BuildProgress| {
+        if json {
+            return;
+        }
+        if p.step != last_step {
+            last_step = p.step.clone();
+            println!("== {}", p.step);
+        }
+        match (p.done, p.total) {
+            // Ninja prints one line per edge: show every 5%.
+            (Some(d), Some(t)) => {
+                if d == t || d < last_done || (d - last_done) * 20 >= t {
+                    last_done = d;
+                    println!("  [{d}/{t}] {}%", d * 100 / t);
+                }
+            }
+            // The compilers' own warnings run to thousands of lines; a
+            // failure's last lines come back in the error anyway.
+            _ if p.step == "build" && !(p.line.contains("error") || p.line.contains("FAILED")) => {}
+            _ => println!("  {}", p.line),
+        }
+    };
+    let started = std::time::Instant::now();
+    let r = update::build_from_ref(cfg, &src, &gpus, &mut progress, &cancel)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+    let v = &r.verify;
+    println!(
+        "{} {} at {} in {:.1} min — binary reports {}; HIP {}",
+        if r.skipped_existing { "already built:" } else { "built" },
+        r.tag,
+        r.dir.display(),
+        started.elapsed().as_secs_f64() / 60.0,
+        v.version.as_deref().unwrap_or("?"),
+        if v.hip_ok { "OK" } else { "NOT LOADED" }
+    );
+    for d in &v.devices {
+        println!("    {}{}  {}  {} MiB", d.backend, d.index, d.name, d.total_mib);
+    }
+    if !v.detail.is_empty() {
+        println!("    {}", v.detail.trim().replace('\n', "\n    "));
+    }
+    println!("never promoted automatically: pick it for a profile in the editor (its --version build number is the ref's own count, not an upstream release).");
+    Ok(())
 }
 
 // -------------------------------------------------------------- runtimes ----
