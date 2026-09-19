@@ -22,14 +22,17 @@
 //! Nothing here launches a server or touches VRAM. Benchmarks stay a separate,
 //! explicit step because the GPUs are shared.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::compat::SourceCaps;
 use crate::config::Config;
 use crate::devices;
 use crate::discovery::{self, Build, BuildPatch, Channel, GitSource, RUNNER_EXE};
@@ -560,9 +563,21 @@ pub struct Manifest {
     /// What a `Channel::Git` build was compiled from.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "discovery::lenient_git")]
     pub git: Option<GitSource>,
+    /// The architecture, pre-tokenizer and tensor-type tables of the source
+    /// that was compiled, read at build time. `compat::probe_build` trusts
+    /// these over its DLL heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_caps")]
+    pub caps: Option<SourceCaps>,
     /// Fields a newer FIDIM wrote, kept through every re-verify rewrite.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// serde `deserialize_with` for a manifest's `caps`: a malformed block reads
+/// as none.
+fn lenient_caps<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<SourceCaps>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -916,6 +931,635 @@ fn tail_lines(s: &str, n: usize) -> String {
 
 fn read_manifest(dir: &Path) -> Option<Manifest> {
     serde_json::from_str(&std::fs::read_to_string(manifest_path(dir)).ok()?).ok()
+}
+
+// -------------------------------------------------------------- git refs ----
+
+/// A git ref to compile: a fork's branch, an upstream pull request, a tag
+/// or a bare commit. The commit is pinned before the build starts and the
+/// build refuses to run if the ref no longer points at it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceRef {
+    /// `https://` clone URL, e.g. `https://github.com/ifm-ai/llama.cpp`.
+    pub remote_url: String,
+    /// Branch, tag, `pull/<n>/head`, or the commit itself.
+    pub git_ref: String,
+    /// The full 40-digit commit the ref must resolve to.
+    pub sha: String,
+    /// Short human name, e.g. `ifm-ai K2Horizon fork`; the install
+    /// directory is named after it.
+    pub label: String,
+}
+
+/// `pull/<n>/head` -> n.
+pub fn pull_number(git_ref: &str) -> Option<u32> {
+    git_ref.strip_prefix("pull/")?.strip_suffix("/head")?.parse().ok()
+}
+
+fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+impl SourceRef {
+    /// A name for the build list from where it comes from:
+    /// `ifm-ai K2Horizon fork`, `PR #27752`, `upstream b11046`,
+    /// `someone PR #3`, `someone fork`.
+    pub fn default_label(remote_url: &str, git_ref: &str) -> String {
+        let (owner, repo) = crate::compat::github::owner_repo_from_url(remote_url).unwrap_or_else(|| {
+            // Not GitHub: the path's last two segments.
+            let mut segs = remote_url.trim_end_matches('/').rsplit('/');
+            let repo = segs.next().unwrap_or("").trim_end_matches(".git").to_string();
+            let owner = segs.next().unwrap_or("git").to_string();
+            (owner, repo)
+        });
+        let upstream = owner.eq_ignore_ascii_case(crate::compat::UPSTREAM_OWNER)
+            && repo.eq_ignore_ascii_case(crate::compat::UPSTREAM_REPO);
+        if let Some(n) = pull_number(git_ref) {
+            return if upstream { format!("PR #{n}") } else { format!("{owner} PR #{n}") };
+        }
+        if is_full_sha(git_ref) {
+            return if upstream { "upstream".into() } else { format!("{owner} fork") };
+        }
+        let tail = git_ref.rsplit('/').next().unwrap_or(git_ref);
+        if upstream { format!("upstream {tail}") } else { format!("{owner} {tail} fork") }
+    }
+
+    /// Everything here reaches `git` and `cmd.exe` as arguments, and may have
+    /// come from a model card: only a strict character set passes.
+    pub fn validate(&self) -> Result<()> {
+        let url = &self.remote_url;
+        let url_ok = url.starts_with("https://")
+            && url.len() <= 300
+            && url.len() > "https://".len()
+            && url.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'/' | b':' | b'-'));
+        if !url_ok {
+            return Err(upd(format!(
+                "remote `{url}` is not an https:// URL of letters, digits and . _ ~ / : - only"
+            )));
+        }
+        let r = &self.git_ref;
+        let ref_ok = !r.is_empty()
+            && r.len() <= 200
+            && !r.starts_with(['-', '/', '.'])
+            && !r.ends_with(['/', '.'])
+            && !r.ends_with(".lock")
+            && !r.contains("..")
+            && !r.contains("//")
+            && r.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'));
+        if !ref_ok {
+            return Err(upd(format!("`{r}` is not a branch, tag, pull/<n>/head or commit name FIDIM will build")));
+        }
+        if !is_full_sha(&self.sha) {
+            return Err(upd(format!("`{}` is not a full 40-digit commit", self.sha)));
+        }
+        if self.label.chars().count() > 80 || self.label.chars().any(char::is_control) {
+            return Err(upd("the build label must be one line of at most 80 characters"));
+        }
+        Ok(())
+    }
+
+    fn sha8(&self) -> String {
+        self.sha.chars().take(8).collect::<String>().to_ascii_lowercase()
+    }
+
+    pub fn git_source(&self) -> GitSource {
+        GitSource {
+            remote: self.remote_url.clone(),
+            git_ref: self.git_ref.clone(),
+            commit: self.sha.to_ascii_lowercase(),
+            label: self.label.clone(),
+        }
+    }
+}
+
+/// A label as a directory-name part: letters, digits, `.`, `_` and `-`,
+/// at most 48 characters (`ifm-ai K2Horizon fork` -> `ifm-ai-K2Horizon-fork`).
+pub fn sanitize_label(label: &str) -> String {
+    let mut out = String::new();
+    for c in label.chars() {
+        let ok = c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        if ok {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out: String = out.trim_matches(['-', '.']).chars().take(48).collect();
+    let out = out.trim_end_matches(['-', '.']).to_string();
+    if out.is_empty() { "git".into() } else { out }
+}
+
+/// `<install_root>/<sanitized label>-<sha8>-src`: immutable, one per commit.
+pub fn source_install_dir(cfg: &Config, src: &SourceRef) -> Result<PathBuf> {
+    install_dir(cfg, &format!("{}-{}", sanitize_label(&src.label), src.sha8()), "src")
+}
+
+pub use crate::toolchain::normalize_gpu_targets;
+
+/// The exact GPU target of each discrete card from ROCm's `hipInfo`
+/// output, else a guess from the card names; comma-separated. None when
+/// neither says.
+pub fn default_gpu_targets(hipinfo_text: Option<&str>, device_names: &[String]) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(text) = hipinfo_text {
+        for d in devices::parse_hipinfo(text).into_iter().filter(|d| !d.is_integrated) {
+            if let Some(a) = d.gcn_arch {
+                // `gfx90a:sramecc+:xnack-` carries feature flags after a colon.
+                let a = a.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+                if a.starts_with("gfx") && !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        for n in device_names {
+            if let Some(g) = gfx_from_name(n) {
+                if !out.contains(&g.to_string()) {
+                    out.push(g.to_string());
+                }
+            }
+        }
+    }
+    (!out.is_empty()).then(|| out.join(","))
+}
+
+/// The GPU target of a well-known discrete card or APU, by marketing name.
+fn gfx_from_name(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_uppercase();
+    let table: &[(&[&str], &str)] = &[
+        (&["R9700", "RX 9070"], "gfx1201"),
+        (&["RX 9060"], "gfx1200"),
+        (&["RX 7900", "W7900", "W7800"], "gfx1100"),
+        (&["RX 7800", "RX 7700", "W7700"], "gfx1101"),
+        (&["RX 7600", "W7600"], "gfx1102"),
+        (&["8060S", "8050S", "8040S"], "gfx1151"),
+        (&["890M", "880M"], "gfx1150"),
+    ];
+    table.iter().find(|(keys, _)| keys.iter().any(|k| n.contains(k))).map(|(_, g)| *g)
+}
+
+/// The commit `git_ref` points at in `remote_url` (`git ls-remote`, no API
+/// quota). A full commit is its own answer; an abbreviated one cannot be
+/// looked up this way.
+pub fn pin_ref(remote_url: &str, git_ref: &str) -> Result<String> {
+    if is_full_sha(git_ref) {
+        return Ok(git_ref.to_ascii_lowercase());
+    }
+    if git_ref.len() >= 7 && git_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(upd(format!("`{git_ref}` looks like an abbreviated commit: give all 40 digits")));
+    }
+    SourceRef { remote_url: remote_url.into(), git_ref: git_ref.into(), sha: "0".repeat(40), label: String::new() }
+        .validate()?;
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", "--", remote_url, git_ref])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null());
+    crate::launch::hide_console(&mut cmd);
+    let out = cmd.output().map_err(|e| upd(format!("git ls-remote: {e} (is git installed and on PATH?)")))?;
+    if !out.status.success() {
+        return Err(upd(format!(
+            "git ls-remote {remote_url} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    pick_ls_remote(&String::from_utf8_lossy(&out.stdout), git_ref)
+        .ok_or_else(|| upd(format!("{remote_url} has no branch, tag or ref named `{git_ref}`")))
+}
+
+/// The commit for `git_ref` in `git ls-remote` output: a branch first, then
+/// a tag (peeled to its commit), then any ref with that exact name.
+pub fn pick_ls_remote(text: &str, git_ref: &str) -> Option<String> {
+    let refs: Vec<(&str, &str)> = text
+        .lines()
+        .filter_map(|l| l.trim().split_once('\t'))
+        .filter(|(sha, _)| is_full_sha(sha))
+        .collect();
+    let find = |name: &str| refs.iter().find(|(_, r)| *r == name).map(|(s, _)| s.to_ascii_lowercase());
+    let r = git_ref.strip_prefix("refs/").unwrap_or(git_ref);
+    find(&format!("refs/heads/{r}"))
+        .or_else(|| find(&format!("refs/tags/{r}^{{}}")))
+        .or_else(|| find(&format!("refs/tags/{r}")))
+        .or_else(|| find(&format!("refs/{r}")))
+}
+
+/// One progress report from a source build.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BuildProgress {
+    /// `doctor`, `clone`, `fetch`, `worktree`, `configure`, `build`,
+    /// `copy`, `cleanup`, `install`, `verify`.
+    pub step: String,
+    /// Ninja's `[done/total]` while compiling.
+    pub done: Option<u32>,
+    pub total: Option<u32>,
+    /// The output line as printed (stdout and stderr merged).
+    pub line: String,
+}
+
+/// `[12/441] Building HIP object ...` -> (12, 441).
+pub fn ninja_progress(line: &str) -> Option<(u32, u32)> {
+    let rest = line.trim_start().strip_prefix('[')?;
+    let (inside, _) = rest.split_once(']')?;
+    let (a, b) = inside.split_once('/')?;
+    let (done, total) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+    (total > 0 && done <= total).then_some((done, total))
+}
+
+/// `=== STEP configure ...` from the build script -> `configure`.
+fn script_step(line: &str) -> Option<&str> {
+    line.trim().strip_prefix("=== STEP ")?.split_whitespace().next()
+}
+
+/// What the build script's exit codes mean.
+fn script_exit_meaning(code: i32) -> &'static str {
+    match code {
+        64 => "bad arguments",
+        65 => "an argument failed validation",
+        66 => "a toolchain part is missing (Visual Studio C++ tools, CMake, Ninja or the HIP SDK clang)",
+        67 => "cloning upstream llama.cpp failed",
+        68 => "fetching the ref failed (network, or the ref no longer exists)",
+        70 => "the ref no longer points at the pinned commit (it moved: resolve it again)",
+        71 => "creating the build worktree failed",
+        72 => "the Visual Studio environment (vcvars64.bat) failed",
+        73 => "CMake configure failed",
+        74 => "compiling failed",
+        75 => "copying the binaries out failed",
+        _ => "the build script failed",
+    }
+}
+
+/// The build script, compiled in so an installed FIDIM needs no repo
+/// checkout. Written out next to the clone (CRLF, as cmd.exe expects).
+const BUILD_FROM_REF_BAT: &str = include_str!("../../../scripts/build-from-ref.bat");
+
+fn materialize_script(dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    let p = dir.join("build-from-ref.bat");
+    let text = BUILD_FROM_REF_BAT.replace("\r\n", "\n").replace('\n', "\r\n");
+    if std::fs::read_to_string(&p).ok().as_deref() != Some(text.as_str()) {
+        std::fs::write(&p, &text).map_err(|e| Error::io(&p, e))?;
+    }
+    Ok(p)
+}
+
+/// FIDIM's own llama.cpp clone for source builds, `~/.fidim/src/llama.cpp`:
+/// a partial clone (every commit, file contents fetched on demand) that no
+/// one else checks out. Each build is a detached worktree beside it.
+pub fn source_checkout_dir() -> PathBuf {
+    Config::config_dir().join("src").join("llama.cpp")
+}
+
+/// Holds `.wt-<sha8>.lock` while a build of that commit runs.
+struct BuildLock(PathBuf);
+
+impl BuildLock {
+    fn take(path: &Path) -> Result<Self> {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                if pid != std::process::id() && crate::supervise::process_alive(pid) {
+                    return Err(upd(format!(
+                        "a build of this commit is already running (pid {pid}); wait for it or cancel it"
+                    )));
+                }
+            }
+        }
+        std::fs::write(path, std::process::id().to_string()).map_err(|e| Error::io(path, e))?;
+        Ok(BuildLock(path.to_path_buf()))
+    }
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Remove a build's worktree (and the build tree inside it) and its
+/// staging directory. Files a killed compiler held can take a moment to
+/// be released, hence the retries.
+fn cleanup_ref_build(checkout: &Path, worktree: &Path, staging: &Path) {
+    let git = |args: &[&std::ffi::OsStr]| {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(checkout).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        crate::launch::hide_console(&mut c);
+        let _ = c.status();
+    };
+    if worktree.exists() && checkout.join(".git").exists() {
+        git(&["worktree".as_ref(), "remove".as_ref(), "--force".as_ref(), worktree.as_os_str()]);
+    }
+    for dir in [worktree, staging] {
+        for attempt in 0..6 {
+            if !dir.exists() || std::fs::remove_dir_all(dir).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250 * (attempt + 1)));
+        }
+    }
+    if checkout.join(".git").exists() {
+        git(&["worktree".as_ref(), "prune".as_ref()]);
+    }
+}
+
+/// Stream a child's stdout and stderr, split on `\n` and `\r`, into one
+/// channel.
+fn pump_lines(r: impl Read + Send + 'static, tx: std::sync::mpsc::Sender<String>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(r);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    for part in String::from_utf8_lossy(&buf).split(['\r', '\n']) {
+                        let part = part.trim_end();
+                        if !part.trim().is_empty() && tx.send(part.to_string()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// How a build script run ended.
+#[derive(Debug)]
+enum ScriptEnd {
+    Exited(std::process::ExitStatus),
+    Cancelled,
+}
+
+/// Lines of output kept for the error report of a failed build: the last
+/// ones, and the ones that look like errors. A HIP compile prints tens of
+/// thousands of warnings, and when one job fails the others keep printing
+/// theirs, so the error can be far from the tail.
+#[derive(Debug, Default)]
+struct ScriptLog {
+    tail: VecDeque<String>,
+    errors: Vec<String>,
+}
+
+const TAIL_LINES: usize = 40;
+const ERROR_LINES: usize = 30;
+
+impl ScriptLog {
+    fn push(&mut self, line: &str) {
+        if self.tail.len() == TAIL_LINES {
+            self.tail.pop_front();
+        }
+        self.tail.push_back(line.to_string());
+        let t = line.trim_start();
+        let looks_like_error = t.starts_with("FAILED:")
+            || t.starts_with("CMake Error")
+            || t.starts_with("fatal:")
+            || t.starts_with("error:")
+            || t.contains(" error:")
+            || t.contains(": fatal error")
+            || t.contains(" error LNK")
+            || t.ends_with("_FAILED")
+            || t.starts_with("SHA_MISMATCH")
+            || t.starts_with("NO_");
+        if looks_like_error && self.errors.len() < ERROR_LINES && !self.errors.iter().any(|e| e == line) {
+            self.errors.push(line.to_string());
+        }
+    }
+
+    /// The error lines (when any), then the last lines.
+    fn report(&self) -> String {
+        let tail = self.tail.iter().cloned().collect::<Vec<_>>().join("\n");
+        if self.errors.is_empty() {
+            format!("Last output:\n{tail}")
+        } else {
+            format!("Errors:\n{}\nLast output:\n{tail}", self.errors.join("\n"))
+        }
+    }
+}
+
+/// Run the build script: its stdout and stderr, merged, become
+/// `BuildProgress` reports (the step from `=== STEP` lines, Ninja's
+/// `[n/m]`), and the last lines stay in `tail`. The script and everything it
+/// starts share a kill-on-close job, so `cancel` (checked five times a
+/// second) ends the whole tree, and nothing outlives an early return.
+fn run_build_script(
+    mut cmd: Command,
+    first_step: &str,
+    progress: &mut dyn FnMut(BuildProgress),
+    cancel: &AtomicBool,
+    log: &mut ScriptLog,
+) -> Result<ScriptEnd> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::launch::hide_console(&mut cmd);
+    let mut job = Some(crate::diffusion::job::KillOnCloseJob::new().map_err(|e| upd(format!("job object: {e}")))?);
+    let mut child = cmd.spawn().map_err(|e| upd(format!("spawn {:?}: {e}", cmd.get_program())))?;
+    let in_job = job.as_ref().is_some_and(|j| j.assign(&child).is_ok());
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let readers = [
+        child.stdout.take().map(|o| pump_lines(o, tx.clone())),
+        child.stderr.take().map(|e| pump_lines(e, tx.clone())),
+    ];
+    drop(tx);
+    let mut step = first_step.to_string();
+    let mut handle = |line: String, progress: &mut dyn FnMut(BuildProgress)| {
+        if let Some(s) = script_step(&line) {
+            step = s.to_string();
+        }
+        let (done, total) = match ninja_progress(&line) {
+            Some((d, t)) => (Some(d), Some(t)),
+            None => (None, None),
+        };
+        log.push(&line);
+        progress(BuildProgress { step: step.clone(), done, total, line });
+    };
+    let end = loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => handle(line, progress),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // Both pipes closed: the script is done or about to be.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break ScriptEnd::Exited(child.wait().map_err(|e| upd(format!("wait for the build: {e}")))?);
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            // Closing the job kills the script and everything it started
+            // (git, cmake, ninja, clang).
+            drop(job.take());
+            if !in_job {
+                let mut k = Command::new("taskkill");
+                k.args(["/PID", &child.id().to_string(), "/T", "/F"]);
+                crate::launch::hide_console(&mut k);
+                let _ = k.output();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            break ScriptEnd::Cancelled;
+        }
+        if let Some(s) = child.try_wait().map_err(|e| upd(format!("wait for the build: {e}")))? {
+            // Anything it left running (holding the pipes open) goes with the job.
+            drop(job.take());
+            while let Ok(line) = rx.recv_timeout(Duration::from_millis(500)) {
+                handle(line, progress);
+            }
+            break ScriptEnd::Exited(s);
+        }
+    };
+    drop(job);
+    if matches!(end, ScriptEnd::Exited(_)) {
+        for r in readers.into_iter().flatten() {
+            let _ = r.join();
+        }
+    }
+    Ok(end)
+}
+
+/// Compile `src` from source for `gpu_targets` (e.g. `gfx1201`) into the
+/// immutable `<install_root>/<label>-<sha8>-src`, then verify it without
+/// loading a model.
+///
+/// Uses one FIDIM-owned partial clone of upstream (`source_checkout_dir`,
+/// never the user's own checkouts): fetches `src.git_ref` from
+/// `src.remote_url`, refuses unless it resolves to `src.sha`, builds a
+/// detached worktree of that commit with CMake + Ninja (HIP via the HIP SDK
+/// clang, targets llama-server, llama-quantize and llama-tokenize), copies
+/// `bin` out, and removes the worktree and build tree. The toolchain doctor
+/// runs first, so a known compiler clash stops the build in seconds, not
+/// minutes. `cancel` kills the whole process tree and cleans up.
+///
+/// Fork and pull-request code is whatever its author wrote: callers ask the
+/// user before building one.
+pub fn build_from_ref(
+    cfg: &Config,
+    src: &SourceRef,
+    gpu_targets: &str,
+    progress: &mut dyn FnMut(BuildProgress),
+    cancel: &AtomicBool,
+) -> Result<InstallReport> {
+    let mut src = src.clone();
+    src.sha = src.sha.to_ascii_lowercase();
+    if src.label.trim().is_empty() {
+        src.label = SourceRef::default_label(&src.remote_url, &src.git_ref);
+    }
+    src.validate()?;
+    let gpus = normalize_gpu_targets(gpu_targets)?;
+    let name = src.git_source().display();
+    let mut say = |step: &str, line: String| progress(BuildProgress { step: step.into(), done: None, total: None, line });
+
+    let dir = source_install_dir(cfg, &src)?;
+    let exe = dir.join("bin").join("llama-server.exe");
+    if exe.is_file() {
+        say("verify", format!("{name} already built at {} — verifying only", dir.display()));
+        let verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
+        if let Some(mut m) = read_manifest(&dir) {
+            m.verify = verify.clone();
+            write_manifest(&dir, &m)?;
+        }
+        return Ok(InstallReport { tag: name, dir, source: "git-ref".into(), skipped_existing: true, verify });
+    }
+    if dir.exists() {
+        return Err(upd(format!("{} exists but holds no build; remove it and build again", dir.display())));
+    }
+
+    say("doctor", format!("checking the toolchain for {gpus}"));
+    let tc = crate::toolchain::detect(cfg);
+    let first_gfx = gpus.split(',').next().unwrap_or("gfx1201").to_string();
+    let findings = crate::toolchain::doctor_with(&tc, &first_gfx);
+    for f in &findings {
+        say("doctor", f.summary());
+    }
+    let blockers: Vec<String> = findings.iter().filter(|f| f.blocks()).map(|f| f.with_fix()).collect();
+    if !blockers.is_empty() {
+        return Err(upd(format!("the toolchain cannot build llama.cpp here:\n{}", blockers.join("\n"))));
+    }
+
+    let checkout = source_checkout_dir();
+    let src_root = checkout.parent().map(Path::to_path_buf).unwrap_or_else(|| Config::config_dir().join("src"));
+    let script = materialize_script(&src_root)?;
+    let worktree = src_root.join(format!(".wt-{}", src.sha8()));
+    let _lock = BuildLock::take(&src_root.join(format!(".wt-{}.lock", src.sha8())))?;
+    let parent = dir.parent().ok_or_else(|| upd("install dir has no parent"))?.to_path_buf();
+    std::fs::create_dir_all(&parent).map_err(|e| Error::io(&parent, e))?;
+    // Dot-prefixed, so a scan never offers a half-copied build.
+    let staging = parent.join(format!(".fidim-tmp-src-{}", src.sha8()));
+    cleanup_ref_build(&checkout, &worktree, &staging);
+
+    let mut cmd = Command::new(&script);
+    cmd.arg(&checkout)
+        .arg(&src.remote_url)
+        .arg(&src.git_ref)
+        .arg(&src.sha)
+        .arg(&staging)
+        .arg(&gpus)
+        .env("FIDIM_WORKTREE", &worktree)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    tc.apply_env(&mut cmd);
+    say("clone", format!("building {name} for {gpus} with {}", script.display()));
+    let mut log = ScriptLog::default();
+    let status = match run_build_script(cmd, "clone", progress, cancel, &mut log)? {
+        ScriptEnd::Exited(s) => s,
+        ScriptEnd::Cancelled => {
+            cleanup_ref_build(&checkout, &worktree, &staging);
+            return Err(upd(format!("build of {name} cancelled; its worktree and staging files were removed")));
+        }
+    };
+    if !status.success() {
+        cleanup_ref_build(&checkout, &worktree, &staging);
+        let code = status.code().unwrap_or(-1);
+        return Err(upd(format!(
+            "building {name} failed: {} (exit {code}). {}",
+            script_exit_meaning(code),
+            log.report()
+        )));
+    }
+
+    let mut say = |step: &str, line: String| progress(BuildProgress { step: step.into(), done: None, total: None, line });
+    let installed = (|| -> Result<()> {
+        if !staging.join("bin").join("llama-server.exe").is_file() {
+            return Err(upd("the build finished but produced no llama-server.exe"));
+        }
+        // The tables of exactly what was compiled, for compat::probe_build.
+        let source_copy = staging.join("source");
+        let caps = crate::compat::caps_from_dir(&source_copy).ok();
+        let _ = std::fs::remove_dir_all(&source_copy);
+        write_manifest(
+            &staging,
+            &Manifest {
+                tag: name.clone(),
+                source: "git-ref".into(),
+                installed_at_unix: now_unix(),
+                channel: Some(Channel::Git),
+                gfx_target: Some(gpus.clone()),
+                git: Some(src.git_source()),
+                caps,
+                ..Default::default()
+            },
+        )?;
+        say("install", format!("moving the build into {}", dir.display()));
+        let mut retries = 0;
+        loop {
+            match std::fs::rename(&staging, &dir) {
+                Ok(()) => return Ok(()),
+                Err(_) if retries < 3 => {
+                    retries += 1;
+                    std::thread::sleep(Duration::from_millis(700));
+                }
+                Err(e) => return Err(Error::io(&dir, e)),
+            }
+        }
+    })();
+    cleanup_ref_build(&checkout, &worktree, &staging);
+    installed?;
+
+    say("verify", "verifying: --version and --list-devices (no model load)".into());
+    let verify = verify_build(&exe, crate::runtime::default_prepend(cfg, &exe).as_deref());
+    if let Some(mut m) = read_manifest(&dir) {
+        m.verify = verify.clone();
+        write_manifest(&dir, &m)?;
+    }
+    Ok(InstallReport { tag: name, dir, source: "git-ref".into(), skipped_existing: false, verify })
 }
 
 // --------------------------------------------------------- unsloth install ----
@@ -2026,5 +2670,305 @@ mod tests {
         std::fs::write(&f, b"").unwrap();
         assert_eq!(sha256_file(&f).unwrap(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    // ------------------------------------------------------------ git refs ----
+
+    const K2_SHA: &str = "42adf019f76013dac873b5b43950d54d5ab27216";
+
+    fn k2_ref() -> SourceRef {
+        SourceRef {
+            remote_url: "https://github.com/ifm-ai/llama.cpp".into(),
+            git_ref: "model/K2Horizon".into(),
+            sha: K2_SHA.into(),
+            label: "ifm-ai K2Horizon fork".into(),
+        }
+    }
+
+    #[test]
+    fn source_ref_labels_and_directories() {
+        let lbl = SourceRef::default_label;
+        assert_eq!(lbl("https://github.com/ifm-ai/llama.cpp", "model/K2Horizon"), "ifm-ai K2Horizon fork");
+        assert_eq!(lbl("https://github.com/ggml-org/llama.cpp", "pull/27752/head"), "PR #27752");
+        assert_eq!(lbl("https://github.com/ifm-ai/llama.cpp", "pull/1/head"), "ifm-ai PR #1");
+        assert_eq!(lbl("https://github.com/ggml-org/llama.cpp", "b11046"), "upstream b11046");
+        assert_eq!(lbl("https://github.com/ggml-org/llama.cpp", K2_SHA), "upstream");
+        assert_eq!(lbl("https://github.com/someone/llama.cpp.git", K2_SHA), "someone fork");
+        assert_eq!(lbl("https://gitlab.com/group/llama.cpp.git", "main"), "group main fork");
+        assert_eq!(pull_number("pull/27752/head"), Some(27752));
+        assert_eq!(pull_number("pull/x/head"), None);
+        assert_eq!(pull_number("model/K2Horizon"), None);
+
+        assert_eq!(sanitize_label("ifm-ai K2Horizon fork"), "ifm-ai-K2Horizon-fork");
+        assert_eq!(sanitize_label("PR #27752"), "PR-27752");
+        assert_eq!(sanitize_label("  ../..\\evil: name  "), "evil-name");
+        assert_eq!(sanitize_label("日本語"), "git");
+        assert_eq!(sanitize_label(&"x".repeat(100)).len(), 48);
+
+        let mut cfg = Config::default_for_machine();
+        cfg.install_root = Some(PathBuf::from(r"C:\fidim-builds"));
+        assert_eq!(
+            source_install_dir(&cfg, &k2_ref()).unwrap(),
+            PathBuf::from(r"C:\fidim-builds\ifm-ai-K2Horizon-fork-42adf019-src")
+        );
+        let g = k2_ref().git_source();
+        assert_eq!(g.display(), "ifm-ai K2Horizon fork @42adf01");
+        assert_eq!(GitSource { label: String::new(), ..g.clone() }.display(), "model/K2Horizon @42adf01");
+    }
+
+    /// Everything in a SourceRef reaches git and cmd.exe as an argument and
+    /// may have come from a model card.
+    #[test]
+    fn source_ref_validation_is_strict() {
+        assert!(k2_ref().validate().is_ok());
+        let with = |f: &dyn Fn(&mut SourceRef)| {
+            let mut r = k2_ref();
+            f(&mut r);
+            r.validate()
+        };
+        for bad_url in [
+            "http://github.com/ifm-ai/llama.cpp",
+            "https://",
+            "https://github.com/a b/llama.cpp",
+            "https://github.com/a/llama.cpp&calc",
+            "https://github.com/a/%USERPROFILE%",
+            "https://github.com/a/\"x\"",
+            "https://github.com/a/llama.cpp|x",
+            "file:///C:/x",
+            "--upload-pack=calc",
+        ] {
+            assert!(with(&|r| r.remote_url = bad_url.into()).is_err(), "{bad_url}");
+        }
+        for bad_ref in ["", "-x", "--upload-pack=calc", "/abs", "a/../b", "a//b", "a b", "a;b", "x.lock", "x/", "x.", "a&b", "%x%", "^x"] {
+            assert!(with(&|r| r.git_ref = bad_ref.into()).is_err(), "{bad_ref:?}");
+        }
+        for ok_ref in ["main", "pull/27752/head", "b11046", "feat/new-arch_v2.1", K2_SHA] {
+            assert!(with(&|r| r.git_ref = ok_ref.into()).is_ok(), "{ok_ref}");
+        }
+        for bad_sha in ["42adf01", "zz", &format!("{K2_SHA}0")] {
+            assert!(with(&|r| r.sha = bad_sha.to_string()).is_err(), "{bad_sha}");
+        }
+        assert!(with(&|r| r.label = "two\nlines".into()).is_err());
+        assert!(with(&|r| r.label = "x".repeat(81)).is_err());
+
+        assert_eq!(normalize_gpu_targets("gfx1201").unwrap(), "gfx1201");
+        assert_eq!(normalize_gpu_targets(" GFX1100; gfx1201,gfx1201 ").unwrap(), "gfx1100,gfx1201");
+        assert_eq!(normalize_gpu_targets("gfx90a").unwrap(), "gfx90a");
+        for bad in ["", "1201", "gfx", "gfx1201&calc", "gfx120X", "sm_90"] {
+            assert!(normalize_gpu_targets(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn gpu_targets_from_hipinfo_or_names() {
+        let hip = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/hipinfo.txt")).unwrap();
+        assert_eq!(default_gpu_targets(Some(&hip), &[]).as_deref(), Some("gfx1201"));
+        let flags = "device#   0\nName:  X\nisIntegrated: 0\ngcnArchName:  gfx90a:sramecc+:xnack-\ndevice# 1\nName: iGPU\nisIntegrated: 1\ngcnArchName: gfx1036\n";
+        assert_eq!(default_gpu_targets(Some(flags), &[]).as_deref(), Some("gfx90a"), "feature flags cut, iGPU skipped");
+        let names = vec!["AMD Radeon AI PRO R9700".to_string(), "AMD Radeon(TM) Graphics".to_string(), "AMD Radeon RX 7900 XTX".to_string()];
+        assert_eq!(default_gpu_targets(None, &names).as_deref(), Some("gfx1201,gfx1100"));
+        assert_eq!(default_gpu_targets(Some(""), &["NVIDIA GeForce RTX 3060".to_string()]), None);
+    }
+
+    #[test]
+    fn ls_remote_picks_the_commit() {
+        let out = format!(
+            "{a}\trefs/heads/main\n{b}\trefs/heads/model/K2Horizon\n{c}\trefs/tags/v1\n{d}\trefs/tags/v1^{{}}\n\
+             {e}\trefs/pull/27752/head\n{f}\trefs/tags/model/K2Horizon\n",
+            a = "a".repeat(40),
+            b = K2_SHA,
+            c = "c".repeat(40),
+            d = "d".repeat(40),
+            e = "e".repeat(40),
+            f = "f".repeat(40)
+        );
+        assert_eq!(pick_ls_remote(&out, "model/K2Horizon").as_deref(), Some(K2_SHA), "a branch beats a tag");
+        assert_eq!(pick_ls_remote(&out, "refs/heads/model/K2Horizon").as_deref(), Some(K2_SHA));
+        assert_eq!(pick_ls_remote(&out, "v1"), Some("d".repeat(40)), "an annotated tag, peeled to its commit");
+        assert_eq!(pick_ls_remote(&out, "pull/27752/head"), Some("e".repeat(40)));
+        assert_eq!(pick_ls_remote(&out, "K2Horizon"), None, "no suffix guessing");
+        assert_eq!(pick_ls_remote("garbage\tline\n", "main"), None);
+        assert_eq!(pin_ref("https://github.com/ifm-ai/llama.cpp", &K2_SHA.to_uppercase()).unwrap(), K2_SHA);
+        assert!(pin_ref("https://github.com/ifm-ai/llama.cpp", "42adf019").unwrap_err().to_string().contains("40 digits"));
+        assert!(pin_ref("https://github.com/ifm-ai/llama.cpp", "-x").is_err(), "validated before git runs");
+    }
+
+    #[test]
+    fn ninja_and_script_lines() {
+        assert_eq!(ninja_progress("[12/441] Building HIP object ggml/src/x.obj"), Some((12, 441)));
+        assert_eq!(ninja_progress("  [441/441] Linking CXX executable bin\\llama-server.exe"), Some((441, 441)));
+        assert_eq!(ninja_progress("[0/0] nothing"), None);
+        assert_eq!(ninja_progress("[5/4] odd"), None);
+        assert_eq!(ninja_progress("-- The C compiler identification is Clang 21.0.0"), None);
+        assert_eq!(ninja_progress("[x/y]"), None);
+        assert_eq!(script_step("=== STEP configure (HIP, gfx1201, Release)"), Some("configure"));
+        assert_eq!(script_step("=== BUILD_EXIT 0"), None);
+        assert!(script_exit_meaning(70).contains("moved"));
+        assert!(script_exit_meaning(1).contains("failed"));
+        // The embedded script goes out with CRLF line ends, as cmd.exe expects.
+        let dir = std::env::temp_dir().join(format!("fidim-script-{}", std::process::id()));
+        let p = materialize_script(&dir).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.starts_with("@echo off\r\n") && !text.contains("\r\r") && text.lines().count() > 50);
+        assert!(text.contains("worktree add --quiet --detach") && text.contains("FETCH_HEAD^{commit}"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn write_bat(dir: &Path, name: &str, lines: &[&str]) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, lines.join("\r\n") + "\r\n").unwrap();
+        p
+    }
+
+    #[test]
+    fn build_script_output_and_exit() {
+        let dir = std::env::temp_dir().join(format!("fidim-runscript-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bat = write_bat(
+            &dir,
+            "fake-build.bat",
+            &[
+                "@echo off",
+                "echo === STEP build",
+                "echo [1/3] Building a",
+                "echo oops 1>&2",
+                "echo x.cpp:1:2: error: boom",
+                "echo x.cpp:3:4: warning: loud",
+                "echo [3/3] Linking",
+                "exit /b 74",
+            ],
+        );
+        let mut seen = Vec::new();
+        let mut log = ScriptLog::default();
+        let end = run_build_script(Command::new(&bat), "clone", &mut |p| seen.push(p), &AtomicBool::new(false), &mut log).unwrap();
+        match end {
+            ScriptEnd::Exited(s) => assert_eq!(s.code(), Some(74)),
+            e => panic!("{e:?}"),
+        }
+        assert!(seen.iter().any(|p| p.step == "build" && p.done == Some(1) && p.total == Some(3)), "{seen:?}");
+        assert!(seen.iter().any(|p| p.line == "oops"), "stderr is merged: {seen:?}");
+        assert!(log.tail.iter().any(|l| l == "[3/3] Linking"));
+        assert_eq!(log.errors, ["x.cpp:1:2: error: boom"]);
+        assert!(log.report().starts_with("Errors:\nx.cpp:1:2: error: boom\nLast output:\n"), "{}", log.report());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Cancel kills the whole tree: a grandchild the script started in the
+    /// background never gets to write its file.
+    #[test]
+    fn build_script_cancel_kills_the_tree() {
+        let dir = std::env::temp_dir().join(format!("fidim-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_bat(&dir, "grandchild.bat", &["@echo off", "ping -n 4 127.0.0.1 >nul", "echo late> \"%~dp0late.txt\""]);
+        let bat = write_bat(
+            &dir,
+            "long-build.bat",
+            &["@echo off", "start \"\" /b \"%~dp0grandchild.bat\"", "echo [1/9] start", "ping -n 30 127.0.0.1 >nul", "echo [9/9] never"],
+        );
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let mut log = ScriptLog::default();
+        let end = run_build_script(
+            Command::new(&bat),
+            "build",
+            &mut |p| {
+                if p.done == Some(1) {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            },
+            &cancel,
+            &mut log,
+        )
+        .unwrap();
+        assert!(matches!(end, ScriptEnd::Cancelled), "{end:?}");
+        assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(!dir.join("late.txt").exists(), "the background grandchild survived the cancel");
+        assert!(!log.tail.iter().any(|l| l.contains("never")));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The paths of `build_from_ref` that finish before the toolchain is
+    /// touched: bad input, and a commit that is already built.
+    #[test]
+    fn build_from_ref_refuses_early() {
+        let root = std::env::temp_dir().join(format!("fidim-fromref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cfg = Config::default_for_machine();
+        cfg.install_root = Some(root.clone());
+        let cancel = AtomicBool::new(false);
+        let mut quiet = |_: BuildProgress| {};
+        let bad = SourceRef { sha: "42adf01".into(), ..k2_ref() };
+        assert!(build_from_ref(&cfg, &bad, "gfx1201", &mut quiet, &cancel).unwrap_err().to_string().contains("40-digit"));
+        assert!(build_from_ref(&cfg, &k2_ref(), "gfx1201;calc", &mut quiet, &cancel).is_err());
+        let dir = source_install_dir(&cfg, &k2_ref()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = build_from_ref(&cfg, &k2_ref(), "gfx1201", &mut quiet, &cancel).unwrap_err().to_string();
+        assert!(e.contains("holds no build"), "{e}");
+        // Already built: verified again, nothing rebuilt; an empty label
+        // becomes the default one.
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin").join("llama-server.exe"), b"").unwrap();
+        let mut lines = Vec::new();
+        let r = build_from_ref(&cfg, &k2_ref(), "gfx1201", &mut |p| lines.push(p.line), &cancel).unwrap();
+        assert!(r.skipped_existing);
+        assert_eq!(r.tag, "ifm-ai K2Horizon fork @42adf01");
+        assert_eq!(r.source, "git-ref");
+        assert!(lines[0].contains("already built"), "{lines:?}");
+        let unlabeled = SourceRef { label: String::new(), ..k2_ref() };
+        assert!(build_from_ref(&cfg, &unlabeled, "gfx1201", &mut quiet, &cancel).unwrap().skipped_existing);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Fields this version does not know survive a rewrite; the git and caps
+    /// blocks round-trip, and a malformed one reads as none.
+    #[test]
+    fn manifest_keeps_what_it_does_not_know() {
+        let text = format!(
+            r#"{{"tag":"ifm-ai K2Horizon fork @42adf01","source":"git-ref","installed_at_unix":1,"assets":[],
+                "verify":{{"version":"b10676","commit":"42adf019f","devices":[],"hip_ok":true,"detail":""}},
+                "channel":"git","gfx_target":"gfx1201",
+                "git":{{"remote":"https://github.com/ifm-ai/llama.cpp","git_ref":"model/K2Horizon","commit":"{K2_SHA}","label":"ifm-ai K2Horizon fork"}},
+                "caps":{{"arches":["k2-horizon"],"tokenizer_pres":["k2-horizon"],"ggml_type_count":43,"files":[]}},
+                "from_the_future":{{"x":1}}}}"#
+        );
+        let m: Manifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(m.channel, Some(Channel::Git));
+        assert_eq!(m.git.as_ref().unwrap().display(), "ifm-ai K2Horizon fork @42adf01");
+        assert_eq!(m.caps.as_ref().unwrap().ggml_type_count, Some(43));
+        let back = serde_json::to_value(&m).unwrap();
+        assert_eq!(back["from_the_future"], serde_json::json!({"x": 1}));
+        assert_eq!(back["git"]["commit"], K2_SHA);
+        let broken = text.replace(r#""caps":{"#, r#""caps":5,"old_caps":{"#).replace(r#""git":{"#, r#""git":"nope","old_git":{"#);
+        let m: Manifest = serde_json::from_str(&broken).unwrap();
+        assert!(m.git.is_none() && m.caps.is_none());
+        assert_eq!(m.channel, Some(Channel::Git));
+        // Without any of the new fields: an older manifest still reads.
+        let old: Manifest = serde_json::from_str(
+            r#"{"tag":"b10819","source":"prebuilt","installed_at_unix":1,"assets":[],"verify":{"version":null,"commit":null,"devices":[],"hip_ok":true,"detail":""}}"#,
+        )
+        .unwrap();
+        assert!(old.git.is_none() && old.caps.is_none() && old.extra.is_empty());
+        let out = serde_json::to_string(&old).unwrap();
+        assert!(!out.contains("\"git\"") && !out.contains("\"caps\""), "{out}");
+    }
+
+    #[test]
+    fn git_builds_never_rank_or_promote_as_upstream() {
+        let builds = vec![test_build("b10984-rocm", "b10984", Channel::Upstream), test_build("ifm-ai-K2Horizon-fork-42adf019-src", "b10676", Channel::Git)];
+        assert_eq!(newest_installed(&builds).unwrap().tag, "b10984-rocm");
+        let mut newer = builds.clone();
+        newer[1].version = Some("b99999".into());
+        assert_eq!(newest_installed(&newer).unwrap().tag, "b10984-rocm", "a fork's own history count never wins");
+        assert!(newest_installed(&builds[1..]).is_none());
+        let t = PromoteTarget { channel: Channel::Git, has_llama_server: true, has_runner: false, features: vec![] };
+        let p = test_profile("dd", None, r"C:\b\b10984-rocm");
+        assert!(promote_skip_reason(&p, Path::new(r"C:\b\ifm-ai-K2Horizon-fork-42adf019-src"), &t, &PromoteScope::All)
+            .unwrap()
+            .contains("git ref"));
+        let other = PromoteTarget { channel: Channel::Other, ..t };
+        assert!(promote_skip_reason(&p, Path::new(r"C:\b\x"), &other, &PromoteScope::All).is_some());
     }
 }

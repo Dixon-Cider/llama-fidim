@@ -1,0 +1,28 @@
+{
+ "number": 27752,
+ "html_url": "https://github.com/ggml-org/llama.cpp/pull/27752",
+ "state": "open",
+ "title": "model : add GLM-5.3-Flash (glm5next)",
+ "draft": false,
+ "merged": false,
+ "merged_at": null,
+ "mergeable": false,
+ "mergeable_state": "dirty",
+ "commits": 11,
+ "created_at": "2026-08-26T16:07:23Z",
+ "updated_at": "2026-09-11T02:09:38Z",
+ "head": {
+  "ref": "glm5next/add-glm-5.3-flash",
+  "sha": "1d0c76f3c6d030fdfc269aa27db6334ea2834cec",
+  "repo": {
+   "full_name": "a-contributor/llama.cpp"
+  }
+ },
+ "base": {
+  "ref": "master",
+  "sha": "e107984bcffcfd701e82738092a2b000b6fda7a2",
+  "repo": {
+   "full_name": "ggml-org/llama.cpp"
+  }
+ }
+}

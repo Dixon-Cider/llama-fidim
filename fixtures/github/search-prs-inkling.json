@@ -1,0 +1,28 @@
+{
+ "total_count": 2,
+ "incomplete_results": false,
+ "items": [
+  {
+   "number": 25731,
+   "title": "Add TML Inkling architecture",
+   "state": "open",
+   "draft": true,
+   "html_url": "https://github.com/ggml-org/llama.cpp/pull/25731",
+   "pull_request": {
+    "url": "https://api.github.com/repos/ggml-org/llama.cpp/pulls/25731",
+    "merged_at": null
+   }
+  },
+  {
+   "number": 24523,
+   "title": "Preliminary MiniMax-M3 support",
+   "state": "closed",
+   "draft": false,
+   "html_url": "https://github.com/ggml-org/llama.cpp/pull/24523",
+   "pull_request": {
+    "url": "https://api.github.com/repos/ggml-org/llama.cpp/pulls/24523",
+    "merged_at": null
+   }
+  }
+ ]
+}

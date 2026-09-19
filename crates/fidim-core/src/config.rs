@@ -60,6 +60,12 @@ pub struct Config {
     /// (`HF_TOKEN` in the environment takes precedence).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_token: Option<String>,
+    /// GitHub token for the build resolver's API calls (`GITHUB_TOKEN` in
+    /// the environment takes precedence). Optional: without one GitHub
+    /// allows 60 API requests an hour per IP address and 10 searches a
+    /// minute; with one, 5000 and 30. Read-only public access is enough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_token: Option<String>,
     /// Default keep-alive interval for launched servers (seconds; 0 = off).
     /// A 1-token request this often stops WDDM from evicting the model when
     /// the displays power off. OFF by default: the root cause is the PCIe
@@ -217,6 +223,7 @@ impl Config {
             llama_cpp_source: None,
             source_build_script: None,
             hf_token: None,
+            github_token: None,
             keep_alive_seconds: default_keep_alive(),
             extra: serde_json::Map::new(),
         }

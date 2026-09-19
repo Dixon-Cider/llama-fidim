@@ -1,0 +1,46 @@
+[
+ {
+  "tag_name": "b11046",
+  "name": "b11046",
+  "published_at": "2026-09-18T23:56:03Z",
+  "html_url": "https://github.com/ggml-org/llama.cpp/releases/tag/b11046",
+  "prerelease": true,
+  "body": "<details open>",
+  "assets": [
+   {
+    "name": "llama-b11046-bin-win-cpu-x64.zip",
+    "size": 18454127,
+    "digest": "sha256:dece5ebc80fbc48063540aa4c48fdc91c59328b7ea44c2bdf6e85ec4383b5fc7",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b11046/llama-b11046-bin-win-cpu-x64.zip"
+   },
+   {
+    "name": "llama-b11046-bin-win-rocm-10.0-x64.zip",
+    "size": 256107315,
+    "digest": "sha256:a3d2a039eed798965c2c5299646a2f40b6e1f37e928155874f8ed7394dcad5a5",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b11046/llama-b11046-bin-win-rocm-10.0-x64.zip"
+   }
+  ]
+ },
+ {
+  "tag_name": "b11045",
+  "name": "b11045",
+  "published_at": "2026-09-18T22:30:38Z",
+  "html_url": "https://github.com/ggml-org/llama.cpp/releases/tag/b11045",
+  "prerelease": true,
+  "body": "<details open>",
+  "assets": [
+   {
+    "name": "llama-b11045-bin-win-cpu-x64.zip",
+    "size": 18453864,
+    "digest": "sha256:5cdd6cd5168a1c0c84b405f7fd42cce290c37b80a4867605c758f958a64bd166",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b11045/llama-b11045-bin-win-cpu-x64.zip"
+   },
+   {
+    "name": "llama-b11045-bin-win-rocm-10.0-x64.zip",
+    "size": 256107369,
+    "digest": "sha256:36e30f6172a99fa3bfb39baa28082f405f53353ab33957218199219aa07a2377",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b11045/llama-b11045-bin-win-rocm-10.0-x64.zip"
+   }
+  ]
+ }
+]

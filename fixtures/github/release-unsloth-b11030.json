@@ -1,0 +1,52 @@
+{
+ "tag_name": "b11030-mix-5ff778e",
+ "name": "llama.cpp prebuilt b11030-mix-5ff778e",
+ "published_at": "2026-09-18T15:36:14Z",
+ "html_url": "https://github.com/unslothai/llama.cpp/releases/tag/b11030-mix-5ff778e",
+ "prerelease": false,
+ "body": "Automated Unsloth llama.cpp CUDA + ROCm + Vulkan + macOS + CPU prebuild for upstream [b11030](https://github.com/ggml-org/llama.cpp/releases/tag/b11030), merged with:\r\n\r\n- Qwen3.8-Flash-Next MTP Fix (2x faster now)\r\n- DiffusionGemma ([#24423](https://github.com/ggml-org/llama.cpp/pull/24423), commit [12e0a96](https://github.com/ggml-org/llama.cpp/pull/24423/commits/12e0a9627d02c6395fd4bbf2aadff93d0d46a0e4))\r\n- Add TML Inkling architecture ([#25731](https://github.com/ggml-org/llama.cpp/pull/25731), commit [946fc11](https://github.com/ggml-org/llama.cpp/pull/25731/commits/946fc11d1afb1e6cd316e853f1b23487754a74b9))\r\n- kimi-k3 : the MoonViT-3d vision tower and full-size loading fixes ([unslothai/llama.cpp#70](https://github.com/unslothai/llama.cpp/pull/70), commit [883f2c9](https://github.com/unslothai/llama.cpp/pull/70/commits/883f2c9ba78f3847148454adf025da29385fff3e))\r\n- IQ1_XS, IQ1_XXS, IQ1_XXXS: three quant types below IQ1_S ([unslothai/llama.cpp#61](https://github.com/unslothai/llama.cpp/pull/61), commit [46cbf0e](https://github.com/unslothai/llama.cpp/pull/61/commits/46cbf0e95786fe8f5b7c0e86d57aaf8f8eceea7f))\r\n- sampling: index penalties by token id instead of scanning every candidate ([unslothai/llama.cpp#95](https://github.com/unslothai/llama.cpp/pull/95), commit [3db8cb5](https://github.com/unslothai/llama.cpp/pull/95/commits/3db8cb5b2e9bf291057b9f19960e8601a162da81))\r\n- model: add GLM-5-Next (GLM-5.3-Flash) ([#27754](https://github.com/ggml-org/llama.cpp/pull/27754), commit [86ebfef](https://github.com/ggml-org/llama.cpp/pull/27754/commits/86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9))\r\n- llama: batched readahead for lazily read gather tables ([unslothai/llama.cpp#137](https://github.com/unslothai/llama.cpp/pull/137), commit [4e1865e](https://github.com/unslothai/llama.cpp/pull/137/commits/4e1865e34ec5f6ca39403215c89129c13731be70))\r\n- ggml-cuda: avoid direct ROCm_Host compute on HIP integrated GPUs (port of ggml-org#25863) ([unslothai/llama.cpp#158](https://github.com/unslothai/llama.cpp/pull/158), commit [abfc45b](https://github.com/unslothai/llama.cpp/pull/158/commits/abfc45b9cb21eae4848cb82196e659f42c9a8341))\r\n- ggml-cuda: use cudaMemcpyDefault in the ggml_cuda_cpy 2D fast path ([unslothai/llama.cpp#157](https://github.com/unslothai/llama.cpp/pull/157), commit [6c6da89](https://github.com/unslothai/llama.cpp/pull/157/commits/6c6da89266ba7839d825c9997782af4f4d26b81b))\r\n- ggml-cuda: make GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 actually disable it, and say so on HIP ([unslothai/llama.cpp#149](https://github.com/unslothai/llama.cpp/pull/149), commit [b65a2dc](https://github.com/unslothai/llama.cpp/pull/149/commits/b65a2dce12c14a489e19a059cb6ee59112f1b733))\r\n- MTP for Qwen3.8-Flash-Next ([unslothai/llama.cpp#144](https://github.com/unslothai/llama.cpp/pull/144), commit [ca14269](https://github.com/unslothai/llama.cpp/pull/144/commits/ca1426903fabe9af26cd10c42034cb4bbd2e0e11))\r\n- llama: map each contiguous run of a context's tensors, not one span over all of them ([unslothai/llama.cpp#152](https://github.com/unslothai/llama.cpp/pull/152), commit [b2b5ed9](https://github.com/unslothai/llama.cpp/pull/152/commits/b2b5ed9ff86427a530b762a45d3fdbd453bcd4e8))\r\n- mtmd: test that every projector is registered and uniquely named ([unslothai/llama.cpp#176](https://github.com/unslothai/llama.cpp/pull/176), commit [09ce1a4](https://github.com/unslothai/llama.cpp/pull/176/commits/09ce1a4d2939844e211f7b4d30a296f4c1aed9a8))",
+ "assets": [
+  {
+   "name": "app-b11030-mix-5ff778e-windows-x64-rocm-gfx103X.zip",
+   "size": 150817706,
+   "digest": "sha256:0578bdad7037a500d9abe64fd8e7da5d622d62b4192d2d03157bda611833f80e",
+   "browser_download_url": "https://github.com/unslothai/llama.cpp/releases/download/b11030-mix-5ff778e/app-b11030-mix-5ff778e-windows-x64-rocm-gfx103X.zip"
+  },
+  {
+   "name": "app-b11030-mix-5ff778e-windows-x64-rocm-gfx110X.zip",
+   "size": 170338516,
+   "digest": "sha256:75f0fcb4c39560ef6505592efde7299b28ec7361a9568e8ffab6c107e5f38029",
+   "browser_download_url": "https://github.com/unslothai/llama.cpp/releases/download/b11030-mix-5ff778e/app-b11030-mix-5ff778e-windows-x64-rocm-gfx110X.zip"
+  },
+  {
+   "name": "app-b11030-mix-5ff778e-windows-x64-rocm-gfx1150.zip",
+   "size": 95106018,
+   "digest": "sha256:a41ff680f7643c16245aaa640bcca4042d88b4efdfef19033740c34ef94cde4d",
+   "browser_download_url": "https://github.com/unslothai/llama.cpp/releases/download/b11030-mix-5ff778e/app-b11030-mix-5ff778e-windows-x64-rocm-gfx1150.zip"
+  },
+  {
+   "name": "app-b11030-mix-5ff778e-windows-x64-rocm-gfx1151.zip",
+   "size": 99967564,
+   "digest": "sha256:22016e77913d0c1e4fea4cc8a5737f70b4c5838f58bb74fcc031fa5680ba82e8",
+   "browser_download_url": "https://github.com/unslothai/llama.cpp/releases/download/b11030-mix-5ff778e/app-b11030-mix-5ff778e-windows-x64-rocm-gfx1151.zip"
+  },
+  {
+   "name": "app-b11030-mix-5ff778e-windows-x64-rocm-gfx120X.zip",
+   "size": 494371218,
+   "digest": "sha256:c780a9bda3ce315dee42e0a3045a7884dd9e2d46ec1d6d34c76e42bfecaa9557",
+   "browser_download_url": "https://github.com/unslothai/llama.cpp/releases/download/b11030-mix-5ff778e/app-b11030-mix-5ff778e-windows-x64-rocm-gfx120X.zip"
+  },
+  {
+   "name": "app-b11030-mix-5ff778e-windows-x64-rocm-gfx908.zip",
+   "size": 99394910,
+   "digest": "sha256:a42fb93a6dd347b30521cd1d3278e9127a4dc9023beb16c625a302aad6d1ed2e",
+   "browser_download_url": "https://github.com/unslothai/llama.cpp/releases/download/b11030-mix-5ff778e/app-b11030-mix-5ff778e-windows-x64-rocm-gfx908.zip"
+  },
+  {
+   "name": "app-b11030-mix-5ff778e-windows-x64-rocm-gfx90a.zip",
+   "size": 212559640,
+   "digest": "sha256:d5309d048a0a36a96d7bd1f35804aa9cfcea06baf5640ca3d0bff101b05cc9c6",
+   "browser_download_url": "https://github.com/unslothai/llama.cpp/releases/download/b11030-mix-5ff778e/app-b11030-mix-5ff778e-windows-x64-rocm-gfx90a.zip"
+  }
+ ]
+}
