@@ -542,7 +542,7 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
     if plan.blocked {
         bail!("the plan has errors (above); nothing was done");
     }
-    if plan.needs_consent {
+    if plan.requires_consent() {
         let text = plan.consent.clone().unwrap_or_default();
         if !o.allow_fork {
             bail!("{text}\nPass --allow-fork to build it, or --build none to download the files only; nothing was done.");
@@ -552,7 +552,11 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
         }
     }
     if plan.steps.is_empty() {
-        println!("nothing to do");
+        if json {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            println!("nothing to do");
+        }
         return Ok(());
     }
     if !o.yes && !ask("\nGo ahead?")? {
@@ -603,8 +607,10 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
 
 /// Progress on the terminal: one line per step, a download's bytes and
 /// speed rewritten in place (a line per tenth when not a terminal), a
-/// build's Ninja count every 5%. With --json, one event per line.
+/// build's Ninja count every 5%. With --json, nothing: stdout is one JSON
+/// document, the result, as with `fidim update --source`.
 struct Printer<'a> {
+    out: Box<dyn Write + 'a>,
     plan: &'a WizardPlan,
     json: bool,
     tty: bool,
@@ -618,10 +624,15 @@ struct Printer<'a> {
 
 impl<'a> Printer<'a> {
     fn new(plan: &'a WizardPlan, json: bool) -> Self {
+        Printer::to(Box::new(std::io::stdout()), std::io::stdout().is_terminal(), plan, json)
+    }
+
+    fn to(out: Box<dyn Write + 'a>, tty: bool, plan: &'a WizardPlan, json: bool) -> Self {
         Printer {
+            out,
             plan,
             json,
-            tty: std::io::stdout().is_terminal(),
+            tty,
             last_step: None,
             last_print: Instant::now(),
             last_tenth: 0,
@@ -633,16 +644,13 @@ impl<'a> Printer<'a> {
 
     fn finish_line(&mut self) {
         if self.open_line {
-            println!();
+            let _ = writeln!(self.out);
             self.open_line = false;
         }
     }
 
     fn event(&mut self, e: &WizardEvent) {
         if self.json {
-            if let Ok(s) = serde_json::to_string(e) {
-                println!("{s}");
-            }
             return;
         }
         let n = self.plan.steps.len();
@@ -653,23 +661,23 @@ impl<'a> Printer<'a> {
             self.last_done = 0;
             self.stage.clear();
             if let Some(s) = self.plan.steps.get(e.step) {
-                println!("== [{}/{n}] {}", e.step + 1, s.title);
+                let _ = writeln!(self.out, "== [{}/{n}] {}", e.step + 1, s.title);
             }
         }
         match e.status {
             StepStatus::Failed => {
                 self.finish_line();
-                println!("   failed: {}", e.line.as_deref().unwrap_or("?"));
+                let _ = writeln!(self.out, "   failed: {}", e.line.as_deref().unwrap_or("?"));
                 return;
             }
             StepStatus::Done => {
                 self.finish_line();
-                println!("   done");
+                let _ = writeln!(self.out, "   done");
                 return;
             }
             StepStatus::Skipped => {
                 self.finish_line();
-                println!("   skipped");
+                let _ = writeln!(self.out, "   skipped");
                 return;
             }
             _ => {}
@@ -684,12 +692,12 @@ impl<'a> Printer<'a> {
             if self.tty && due {
                 let bps = e.bps.unwrap_or(0.0);
                 let eta = if bps > 0.0 && total > done { format!("  {}", eta((total - done) as f64 / bps)) } else { String::new() };
-                print!("\r   {:<11} {} / {}  {:>6.1} MB/s{eta}   ", stage, gib(done), gib(total), bps / 1e6);
-                std::io::stdout().flush().ok();
+                let _ = write!(self.out, "\r   {:<11} {} / {}  {:>6.1} MB/s{eta}   ", stage, gib(done), gib(total), bps / 1e6);
+                self.out.flush().ok();
                 self.open_line = true;
                 self.last_print = now;
             } else if !self.tty && (tenth > self.last_tenth || stage != self.stage) {
-                println!("   {stage} {} / {}", gib(done), gib(total));
+                let _ = writeln!(self.out, "   {stage} {} / {}", gib(done), gib(total));
                 self.last_tenth = tenth;
             }
             self.stage = stage;
@@ -699,7 +707,7 @@ impl<'a> Printer<'a> {
         if let Some(stage) = &e.stage {
             if *stage != self.stage {
                 self.finish_line();
-                println!("   -- {stage}");
+                let _ = writeln!(self.out, "   -- {stage}");
                 self.stage = stage.clone();
             }
         }
@@ -707,19 +715,19 @@ impl<'a> Printer<'a> {
             (Some(d), Some(t)) if t > 0 => {
                 if d == t || d < self.last_done || (d - self.last_done) * 20 >= t {
                     self.last_done = d;
-                    println!("   [{d}/{t}] {}%", d * 100 / t);
+                    let _ = writeln!(self.out, "   [{d}/{t}] {}%", d * 100 / t);
                 }
             }
             // Compiler warnings run to thousands of lines; a failure's last
             // lines come back in the error anyway.
             _ if self.stage == "build" => {
                 if let Some(l) = e.line.as_deref().filter(|l| l.contains("error") || l.contains("FAILED")) {
-                    println!("   {l}");
+                    let _ = writeln!(self.out, "   {l}");
                 }
             }
             _ => {
                 if let Some(l) = &e.line {
-                    println!("   {l}");
+                    let _ = writeln!(self.out, "   {l}");
                 }
             }
         }
@@ -747,6 +755,68 @@ mod tests {
         assert_eq!(build_choice(""), BuildChoice::Auto);
         assert_eq!(build_choice("none"), BuildChoice::Skip);
         assert_eq!(build_choice(r"C:\b\b10984-rocm"), BuildChoice::Installed(PathBuf::from(r"C:\b\b10984-rocm")));
+    }
+
+    /// A plan of one download, as `plan` makes it.
+    fn one_download(title: &str) -> WizardPlan {
+        serde_json::from_value(serde_json::json!({
+            "repo": "a/b", "sha": "0".repeat(40), "dest_root": r"C:\m", "dest_dir": r"C:\m",
+            "choice": { "label": "Q8_0", "quant": "Q8_0", "files": [{ "path": "m.gguf", "size": 100, "sha256": null }],
+                        "total_size": 100, "first_file": "m.gguf" },
+            "steps": [{ "title": title, "detail": "", "needs_consent": false,
+                        "action": { "kind": "download", "role": "model", "file": { "path": "m.gguf", "size": 100, "sha256": null },
+                                    "dest": r"C:\m\m.gguf", "have": 0, "present": false } }],
+            "notes": [], "blocked": false, "needs_consent": false, "download_bytes": 100, "total_bytes": 100,
+            "engine": "llama-server", "gated": "no", "build_sources": [], "build_choice": { "kind": "auto" },
+            "toolchain": [], "profile_opts": {}, "devices": []
+        }))
+        .unwrap()
+    }
+
+    fn progress(plan: &WizardPlan, json: bool, events: &[WizardEvent]) -> String {
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut p = Printer::to(Box::new(Shared(buf.clone())), false, plan, json);
+        for e in events {
+            p.event(e);
+        }
+        p.finish_line();
+        drop(p);
+        let out = buf.borrow().clone();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn download_events() -> Vec<WizardEvent> {
+        let at = |done| WizardEvent {
+            step: 0, status: StepStatus::Running, stage: Some("downloading".into()), file: Some("m.gguf".into()),
+            done: Some(done), total: Some(100), bps: Some(1e6), line: None,
+        };
+        let done = WizardEvent { step: 0, status: StepStatus::Done, stage: None, file: None, done: None, total: None, bps: None, line: None };
+        vec![at(0), at(50), at(100), done]
+    }
+
+    /// With --json, stdout is the one result document: no progress lines.
+    #[test]
+    fn json_progress_prints_nothing() {
+        let plan = one_download("Download m.gguf (the model)");
+        assert_eq!(progress(&plan, true, &download_events()), "");
+        let text = progress(&plan, false, &download_events());
+        assert!(text.starts_with("== [1/1] Download m.gguf (the model)
+"), "{text}");
+        assert!(text.contains("
+   downloading 1 KiB / 1 KiB
+"), "{text}");
+        assert!(text.ends_with("   done
+"), "{text}");
     }
 
     #[test]
