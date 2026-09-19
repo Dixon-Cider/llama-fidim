@@ -16,6 +16,7 @@ pub mod gguf;
 pub mod hf;
 pub mod launch;
 pub mod live;
+pub mod overlay;
 pub mod platform;
 pub mod preflight;
 pub mod profile;

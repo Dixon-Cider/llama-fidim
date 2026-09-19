@@ -17,7 +17,9 @@
 //! A second channel, **unsloth**, installs unslothai/llama.cpp's Windows ROCm
 //! zip: one archive with its own ROCm DLLs and the DiffusionGemma runner.
 //! Those builds are recorded as such in the manifest, run with nothing on
-//! PATH, and are never picked as "newest" for llama-server profiles.
+//! PATH, and are never picked as "newest" for llama-server profiles. The
+//! same zip can also be installed with Llama FIDIM's runner patch laid over
+//! it (`overlay`).
 //!
 //! Nothing here launches a server or touches VRAM. Benchmarks stay a separate,
 //! explicit step because the GPUs are shared.
@@ -540,10 +542,10 @@ pub fn verify_build(exe: &Path, rocm_bin: Option<&Path>) -> Verify {
 
 // ----------------------------------------------------------------- install ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub tag: String,
-    /// `prebuilt`, `source` or `unsloth-prebuilt`.
+    /// `prebuilt`, `source`, `unsloth-prebuilt` or `unsloth-overlay`.
     pub source: String,
     pub installed_at_unix: u64,
     pub assets: Vec<String>,
@@ -1245,10 +1247,23 @@ pub struct UnslothCheck {
     pub already_installed: bool,
     /// Fork builds already installed, newest first.
     pub installed: Vec<InstalledRef>,
+    /// The runner-patch overlay for this release (see `overlay`): where it
+    /// is looked for, whether it is published, and where it installs.
+    pub overlay_repo: String,
+    pub overlay_patch: String,
+    pub overlay_available: bool,
+    /// The overlay zip, when published.
+    pub overlay_asset: Option<Asset>,
+    /// Why the overlay is not available, when it is not a plain "not
+    /// published" (the lookup failed, the release lacks an asset).
+    pub overlay_error: Option<String>,
+    pub overlay_install_dir: PathBuf,
+    pub overlay_installed: bool,
 }
 
-/// Latest (or `tag`) fork release against what is installed. Network and a
-/// build scan; the comparison itself is `check_unsloth_against`.
+/// Latest (or `tag`) fork release against what is installed, and whether
+/// the runner-patch overlay is published for it. Network and a build scan;
+/// the comparison itself is `check_unsloth_against`.
 pub fn check_unsloth(
     cfg: &Config,
     device_names: &[String],
@@ -1260,12 +1275,19 @@ pub fn check_unsloth(
         None => latest_unsloth_release()?,
     };
     let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-    check_unsloth_against(cfg, &builds, release, &unsloth_gfx(cfg, device_names, gfx_override))
+    let mut c = check_unsloth_against(cfg, &builds, release, &unsloth_gfx(cfg, device_names, gfx_override))?;
+    let lookup = crate::overlay::lookup(cfg, &c.latest.tag);
+    crate::overlay::apply_lookup(&mut c, lookup);
+    Ok(c)
 }
 
+/// The overlay fields say "not looked up" here; `overlay::apply_lookup`
+/// fills them from a lookup.
 pub fn check_unsloth_against(cfg: &Config, builds: &[Build], latest: Release, gfx: &str) -> Result<UnslothCheck> {
     let install_dir = install_dir(cfg, &latest.tag, "unsloth")?;
     let already_installed = install_dir.join("bin").join(RUNNER_EXE).is_file();
+    let overlay_install_dir = crate::overlay::overlay_install_dir(cfg, &latest.tag)?;
+    let overlay_installed = overlay_install_dir.join("bin").join(RUNNER_EXE).is_file();
     let (asset, asset_error) = match select_unsloth_asset(&latest, gfx) {
         Ok(a) => (Some(a), None),
         Err(e) => (None, Some(e.to_string())),
@@ -1290,6 +1312,13 @@ pub fn check_unsloth_against(cfg: &Config, builds: &[Build], latest: Release, gf
         install_dir,
         already_installed,
         installed: installed.into_iter().map(|(_, r)| r).collect(),
+        overlay_repo: crate::overlay::overlay_repo(cfg),
+        overlay_patch: crate::overlay::OVERLAY_PATCH.to_string(),
+        overlay_available: false,
+        overlay_asset: None,
+        overlay_error: None,
+        overlay_install_dir,
+        overlay_installed,
     })
 }
 
