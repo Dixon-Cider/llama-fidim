@@ -1,6 +1,7 @@
 //! `fidim models`: the model wizard ("Get a model") on the command line.
 //! Thin over `fidim_core::wizard`, as the app's Models tab is.
 
+use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -125,6 +126,29 @@ fn env(cfg: &Config, gfx: Option<String>) -> anyhow::Result<wizard::LiveEnv> {
 
 const GIB: f64 = (1u64 << 30) as f64;
 
+/// Text from a model, a model card, the Hub or GitHub, made safe to print:
+/// control characters (ESC starts the terminal's cursor and colour
+/// sequences, CR and LF start lines) and the bidirectional overrides that
+/// reorder what is shown come out as `\u{..}` escapes. A GGUF's metadata
+/// and a card's YAML are whatever their authors wrote, and a terminal
+/// that obeyed them could hide or fake a line of the plan or of the
+/// consent question.
+fn safe(s: &str) -> Cow<'_, str> {
+    let bad = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    };
+    if !s.chars().any(bad) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.chars().map(|c| if bad(c) { c.escape_unicode().to_string() } else { c.to_string() }).collect())
+}
+
+/// A path, made safe to print.
+fn safe_path(p: &std::path::Path) -> String {
+    safe(&p.to_string_lossy()).into_owned()
+}
+
 fn gib(b: u64) -> String {
     wizard::human_size(b)
 }
@@ -156,8 +180,8 @@ fn verdict(v: &FitVerdict) -> String {
 fn support(s: &Support, needs: &fidim_core::compat::ModelNeeds) -> String {
     match s {
         Support::Yes => "yes".into(),
-        Support::No { missing } => format!("no: lacks {}", fidim_core::compat::describe_missing(needs, missing)),
-        Support::Unknown(why) => format!("maybe: {why}"),
+        Support::No { missing } => format!("no: lacks {}", safe(&fidim_core::compat::describe_missing(needs, missing))),
+        Support::Unknown(why) => format!("maybe: {}", safe(why)),
     }
 }
 
@@ -168,7 +192,7 @@ fn print_notes(notes: &[Note]) {
             Level::Warning => "WARN ",
             Level::Info => "note ",
         };
-        println!("  {tag} {}", n.message);
+        println!("  {tag} {}", safe(&n.message));
     }
 }
 
@@ -178,13 +202,13 @@ fn print_builds(builds: &[BuildVerdict], needs: Option<&fidim_core::compat::Mode
     if builds.is_empty() {
         println!("  none");
     }
-    let w = builds.iter().map(|b| b.name.chars().count()).max().unwrap_or(0).max(10);
+    let w = builds.iter().map(|b| safe(&b.name).chars().count()).max().unwrap_or(0).max(10);
     for b in builds {
         println!(
             "  {:<w$} {:<9} {:<8} {}{}",
-            b.name,
+            safe(&b.name),
             b.channel.as_str(),
-            b.version.as_deref().unwrap_or("?"),
+            safe(b.version.as_deref().unwrap_or("?")),
             support(&b.support, needs),
             if b.broken { " (does not run)" } else { "" }
         );
@@ -192,9 +216,9 @@ fn print_builds(builds: &[BuildVerdict], needs: Option<&fidim_core::compat::Mode
 }
 
 fn print_step(s: &PlanStep, prefix: &str) {
-    println!("{prefix}{}{}", s.explanation, if s.needs_consent { "  [needs your consent]" } else { "" });
+    println!("{prefix}{}{}", safe(&s.explanation), if s.needs_consent { "  [needs your consent]" } else { "" });
     for w in &s.warnings {
-        println!("{prefix}  ! {w}");
+        println!("{prefix}  ! {}", safe(w));
     }
 }
 
@@ -207,7 +231,7 @@ fn print_build_plan(bp: &BuildPlan) {
     if !bp.rejected.is_empty() {
         println!("  ruled out:");
         for r in &bp.rejected {
-            println!("    - {r}");
+            println!("    - {}", safe(r));
         }
     }
 }
@@ -230,7 +254,7 @@ fn search(cfg: &Config, json: bool, query: &str, limit: u32, all: bool, sort: &s
         return Ok(());
     }
     if hits.is_empty() {
-        println!("nothing on Hugging Face matches {query:?}{}", if all { "" } else { " with GGUF files (--all for every format)" });
+        println!("nothing on Hugging Face matches {:?}{}", safe(query), if all { "" } else { " with GGUF files (--all for every format)" });
         return Ok(());
     }
     println!("{:<52} {:<16} {:>7} {:>9} {:>6} {:<7} {:<10} BUILD", "REPO", "ARCH", "PARAMS", "DOWNLOADS", "LIKES", "GATED", "MODIFIED");
@@ -248,13 +272,13 @@ fn search(cfg: &Config, json: bool, query: &str, limit: u32, all: bool, sort: &s
         };
         println!(
             "{:<52} {:<16} {:>7} {:>9} {:>6} {:<7} {:<10} {}",
-            r.id,
-            r.arch.as_deref().unwrap_or("-"),
+            safe(&r.id),
+            safe(r.arch.as_deref().unwrap_or("-")),
             params(r.total_params),
             r.downloads,
             r.likes,
             gated,
-            r.last_modified.as_deref().map(|d| d.get(..10).unwrap_or(d)).unwrap_or("-"),
+            safe(r.last_modified.as_deref().map(|d| d.get(..10).unwrap_or(d)).unwrap_or("-")),
             build
         );
     }
@@ -272,6 +296,7 @@ fn fits_table(fits: &[ChoiceFit], recommended: Option<&str>, labels: &[(String, 
     for (label, file) in labels {
         let f = fits.iter().find(|f| &f.label == label);
         let mark = if recommended == Some(label.as_str()) { "* " } else { "  " };
+        let (label, file) = (safe(label), safe(file));
         match f {
             Some(f) => println!(
                 "  {mark}{:<24} {:>9}  {:<16} {:<16} {:>9}  {file}",
@@ -299,20 +324,20 @@ fn show(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, gfx: Option<Str
         RepoKind::OtherFormat(f) => format!("{f} (not for llama.cpp)"),
         RepoKind::Empty => "no model files".into(),
     };
-    println!("{} @ {}   {kind}", view.repo, short(&view.sha));
+    println!("{} @ {}   {}", safe(&view.repo), safe(short(&view.sha)), safe(&kind));
     if let Some(n) = &view.needs {
         println!(
             "architecture {}{}{}",
-            n.arch,
-            n.tokenizer_pre.as_deref().map(|p| format!(", pre-tokenizer {p}")).unwrap_or_default(),
+            safe(&n.arch),
+            n.tokenizer_pre.as_deref().map(|p| format!(", pre-tokenizer {}", safe(p))).unwrap_or_default(),
             view.header.as_ref().and_then(|h| h.context_length).map(|c| format!(", trained context {c}")).unwrap_or_default()
         );
     }
     print_notes(&view.notes);
     if !view.derivatives.is_empty() {
-        println!("\nGGUF quantizations of {} on the Hub:", view.derivatives_of.as_deref().unwrap_or(&view.repo));
+        println!("\nGGUF quantizations of {} on the Hub:", safe(view.derivatives_of.as_deref().unwrap_or(&view.repo)));
         for d in view.derivatives.iter().take(20) {
-            println!("  {:<56} {:>9} downloads", d.id, d.downloads);
+            println!("  {:<56} {:>9} downloads", safe(&d.id), d.downloads);
         }
     }
     if view.kind != RepoKind::Gguf {
@@ -320,20 +345,20 @@ fn show(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, gfx: Option<Str
     }
     let labels: Vec<(String, String)> =
         view.catalog.choices.iter().map(|c| (c.label.clone(), format!("{}{}", c.first_file, if c.files.len() > 1 { format!(" (+{} parts)", c.files.len() - 1) } else { String::new() }))).collect();
-    let cards: Vec<String> = view.devices.iter().filter(|d| !d.integrated).map(|d| format!("{} ({:.1} GiB)", d.name, d.total_mib as f64 / 1024.0)).collect();
+    let cards: Vec<String> = view.devices.iter().filter(|d| !d.integrated).map(|d| format!("{} ({:.1} GiB)", safe(&d.name), d.total_mib as f64 / 1024.0)).collect();
     println!("\ncards: {}", if cards.is_empty() { "none found".to_string() } else { cards.join(", ") });
     let ctx = view.fits.first().map(|f| f.ctx).unwrap_or(0);
     println!("estimates at context {ctx}, f16 KV; * = recommended");
     fits_table(&view.fits, view.recommended.as_deref(), &labels);
     for (what, list) in [("projectors", &view.catalog.mmproj), ("drafts", &view.catalog.drafts)] {
         if !list.is_empty() {
-            let names: Vec<String> = list.iter().map(|f| format!("{} ({})", f.path, gib(f.size))).collect();
+            let names: Vec<String> = list.iter().map(|f| format!("{} ({})", safe(&f.path), gib(f.size))).collect();
             println!("  {what}: {}", names.join(", "));
         }
     }
     print_builds(&view.builds, view.needs.as_ref());
     match (&view.usable_build, &view.build_plan) {
-        (Some(p), _) => println!("\n{} can load it.", view.builds.iter().find(|b| &b.path == p).map(|b| b.name.as_str()).unwrap_or("an installed build")),
+        (Some(p), _) => println!("\n{} can load it.", safe(view.builds.iter().find(|b| &b.path == p).map(|b| b.name.as_str()).unwrap_or("an installed build"))),
         (None, Some(bp)) => {
             print_build_plan(bp);
             // The sources of the steps offered, not the ones ruled out.
@@ -353,8 +378,8 @@ fn show(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, gfx: Option<Str
     }
     println!(
         "\n`fidim models get {}{}` downloads{}, then creates a profile.",
-        view.repo,
-        view.recommended.as_deref().map(|r| format!(" --quant {r}")).unwrap_or_default(),
+        safe(&view.repo),
+        view.recommended.as_deref().map(|r| format!(" --quant {}", safe(r))).unwrap_or_default(),
         if view.usable_build.is_none() { " (and gets a build)" } else { "" }
     );
     Ok(())
@@ -369,9 +394,9 @@ fn needs(cfg: &Config, json: bool, target: &str, gfx: Option<String>) -> anyhow:
         return Ok(());
     }
     let n = &r.needs;
-    println!("{}{}", r.target, r.repo.as_deref().filter(|rp| *rp != r.target).map(|rp| format!("  ({rp})")).unwrap_or_default());
-    println!("  architecture   {}", n.arch);
-    println!("  pre-tokenizer  {}", n.tokenizer_pre.as_deref().unwrap_or("(not needed: not a BPE vocabulary)"));
+    println!("{}{}", safe(&r.target), r.repo.as_deref().filter(|rp| *rp != r.target).map(|rp| format!("  ({})", safe(rp))).unwrap_or_default());
+    println!("  architecture   {}", safe(&n.arch));
+    println!("  pre-tokenizer  {}", safe(n.tokenizer_pre.as_deref().unwrap_or("(not needed: not a BPE vocabulary)")));
     println!(
         "  tensor types   {}",
         match (n.max_type_id, r.max_tensor_type) {
@@ -416,15 +441,15 @@ fn build_choice(s: &str) -> BuildChoice {
 }
 
 fn print_plan(p: &WizardPlan) {
-    println!("{} @ {}", p.repo, short(&p.sha));
+    println!("{} @ {}", safe(&p.repo), safe(short(&p.sha)));
     let fit = p
         .fit
         .as_ref()
         .map(|f| format!("one card: {}, two-card split: {}", verdict(&f.one_card), verdict(&f.two_card_split)))
         .unwrap_or_else(|| "not estimated".into());
-    println!("file       {} ({}), {fit}", p.choice.label, gib(p.choice.total_size));
+    println!("file       {} ({}), {fit}", safe(&p.choice.label), gib(p.choice.total_size));
     if let Some(b) = &p.build {
-        println!("build      {}{}", b.name, if b.installed { "" } else { " (installed by this plan)" });
+        println!("build      {}{}", safe(&b.name), if b.installed { "" } else { " (installed by this plan)" });
     }
     if let Some(StepAction::Build { plan: ps }) = p.steps.first().map(|s| &s.action) {
         if let PlanAction::BuildFork { source, .. } | PlanAction::BuildPr { source, .. } = &ps.action {
@@ -433,14 +458,14 @@ fn print_plan(p: &WizardPlan) {
             }
         }
     }
-    println!("folder     {}", p.dest_dir.display());
+    println!("folder     {}", safe_path(&p.dest_dir));
     println!("to fetch   {} of {}", gib(p.download_bytes), gib(p.total_bytes));
     println!("steps");
     for (i, s) in p.steps.iter().enumerate() {
-        println!("  {}. {}{}", i + 1, s.title, if s.needs_consent { "  [needs your consent]" } else { "" });
+        println!("  {}. {}{}", i + 1, safe(&s.title), if wizard::step_needs_consent(s) { "  [needs your consent]" } else { "" });
         if !s.detail.is_empty() {
             for line in s.detail.lines() {
-                println!("     {line}");
+                println!("     {}", safe(line));
             }
         }
     }
@@ -448,7 +473,13 @@ fn print_plan(p: &WizardPlan) {
     if !tool_problems.is_empty() {
         println!("toolchain");
         for t in tool_problems {
-            println!("  {:<5} {}: {}{}", t.outcome, t.title, t.message, t.fix.as_deref().map(|f| format!(" (fix: {f})")).unwrap_or_default());
+            println!(
+                "  {:<5} {}: {}{}",
+                safe(&t.outcome),
+                safe(&t.title),
+                safe(&t.message),
+                t.fix.as_deref().map(|f| format!(" (fix: {})", safe(f))).unwrap_or_default()
+            );
         }
     }
     if !p.notes.is_empty() {
@@ -458,18 +489,19 @@ fn print_plan(p: &WizardPlan) {
 }
 
 fn print_source(src: &BuildSource) {
-    println!("source     github.com/{}/{} {} @ {}", src.owner, src.repo, src.git_ref, src.sha);
+    let (owner, repo) = (safe(&src.owner), safe(&src.repo));
+    println!("source     github.com/{owner}/{repo} {} @ {}", safe(&src.git_ref), safe(&src.sha));
     if let Some(l) = &src.linked_as {
-        println!("           (the card links {l}, which GitHub now sends to {}/{})", src.owner, src.repo);
+        println!("           (the card links {}, which GitHub now sends to {owner}/{repo})", safe(l));
     }
     if let (Some(a), Some(b)) = (src.ahead_by, src.behind_by) {
         println!("           {a} commits ahead of upstream master, {b} behind");
     }
     if let Some(pr) = &src.pr {
-        println!("           pull request #{} \"{}\" ({}{})", pr.number, pr.title, pr.state, if pr.draft { ", draft" } else { "" });
+        println!("           pull request #{} \"{}\" ({}{})", pr.number, safe(&pr.title), safe(&pr.state), if pr.draft { ", draft" } else { "" });
     }
     for subj in src.subjects.iter().rev().take(5) {
-        println!("           - {subj}");
+        println!("           - {}", safe(subj));
     }
 }
 
@@ -488,8 +520,8 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
     let mut env = env(cfg, o.gfx.clone())?;
     let view = wizard::inspect_with(&env, cfg, repo, rev)?;
     if view.kind != RepoKind::Gguf {
-        let why = view.notes.iter().find(|n| n.level == Level::Error).map(|n| n.message.clone()).unwrap_or_default();
-        let alts: Vec<&str> = view.derivatives.iter().take(5).map(|d| d.id.as_str()).collect();
+        let why = view.notes.iter().find(|n| n.level == Level::Error).map(|n| safe(&n.message).into_owned()).unwrap_or_default();
+        let alts: Vec<String> = view.derivatives.iter().take(5).map(|d| safe(&d.id).into_owned()).collect();
         bail!("{why}{}", if alts.is_empty() { String::new() } else { format!("\n  try: {}", alts.join(", ")) });
     }
     let choice = match (&o.quant, &o.file) {
@@ -499,7 +531,7 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
                 .iter()
                 .find(|c| c.files.iter().any(|x| x.path == *f || x.name().eq_ignore_ascii_case(f)))
                 .map(|c| c.label.clone())
-                .with_context(|| format!("{} has no model file {f:?} (see `fidim models show {}`)", view.repo, view.repo))?,
+                .with_context(|| format!("{} has no model file {:?} (see `fidim models show {}`)", safe(&view.repo), safe(f), safe(&view.repo)))?,
         ),
         (Some(q), None) => Some(q.clone()),
         _ => None,
@@ -509,7 +541,7 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
     let pick_aux = |arg: &Option<String>, auto: Option<String>, what: &str| -> anyhow::Result<Option<String>> {
         match arg.as_deref() {
             None => Ok(None),
-            Some("auto") => auto.map(Some).with_context(|| format!("{} has no {what}", view.repo)),
+            Some("auto") => auto.map(Some).with_context(|| format!("{} has no {what}", safe(&view.repo))),
             Some(name) => Ok(Some(name.to_string())),
         }
     };
@@ -543,7 +575,7 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
         bail!("the plan has errors (above); nothing was done");
     }
     if plan.requires_consent() {
-        let text = plan.consent.clone().unwrap_or_default();
+        let text = safe(plan.consent.as_deref().unwrap_or("A step runs code nobody reviewed for your machine.")).into_owned();
         if !o.allow_fork {
             bail!("{text}\nPass --allow-fork to build it, or --build none to download the files only; nothing was done.");
         }
@@ -581,23 +613,23 @@ fn get(cfg: &Config, json: bool, repo: &str, rev: Option<&str>, o: GetOpts) -> a
     }
     println!("\ndone in {:.1} min", started.elapsed().as_secs_f64() / 60.0);
     for f in &r.files {
-        println!("  file     {}", f.display());
+        println!("  file     {}", safe_path(f));
     }
     if let Some(b) = &r.build {
         println!(
             "  build    {} at {} ({}; HIP {})",
-            b.tag,
-            b.dir.display(),
-            b.verify.version.as_deref().unwrap_or("?"),
+            safe(&b.tag),
+            safe_path(&b.dir),
+            safe(b.verify.version.as_deref().unwrap_or("?")),
             if b.verify.hip_ok { "OK" } else { "NOT LOADED" }
         );
     }
     for w in &r.warnings {
-        println!("  WARN     {w}");
+        println!("  WARN     {}", safe(w));
     }
     match (&r.profile, &r.profile_path) {
         (Some(p), Some(path)) => {
-            println!("  profile  {} ({})", p.id, path.display());
+            println!("  profile  {} ({})", p.id, safe_path(path));
             println!("\nnothing was launched: `fidim check {id}` runs the pre-flight, `fidim launch {id}` loads it.", id = p.id);
         }
         _ => println!("\nno profile was created"),
@@ -661,13 +693,13 @@ impl<'a> Printer<'a> {
             self.last_done = 0;
             self.stage.clear();
             if let Some(s) = self.plan.steps.get(e.step) {
-                let _ = writeln!(self.out, "== [{}/{n}] {}", e.step + 1, s.title);
+                let _ = writeln!(self.out, "== [{}/{n}] {}", e.step + 1, safe(&s.title));
             }
         }
         match e.status {
             StepStatus::Failed => {
                 self.finish_line();
-                let _ = writeln!(self.out, "   failed: {}", e.line.as_deref().unwrap_or("?"));
+                let _ = writeln!(self.out, "   failed: {}", safe(e.line.as_deref().unwrap_or("?")));
                 return;
             }
             StepStatus::Done => {
@@ -685,7 +717,7 @@ impl<'a> Printer<'a> {
         let is_download = matches!(self.plan.steps.get(e.step).map(|s| &s.action), Some(StepAction::Download { .. }));
         if is_download {
             let (Some(done), Some(total)) = (e.done, e.total) else { return };
-            let stage = e.stage.clone().unwrap_or_default();
+            let stage = safe(e.stage.as_deref().unwrap_or_default()).into_owned();
             let tenth = (done * 10).checked_div(total).unwrap_or(0);
             let now = Instant::now();
             let due = now.duration_since(self.last_print).as_millis() >= 500 || done == total || stage != self.stage;
@@ -704,11 +736,11 @@ impl<'a> Printer<'a> {
             return;
         }
         // A build or an install.
-        if let Some(stage) = &e.stage {
+        if let Some(stage) = e.stage.as_deref().map(safe) {
             if *stage != self.stage {
                 self.finish_line();
                 let _ = writeln!(self.out, "   -- {stage}");
-                self.stage = stage.clone();
+                self.stage = stage.into_owned();
             }
         }
         match (e.done, e.total) {
@@ -722,12 +754,12 @@ impl<'a> Printer<'a> {
             // lines come back in the error anyway.
             _ if self.stage == "build" => {
                 if let Some(l) = e.line.as_deref().filter(|l| l.contains("error") || l.contains("FAILED")) {
-                    let _ = writeln!(self.out, "   {l}");
+                    let _ = writeln!(self.out, "   {}", safe(l));
                 }
             }
             _ => {
                 if let Some(l) = &e.line {
-                    let _ = writeln!(self.out, "   {l}");
+                    let _ = writeln!(self.out, "   {}", safe(l));
                 }
             }
         }
@@ -817,6 +849,35 @@ mod tests {
 "), "{text}");
         assert!(text.ends_with("   done
 "), "{text}");
+    }
+
+    /// A GGUF's architecture or a card's text with terminal sequences in it
+    /// prints as escapes: no line of the plan can be erased, moved or hidden.
+    #[test]
+    fn untrusted_text_prints_without_control_characters() {
+        let evil = "k2\x1b[2K\x1b[1A\x1b[2K\rSPOOFED-LINE\npre\x1b[8mHIDDEN\u{9b}2J\u{202e}txt.exe";
+        let shown = safe(evil);
+        assert!(!shown.chars().any(|c| c.is_control() || c == '\u{202e}'), "{shown}");
+        assert_eq!(
+            shown,
+            r"k2\u{1b}[2K\u{1b}[1A\u{1b}[2K\u{d}SPOOFED-LINE\u{a}pre\u{1b}[8mHIDDEN\u{9b}2J\u{202e}txt.exe"
+        );
+        assert!(matches!(safe("gemma4 · modèle"), Cow::Borrowed(_)), "ordinary text, accents included, is untouched");
+        // Through the progress printer too: a step title and a build line.
+        let plan = one_download("Build \x1b[8mfork");
+        let events = [WizardEvent {
+            step: 0,
+            status: StepStatus::Failed,
+            stage: None,
+            file: None,
+            done: None,
+            total: None,
+            bps: None,
+            line: Some("error: \x1b[31mred\x1b[0m".into()),
+        }];
+        let out = progress(&plan, false, &events);
+        assert!(!out.contains('\x1b'), "{out}");
+        assert!(out.contains(r"Build \u{1b}[8mfork") && out.contains(r"failed: error: \u{1b}[31mred"), "{out}");
     }
 
     #[test]

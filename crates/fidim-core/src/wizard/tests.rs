@@ -580,6 +580,19 @@ fn inspect_notes_a_gated_repo_without_a_token() {
     let gated = view.notes.iter().find(|n| n.code == "gated").unwrap();
     assert!(gated.message.contains("https://huggingface.co/ngquocvinh/K2-Horizon-7B-GGUF") && gated.message.contains("by hand"), "{}", gated.message);
     assert!(view.notes.iter().any(|n| n.code == "no-token" && n.level == Level::Warning));
+
+    // The card's terms are someone else's text: one line, no control
+    // characters, at most 400 of them.
+    f.info.gated_prompt = Some("Agree\r\n\x1b[2K\x1b[1Ato  the\tterms.\u{9b}8m\n\n".to_string() + &"x".repeat(1000));
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    let gated = &view.notes.iter().find(|n| n.code == "gated").unwrap().message;
+    let terms = gated.split(". The terms: ").nth(1).unwrap();
+    assert!(!gated.chars().any(char::is_control), "{gated:?}");
+    assert!(terms.starts_with("Agree [2K [1Ato the terms. 8m xxx"), "{terms:?}");
+    assert_eq!(terms.chars().count(), 400);
+    f.info.gated_prompt = Some(" \r\n ".into());
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    assert!(!view.notes.iter().find(|n| n.code == "gated").unwrap().message.contains("The terms"));
 }
 
 #[test]

@@ -1036,6 +1036,14 @@ fn gib(b: u64) -> String {
     human_size(b)
 }
 
+/// Someone else's text (a model card's gating terms) as one short line:
+/// runs of whitespace, line breaks and control characters made one space,
+/// at most `max` characters, as commit subjects are kept.
+fn one_line(text: &str, max: usize) -> String {
+    let words: Vec<&str> = text.split(|c: char| c.is_whitespace() || c.is_control()).filter(|w| !w.is_empty()).collect();
+    words.join(" ").chars().take(max).collect()
+}
+
 fn short(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
@@ -1270,7 +1278,12 @@ pub fn inspect_with(env: &dyn Env, cfg: &Config, input: &str, rev: Option<&str>)
             format!(
                 "{repo} is gated: accept its terms at {}/{repo}{how} before downloading{}",
                 hub::DEFAULT_ENDPOINT,
-                info.gated_prompt.as_deref().map(|p| format!(". The terms: {}", p.chars().take(400).collect::<String>())).unwrap_or_default()
+                info.gated_prompt
+                    .as_deref()
+                    .map(|p| one_line(p, 400))
+                    .filter(|p| !p.is_empty())
+                    .map(|p| format!(". The terms: {p}"))
+                    .unwrap_or_default()
             ),
         ));
         if !env.has_hf_token() {
