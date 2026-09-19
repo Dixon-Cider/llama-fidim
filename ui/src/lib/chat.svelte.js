@@ -78,14 +78,20 @@ export async function init() {
   consumePending();
 }
 
-export async function refreshTargets() {
-  try {
-    chat.targets = (await api("chat_targets")) ?? [];
-    chat.targetsError = "";
-  } catch (e) {
-    chat.targetsError = String(e);
-  }
-  chat.targetsLoaded = true;
+// A slow server can make one poll outlast the refresh interval: never
+// stack them.
+let targetsBusy = null;
+export function refreshTargets() {
+  targetsBusy ??= (async () => {
+    try {
+      chat.targets = (await api("chat_targets")) ?? [];
+      chat.targetsError = "";
+    } catch (e) {
+      chat.targetsError = String(e);
+    }
+    chat.targetsLoaded = true;
+  })().finally(() => (targetsBusy = null));
+  return targetsBusy;
 }
 
 export async function refreshList() {
