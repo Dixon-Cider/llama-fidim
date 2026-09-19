@@ -95,23 +95,60 @@
   Pop $R0
 !macroend
 
+; Set $R1 to 1 when ${DIR} and ${OTHER} are the same folder, however they
+; are spelled: with `.\` in the path, as a short 8.3 name, through a
+; junction. Comparing the paths as text misses those, and the old folder's
+; retirement would then delete the files just installed into it. A file
+; created in ${DIR} shows up in ${OTHER} only when they are one folder (it
+; is deleted again). When no file can be created in ${DIR}, $R1 is 1 as
+; well, so the callers leave ${OTHER} alone. Uses $R0 and $R1; the caller
+; saves them.
+!macro FIDIM_SAME_FOLDER DIR OTHER
+  StrCpy $R1 0
+  ${If} ${FileExists} "${OTHER}\*.*"
+    ClearErrors
+    GetTempFileName $R0 "${DIR}"
+    ${If} ${Errors}
+    ${OrIf} $R0 == ""
+      StrCpy $R1 1
+    ${Else}
+      ${GetFileName} $R0 $R1
+      ${If} ${FileExists} "${OTHER}\$R1"
+        StrCpy $R1 1
+      ${Else}
+        StrCpy $R1 0
+      ${EndIf}
+      Delete $R0
+    ${EndIf}
+    ClearErrors
+  ${EndIf}
+!macroend
+
 ; Delete the shortcut ${LNK} (and its Start and taskbar pins) when it starts
-; ${OLDDIR}\llama-fidim.exe, the entry scripts/install.ps1 created. The
-; installer writes its own entry under that name right after PREINSTALL.
+; ${OLDDIR}\llama-fidim.exe, the entry scripts/install.ps1 created, unless
+; ${OLDDIR} is ${NEWDIR}, the folder being installed into. The installer
+; writes its own entry under that name right after PREINSTALL.
 ; IsShortcutTarget and UnpinShortcut come from Tauri's utils.nsh.
-!macro FIDIM_RETIRE_OLD_SHORTCUT LNK OLDDIR
+!macro FIDIM_RETIRE_OLD_SHORTCUT LNK OLDDIR NEWDIR
   ${If} ${FileExists} "${LNK}"
     Push $0
     Push $1
     Push $2
     Push $3
-    !insertmacro IsShortcutTarget "${LNK}" "${OLDDIR}\llama-fidim.exe"
-    Pop $0
-    ${If} $0 = 1
-      !insertmacro UnpinShortcut "${LNK}"
-      Delete "${LNK}"
-      DetailPrint "Removed the old Start Menu entry for ${OLDDIR}."
+    Push $R0
+    Push $R1
+    !insertmacro FIDIM_SAME_FOLDER "${NEWDIR}" "${OLDDIR}"
+    ${If} $R1 = 0
+      !insertmacro IsShortcutTarget "${LNK}" "${OLDDIR}\llama-fidim.exe"
+      Pop $0
+      ${If} $0 = 1
+        !insertmacro UnpinShortcut "${LNK}"
+        Delete "${LNK}"
+        DetailPrint "Removed the old Start Menu entry for ${OLDDIR}."
+      ${EndIf}
     ${EndIf}
+    Pop $R1
+    Pop $R0
     Pop $3
     Pop $2
     Pop $1
@@ -121,18 +158,26 @@
 
 ; Retire what scripts/install.ps1 put in ${OLDDIR}: its three executables,
 ; with running ones moved aside, and then the folder if nothing else is in
-; it. Runs after the GUI was closed, so only helpers can be running.
-!macro FIDIM_RETIRE_OLD_INSTALL OLDDIR
+; it; unless ${OLDDIR} is ${NEWDIR}, the folder just installed into. Runs
+; after the GUI was closed, so only helpers can be running.
+!macro FIDIM_RETIRE_OLD_INSTALL OLDDIR NEWDIR
   ${If} ${FileExists} "${OLDDIR}\*.*"
-    !insertmacro FIDIM_MOVE_ASIDE "${OLDDIR}" "fidim-dg.exe"
-    !insertmacro FIDIM_MOVE_ASIDE "${OLDDIR}" "fidim.exe"
-    !insertmacro FIDIM_MOVE_ASIDE "${OLDDIR}" "llama-fidim.exe"
-    ClearErrors
-    RMDir "${OLDDIR}"
-    ${IfNot} ${Errors}
-      DetailPrint "Removed the old install folder ${OLDDIR}."
+    Push $R0
+    Push $R1
+    !insertmacro FIDIM_SAME_FOLDER "${NEWDIR}" "${OLDDIR}"
+    ${If} $R1 = 0
+      !insertmacro FIDIM_MOVE_ASIDE "${OLDDIR}" "fidim-dg.exe"
+      !insertmacro FIDIM_MOVE_ASIDE "${OLDDIR}" "fidim.exe"
+      !insertmacro FIDIM_MOVE_ASIDE "${OLDDIR}" "llama-fidim.exe"
+      ClearErrors
+      RMDir "${OLDDIR}"
+      ${IfNot} ${Errors}
+        DetailPrint "Removed the old install folder ${OLDDIR}."
+      ${EndIf}
+      ClearErrors
     ${EndIf}
-    ClearErrors
+    Pop $R1
+    Pop $R0
   ${EndIf}
 !macroend
 
@@ -161,15 +206,11 @@ FunctionEnd
   !insertmacro FIDIM_CLOSE_APP
   !insertmacro FIDIM_MOVE_ASIDE "$INSTDIR" "fidim-dg.exe"
   !insertmacro FIDIM_MOVE_ASIDE "$INSTDIR" "fidim.exe"
-  ${If} "$INSTDIR" != "${FIDIM_OLD_INSTALL_DIR}"
-    !insertmacro FIDIM_RETIRE_OLD_SHORTCUT "${FIDIM_OLD_SHORTCUT}" "${FIDIM_OLD_INSTALL_DIR}"
-  ${EndIf}
+  !insertmacro FIDIM_RETIRE_OLD_SHORTCUT "${FIDIM_OLD_SHORTCUT}" "${FIDIM_OLD_INSTALL_DIR}" "$INSTDIR"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ${If} "$INSTDIR" != "${FIDIM_OLD_INSTALL_DIR}"
-    !insertmacro FIDIM_RETIRE_OLD_INSTALL "${FIDIM_OLD_INSTALL_DIR}"
-  ${EndIf}
+  !insertmacro FIDIM_RETIRE_OLD_INSTALL "${FIDIM_OLD_INSTALL_DIR}" "$INSTDIR"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

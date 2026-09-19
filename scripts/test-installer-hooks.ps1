@@ -54,6 +54,7 @@ $old = Join-Path $tmp 'Programs\LlamaFIDIM'
 $sm = Join-Path $tmp 'Start Menu'
 $lnk = Join-Path $sm 'Llama FIDIM.lnk'
 $guiName = "fidim-hooks-gui-$id"
+$junction = Join-Path $tmp 'LlamaFIDIM-junction'
 New-Item -ItemType Directory -Force $inst, $old, $sm, (Join-Path $tmp 'home'), (Join-Path $tmp 'gui') | Out-Null
 
 $failures = New-Object System.Collections.Generic.List[string]
@@ -272,7 +273,27 @@ SectionEnd
   foreach ($p in $procs) { $p.WaitForExit(5000) | Out-Null }
   Run-Hooks 'install'
   Check (@(Get-ChildItem $inst -Filter '*.old-*').Count -eq 0) 'no renamed copies left in the install folder'
+  Check (@(Get-ChildItem $inst -Filter '*.tmp').Count -eq 0) 'nor anything else'
   Check (-not (Test-Path $old)) 'the old folder is gone'
+
+  Write-Host "== 6. installing into the old folder under another spelling keeps what it installed"
+  New-Item -ItemType Directory -Force $old | Out-Null
+  New-Item -ItemType Junction -Path $junction -Target $old | Out-Null
+  $spellings = [ordered]@{ 'with .\ in it' = (Join-Path $tmp 'Programs\.\LlamaFIDIM'); 'through a junction' = $junction }
+  $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($old).ShortPath
+  if ($short -ne $old) { $spellings['as its 8.3 name'] = $short } else { Write-Host "  (8.3 names are off on this volume; that spelling is skipped)" }
+  foreach ($what in $spellings.Keys) {
+    New-Item -ItemType Directory -Force $old | Out-Null
+    Get-ChildItem $old -Force | Remove-Item -Force
+    Copy-Item $Fidim (Join-Path $old 'llama-fidim.exe')
+    New-Lnk (Join-Path $old 'llama-fidim.exe')
+    Run-Hooks 'install' 0 $spellings[$what]
+    foreach ($f in 'llama-fidim.exe', 'fidim.exe', 'fidim-dg.exe', 'uninstall.exe') {
+      Check (Is-New (Join-Path $old $f)) "$what`: the new $f stays"
+    }
+    Check (Test-Path $lnk) "$what`: its Start Menu entry stays"
+    Check (@(Get-ChildItem $old -Filter '*.tmp').Count -eq 0) "$what`: nothing else is left in the folder"
+  }
 } finally {
   foreach ($h in $handles) { $h.Dispose() }
   foreach ($p in $procs) {
@@ -280,6 +301,8 @@ SectionEnd
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
   }
   Start-Sleep -Milliseconds 300
+  # The junction itself, not what it points to.
+  if (Test-Path $junction) { [IO.Directory]::Delete($junction, $false) }
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item Env:\FIDIM_HOME -ErrorAction SilentlyContinue
 }
