@@ -75,12 +75,27 @@ welcome, and a report that includes your card, driver version and the
 
 ## Install
 
-**From a release.** Download `llama-fidim-vX.Y.Z-win-x64.zip` from the
-[releases page](https://github.com/Dixon-Cider/llama-fidim/releases),
-extract it anywhere, and run `llama-fidim.exe`. The `fidim.exe` beside it is
-the CLI; add the folder to your PATH if you want it in every shell.
-`fidim-dg.exe` is the DiffusionGemma server the app starts; keep it in the
-same folder. A `.sha256` file sits next to each zip.
+**Installer.** Download `llama-fidim-vX.Y.Z-win-x64-setup.exe` from the
+[releases page](https://github.com/Dixon-Cider/llama-fidim/releases) and run
+it. It installs for your user only, without administrator rights, into
+`%LOCALAPPDATA%\Llama FIDIM`, adds a Start Menu entry, and registers an
+uninstaller under Settings > Apps. A newer version installs over the old
+one. Installing, upgrading or uninstalling closes the app's window but
+leaves a running DiffusionGemma server or keep-alive helper running, and
+never touches `~\.fidim`. The installer and the programs are not
+code-signed yet, so SmartScreen warns about an unknown publisher (More
+info, Run anyway), and Smart App Control, when it is on, may block them.
+
+**Zip.** `llama-fidim-vX.Y.Z-win-x64.zip` from the same page holds the same
+programs: extract it anywhere and run `llama-fidim.exe`. The `fidim.exe`
+beside it is the CLI. `fidim-dg.exe` is the DiffusionGemma server the app
+starts; keep it in the same folder. A `.sha256` file sits next to each
+download.
+
+**`fidim` in every terminal.** `fidim path add` puts the folder holding
+that `fidim.exe` on your user PATH, `fidim path remove` takes it off, and
+`fidim path status` shows where things stand. Terminals opened afterwards
+see the change. The installer leaves PATH alone.
 
 **From source.** Build and install from the repo:
 
@@ -91,9 +106,25 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
 The script checks for the build tools, builds the CLI and the GUI, installs
-both under `%LOCALAPPDATA%\Programs\LlamaFIDIM`, and creates a Start Menu
-entry. Add `-AddToPath` to make `fidim` available in every shell. Re-run it
-after pulling changes.
+them into `%LOCALAPPDATA%\Llama FIDIM`, the installer's folder, and creates
+a Start Menu entry. Add `-AddToPath` to make `fidim` available in every
+shell. Re-run it after pulling changes.
+
+**Moving from the old folder.** The script used to install into
+`%LOCALAPPDATA%\Programs\LlamaFIDIM`. The script and the installer both
+retire that folder: Llama FIDIM's files in it are deleted, except that
+servers and helpers running from it keep running (they are renamed aside
+and go with a later install), and the folder goes once it is empty. A
+taskbar pin to it has to be pinned again. If that folder was on your user
+PATH, the script moves the entry to the new folder; after the installer,
+run `fidim path add` from the new folder instead.
+
+**Building the installer.** After `cargo build --release -p fidim-cli`,
+`pnpm tauri build --bundles nsis --config src-tauri/tauri.release.conf.json`
+in `ui\` writes `target\release\bundle\nsis\Llama FIDIM_<version>_x64-setup.exe`.
+`scripts\test-installer-hooks.ps1` then exercises its install hooks in a
+temporary folder without installing anything. Signing is described in
+[docs/signing.md](docs/signing.md).
 
 **Which version you have.** `fidim --version` and the bottom of the app's
 sidebar name the release and the commit a build came from, like
@@ -134,6 +165,8 @@ fidim update --channel unsloth [--install]
                            Unsloth builds, which carry the DiffusionGemma runner
 fidim rocm list|install    ROCm runtimes from AMD's channels
 fidim runtimes             every runtime a profile can name
+fidim path add|remove|status
+                           this folder on the user PATH, or off it
 ```
 
 ## DiffusionGemma (experimental)
@@ -220,9 +253,13 @@ crates/fidim-core   discovery, GGUF headers, devices, VRAM estimate, pre-flight,
                     launch, supervision, router, live view, updates, ROCm runtimes,
                     the DiffusionGemma server
 crates/fidim-cli    the fidim and fidim-dg binaries
-ui/                 Tauri 2 + Svelte 5 desktop app
+ui/                 Tauri 2 + Svelte 5 desktop app; src-tauri/tauri.release.conf.json
+                    and src-tauri/windows/hooks.nsh make the installer
 scripts/            install.ps1, build-from-tag.bat (source builds),
-                    release.ps1 (sets the version, dates CHANGELOG.md, tags)
+                    release.ps1 (sets the version, dates CHANGELOG.md, tags),
+                    test-installer-hooks.ps1 (the installer's hooks, anywhere),
+                    test-installer.ps1 (the whole installer, throwaway machines)
+docs/               signing.md: turning on release signing
 fixtures/           captured --list-devices / hipInfo / WMI output used by tests
 ```
 
