@@ -388,7 +388,9 @@ pub fn stage_from_checkout(src: &Path, progress: &mut dyn FnMut(String)) -> Resu
         return Err(upd(format!("{} is not a checkout of {REPO} (no Cargo.toml, crates/fidim-cli and ui/src-tauri)", src.display())));
     }
     let head = git(src, &["rev-parse", "HEAD"]);
-    let dirty = git(src, &["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.trim().is_empty());
+    // Content, not file status: `pnpm tauri build` rewrites a manifest's
+    // line endings, which `git status` reports and `git diff` does not.
+    let dirty = git_exit(src, &["diff", "--quiet", "HEAD", "--"]).map(|code| code != 0);
     let mut env: Vec<(String, String)> = Vec::new();
     if let Some(h) = &head {
         env.push(("FIDIM_BUILD_ID".into(), format!("{}@{h}", src.display())));
@@ -416,6 +418,11 @@ pub fn stage_from_checkout(src: &Path, progress: &mut dyn FnMut(String)) -> Resu
         std::fs::copy(&from, stage.join(exe)).map_err(|e| crate::Error::io(&from, e))?;
     }
     finish_stage(stage, "checkout", None, Some(src.to_path_buf()), progress)
+}
+
+/// A git command's exit code (None when git itself could not run).
+fn git_exit(dir: &Path, args: &[&str]) -> Option<i32> {
+    Command::new("git").env("GIT_OPTIONAL_LOCKS", "0").arg("-C").arg(dir).args(args).output().ok()?.status.code()
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
