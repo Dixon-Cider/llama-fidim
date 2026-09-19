@@ -56,10 +56,17 @@ pub struct Config {
     /// tag from source with the local HIP toolchain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_build_script: Option<PathBuf>,
-    /// Hugging Face token for gated repos when fetching creator defaults
-    /// (`HF_TOKEN` in the environment takes precedence).
+    /// Hugging Face token for gated repos (creator defaults, the model
+    /// wizard). `HF_TOKEN` and `HF_TOKEN_PATH` in the environment take
+    /// precedence; see `hub::token`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_token: Option<String>,
+    /// Also use the token `huggingface-cli login` saved
+    /// (`%USERPROFILE%\.cache\huggingface\token`, or `%HF_HOME%\token`) when
+    /// no other token is set. Off by default: that file belongs to another
+    /// tool, and reading it is the user's call.
+    #[serde(default)]
+    pub hf_use_cli_token: bool,
     /// Default keep-alive interval for launched servers (seconds; 0 = off).
     /// A 1-token request this often stops WDDM from evicting the model when
     /// the displays power off. OFF by default: the root cause is the PCIe
@@ -217,6 +224,7 @@ impl Config {
             llama_cpp_source: None,
             source_build_script: None,
             hf_token: None,
+            hf_use_cli_token: false,
             keep_alive_seconds: default_keep_alive(),
             extra: serde_json::Map::new(),
         }

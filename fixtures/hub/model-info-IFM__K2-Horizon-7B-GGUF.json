@@ -1,0 +1,116 @@
+{
+ "_id": "6a996dca0344f3cc139b455a",
+ "id": "IFM/K2-Horizon-7B-GGUF",
+ "author": "IFM",
+ "sha": "bcb8c25b76112ce96a962f5b8ab624435d1ee0c9",
+ "lastModified": "2026-09-04T11:06:23.000Z",
+ "private": false,
+ "disabled": false,
+ "gated": false,
+ "downloads": 8835,
+ "likes": 51,
+ "tags": [
+  "transformers",
+  "gguf",
+  "k2-horizon",
+  "7b",
+  "dense",
+  "open-weights",
+  "ifm",
+  "text-generation",
+  "en",
+  "dataset:IFM/K2-Horizon-Pretrain-Data",
+  "dataset:IFM/K2-Horizon-Midtrain-Data",
+  "base_model:IFM/K2-Horizon-7B",
+  "base_model:quantized:IFM/K2-Horizon-7B",
+  "license:apache-2.0",
+  "endpoints_compatible",
+  "region:us",
+  "conversational"
+ ],
+ "pipeline_tag": "text-generation",
+ "library_name": "transformers",
+ "cardData": {
+  "pipeline_tag": "text-generation",
+  "library_name": "transformers",
+  "model_name": "K2-Horizon-7B",
+  "language": [
+   "en"
+  ],
+  "license": "apache-2.0",
+  "datasets": [
+   "IFM/K2-Horizon-Pretrain-Data",
+   "IFM/K2-Horizon-Midtrain-Data"
+  ],
+  "tags": [
+   "k2-horizon",
+   "7b",
+   "dense",
+   "open-weights",
+   "ifm"
+  ],
+  "base_model": [
+   "IFM/K2-Horizon-7B"
+  ]
+ },
+ "gguf": {
+  "total": 8999178240,
+  "architecture": "k2-horizon",
+  "context_length": 524288,
+  "chat_template": "(trimmed: 43040 characters)",
+  "bos_token": "<|ifm|begin_of_text|>",
+  "eos_token": "<|ifm|endoftext|>",
+  "totalFileSize": 18010413440
+ },
+ "baseModels": {
+  "relation": "quantized",
+  "models": [
+   {
+    "_id": "6a975c5613a39157923a52c1",
+    "id": "IFM/K2-Horizon-7B"
+   }
+  ]
+ },
+ "siblings": [
+  {
+   "rfilename": ".gitattributes",
+   "blobId": "121ecb3df86ebf8d34468f757ae8e24cd6b6d857",
+   "size": 1736
+  },
+  {
+   "rfilename": "K2-Horizon-7B-BF16.gguf",
+   "blobId": "0f4cad4687da50d868d8aa3512038fc70e62333c",
+   "size": 18010413440,
+   "lfs": {
+    "sha256": "088c5d0814ef955d137fd1073ee3a68f6a53411fca44b75dc58a320640000444",
+    "size": 18010413440,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "README.md",
+   "blobId": "b4279ee7f48992ee4ab45e34f7158114e7b5ff42",
+   "size": 19184
+  },
+  {
+   "rfilename": "assets/k2-horizon-7b-benchmarks.png",
+   "blobId": "2f2c9fc3d0b7ae4fb2367802b38721c9bffeb53e",
+   "size": 1205943,
+   "lfs": {
+    "sha256": "5aa8a375bb1cbc9a80364bad58ddeeb2ebf9bdf0ca5a11d46e0b527daed98823",
+    "size": 1205943,
+    "pointerSize": 132
+   }
+  },
+  {
+   "rfilename": "assets/k2-horizon-7b-training-loss-vs-tokens.png",
+   "blobId": "6bb46dcbe6bf98f1a299b5896a4068994f319957",
+   "size": 482156,
+   "lfs": {
+    "sha256": "d8163616abc92c80bc0ac891dd2fd922bbf4b824a4f1816dfe87f5094b619fee",
+    "size": 482156,
+    "pointerSize": 131
+   }
+  }
+ ]
+}

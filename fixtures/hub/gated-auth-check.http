@@ -1,0 +1,9 @@
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json; charset=utf-8
+RateLimit: "api";r=489;t=74
+RateLimit-Policy: "fixed window";"api";q=500;w=300
+X-Error-Code: GatedRepo
+X-Error-Message: Access to model google/gemma-3-4b-it is restricted. You must have access to it and be authenticated to access it. Please log in.
+WWW-Authenticate: Bearer realm="Authentication required", charset="UTF-8"
+
+{"error":"Access to model google/gemma-3-4b-it is restricted. You must have access to it and be authenticated to access it. Please log in."}

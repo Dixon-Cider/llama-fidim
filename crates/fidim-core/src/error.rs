@@ -45,8 +45,42 @@ pub enum Error {
     #[error("update: {0}")]
     Update(String),
 
+    /// A remote service (the Hugging Face Hub, a CDN) refused or failed a
+    /// request. `kind` is what a caller branches on; `message` is written
+    /// for the user and already says what to do.
+    #[error("{message}")]
+    Http { kind: HttpErrorKind, message: String },
+
+    /// An argument that cannot name anything real (a malformed repo id).
+    #[error("{0}")]
+    InvalidInput(String),
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Why a remote request failed, from the status code and the Hub's
+/// `X-Error-Code` header (the status alone is ambiguous: the Hub answers 401
+/// both for a gated repo and for one that does not exist).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HttpErrorKind {
+    /// The repo is gated: its terms must be accepted on the website and a
+    /// token sent (401 without one, 403 with one that has no access yet).
+    Gated,
+    /// The token was rejected, or the repo is private or does not exist
+    /// (the Hub does not say which).
+    RepoNotFound,
+    RevisionNotFound,
+    /// The file is not in the repo at that revision.
+    EntryNotFound,
+    RateLimited { retry_after_secs: Option<u64> },
+    /// Any other HTTP status.
+    Status { status: u16 },
+    /// DNS, connect, TLS, reset, timeout.
+    Network,
+    /// A success status with a body that is not what the endpoint returns.
+    Malformed,
 }
 
 impl Error {

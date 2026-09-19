@@ -14,6 +14,7 @@ pub mod estimate;
 pub mod export;
 pub mod gguf;
 pub mod hf;
+pub mod hub;
 pub mod launch;
 pub mod live;
 pub mod platform;
@@ -25,5 +26,8 @@ pub mod runtime;
 pub mod supervise;
 pub mod update;
 
-pub use error::Error;
+#[cfg(test)]
+mod test_http;
+
+pub use error::{Error, HttpErrorKind};
 pub type Result<T> = std::result::Result<T, Error>;
