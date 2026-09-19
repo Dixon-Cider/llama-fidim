@@ -182,6 +182,20 @@ enum Cmd {
         /// config.rocm_family, else guessed from the cards.
         #[arg(long)]
         gfx: Option<String>,
+        /// Unsloth channel: the build with Llama FIDIM's runner patch
+        /// (dgpatch5) laid over it, from the overlay published for the
+        /// release. Installs beside the plain build as <tag>-unsloth-dgpatch5.
+        #[arg(long)]
+        overlay: bool,
+        /// Like --overlay, from a local overlay instead: the folder
+        /// packaging/dg-overlay/scripts/build-local.ps1 writes, or its zip
+        /// with fidim-overlay.json beside it.
+        #[arg(long, value_name = "PATH")]
+        overlay_from: Option<PathBuf>,
+        /// With --overlay/--overlay-from: an already downloaded Unsloth zip to
+        /// use instead of downloading it; checked the same way.
+        #[arg(long, value_name = "ZIP")]
+        base_zip: Option<PathBuf>,
     },
 }
 
@@ -251,8 +265,12 @@ fn main() -> anyhow::Result<()> {
             cmd_bench(&cfg, &platform, &profile_id, concurrency, tokens, warmups, no_save)
         }
         Cmd::Rocm { cmd } => cmd_rocm(&cfg, cli.json, cmd),
-        Cmd::Update { install, source, promote, all, rollback, tag, channel, gfx } => {
-            cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag, &channel, gfx)
+        Cmd::Update { install, source, promote, all, rollback, tag, channel, gfx, overlay, overlay_from, base_zip } => {
+            let overlay = match overlay_from {
+                Some(p) => Some(fidim_core::overlay::OverlaySource::Local(p)),
+                None => overlay.then_some(fidim_core::overlay::OverlaySource::Published),
+            };
+            cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag, &channel, gfx, overlay, base_zip)
         }
     }
 }
@@ -352,6 +370,8 @@ fn cmd_update(
     tag: Option<String>,
     channel: &str,
     gfx: Option<String>,
+    overlay: Option<fidim_core::overlay::OverlaySource>,
+    base_zip: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use fidim_core::update::{self, PromoteScope};
 
@@ -361,6 +381,12 @@ fn cmd_update(
     }
     if gfx.is_some() && channel != "unsloth" {
         bail!("--gfx picks the GPU target of an Unsloth build; add --channel unsloth");
+    }
+    if overlay.is_some() && channel != "unsloth" {
+        bail!("--overlay and --overlay-from lay the runner patch over an Unsloth build; add --channel unsloth");
+    }
+    if base_zip.is_some() && overlay.is_none() {
+        bail!("--base-zip goes with --overlay or --overlay-from");
     }
     // Rollback undoes the last promotion batch whichever channel made it.
     if rollback {
@@ -379,7 +405,8 @@ fn cmd_update(
         return Ok(());
     }
     if channel == "unsloth" {
-        return cmd_update_unsloth(cfg, json, install, source, promote, all, tag.as_deref(), gfx.as_deref());
+        let o = UnslothOverlay { source: overlay, base_zip };
+        return cmd_update_unsloth(cfg, json, install, source, promote, all, tag.as_deref(), gfx.as_deref(), o);
     }
 
     let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
@@ -506,8 +533,15 @@ fn print_promote(json: bool, r: &fidim_core::update::PromoteReport, to_dir: &std
     Ok(())
 }
 
+/// What `--overlay`, `--overlay-from` and `--base-zip` asked for.
+struct UnslothOverlay {
+    source: Option<fidim_core::overlay::OverlaySource>,
+    base_zip: Option<PathBuf>,
+}
+
 /// `fidim update --channel unsloth`: unslothai/llama.cpp's prebuilt Windows
-/// ROCm zip, the build that carries the DiffusionGemma runner. Installed
+/// ROCm zip, the build that carries the DiffusionGemma runner, optionally
+/// with Llama FIDIM's runner patch laid over it (`--overlay`). Installed
 /// side by side like upstream builds; its promotion considers every profile
 /// and moves only diffusion ones (`update::promote_skip_reason`).
 #[allow(clippy::too_many_arguments)]
@@ -520,7 +554,9 @@ fn cmd_update_unsloth(
     all: bool,
     tag: Option<&str>,
     gfx: Option<&str>,
+    overlay: UnslothOverlay,
 ) -> anyhow::Result<()> {
+    use fidim_core::overlay::{self as ov, OverlaySource};
     use fidim_core::update::{self, PromoteScope};
 
     if source {
@@ -531,6 +567,7 @@ fn cmd_update_unsloth(
     }
     let names: Vec<String> = WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect();
     let c = update::check_unsloth(cfg, &names, gfx, tag)?;
+    let patched = overlay.source.is_some();
     if !json {
         println!("unsloth latest  : {} ({})", c.latest.tag, c.latest.published_at);
         println!("upstream base   : {}", c.upstream_tag.as_deref().unwrap_or("?"));
@@ -551,6 +588,19 @@ fn cmd_update_unsloth(
             (None, None) => {}
         }
         println!("install dir     : {}{}", c.install_dir.display(), if c.already_installed { "  [present]" } else { "" });
+        match (&c.overlay_asset, &c.overlay_error) {
+            (Some(a), _) => println!("runner patch    : {} published in {} ({}, {} MB)", c.overlay_patch, c.overlay_repo, a.name, a.size >> 20),
+            (None, Some(e)) => println!("runner patch    : {} unavailable — {e}", c.overlay_patch),
+            (None, None) => println!("runner patch    : {} not published for this release in {}", c.overlay_patch, c.overlay_repo),
+        }
+        if let Some(OverlaySource::Local(p)) = &overlay.source {
+            println!("overlay from    : {}", p.display());
+        }
+        println!(
+            "patched dir     : {}{}",
+            c.overlay_install_dir.display(),
+            if c.overlay_installed { "  [present]" } else { "" }
+        );
         if c.installed.is_empty() {
             println!("installed       : none");
         }
@@ -559,13 +609,21 @@ fn cmd_update_unsloth(
             println!("installed       : {} ({}) at {}{patch}", i.tag, i.version, i.path.display());
         }
     }
+    // The build this command acts on: the plain one, or the patched one.
+    let (target_dir, target_installed) =
+        if patched { (&c.overlay_install_dir, c.overlay_installed) } else { (&c.install_dir, c.already_installed) };
     if !install && !promote {
         if json {
             println!("{}", serde_json::to_string_pretty(&c)?);
-        } else if c.already_installed {
+        } else if target_installed {
             println!("installed. --promote moves diffusion profiles onto it.");
+        } else if patched {
+            println!("run with --install to fetch it and lay the runner patch over it.");
         } else {
-            println!("run with --install to fetch it (--gfx picks another GPU target).");
+            println!(
+                "run with --install to fetch it (--gfx picks another GPU target{}).",
+                if c.overlay_available { ", --overlay adds the runner patch" } else { "" }
+            );
         }
         return Ok(());
     }
@@ -576,12 +634,16 @@ fn cmd_update_unsloth(
         }
     };
     let report = if install {
-        let r = update::install_unsloth(cfg, &c.latest, &c.gfx, &mut progress)?;
+        let r = match &overlay.source {
+            Some(src) => ov::install_unsloth_overlay(cfg, &c.latest, &c.gfx, src, overlay.base_zip.as_deref(), &mut progress)?,
+            None => update::install_unsloth(cfg, &c.latest, &c.gfx, &mut progress)?,
+        };
         if !json {
             let v = &r.verify;
             println!(
-                "installed {} at {} — bundled llama-server reports {}; HIP {}; runner {}",
+                "installed {}{} at {} — bundled llama-server reports {}; HIP {}; runner {}",
                 r.tag,
+                if patched { format!(" with {}", c.overlay_patch) } else { String::new() },
                 r.dir.display(),
                 v.version.as_deref().unwrap_or("?"),
                 if v.hip_ok { "OK" } else { "NOT LOADED" },
@@ -602,13 +664,14 @@ fn cmd_update_unsloth(
     if promote {
         let (dir, verify) = match &report {
             Some(r) => (r.dir.clone(), r.verify.clone()),
-            None if c.already_installed => {
+            None if target_installed => {
                 if !json {
-                    println!("verifying {} (--version and --list-devices, no model load)", c.install_dir.display());
+                    println!("verifying {} (--version and --list-devices, no model load)", target_dir.display());
                 }
-                (c.install_dir.clone(), update::verify_unsloth(&c.install_dir))
+                let v = if patched { ov::verify_overlay(target_dir) } else { update::verify_unsloth(target_dir) };
+                (target_dir.clone(), v)
             }
-            None => bail!("{} is not installed; add --install", c.latest.tag),
+            None => bail!("{}{} is not installed; add --install", c.latest.tag, if patched { " with the runner patch" } else { "" }),
         };
         if !verify.hip_ok {
             bail!("refusing to promote onto {}: the bundled HIP backend did not load\n{}", dir.display(), verify.detail.trim());
