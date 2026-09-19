@@ -199,3 +199,4 @@ if ($failures.Count) {
   exit 1
 }
 Write-Host "all hook checks passed" -ForegroundColor Green
+exit 0
