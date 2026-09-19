@@ -51,6 +51,17 @@ welcome, and a report that includes your card, driver version and the
   the text it is generating, with a detector for endless loops.
 
   ![A slot caught looping: the tile reads "loop x8", the drawer shows the repeated fragment](docs/loop.png)
+- **Chat.** Talk to any server Llama FIDIM started, a router model (it
+  loads on the first message) or a DiffusionGemma run. Replies stream in
+  with their reasoning folded away, prefill progress, decode speed and
+  draft acceptance, and Stop frees the slot at once. A DiffusionGemma
+  reply shows its block denoising beside the text and can be replayed
+  afterwards. Each conversation can override the system prompt, thinking
+  and sampler (every field shows the server's own default), and a profile
+  can keep those as the default for new chats. Conversations are saved on
+  this PC as plain JSON; Settings turns that off. **Copy endpoint** in
+  Running hands the OpenAI base URL, model id and ready-to-paste snippets
+  to other programs.
 - **Updates that leave running servers alone.** llama.cpp releases install
   side by side with a changelog of what changed since your build. ROCm
   runtimes install the same way from AMD's release and nightly channels,
@@ -59,7 +70,8 @@ welcome, and a report that includes your card, driver version and the
 - **Benchmarks.** Serial and concurrent decode sweeps against a running
   server, stored per profile as its baseline.
 - **Nearly everything the GUI does, the `fidim` CLI does too.** The live
-  slot text and the profile editor are GUI only; profiles are plain JSON.
+  slot text, the profile editor and the chat are GUI only; profiles are
+  plain JSON.
 
 ## Requirements
 
@@ -112,8 +124,9 @@ each release changed.
    **Save & load**. The Running tab shows it come up.
 
 Everything lives under `~\.fidim`: `config.json`, `profiles\*.json`,
-run state and logs under `runs\`, and the router preset. All of it is plain
-JSON you can edit by hand.
+run state and logs under `runs\`, the router preset, and saved chats under
+`chats\` (with per-profile chat defaults in `chat\presets.json`). All of it
+is plain JSON you can edit by hand.
 
 ## The CLI
 
@@ -212,18 +225,30 @@ These came from real failures on real hardware and are deliberate:
   and rolling back change files and profiles only. The one process it
   starts is a brief `llama-server --list-devices` to confirm a new build's
   HIP backend loads.
+- **The chat streams from the app, not from the page.** A reply is
+  untrusted text shown in a window that can start and stop servers, so the
+  page never talks to a server itself: the Rust side does, for runs Llama
+  FIDIM started only, and passes the stream over a per-request channel.
+  Replies are rendered as markdown with raw HTML off, sanitized again, and
+  shown under a content security policy; links open in your browser only
+  when you choose Open.
+- **Stop on a DiffusionGemma reply frees the chat, not the GPU.** The
+  runner cannot abandon a request halfway, so it finishes the reply in the
+  background and the next message queues behind it. A request stopped
+  while still queued is skipped.
 
 ## Layout
 
 ```
 crates/fidim-core   discovery, GGUF headers, devices, VRAM estimate, pre-flight,
                     launch, supervision, router, live view, updates, ROCm runtimes,
-                    the DiffusionGemma server
+                    the DiffusionGemma server, the chat's streaming client
 crates/fidim-cli    the fidim and fidim-dg binaries
 ui/                 Tauri 2 + Svelte 5 desktop app
 scripts/            install.ps1, build-from-tag.bat (source builds),
                     release.ps1 (sets the version, dates CHANGELOG.md, tags)
-fixtures/           captured --list-devices / hipInfo / WMI output used by tests
+fixtures/           --list-devices / hipInfo / WMI output and server responses
+                    used by tests
 ```
 
 ```

@@ -13,6 +13,38 @@ build with uncommitted changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Chat.** A Chat tab talks to any server Llama FIDIM started: a
+  standalone llama-server, a model behind the router (loaded on the first
+  message) or a DiffusionGemma run. Replies stream with their reasoning in
+  a fold, prefill progress, live decode speed, draft acceptance and a
+  context gauge; Stop frees a llama-server slot at once. Messages can be
+  copied, regenerated, edited and resent, or deleted.
+- A DiffusionGemma reply shows its block denoising beside the text while
+  it streams, including its place in the queue, and can be replayed step
+  by step afterwards.
+- Per-conversation system prompt, thinking on or off, and sampler
+  overrides; every field shows the server's effective default and, on
+  request, the model author's. "Save as default for this profile" keeps
+  them for new chats.
+- Conversations are saved on this PC under `~\.fidim\chats` and can be
+  deleted one by one or all at once; a Settings switch turns saving off.
+- **Copy endpoint** in Running, for every server and router model: the
+  OpenAI base URL, the model id, and curl, Python and environment snippets.
+- fidim-dg names the job in a streamed reply with an SSE comment,
+  `: dg task <id>`, matching `/slots` and `/frames`. OpenAI clients skip
+  comments.
+
+### Changed
+
+- The app runs under a content security policy: no remote scripts,
+  styles, images or connections. Links in chat replies open in the default
+  browser, http and https only, and only when chosen.
+- Health checks, readiness and the live view reach a server bound to
+  0.0.0.0 over loopback; connecting to the wildcard address fails on
+  Windows.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added
