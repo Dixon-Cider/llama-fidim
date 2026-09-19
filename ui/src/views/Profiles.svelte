@@ -941,7 +941,7 @@
             </label>
             <label class="field" style="grid-column: span 3;" title={faWorks
               ? `Sends FA=1 to the runner. This build pads keys for the flash-attention kernel of DiffusionGemma's 512-dim heads, so they run on the GPU and it is faster${faTurnSizing ? "; the runner then sizes its context by the per-request working set instead of the N² scores buffer (65,536 on a 32 GB card instead of ≈12K)" : ""}. Separate from llama-server's flash attention setting.`
-              : "Sends FA=1 to the runner. On this build DiffusionGemma's 512-dim attention heads get no flash-attention kernel (their key count is not padded to its 256-key stride) and fall back to the CPU, which is slower. A locally patched runner build fixes that. Separate from llama-server's flash attention setting."}>
+              : "Sends FA=1 to the runner. On this build DiffusionGemma's 512-dim attention heads get no flash-attention kernel (their key count is not padded to its 256-key stride) and fall back to the CPU, which is slower. A patched runner build fixes that (Updates: Install with FIDIM runner patch). Separate from llama-server's flash attention setting."}>
               <span class="k">flash attention</span>
               <span>
                 <input type="checkbox" bind:checked={draft.diffusion.flash_attn} onchange={scheduleCheck} /> FA=1

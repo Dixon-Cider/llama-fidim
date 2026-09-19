@@ -32,6 +32,11 @@
   let dgPromote = $state(null);  // PromoteReport
   let dgError = $state("");
   let dgGfx = $state("");        // "" = automatic (config family, else a guess from the cards)
+  // Install with the FIDIM runner patch laid over the zip (the overlay
+  // published for the release). Offered only when it is.
+  let dgOverlay = $state(false);
+  const dgWithPatch = $derived(dgOverlay && !!dg?.overlay_available);
+  const dgTargetInstalled = $derived(dgWithPatch ? !!dg?.overlay_installed : !!dg?.already_installed);
   // Which section's action the shared progress log belongs to, so it
   // renders under the button that started it.
   let logOwner = $state("upstream");
@@ -136,7 +141,7 @@
   async function dgDoInstall() {
     dgInstalling = true; dgError = ""; log = []; logOwner = "unsloth"; dgInstall = null; dgPromote = null;
     try {
-      dgInstall = await api("unsloth_install", { tag: dg?.latest?.tag ?? null, gfx: dg?.gfx ?? (dgGfx || null) });
+      dgInstall = await api("unsloth_install", { tag: dg?.latest?.tag ?? null, gfx: dg?.gfx ?? (dgGfx || null), overlay: dgWithPatch });
       await dgCheck();
     } catch (e) { dgError = String(e); }
     dgInstalling = false;
@@ -369,8 +374,10 @@
       </button>
       {#if dg}
         <button class="btn primary" onclick={dgDoInstall} disabled={dgInstalling || !dg.asset}
-          title="Download the zip, check it against GitHub's sha256 digest, unpack it into its own folder, then run --version and --list-devices on it. No model is loaded.">
-          {dgInstalling ? "Installing…" : dg.already_installed ? "Re-verify" : "Install"}
+          title={dgWithPatch
+            ? "Download the zip and the runner patch, check both against GitHub's sha256 digests and the patch's descriptor, unpack the zip into its own folder with the patched binaries laid over it, then run --version and --list-devices on it. No model is loaded."
+            : "Download the zip, check it against GitHub's sha256 digest, unpack it into its own folder, then run --version and --list-devices on it. No model is loaded."}>
+          {dgInstalling ? "Installing…" : dgTargetInstalled ? "Re-verify" : dgWithPatch ? "Install with patch" : "Install"}
         </button>
       {/if}
     </span>
@@ -394,8 +401,22 @@
               {:else}<span class="chip warn" title="The download cannot be checked against a published hash.">no digest published</span>{/if}
             {:else}<span class="chip block">{dg.asset_error}</span>{/if}
           </td></tr>
+        <tr><th title="Llama FIDIM's DiffusionGemma runner patch ({dg.overlay_patch}), built for this exact release and laid over Unsloth's zip: F16 prompt-KV store with a sliding-window ring, flash attention on the GPU, longer context, prefill reuse across blocks. Unsloth's ggml and ROCm files stay as shipped.">Runner patch</th>
+          <td colspan="3">
+            {#if dg.overlay_available}
+              <label style="display: inline-flex; gap: 6px; align-items: center; margin-right: 10px;"
+                title="Installs into {dg.overlay_install_dir}, beside the plain build. Every file is checked against the patch's descriptor, which also names the exact Unsloth zip it was built for.">
+                <input type="checkbox" bind:checked={dgOverlay} disabled={dgInstalling} />
+                Install with FIDIM runner patch
+              </label>
+              <span class="mono faint">{dg.overlay_patch} · {dg.overlay_asset.name} ({(dg.overlay_asset.size / 1048576).toFixed(0)} MB)</span>
+              {#if dg.overlay_installed}<span class="chip pass">installed</span>{/if}
+            {:else if dg.overlay_error}<span class="chip warn" title={dg.overlay_error}>{dg.overlay_patch} unavailable</span>
+              <span class="faint small">{dg.overlay_error}</span>
+            {:else}<span class="faint">{dg.overlay_patch} is not published for this release ({dg.overlay_repo})</span>{/if}
+          </td></tr>
         <tr><th>Install target</th>
-          <td class="path" colspan="3">{dg.install_dir}</td></tr>
+          <td class="path" colspan="3">{dgWithPatch ? dg.overlay_install_dir : dg.install_dir}</td></tr>
         <tr><th>Installed</th>
           <td colspan="3">
             {#each dg.installed as b}
@@ -421,6 +442,7 @@
   <div class="card">
     <h2 style="margin-top: 0;">
       {dgInstall.tag} <span class="chip plain">unsloth</span>
+      {#if dgInstall.source === "unsloth-overlay"}<span class="chip accent" title="Unsloth's zip with the runner patch laid over it">patch: {dg?.overlay_patch ?? "dgpatch5"}</span>{/if}
       {#if dgInstall.verify.hip_ok}<span class="chip pass">HIP backend loaded</span>
       {:else}<span class="chip block">HIP backend did not load</span>{/if}
       {#if dgInstall.verify.runner_present}<span class="chip pass">runner present</span>

@@ -375,6 +375,8 @@ const MOCK_DG_PROFILE = {
 const MOCK_UNSLOTH_TAG = "b11031-mix-3e83366";
 const MOCK_UNSLOTH_GFX = ["gfx103X", "gfx110X", "gfx1150", "gfx1151", "gfx120X", "gfx908", "gfx90a"];
 let mockUnslothInstalled = false;
+// The runner-patch overlay is published for the mock release; installed on demand.
+let mockOverlayInstalled = false;
 
 const MOCK_LOG_LINES = [
   "0.00.339 I   - ROCm0   : AMD Radeon AI PRO R9700 (32624 MiB, 32472 MiB free)",
@@ -519,23 +521,30 @@ async function mock(cmd, args) {
       const name = `app-${tag}-windows-x64-rocm-${gfx}.zip`;
       const known = MOCK_UNSLOTH_GFX.includes(gfx);
       const dir = `C:\\llama.cpp\\${tag}-unsloth`;
-      const installed = MOCK_BUILDS.filter((b) => b.channel === "unsloth").map((b) => ({ tag: b.tag, version: b.version, path: b.path }));
+      const installed = MOCK_BUILDS.filter((b) => b.channel === "unsloth").map((b) => ({ tag: b.tag, version: b.version, path: b.path, patch: b.patch?.name }));
       if (mockUnslothInstalled) installed.unshift({ tag: `${tag}-unsloth`, version: "b11031", path: dir });
+      if (mockOverlayInstalled) installed.unshift({ tag: `${tag}-unsloth-dgpatch5`, version: "b11031", path: `${dir}-dgpatch5`, patch: "dgpatch5" });
+      const overlayPublished = tag === MOCK_UNSLOTH_TAG;
       return {
         latest: { tag, published_at: "2026-09-18T21:04:11Z", html_url: `https://github.com/unslothai/llama.cpp/releases/tag/${tag}`, assets: [], name: `llama.cpp prebuilt ${tag}`, body: "" },
         upstream_tag: "b11031", gfx, gfx_available: MOCK_UNSLOTH_GFX,
         asset: known ? { name, url: "", size: 494370803, digest: "sha256:09135ea01882040460a1eda0f301ca28effd270fdf661c3697d29119e2234011" } : null,
         asset_error: known ? null : `release ${tag} has no ${name}; its Windows ROCm zips are: ${MOCK_UNSLOTH_GFX.map((g) => `app-${tag}-windows-x64-rocm-${g}.zip`).join(", ")}`,
         install_dir: dir, already_installed: mockUnslothInstalled, installed,
+        overlay_repo: "Dixon-Cider/fidim-dg-overlay", overlay_patch: "dgpatch5", overlay_available: overlayPublished,
+        overlay_asset: overlayPublished ? { name: `fidim-dg-overlay-${tag}-windows-x64.zip`, url: "", size: 9437184, digest: "sha256:0ce183b190a9b2e678e9bd6e31c40c42b878834233f75529e6d785fa3106eeb8" } : null,
+        overlay_error: null, overlay_install_dir: `${dir}-dgpatch5`, overlay_installed: mockOverlayInstalled,
       };
     }
     case "unsloth_install": {
       await new Promise((r) => setTimeout(r, 1500));
       const tag = args.tag ?? MOCK_UNSLOTH_TAG;
-      const skipped = mockUnslothInstalled;
-      mockUnslothInstalled = true;
+      const overlay = !!args.overlay;
+      const skipped = overlay ? mockOverlayInstalled : mockUnslothInstalled;
+      if (overlay) mockOverlayInstalled = true; else mockUnslothInstalled = true;
       return {
-        tag, dir: `C:\\llama.cpp\\${tag}-unsloth`, source: "unsloth-prebuilt", skipped_existing: skipped,
+        tag, dir: `C:\\llama.cpp\\${tag}-unsloth${overlay ? "-dgpatch5" : ""}`,
+        source: overlay ? "unsloth-overlay" : "unsloth-prebuilt", skipped_existing: skipped,
         verify: {
           version: "b11031", commit: "a41c7e2d0", hip_ok: true, detail: "", runner_present: true,
           devices: MOCK_DEVICES.map((d) => ({ index: d.device.hip_index, backend: "ROCm", name: d.device.name, total_mib: d.device.total_mib })),
