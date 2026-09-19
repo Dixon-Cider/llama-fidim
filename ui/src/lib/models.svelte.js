@@ -25,6 +25,7 @@ export const wz = $state({
   ctx: null,            // null = the estimate's, at most 32768
   // 3 Build, 4 Get
   plan: null,           // wizard_plan result
+  planKey: "",          // the picks (request) the plan was made for
   planning: false,
   planError: "",
   build: { kind: "auto" },
@@ -148,12 +149,23 @@ export async function open(input) {
   wz.findError = "";
   try {
     const v = await api("wizard_inspect", { input, rev: null });
+    // Another repo: a finished job (done, failed or stopped) is dismissed,
+    // so Get shows this repo's plan and its Start, not the old job and a
+    // Resume that would run something else. A running job is never
+    // dismissed (the steps cannot be left while one runs).
+    if (wz.job?.finished) {
+      await api("wizard_forget", { job: wz.job.job }).catch(() => {});
+      wz.job = null;
+      wz.jobError = "";
+      wz.check = null;
+    }
     wz.view = v;
     wz.choice = v.preselect ?? v.recommended ?? v.catalog?.choices?.[0]?.label ?? null;
     wz.mmproj = "";
     wz.draft = "";
     wz.ctx = null;
     wz.plan = null;
+    wz.planKey = "";
     wz.planError = "";
     wz.build = { kind: "auto" };
     wz.consent = false;
@@ -179,6 +191,12 @@ function request() {
   };
 }
 
+const requestKey = () => JSON.stringify(request());
+
+/// The plan was made for the picks as they are now (the file, extras,
+/// context, build and folder): a change on Choose file makes it stale.
+export const planIsCurrent = () => !!wz.plan && !!wz.view && wz.plan.repo === wz.view.repo && wz.planKey === requestKey();
+
 /// Plan again for the current picks. The consent given stays only while
 /// it is consent to the same thing.
 export async function makePlan() {
@@ -186,11 +204,13 @@ export async function makePlan() {
   wz.planning = true;
   wz.planError = "";
   const before = wz.plan?.consent ?? null;
+  const key = requestKey();
   try {
     // The view by its id: core plans from its own copy of it.
     const p = await api("wizard_plan", { viewId: wz.view.view_id, request: request() });
     if (p.consent !== before) wz.consent = false;
     wz.plan = p;
+    wz.planKey = key;
   } catch (e) {
     wz.planError = String(e);
   }
@@ -198,7 +218,17 @@ export async function makePlan() {
   return !wz.planError;
 }
 
+/// The plan for the current picks: the one there is when it is current,
+/// else a new one. False when planning failed (planError says why).
+export async function ensurePlan() {
+  return planIsCurrent() || (await makePlan());
+}
+
 export async function toBuild() {
+  if (!wz.destRoot) {
+    wz.planError = "Add a model folder to save into first (Save to, above).";
+    return;
+  }
   if (await makePlan()) wz.step = 3;
 }
 
@@ -209,7 +239,9 @@ export function setBuild(choice) {
 
 export function setDest(path) {
   wz.destRoot = path;
-  makePlan();
+  if (wz.planError.startsWith("Add a model folder")) wz.planError = "";
+  // On Choose file there is no plan yet: Continue makes it.
+  if (wz.plan) makePlan();
 }
 
 export async function addRoot(path) {
@@ -233,8 +265,16 @@ export async function addRoot(path) {
   return false;
 }
 
-export async function start() {
+/// Start the plan. `asIs`: a finished job's own plan (resumed with no repo
+/// view to plan again from); otherwise a plan made for other picks than
+/// the ones shown is made again first and not started, so what starts is
+/// always what the person looked at.
+export async function start({ asIs = false } = {}) {
   if (!wz.plan) return;
+  if (!asIs && !planIsCurrent()) {
+    await makePlan();
+    return;
+  }
   wz.starting = true;
   wz.jobError = "";
   wz.check = null;
@@ -262,20 +302,25 @@ export async function cancel() {
   }
 }
 
-/// Try a failed or stopped job again: plan afresh (what is on disk now),
-/// then start. Downloads resume from their .part files.
+/// Try a failed or stopped job again: plan afresh (what is on disk now)
+/// when the repo shown is the job's, then start. Downloads resume from
+/// their .part files.
 export async function resume() {
   const old = wz.job;
-  if (wz.view && (await makePlan())) {
-    if (old?.finished) await api("wizard_forget", { job: old.job }).catch(() => {});
+  if (!old?.finished) return;
+  const same = !!wz.view && wz.view.repo === old.plan?.repo && wz.view.sha === old.plan?.sha;
+  if (same) {
+    if (!(await makePlan())) return;
+    await api("wizard_forget", { job: old.job }).catch(() => {});
     wz.job = null;
     await start();
-  } else if (!wz.view && old?.plan) {
-    // Came back to a job whose repo view is gone: its own plan.
+  } else if (old.plan) {
+    // No view of the job's repo (the page reloaded): the job's own plan,
+    // which core still holds by its id.
     await api("wizard_forget", { job: old.job }).catch(() => {});
     wz.job = null;
     wz.plan = old.plan;
-    await start();
+    await start({ asIs: true });
   }
 }
 
@@ -296,7 +341,7 @@ export async function startOver() {
   if (wz.job && !wz.job.finished) return;
   if (wz.job) await api("wizard_forget", { job: wz.job.job }).catch(() => {});
   Object.assign(wz, {
-    step: 1, view: null, choice: null, mmproj: "", draft: "", ctx: null, plan: null, planError: "",
+    step: 1, view: null, choice: null, mmproj: "", draft: "", ctx: null, plan: null, planKey: "", planError: "",
     build: { kind: "auto" }, consent: false, job: null, jobError: "", check: null,
   });
 }

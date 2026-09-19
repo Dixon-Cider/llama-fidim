@@ -302,7 +302,8 @@ export function createWizardMock(ctx) {
     const rootPath = req.dest_root ?? roots[0].path;
     const root = roots.find((x) => x.path.toLowerCase() === String(rootPath).toLowerCase()) ?? { path: rootPath, free_bytes: null };
     const [owner, name] = v.repo.split("/");
-    const destDir = `${root.path}\\${owner}\\${name}`;
+    // Joined as a path is: a drive's root (E:\) ends in its separator.
+    const destDir = `${String(root.path).replace(/[\\/]+$/, "")}\\${owner}\\${name}`;
     const dest = (f) => `${destDir}\\${f.path.split("/").pop()}`;
     const notes = [];
     const steps = [];

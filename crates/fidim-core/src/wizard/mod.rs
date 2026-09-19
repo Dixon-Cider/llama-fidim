@@ -1818,7 +1818,13 @@ pub fn plan_with(env: &dyn Env, cfg: &Config, view: &RepoView, req: &PlanRequest
         .dest_root
         .clone()
         .or_else(|| cfg.model_roots.first().cloned())
-        .ok_or_else(|| Error::InvalidInput("no model folder: add one in Settings, or pass --dest".into()))?;
+        .ok_or_else(|| {
+            Error::InvalidInput(
+                "no model folder to save into: add one (Add a folder in the Models tab, Settings > model folders, \
+                 or --dest on the command line)"
+                    .into(),
+            )
+        })?;
     if !dest_root.is_absolute() {
         return Err(Error::InvalidInput(format!("{} is not an absolute folder path", dest_root.display())));
     }

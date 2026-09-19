@@ -10,7 +10,7 @@
   import { arrive, leave, stagger, toastFly, LAYOUT } from "../motion.js";
   import { handoff } from "../lib/handoff.js";
   import {
-    wz, init, submit, open, looksLikeRepo, toBuild, setBuild, setDest, addRoot, start, cancel, resume, runCheck, startOver, makePlan,
+    wz, init, submit, open, looksLikeRepo, toBuild, setBuild, setDest, addRoot, start, cancel, resume, runCheck, startOver, ensurePlan,
   } from "../lib/models.svelte.js";
   import {
     gib, mbps, eta, params, shortSha, day, levelChip, fitChip, fitWord, actionTitle, sourceOf, supportText, supportChip,
@@ -40,7 +40,10 @@
   }
   async function goStep(n) {
     if (!canGo(n)) return;
-    if ((n === 3 || n === 4) && !wz.plan) await makePlan();
+    // Build and Get show the plan for the picks as they are now: one made
+    // before a file, extra or context changed on Choose file is made again.
+    // Get with a job shows the job, not a plan.
+    if ((n === 3 || (n === 4 && !wz.job)) && !(await ensurePlan())) return;
     wz.step = n;
   }
 
@@ -137,6 +140,33 @@
   const statusChip = (s) => ({ pending: "plain", running: "accent", done: "pass", failed: "block", stopped: "warn", skipped: "plain" }[s] ?? "plain");
   const stepIcon = (a) => (a.kind === "build" ? "build" : a.kind === "download" ? a.role : "profile");
 </script>
+
+<!-- Where the files go: the model folders with their free space, and a
+     folder to add (saved into Settings > model folders). On Get, and on
+     Choose file while there is no folder at all. -->
+{#snippet saveTo()}
+  <section class="card">
+    <div class="sec">Save to <span class="faint">model folders; the scan finds what lands in them</span></div>
+    <div class="roots">
+      {#each wz.roots as r (r.path)}
+        <label class="opt-row" class:on={wz.destRoot === r.path}>
+          <input type="radio" name="root" checked={wz.destRoot === r.path} onchange={() => setDest(r.path)} disabled={wz.planning} />
+          <span class="mono">{r.path}</span>
+          <span class="faint small">{r.free_bytes != null ? `${gib(r.free_bytes)} free` : "free space unknown"}{r.exists ? "" : " · created on first download"}</span>
+        </label>
+      {:else}
+        <div class="faint small">No model folder yet: add one, for example a folder on a drive with room for models.</div>
+      {/each}
+    </div>
+    <div class="addroot">
+      <input class="mono" bind:value={newRoot} placeholder="D:\models" spellcheck="false"
+        onkeydown={async (e) => { if (e.key === "Enter" && (await addRoot(newRoot))) newRoot = ""; }} />
+      <button class="btn" disabled={!newRoot.trim() || wz.rootBusy} onclick={async () => { if (await addRoot(newRoot)) newRoot = ""; }}
+        title="Adds the folder to Settings > model folders (and creates it), then saves there.">{wz.rootBusy ? "Adding…" : "Add a folder"}</button>
+      {#if wz.rootError}<span class="chip block">{wz.rootError}</span>{/if}
+    </div>
+  </section>
+{/snippet}
 
 <h1>
   Get a model
@@ -320,6 +350,12 @@
       </div>
     </section>
 
+    {#if !wz.destRoot}
+      <!-- No model folder yet (no LM Studio folder to pick up): the plan
+           needs one, so the picker is here rather than only on Get. -->
+      {@render saveTo()}
+    {/if}
+
     <section class="card">
       <div class="notice">
         {#if usable}
@@ -334,7 +370,8 @@
       <div class="toolbar" style="margin: 14px 0 0;">
         <button class="btn" onclick={() => (wz.step = 1)}>Back</button>
         <div class="grow"></div>
-        <button class="btn primary" onclick={toBuild} disabled={!wz.choice || wz.planning}>{#if wz.planning}<span class="spinner"></span> Planning…{:else}Continue{/if}</button>
+        {#if !wz.destRoot}<span class="faint small">Add a model folder above to save into first.</span>{/if}
+        <button class="btn primary" onclick={toBuild} disabled={!wz.choice || wz.planning || !wz.destRoot}>{#if wz.planning}<span class="spinner"></span> Planning…{:else}Continue{/if}</button>
       </div>
     </section>
   {/if}
@@ -464,27 +501,7 @@
 <!-- 4 Get --------------------------------------------------------------- -->
 {:else if wz.step === 4 && jobPlan}
   {#if !wz.job}
-    <section class="card">
-      <div class="sec">Save to <span class="faint">model folders; the scan finds what lands in them</span></div>
-      <div class="roots">
-        {#each wz.roots as r (r.path)}
-          <label class="opt-row" class:on={wz.destRoot === r.path}>
-            <input type="radio" name="root" checked={wz.destRoot === r.path} onchange={() => setDest(r.path)} disabled={wz.planning} />
-            <span class="mono">{r.path}</span>
-            <span class="faint small">{r.free_bytes != null ? `${gib(r.free_bytes)} free` : "free space unknown"}{r.exists ? "" : " · created on first download"}</span>
-          </label>
-        {:else}
-          <div class="faint small">No model folder yet: add one.</div>
-        {/each}
-      </div>
-      <div class="addroot">
-        <input class="mono" bind:value={newRoot} placeholder="D:\models" spellcheck="false"
-          onkeydown={async (e) => { if (e.key === "Enter" && (await addRoot(newRoot))) newRoot = ""; }} />
-        <button class="btn" disabled={!newRoot.trim() || wz.rootBusy} onclick={async () => { if (await addRoot(newRoot)) newRoot = ""; }}
-          title="Adds the folder to Settings > model folders (and creates it), then saves there.">{wz.rootBusy ? "Adding…" : "Add a folder"}</button>
-        {#if wz.rootError}<span class="chip block">{wz.rootError}</span>{/if}
-      </div>
-    </section>
+    {@render saveTo()}
   {/if}
 
   <section class="card">
@@ -507,7 +524,10 @@
           <div class="head">
             <span class="chip {statusChip(status)}" class:live={status === "running"}>{status === "pending" ? stepIcon(s.action) : status}</span>
             <span class="title">{s.title}</span>
-            {#if s.needs_consent}<span class="chip warn" title={jobPlan.consent}>consented</span>{/if}
+            {#if s.needs_consent}
+              {#if wz.job ? wz.job.consent : wz.consent}<span class="chip warn" title={jobPlan.consent}>consented</span>
+              {:else}<span class="chip block" title={jobPlan.consent}>needs consent</span>{/if}
+            {/if}
           </div>
           {#if s.action.kind === "download"}
             {@const total = pg?.total ?? s.action.file.size}
