@@ -9,7 +9,15 @@ on a GPU that runs other work.
 
 Commands are for PowerShell from the root of a Llama FIDIM checkout, with
 `fidim.exe` from `cargo build --release -p fidim-cli` (target\release) or an
-installed copy. Nothing here writes to `~\.fidim`: step 2 uses its own home.
+installed copy. Steps 1 to 5 write nothing to `~\.fidim` (step 2 uses its
+own home). Step 6 installs the build into the live Llama FIDIM, beside the
+other builds, and changes no profile.
+
+Do not move profiles onto the overlay while it is being validated: no
+`--promote`, and not **Move diffusion profiles onto it** on the Updates tab.
+Promotion moves a diffusion profile on a dgpatch4 build (the live
+`dg-26b`) onto dgpatch5, because dgpatch5 has every feature dgpatch4
+declares.
 
 ## 1. Build the overlay locally (no GPU)
 
@@ -101,9 +109,28 @@ the SDK runtime is the Studio crash, and blocks publishing.
 
 ## 6. Through Llama FIDIM (GPU, owner's go-ahead)
 
-Point a copy of the DiffusionGemma profile at the new build (Profiles, build
-`b11030-mix-5ff778e-unsloth-dgpatch5`), launch it, and send one chat request.
-Pre-flight must show the patched sizing (FA on, context up to 65,536).
+The Profiles view lists only the builds the live Llama FIDIM scans (its
+`build_roots`, and its install folder), not the scratch home of step 2.
+Install the same overlay into the live home first. Without `--install` the
+command only prints where it would go (`patched dir`: the install_root, else
+the first build root, beside the dgpatch4 build); with it, it adds that one
+folder and changes nothing else (no `--promote`):
+
+```powershell
+Remove-Item Env:FIDIM_HOME -ErrorAction SilentlyContinue
+$o = @('--channel', 'unsloth', '--tag', 'b11030-mix-5ff778e', '--gfx', 'gfx120X',
+       '--overlay-from', "$env:TEMP\fidim-dgo\out")
+fidim update @o
+fidim update @o --install --base-zip "$env:TEMP\fidim-dgo\dl\app-b11030-mix-5ff778e-windows-x64-rocm-gfx120X.zip"
+```
+
+Then in Profiles select the DiffusionGemma profile, **Duplicate** it, and in
+the copy pick build `b11030-mix-5ff778e-unsloth-dgpatch5` (the original stays
+on its build). Launch the copy and send one chat request. Pre-flight must
+show the patched sizing (FA on, context up to 65,536).
+
+If validation fails, stop the copy, delete it in Profiles, and remove the
+`patched dir` folder the install printed.
 
 ## 7. Before the first release
 
