@@ -44,12 +44,16 @@ jobs:
     defaults:
       run:
         shell: pwsh
-    env:
-      GH_TOKEN: ${{ github.token }}
     # Everything is built in $RUNNER_TEMP\o, outside the checkout: the build
     # stamps its version from the first git repository above the source.
+    # The build runs code this repository does not control (Unsloth's
+    # source and CMake scripts, the BoringSSL clone, Unsloth's binaries in
+    # the smoke test), so the token goes only to the steps that call GitHub,
+    # and the checkout keeps no credentials.
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Git settings and Ninja
         run: |
@@ -59,9 +63,13 @@ jobs:
           # it on PATH; this one is the fallback, as in upstream's recipe.
           choco install ninja --no-progress -y
 
+      - name: Script self-tests (no network, no build)
+        run: ./tests/scripts.tests.ps1
+
       - name: Resolve the Unsloth tag
         id: tag
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.unsloth_tag }}
         run: |
           . ./scripts/common.ps1
@@ -76,6 +84,8 @@ jobs:
           exit 0
 
       - name: Fetch the base (source and the gfx120X zip)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: ./scripts/fetch-base.ps1 -Tag ${{ steps.tag.outputs.tag }} -WorkDir "$env:RUNNER_TEMP\o" -Gfx gfx120X
 
       - name: Apply the patch
@@ -84,6 +94,8 @@ jobs:
 
       - name: Open an issue when the patch no longer applies
         if: failure() && steps.apply.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
           $run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
@@ -93,14 +105,16 @@ jobs:
       - name: Build
         run: ./scripts/build.ps1 -WorkDir "$env:RUNNER_TEMP\o" -Toolchain ${{ inputs.toolchain }}
 
-      - name: Gate (symbol closure and file set)
-        run: ./scripts/gate.ps1 -WorkDir "$env:RUNNER_TEMP\o"
-
       # Whether the HIP runtime DLLs load on a runner without an AMD GPU or
-      # driver is not known, so this one only reports.
+      # driver is not known, so this one only reports. It runs first: every
+      # gate run starts by removing gate.pass, and the one that decides
+      # (below) must be the last.
       - name: Smoke test (llama-server --version on base + overlay)
         continue-on-error: true
         run: ./scripts/gate.ps1 -WorkDir "$env:RUNNER_TEMP\o" -Smoke
+
+      - name: Gate (symbol closure and file set)
+        run: ./scripts/gate.ps1 -WorkDir "$env:RUNNER_TEMP\o"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -112,6 +126,7 @@ jobs:
             ${{ runner.temp }}/o/base.json
             ${{ runner.temp }}/o/build-info.json
             ${{ runner.temp }}/o/ggml-imports.json
+            ${{ runner.temp }}/o/gate.pass
 
   sign:
     needs: build
@@ -181,6 +196,7 @@ jobs:
             ${{ runner.temp }}/o/base.json
             ${{ runner.temp }}/o/build-info.json
             ${{ runner.temp }}/o/ggml-imports.json
+            ${{ runner.temp }}/o/gate.pass
 
   release:
     needs: [build, sign]
@@ -196,10 +212,10 @@ jobs:
     defaults:
       run:
         shell: pwsh
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
@@ -216,6 +232,8 @@ jobs:
             ${{ runner.temp }}/out/fidim-overlay.json
 
       - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           . ./scripts/common.ps1
           $tag = "${{ needs.build.outputs.tag }}"

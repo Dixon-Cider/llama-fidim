@@ -89,10 +89,12 @@ msvc):
 
 1. **build** (windows-2022, Visual Studio 2022, no ROCm): fetch and check the
    base, apply the patch (a patch that no longer applies opens an issue),
-   build, and gate against the release's gfx120X zip. A second gate run
-   also starts `llama-server --version` on base + overlay; whether AMD's HIP
-   runtime loads on a runner without an AMD GPU is not known, so that step
-   only reports.
+   build, and gate against the release's gfx120X zip. A gate run before
+   that one also starts `llama-server --version` on base + overlay; whether
+   AMD's HIP runtime loads on a runner without an AMD GPU is not known, so
+   that step only reports. The GitHub token reaches only the steps that call
+   GitHub, never the build or the smoke test, which run code from Unsloth's
+   release.
 2. **sign**, only when the repository variable `AS_ACCOUNT` is set: Azure
    Artifact Signing through GitHub OIDC, in the `release-signing`
    environment (give it a required reviewer). It needs the variables
@@ -129,7 +131,7 @@ from the first repository above the source). The release assets land in
 | `scripts/package.ps1` | the zip, the descriptor, the patch, SHA256SUMS; only after the gate passed |
 | `scripts/build-local.ps1` | all of the above in order |
 | `scripts/common.ps1` | shared settings: the repository name (`$OverlayRepo`), the patch name, the file allowlist |
-| `tests/scripts.tests.ps1` | self-tests of the above that need no network or build |
+| `tests/scripts.tests.ps1` | self-tests of the above that need no network or build (the workflow runs them first) |
 
 ## The repository name
 
