@@ -153,6 +153,9 @@ pub struct BuildMeta {
     pub patch: Option<BuildPatch>,
     /// Set on `Channel::Git` builds.
     pub git: Option<GitSource>,
+    /// The runtime a source build was compiled against (see
+    /// `update::Manifest::runtime`); `runtime::resolve_for_build` uses it.
+    pub runtime: Option<String>,
 }
 
 impl BuildMeta {
@@ -178,6 +181,8 @@ struct ManifestLite {
     patch: Option<BuildPatch>,
     #[serde(default, deserialize_with = "lenient_git")]
     git: Option<GitSource>,
+    #[serde(default)]
+    runtime: Option<String>,
 }
 
 /// Read a build's channel metadata. No manifest, or one that does not parse,
@@ -193,6 +198,7 @@ pub fn read_build_meta(dir: &Path) -> BuildMeta {
             release_tag: m.release_tag,
             patch: m.patch,
             git: m.git,
+            runtime: m.runtime,
         },
         Err(_) => BuildMeta::default(),
     }

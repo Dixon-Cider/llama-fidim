@@ -306,7 +306,7 @@ pub fn launch(cfg: &Config, rc: &RouterConfig, profiles: &[Profile], devices: &[
         launch::wait_port_free(&rc.host, rc.port, Duration::from_secs(20))?;
     }
 
-    let path_prepend = crate::runtime::path_prepend(cfg, rc.rocm_runtime.as_deref())?;
+    let path_prepend = crate::runtime::path_prepend_for_build(cfg, rc.rocm_runtime.as_deref(), build_dir)?;
     let plan = router_plan(rc, exe, &ini, &rendered.env, path_prepend);
     let profile = synthetic_profile(rc, build_dir)?;
     let state = supervise::spawn(&plan, &profile, &cfg.runs_dir, rendered.device_keys.clone(), vec![], false, 0)?;

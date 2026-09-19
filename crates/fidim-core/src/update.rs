@@ -581,6 +581,11 @@ pub struct Manifest {
     /// these over its DLL heuristic.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_caps")]
     pub caps: Option<SourceCaps>,
+    /// The ROCm runtime (a `fidim runtimes` name) a source build was compiled
+    /// against. Its ggml-hip loads against that runtime's DLLs only, so it is
+    /// what the build runs with unless a profile names another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
     /// Fields a newer FIDIM wrote, kept through every re-verify rewrite.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -1756,6 +1761,9 @@ pub fn build_from_ref(
                 git: Some(src.git_source()),
                 caps,
                 patch,
+                // The HIP SDK it compiled against: its ggml-hip loads only
+                // against that runtime's DLLs.
+                runtime: tc.rocm.as_deref().and_then(|d| crate::runtime::name_for_rocm_dir(cfg, d)),
                 ..Default::default()
             },
         )?;

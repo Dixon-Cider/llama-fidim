@@ -444,7 +444,7 @@ impl PrepareInputs {
         let runtime_path = if meta.bundled_runtime {
             None
         } else {
-            crate::runtime::path_prepend(cfg, profile.rocm_runtime.as_deref())?
+            crate::runtime::path_prepend_for_build(cfg, profile.rocm_runtime.as_deref(), &profile.build.path)?
         };
         let build_version_output =
             run_capture(&server_exe, &["--version"], runtime_path.as_deref())
@@ -588,7 +588,7 @@ pub fn prepare_with_inputs(
     let runtime = if meta.bundled_runtime {
         None
     } else {
-        Some(crate::runtime::resolve(cfg, profile.rocm_runtime.as_deref())?)
+        Some(crate::runtime::resolve_for_build(cfg, profile.rocm_runtime.as_deref(), &profile.build.path)?)
     };
     // SDK identity for the baseline fingerprint: hipconfig where the runtime
     // has one (the HIP SDK), else the runtime's name + version.
