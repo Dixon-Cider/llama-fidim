@@ -320,13 +320,27 @@ impl Env for Fake {
         std::fs::write(dest, b"not a real model").unwrap();
         Ok(file.size)
     }
-    fn install_upstream(&self, tag: &str, progress: &mut dyn FnMut(String)) -> Result<InstallReport> {
+    fn install_upstream(&self, tag: &str, progress: &mut dyn FnMut(String), cancel: &AtomicBool) -> Result<InstallReport> {
         self.call(format!("install_upstream {tag}"));
         progress(format!("{tag}: 10 / 20 MB"));
+        // As install_prebuilt_cancellable: the flag, raised while its zips
+        // download, ends it.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
         Ok(report(&self.root.join("builds").join(format!("{tag}-rocm")), tag))
     }
-    fn install_unsloth(&self, tag: &str, gfx: &str, _progress: &mut dyn FnMut(String)) -> Result<InstallReport> {
+    fn install_unsloth(
+        &self,
+        tag: &str,
+        gfx: &str,
+        _progress: &mut dyn FnMut(String),
+        cancel: &AtomicBool,
+    ) -> Result<InstallReport> {
         self.call(format!("install_unsloth {tag} {gfx}"));
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
         Ok(report(&self.root.join("builds").join(format!("{tag}-unsloth")), tag))
     }
     fn build_source(
@@ -334,10 +348,16 @@ impl Env for Fake {
         src: &SourceRef,
         gpu_targets: &str,
         progress: &mut dyn FnMut(BuildProgress),
-        _cancel: &AtomicBool,
+        cancel: &AtomicBool,
     ) -> Result<InstallReport> {
         self.call(format!("build_source {} {} {} {gpu_targets}", src.remote_url, src.git_ref, src.sha));
         progress(BuildProgress { step: "build".into(), done: Some(239), total: Some(478), line: "[239/478] Building HIP object".into() });
+        // As build_from_ref: a stop ends the build script and reports its cleanup.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Update(
+                "build of ifm-ai K2Horizon fork @42adf01 cancelled; its worktree and staging files were removed".into(),
+            ));
+        }
         let dir = update::source_install_dir(&self.cfg(), src).unwrap();
         Ok(report(&dir, "ifm-ai K2Horizon fork @42adf01"))
     }
@@ -1135,6 +1155,66 @@ fn a_source_build_counts_its_scratch_drive() {
     let on_src_drive = build_space(&ps, &src.parent().unwrap().join("builds").join("x"));
     assert_eq!(on_src_drive.len(), 1);
     assert_eq!(on_src_drive[0].1, SOURCE_SCRATCH_BYTES + SOURCE_INSTALL_BYTES);
+}
+
+/// Stop pressed during a source build or an install: the job ends as
+/// `cancelled` (the view's "stopped"), not with the build's own words.
+#[test]
+fn a_stopped_build_or_install_reads_cancelled() {
+    let f = Fake::k2("run-stop-build");
+    let cfg = f.cfg();
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    let plan = plan_with(&f, &cfg, &view, &PlanRequest::default()).unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut events = Vec::new();
+    let r = run_with(
+        &f,
+        &cfg,
+        &plan,
+        true,
+        &mut |e| {
+            // Stop while ninja runs.
+            if e.stage.as_deref() == Some("build") {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            events.push(e.clone())
+        },
+        &cancel,
+    );
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    let failed = events.iter().find(|e| e.status == StepStatus::Failed).unwrap();
+    assert_eq!((failed.step, failed.line.as_deref()), (0, Some("cancelled")));
+    let mut jp = JobProgress::new(&plan);
+    events.iter().for_each(|e| jp.apply(e));
+    assert_eq!(jp.steps[0].error.as_deref(), Some("cancelled"));
+    assert!(!f.calls().iter().any(|c| c.starts_with("download")), "nothing after the stop");
+
+    // An upstream install stops too (its zips' download sees the flag).
+    let mut up = plan.clone();
+    let dir = cfg.install_root.clone().unwrap().join("b11046-rocm");
+    let ps = PlanStep {
+        action: PlanAction::InstallUpstream { tag: "b11046".into(), install_dir: dir },
+        explanation: String::new(),
+        needs_consent: false,
+        verified: true,
+        warnings: vec![],
+    };
+    up.steps[0] = Step { title: step_title(&ps), detail: String::new(), needs_consent: false, action: StepAction::Build { plan: ps } };
+    let cancel = AtomicBool::new(false);
+    let r = run_with(
+        &f,
+        &cfg,
+        &up,
+        false,
+        &mut |e| {
+            if e.stage.as_deref() == Some("install") {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        },
+        &cancel,
+    );
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    assert!(f.calls().iter().any(|c| c == "install_upstream b11046"));
 }
 
 #[test]

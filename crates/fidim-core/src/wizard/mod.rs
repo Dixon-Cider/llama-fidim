@@ -609,8 +609,15 @@ pub trait Env {
         progress: &mut dyn FnMut(&fetch::Progress),
         cancel: &AtomicBool,
     ) -> Result<u64>;
-    fn install_upstream(&self, tag: &str, progress: &mut dyn FnMut(String)) -> Result<InstallReport>;
-    fn install_unsloth(&self, tag: &str, gfx: &str, progress: &mut dyn FnMut(String)) -> Result<InstallReport>;
+    /// Install a prebuilt; `cancel` stops it while its zips download.
+    fn install_upstream(&self, tag: &str, progress: &mut dyn FnMut(String), cancel: &AtomicBool) -> Result<InstallReport>;
+    fn install_unsloth(
+        &self,
+        tag: &str,
+        gfx: &str,
+        progress: &mut dyn FnMut(String),
+        cancel: &AtomicBool,
+    ) -> Result<InstallReport>;
     fn build_source(
         &self,
         src: &SourceRef,
@@ -819,15 +826,21 @@ impl Env for LiveEnv {
         req.expected_sha256 = file.sha256.clone();
         fetch::download_resumable(&req, dest, progress, cancel)
     }
-    fn install_upstream(&self, tag: &str, progress: &mut dyn FnMut(String)) -> Result<InstallReport> {
+    fn install_upstream(&self, tag: &str, progress: &mut dyn FnMut(String), cancel: &AtomicBool) -> Result<InstallReport> {
         let release = update::release_by_tag(tag)?;
-        let r = update::install_prebuilt(&self.cfg, &release, progress);
+        let r = update::install_prebuilt_cancellable(&self.cfg, &release, progress, cancel);
         forget_builds();
         r
     }
-    fn install_unsloth(&self, tag: &str, gfx: &str, progress: &mut dyn FnMut(String)) -> Result<InstallReport> {
+    fn install_unsloth(
+        &self,
+        tag: &str,
+        gfx: &str,
+        progress: &mut dyn FnMut(String),
+        cancel: &AtomicBool,
+    ) -> Result<InstallReport> {
         let release = update::unsloth_release_by_tag(tag)?;
-        let r = update::install_unsloth(&self.cfg, &release, gfx, progress);
+        let r = update::install_unsloth_cancellable(&self.cfg, &release, gfx, progress, cancel);
         forget_builds();
         r
     }
@@ -2209,9 +2222,9 @@ fn run_step(
             let mut line = |stage: &str, text: String| {
                 progress(&WizardEvent { stage: Some(stage.into()), line: Some(text), ..WizardEvent::status(i, StepStatus::Running) })
             };
-            let report = match &ps.action {
-                PlanAction::InstallUpstream { tag, .. } => env.install_upstream(tag, &mut |l| line("install", l))?,
-                PlanAction::InstallUnsloth { tag, gfx, .. } => env.install_unsloth(tag, gfx, &mut |l| line("install", l))?,
+            let outcome = match &ps.action {
+                PlanAction::InstallUpstream { tag, .. } => env.install_upstream(tag, &mut |l| line("install", l), cancel),
+                PlanAction::InstallUnsloth { tag, gfx, .. } => env.install_unsloth(tag, gfx, &mut |l| line("install", l), cancel),
                 PlanAction::BuildPr { source, gpu_targets, .. } | PlanAction::BuildFork { source, gpu_targets, .. } => {
                     env.build_source(
                         source,
@@ -2226,9 +2239,16 @@ fn run_step(
                             })
                         },
                         cancel,
-                    )?
+                    )
                 }
                 PlanAction::UseInstalled { .. } | PlanAction::Unsupported { .. } => return Ok(StepStatus::Skipped),
+            };
+            // Stopped by the user: `cancelled`, as a stopped download is,
+            // whatever words the build used for it (build_from_ref reports
+            // its cleanup), so the step reads "stopped", not "failed".
+            let report = match outcome {
+                Err(_) if cancel.load(Ordering::Relaxed) => return Err(Error::Cancelled),
+                r => r?,
             };
             if !report.verify.hip_ok {
                 result.warnings.push(format!(

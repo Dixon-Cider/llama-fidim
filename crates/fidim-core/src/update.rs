@@ -616,8 +616,27 @@ pub(crate) fn download(asset: &Asset, to: &Path, progress: &mut dyn FnMut(String
     download_url(&asset.url, &asset.name, to, progress).map(|_| ())
 }
 
+fn download_cancellable(asset: &Asset, to: &Path, progress: &mut dyn FnMut(String), cancel: &AtomicBool) -> Result<()> {
+    download_url_cancellable(&asset.url, &asset.name, to, progress, cancel).map(|_| ())
+}
+
 /// Stream `url` to `to` with progress every 16 MB; returns bytes written.
 pub fn download_url(url: &str, name: &str, to: &Path, progress: &mut dyn FnMut(String)) -> Result<u64> {
+    download_url_cancellable(url, name, to, progress, &AtomicBool::new(false))
+}
+
+/// `download_url` that stops with `Error::Cancelled` once `cancel` is
+/// raised, between chunks; the partial file is the caller's to remove.
+pub fn download_url_cancellable(
+    url: &str,
+    name: &str,
+    to: &Path,
+    progress: &mut dyn FnMut(String),
+    cancel: &AtomicBool,
+) -> Result<u64> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Error::Cancelled);
+    }
     let resp = agent()
         .get(url)
         .set("User-Agent", USER_AGENT)
@@ -630,6 +649,9 @@ pub fn download_url(url: &str, name: &str, to: &Path, progress: &mut dyn FnMut(S
     let mut done: u64 = 0;
     let mut last_report: u64 = 0;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
         let n = reader.read(&mut buf).map_err(|e| upd(format!("download {name}: {e}")))?;
         if n == 0 {
             break;
@@ -746,6 +768,19 @@ pub fn install_prebuilt(
     release: &Release,
     progress: &mut dyn FnMut(String),
 ) -> Result<InstallReport> {
+    install_prebuilt_cancellable(cfg, release, progress, &AtomicBool::new(false))
+}
+
+/// `install_prebuilt` that stops with `Error::Cancelled` once `cancel` is
+/// raised while the zips download (or before they are unpacked), removing
+/// the half-made install like any failure. Unpacking and the check after
+/// it take seconds and run to the end.
+pub fn install_prebuilt_cancellable(
+    cfg: &Config,
+    release: &Release,
+    progress: &mut dyn FnMut(String),
+    cancel: &AtomicBool,
+) -> Result<InstallReport> {
     let dir = install_dir(cfg, &release.tag, "rocm")?;
     let bin = dir.join("bin");
     let exe = bin.join("llama-server.exe");
@@ -796,8 +831,11 @@ pub fn install_prebuilt(
         for a in [&cpu, &rocm] {
             let to = tmp.join(&a.name);
             progress(format!("downloading {} ({} MB)", a.name, a.size >> 20));
-            download(a, &to, progress)?;
+            download_cancellable(a, &to, progress, cancel)?;
             names.push(a.name.clone());
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
         }
         std::fs::create_dir_all(&bin).map_err(|e| Error::io(&bin, e))?;
         for a in [&cpu, &rocm] {
@@ -1965,6 +2003,19 @@ pub fn install_unsloth(
     gfx: &str,
     progress: &mut dyn FnMut(String),
 ) -> Result<InstallReport> {
+    install_unsloth_cancellable(cfg, release, gfx, progress, &AtomicBool::new(false))
+}
+
+/// `install_unsloth` that stops with `Error::Cancelled` once `cancel` is
+/// raised while the zip downloads (or before it is unpacked), removing its
+/// temporary folder like any failure.
+pub fn install_unsloth_cancellable(
+    cfg: &Config,
+    release: &Release,
+    gfx: &str,
+    progress: &mut dyn FnMut(String),
+    cancel: &AtomicBool,
+) -> Result<InstallReport> {
     // install_dir refuses Unsloth Studio's own tree.
     let dir = install_dir(cfg, &release.tag, "unsloth")?;
     if dir.join("bin").join(RUNNER_EXE).is_file() {
@@ -2010,7 +2061,7 @@ pub fn install_unsloth(
 
     let staged = (|| -> Result<PathBuf> {
         progress(format!("downloading {} ({} MB)", asset.name, asset.size >> 20));
-        download(&asset, &zip, progress)?;
+        download_cancellable(&asset, &zip, progress, cancel)?;
         let sha = sha256_file(&zip)?;
         match asset.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")) {
             Some(want) if !want.eq_ignore_ascii_case(&sha) => {
@@ -2021,6 +2072,9 @@ pub fn install_unsloth(
             }
             Some(_) => progress(format!("sha256 verified ({}…)", &sha[..16])),
             None => progress(format!("{}: no digest published; integrity not verified", asset.name)),
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
         }
         progress(format!("extracting into {}", dir.display()));
         install_unsloth_from_zip(
@@ -3578,6 +3632,35 @@ mod tests {
         assert!(!marker.exists(), "git_command must not run a credential helper");
         assert!(String::from_utf8_lossy(&ours.stderr).contains("terminal prompts disabled"), "{}", String::from_utf8_lossy(&ours.stderr));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Stop during an install: nothing is fetched once the flag is up, and
+    /// the half-made install and its temporary folder are gone.
+    #[test]
+    fn installs_stop_when_cancelled() {
+        let root = std::env::temp_dir().join(format!("fidim-install-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cfg = Config::default_for_machine();
+        cfg.install_root = Some(root.clone());
+        let cancel = AtomicBool::new(true);
+        let mut lines = Vec::new();
+        let up = parse_release(RELEASE_JSON).unwrap();
+        let r = install_prebuilt_cancellable(&cfg, &up, &mut |l| lines.push(l), &cancel);
+        assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(UNSLOTH_CAPTURED).unwrap();
+        let mix = parse_release(&v[0].to_string()).unwrap();
+        let r = install_unsloth_cancellable(&cfg, &mix, "gfx120X", &mut |l| lines.push(l), &cancel);
+        assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+        // Neither left a build, a half-made directory or a temporary folder.
+        let left: Vec<String> = std::fs::read_dir(&root)
+            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(matches!(
+            download_url_cancellable("https://x/never", "never", &root.join("never"), &mut |_| {}, &cancel),
+            Err(Error::Cancelled)
+        ));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The paths of `build_from_ref` that finish before the toolchain is
