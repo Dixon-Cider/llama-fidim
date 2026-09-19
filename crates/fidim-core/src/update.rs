@@ -17,7 +17,9 @@
 //! A second channel, **unsloth**, installs unslothai/llama.cpp's Windows ROCm
 //! zip: one archive with its own ROCm DLLs and the DiffusionGemma runner.
 //! Those builds are recorded as such in the manifest, run with nothing on
-//! PATH, and are never picked as "newest" for llama-server profiles.
+//! PATH, and are never picked as "newest" for llama-server profiles. The
+//! same zip can also be installed with Llama FIDIM's runner patch laid over
+//! it (`overlay`).
 //!
 //! Nothing here launches a server or touches VRAM. Benchmarks stay a separate,
 //! explicit step because the GPUs are shared.
@@ -46,7 +48,7 @@ const USER_AGENT: &str = concat!("llama-fidim/", env!("CARGO_PKG_VERSION"));
 /// Manifest written into every build directory this module creates.
 pub const MANIFEST_NAME: &str = "fidim-build.json";
 
-fn upd(msg: impl Into<String>) -> Error {
+pub(crate) fn upd(msg: impl Into<String>) -> Error {
     Error::Update(msg.into())
 }
 
@@ -127,13 +129,24 @@ fn agent() -> ureq::Agent {
 }
 
 fn get_json(url: &str) -> Result<String> {
-    agent()
+    get_json_opt(url)?.ok_or_else(|| upd(format!("GitHub API {url}: 404 Not Found")))
+}
+
+/// `get_json`, with a 404 as None: a release that does not exist is an
+/// answer, not an error.
+pub(crate) fn get_json_opt(url: &str) -> Result<Option<String>> {
+    let resp = match agent()
         .get(url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| upd(format!("GitHub API {url}: {e}")))?
-        .into_string()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(e) => return Err(upd(format!("GitHub API {url}: {e}"))),
+    };
+    resp.into_string()
+        .map(Some)
         .map_err(|e| upd(format!("GitHub API {url}: reading body: {e}")))
 }
 
@@ -535,8 +548,8 @@ pub fn verify_build(exe: &Path, rocm_bin: Option<&Path>) -> Verify {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub tag: String,
-    /// `prebuilt`, `source` (a release tag), `git-ref` (any other git ref)
-    /// or `unsloth-prebuilt`.
+    /// `prebuilt`, `source` (a release tag), `git-ref` (any other git ref),
+    /// `unsloth-prebuilt` or `unsloth-overlay`.
     pub source: String,
     pub installed_at_unix: u64,
     pub assets: Vec<String>,
@@ -590,16 +603,16 @@ pub struct InstallReport {
     pub verify: Verify,
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn write_manifest(dir: &Path, m: &Manifest) -> Result<()> {
+pub(crate) fn write_manifest(dir: &Path, m: &Manifest) -> Result<()> {
     let p = dir.join(MANIFEST_NAME);
     std::fs::write(&p, serde_json::to_string_pretty(m)?).map_err(|e| Error::io(&p, e))
 }
 
-fn download(asset: &Asset, to: &Path, progress: &mut dyn FnMut(String)) -> Result<()> {
+pub(crate) fn download(asset: &Asset, to: &Path, progress: &mut dyn FnMut(String)) -> Result<()> {
     download_url(&asset.url, &asset.name, to, progress).map(|_| ())
 }
 
@@ -929,7 +942,7 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-fn read_manifest(dir: &Path) -> Option<Manifest> {
+pub(crate) fn read_manifest(dir: &Path) -> Option<Manifest> {
     serde_json::from_str(&std::fs::read_to_string(manifest_path(dir)).ok()?).ok()
 }
 
@@ -1847,6 +1860,36 @@ pub fn install_unsloth_from_zip(zip: &Path, tmp: &Path, final_dir: &Path, meta: 
 }
 
 fn stage_unsloth(zip: &Path, tmp: &Path, final_dir: &Path, meta: &UnslothMeta) -> Result<PathBuf> {
+    stage_unsloth_base(zip, tmp, final_dir, &meta.asset_name)?;
+    // Before the move, or 500 MB of zip would live on inside the build.
+    let _ = std::fs::remove_file(zip);
+    finish_unsloth_stage(
+        tmp,
+        final_dir,
+        &Manifest {
+            tag: meta.tag.clone(),
+            source: "unsloth-prebuilt".into(),
+            installed_at_unix: now_unix(),
+            // Never a `shim:` entry: retire_build_shims renames exactly those,
+            // and a bundle's own hipblas.dll must stay where it is.
+            assets: vec![meta.asset_name.clone()],
+            verify: Verify::default(),
+            channel: Some(Channel::Unsloth),
+            bundled_runtime: true,
+            release_tag: Some(meta.tag.clone()),
+            asset_sha256: meta.sha256.clone(),
+            gfx_target: Some(meta.gfx.clone()),
+            patch: None,
+            ..Default::default()
+        },
+    )
+}
+
+/// The part every fork install shares: refuse an existing `final_dir` or a
+/// path too deep for the zip, unpack the zip into `tmp/bin`, and require the
+/// runner and llama-server at its top level. Returns `tmp/bin`. The caller
+/// removes `tmp` on failure.
+pub(crate) fn stage_unsloth_base(zip: &Path, tmp: &Path, final_dir: &Path, asset_name: &str) -> Result<PathBuf> {
     if final_dir.exists() {
         return Err(upd(format!(
             "{} already exists but holds no complete build; remove it and install again",
@@ -1870,33 +1913,16 @@ fn stage_unsloth(zip: &Path, tmp: &Path, final_dir: &Path, meta: &UnslothMeta) -
     extract_into(zip, &bin)?;
     for need in [RUNNER_EXE, "llama-server.exe"] {
         if !bin.join(need).is_file() {
-            return Err(upd(format!(
-                "{} has no {need} at its top level: the fork's Windows layout changed",
-                meta.asset_name
-            )));
+            return Err(upd(format!("{asset_name} has no {need} at its top level: the fork's Windows layout changed")));
         }
     }
-    // Before the move, or 500 MB of zip would live on inside the build.
-    let _ = std::fs::remove_file(zip);
-    write_manifest(
-        tmp,
-        &Manifest {
-            tag: meta.tag.clone(),
-            source: "unsloth-prebuilt".into(),
-            installed_at_unix: now_unix(),
-            // Never a `shim:` entry: retire_build_shims renames exactly those,
-            // and a bundle's own hipblas.dll must stay where it is.
-            assets: vec![meta.asset_name.clone()],
-            verify: Verify::default(),
-            channel: Some(Channel::Unsloth),
-            bundled_runtime: true,
-            release_tag: Some(meta.tag.clone()),
-            asset_sha256: meta.sha256.clone(),
-            gfx_target: Some(meta.gfx.clone()),
-            patch: None,
-            ..Default::default()
-        },
-    )?;
+    Ok(bin)
+}
+
+/// Write the manifest into `tmp` and move `tmp` into place as `final_dir`,
+/// which only ever appears complete.
+pub(crate) fn finish_unsloth_stage(tmp: &Path, final_dir: &Path, manifest: &Manifest) -> Result<PathBuf> {
+    write_manifest(tmp, manifest)?;
     if let Some(parent) = final_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
@@ -2044,10 +2070,23 @@ pub struct UnslothCheck {
     pub already_installed: bool,
     /// Fork builds already installed, newest first.
     pub installed: Vec<InstalledRef>,
+    /// The runner-patch overlay for this release (see `overlay`): where it
+    /// is looked for, whether it is published, and where it installs.
+    pub overlay_repo: String,
+    pub overlay_patch: String,
+    pub overlay_available: bool,
+    /// The overlay zip, when published.
+    pub overlay_asset: Option<Asset>,
+    /// Why the overlay is not available, when it is not a plain "not
+    /// published" (the lookup failed, the release lacks an asset).
+    pub overlay_error: Option<String>,
+    pub overlay_install_dir: PathBuf,
+    pub overlay_installed: bool,
 }
 
-/// Latest (or `tag`) fork release against what is installed. Network and a
-/// build scan; the comparison itself is `check_unsloth_against`.
+/// Latest (or `tag`) fork release against what is installed, and whether
+/// the runner-patch overlay is published for it. Network and a build scan;
+/// the comparison itself is `check_unsloth_against`.
 pub fn check_unsloth(
     cfg: &Config,
     device_names: &[String],
@@ -2059,12 +2098,19 @@ pub fn check_unsloth(
         None => latest_unsloth_release()?,
     };
     let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-    check_unsloth_against(cfg, &builds, release, &unsloth_gfx(cfg, device_names, gfx_override))
+    let mut c = check_unsloth_against(cfg, &builds, release, &unsloth_gfx(cfg, device_names, gfx_override))?;
+    let lookup = crate::overlay::lookup(cfg, &c.latest.tag);
+    crate::overlay::apply_lookup(&mut c, lookup);
+    Ok(c)
 }
 
+/// The overlay fields say "not looked up" here; `overlay::apply_lookup`
+/// fills them from a lookup.
 pub fn check_unsloth_against(cfg: &Config, builds: &[Build], latest: Release, gfx: &str) -> Result<UnslothCheck> {
     let install_dir = install_dir(cfg, &latest.tag, "unsloth")?;
     let already_installed = install_dir.join("bin").join(RUNNER_EXE).is_file();
+    let overlay_install_dir = crate::overlay::overlay_install_dir(cfg, &latest.tag)?;
+    let overlay_installed = overlay_install_dir.join("bin").join(RUNNER_EXE).is_file();
     let (asset, asset_error) = match select_unsloth_asset(&latest, gfx) {
         Ok(a) => (Some(a), None),
         Err(e) => (None, Some(e.to_string())),
@@ -2089,6 +2135,13 @@ pub fn check_unsloth_against(cfg: &Config, builds: &[Build], latest: Release, gf
         install_dir,
         already_installed,
         installed: installed.into_iter().map(|(_, r)| r).collect(),
+        overlay_repo: crate::overlay::overlay_repo(cfg),
+        overlay_patch: crate::overlay::OVERLAY_PATCH.to_string(),
+        overlay_available: false,
+        overlay_asset: None,
+        overlay_error: None,
+        overlay_install_dir,
+        overlay_installed,
     })
 }
 
@@ -2236,6 +2289,60 @@ pub fn promote_skip_reason(p: &Profile, to_dir: &Path, t: &PromoteTarget, scope:
     }
 }
 
+/// The profiles a promotion onto `to_dir` moves, and (id, reason) for the
+/// ones it leaves alone.
+fn promotion_plan(cfg: &Config, to_dir: &Path, scope: &PromoteScope) -> Result<(Vec<Profile>, Vec<(String, String)>)> {
+    let target = promote_target(to_dir);
+    if !target.has_llama_server && !target.has_runner {
+        return Err(upd(format!("{} has neither bin/llama-server.exe nor bin/{RUNNER_EXE}", to_dir.display())));
+    }
+    let mut moving = Vec::new();
+    let mut skipped = Vec::new();
+    for p in Profile::load_all(&cfg.profile_dir)? {
+        match promote_skip_reason(&p, to_dir, &target, scope) {
+            Some(why) => skipped.push((p.id.clone(), why)),
+            None => moving.push(p),
+        }
+    }
+    Ok((moving, skipped))
+}
+
+/// A profile a promotion would move.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromoteMove {
+    pub profile_id: String,
+    /// The build it is on now.
+    pub from: BuildSnap,
+    /// The runner patch that build carries (`dgpatch4`), if any: the
+    /// profile then moves from one patched runner to another, which the
+    /// promotion allows when the target's patch has every feature of it.
+    pub from_patch: Option<String>,
+}
+
+/// What a promotion would do, computed without changing anything.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromotePreview {
+    pub moves: Vec<PromoteMove>,
+    /// (profile id, reason) for profiles it would leave alone.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// The profiles `promote` would move onto `to_dir` with `scope`, and why the
+/// others stay, so the choice can be shown before anything moves. Passing
+/// the moves' ids back as `PromoteScope::Ids` moves exactly those.
+pub fn promote_preview(cfg: &Config, to_dir: &Path, scope: &PromoteScope) -> Result<PromotePreview> {
+    let (moving, skipped) = promotion_plan(cfg, to_dir, scope)?;
+    let moves = moving
+        .into_iter()
+        .map(|p| PromoteMove {
+            from_patch: discovery::read_build_meta(&p.build.path).patch.map(|b| b.label().to_string()),
+            from: BuildSnap { path: p.build.path.clone(), version: p.build.version.clone() },
+            profile_id: p.id,
+        })
+        .collect();
+    Ok(PromotePreview { moves, skipped })
+}
+
 /// Re-point profiles onto `to_dir`. Old build directories are never touched,
 /// so rollback is a metadata operation. Baselines stay on the profile: the
 /// fingerprint includes the build version, so the next bench records fresh
@@ -2246,19 +2353,11 @@ pub fn promote(
     to_version: Option<String>,
     scope: PromoteScope,
 ) -> Result<PromoteReport> {
-    let target = promote_target(to_dir);
-    if !target.has_llama_server && !target.has_runner {
-        return Err(upd(format!("{} has neither bin/llama-server.exe nor bin/{RUNNER_EXE}", to_dir.display())));
-    }
+    let (moving, skipped) = promotion_plan(cfg, to_dir, &scope)?;
     let to = BuildSnap { path: to_dir.to_path_buf(), version: to_version };
     let mut entries = Vec::new();
-    let mut skipped = Vec::new();
-    for mut p in Profile::load_all(&cfg.profile_dir)? {
+    for mut p in moving {
         let id = p.id.clone();
-        if let Some(why) = promote_skip_reason(&p, to_dir, &target, &scope) {
-            skipped.push((id, why));
-            continue;
-        }
         let from = BuildSnap { path: p.build.path.clone(), version: p.build.version.clone() };
         p.build.path = to.path.clone();
         p.build.version = to.version.clone();
@@ -2703,6 +2802,80 @@ mod tests {
         };
         assert_eq!(skip(&on_patch, Path::new(r"C:\b\other-dgpatch"), &superset, &all), None);
         assert_eq!(skip(&dg, &patched_dir, &promote_target(&patched_dir), &all), None, "moving onto a patch is fine");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The preview the Updates view confirms before moving diffusion
+    /// profiles: which move (and off which patch), which stay, nothing written.
+    #[test]
+    fn promote_preview_lists_the_moves_and_writes_nothing() {
+        let root = std::env::temp_dir().join(format!("fidim-promote-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        const FEATURES: &str = r#"["dg-pkv-f16","dg-swa-ring","dg-fa-pad","dg-fa-turn-sizing","dg-step-fail-err","dg-frame-special","dg-prefill-reuse","dg-sc-splitk"]"#;
+        let build = |name: &str, patch: Option<&str>| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::write(dir.join("bin").join("llama-server.exe"), b"").unwrap();
+            std::fs::write(dir.join("bin").join(RUNNER_EXE), b"").unwrap();
+            let patch = patch.map(|n| format!(r#","patch":{{"name":"{n}","features":{FEATURES}}}"#)).unwrap_or_default();
+            std::fs::write(
+                dir.join(MANIFEST_NAME),
+                format!(
+                    r#"{{"tag":"{name}","source":"unsloth-overlay","installed_at_unix":1,"assets":[],"verify":{{"version":null,"commit":null,"devices":[],"hip_ok":false,"detail":""}},"channel":"unsloth","bundled_runtime":true{patch}}}"#
+                ),
+            )
+            .unwrap();
+            dir
+        };
+        let dgpatch4 = build("b11027-mix-3e83366-unsloth-dgpatch4", Some("dgpatch4"));
+        let plain = build("b11027-mix-3e83366-unsloth", None);
+        let overlay = build("b11030-mix-5ff778e-unsloth-dgpatch5", Some("dgpatch5"));
+
+        let mut cfg = Config::default_for_machine();
+        cfg.profile_dir = root.join("profiles");
+        std::fs::create_dir_all(&cfg.profile_dir).unwrap();
+        let mut pinned = test_profile("dg-pinned", Some("diffusion-gemma"), &dgpatch4.to_string_lossy());
+        pinned.extra.insert("build_pinned".into(), serde_json::Value::Bool(true));
+        for p in [
+            test_profile("dg-26b", Some("diffusion-gemma"), &dgpatch4.to_string_lossy()),
+            test_profile("dg-plain", Some("diffusion-gemma"), &plain.to_string_lossy()),
+            test_profile("worker", None, r"C:\b\b10819-rocm"),
+            pinned,
+        ] {
+            p.save(&cfg.profile_dir.join(format!("{}.json", p.id))).unwrap();
+        }
+        let before: Vec<String> = ["dg-26b", "dg-plain", "worker", "dg-pinned"]
+            .iter()
+            .map(|id| std::fs::read_to_string(cfg.profile_dir.join(format!("{id}.json"))).unwrap())
+            .collect();
+
+        // Onto the dgpatch5 overlay: the dgpatch4 profile moves (every one of
+        // its features is there), and says so; so does the plain one.
+        let pv = promote_preview(&cfg, &overlay, &PromoteScope::All).unwrap();
+        let moves: Vec<(&str, Option<&str>)> =
+            pv.moves.iter().map(|m| (m.profile_id.as_str(), m.from_patch.as_deref())).collect();
+        assert_eq!(moves, [("dg-26b", Some("dgpatch4")), ("dg-plain", None)]);
+        assert_eq!(pv.moves[0].from.path, dgpatch4);
+        let skipped: std::collections::BTreeMap<&str, &str> = pv.skipped.iter().map(|(i, w)| (i.as_str(), w.as_str())).collect();
+        assert_eq!(skipped.get("worker"), Some(&"Unsloth fork build: pick it in the editor if wanted"));
+        assert_eq!(skipped.get("dg-pinned"), Some(&"pinned (build_pinned = true)"));
+
+        // Onto the plain build the dgpatch4 profile stays, and only the ids
+        // confirmed are in scope.
+        let pv = promote_preview(&cfg, &plain, &PromoteScope::All).unwrap();
+        assert!(pv.moves.is_empty(), "{:?}", pv.moves);
+        assert!(pv.skipped.iter().any(|(i, w)| i == "dg-26b" && w.contains("on a patched runner build (dgpatch4)")));
+        let pv = promote_preview(&cfg, &overlay, &PromoteScope::Ids(vec!["dg-plain".into()])).unwrap();
+        assert_eq!(pv.moves.iter().map(|m| m.profile_id.as_str()).collect::<Vec<_>>(), ["dg-plain"]);
+        assert!(pv.skipped.iter().any(|(i, w)| i == "dg-26b" && w == "out of scope"));
+
+        // A folder that is no build is an error, as for promote itself.
+        assert!(promote_preview(&cfg, &root.join("nothing"), &PromoteScope::All).is_err());
+        let after: Vec<String> = ["dg-26b", "dg-plain", "worker", "dg-pinned"]
+            .iter()
+            .map(|id| std::fs::read_to_string(cfg.profile_dir.join(format!("{id}.json"))).unwrap())
+            .collect();
+        assert_eq!(before, after, "a preview writes nothing");
         std::fs::remove_dir_all(root).ok();
     }
 

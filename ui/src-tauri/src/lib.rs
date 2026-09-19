@@ -728,7 +728,8 @@ fn adapter_names() -> Vec<String> {
 }
 
 /// Latest (or `tag`) Unsloth fork release, the zip for this machine's GPU
-/// target, and the fork builds already installed. Network + a build scan.
+/// target, whether the runner-patch overlay is published for it, and the
+/// fork builds already installed. Network + a build scan.
 #[tauri::command]
 async fn unsloth_check(tag: Option<String>, gfx: Option<String>) -> Result<serde_json::Value, String> {
     blocking(move || {
@@ -740,14 +741,16 @@ async fn unsloth_check(tag: Option<String>, gfx: Option<String>) -> Result<serde
     .await
 }
 
-/// Download, digest-check, install and verify an Unsloth fork build.
-/// Progress streams as `update-progress`. Never starts the runner.
+/// Download, digest-check, install and verify an Unsloth fork build; with
+/// `overlay`, the build with the published runner-patch overlay laid over
+/// it. Progress streams as `update-progress`. Never starts the runner.
 #[tauri::command]
 async fn unsloth_install(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     tag: Option<String>,
     gfx: Option<String>,
+    overlay: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let cache = state.cache.clone();
     blocking(move || {
@@ -761,21 +764,41 @@ async fn unsloth_install(
         let mut progress = |line: String| {
             let _ = app.emit("update-progress", line);
         };
-        let r = update::install_unsloth(&cfg, &release, &gfx, &mut progress).map_err(|e| e.to_string())?;
+        let r = if overlay.unwrap_or(false) {
+            let source = fidim_core::overlay::OverlaySource::Published;
+            fidim_core::overlay::install_unsloth_overlay(&cfg, &release, &gfx, &source, None, &mut progress)
+        } else {
+            update::install_unsloth(&cfg, &release, &gfx, &mut progress)
+        }
+        .map_err(|e| e.to_string())?;
         invalidate_build_caches(&cache);
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
     .await
 }
 
-/// Move diffusion profiles onto a fork build. Every profile is considered;
-/// the promote rules skip llama-server ones and anything pinned.
+/// Which diffusion profiles `unsloth_promote` would move onto a fork build,
+/// off which runner patch, and why the others stay. Changes nothing; the
+/// Updates view shows it for confirmation.
 #[tauri::command]
-async fn unsloth_promote(to_path: String, to_version: Option<String>) -> Result<serde_json::Value, String> {
+async fn unsloth_promote_preview(to_path: String) -> Result<serde_json::Value, String> {
     blocking(move || {
         let cfg = cfg()?;
-        let r = update::promote(&cfg, &PathBuf::from(to_path), to_version, PromoteScope::All)
-            .map_err(|e| e.to_string())?;
+        let r = update::promote_preview(&cfg, &PathBuf::from(to_path), &PromoteScope::All).map_err(|e| e.to_string())?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Move diffusion profiles onto a fork build: the confirmed `ids` of a
+/// preview, or (without ids) every profile the promote rules allow; they
+/// skip llama-server ones and anything pinned.
+#[tauri::command]
+async fn unsloth_promote(to_path: String, to_version: Option<String>, ids: Option<Vec<String>>) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let scope = ids.map(PromoteScope::Ids).unwrap_or(PromoteScope::All);
+        let r = update::promote(&cfg, &PathBuf::from(to_path), to_version, scope).map_err(|e| e.to_string())?;
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
     .await
@@ -1091,6 +1114,7 @@ pub fn run() {
             update_history,
             unsloth_check,
             unsloth_install,
+            unsloth_promote_preview,
             unsloth_promote,
             list_runtimes,
             creator_defaults,

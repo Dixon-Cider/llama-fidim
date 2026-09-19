@@ -322,13 +322,25 @@ pub const DG_OWNED_ENV: &[&str] = &[
     "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
 ];
 
-/// Test hooks of the patched DiffusionGemma runner (a local build of
-/// Unsloth's source): they corrupt the prompt-KV store, change its layout
-/// under the sizing model, or stop the runner. The helper strips them from
-/// the runner's environment; validate warns when a profile sets one.
-/// (DG_POOL_TRIM is a real, default-off memory option and passes through.)
-pub const DG_TEST_HOOK_ENV: &[&str] =
-    &["DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_RING_POISON", "DG_DUMP_LOGITS", "DG_EXIT_AFTER_DUMP"];
+/// Test hooks of the locally built patched DiffusionGemma runners (dgpatch4
+/// and earlier): they corrupt the prompt-KV store, change its layout under
+/// the sizing model, stop the runner, time every graph node, or change the
+/// self-conditioning matmul. The helper strips them from the runner's
+/// environment; validate warns when a profile sets one. The published
+/// dgpatch5 overlay has none of them.
+/// (DG_POOL_TRIM passes through: a default-off memory option of those local
+/// builds, and inert on overlay and stock builds, which do not carry it.)
+pub const DG_TEST_HOOK_ENV: &[&str] = &[
+    "DG_PKV_TYPE",
+    "DG_SWA_WINDOW",
+    "DG_POISON",
+    "DG_RING_POISON",
+    "DG_DUMP_LOGITS",
+    "DG_EXIT_AFTER_DUMP",
+    "DG_PROFILE",
+    "DG_SC_SPLITK",
+    "DG_SC_SPLITK_CHECK",
+];
 
 /// Windows env names are case-insensitive (and so is Rust's `Command` env
 /// there), so `hip_visible_devices` overrides `HIP_VISIBLE_DEVICES`.
@@ -1164,6 +1176,9 @@ mod tests {
         // The runner's test hooks never reach it; setting one is a mistake.
         let mut p = diffusion_profile();
         p.env.insert("dg_pkv_type".into(), "f32".into());
+        only_warning(&p, "dg-test-hook-env");
+        let mut p = diffusion_profile();
+        p.env.insert("DG_PROFILE".into(), "2".into());
         only_warning(&p, "dg-test-hook-env");
 
         // FIDIM turns the HIP runtime cache off; a profile that turns it on is told the cost.

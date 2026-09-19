@@ -55,6 +55,19 @@ build with uncommitted changes.
   lookups; without one, answers are cached to stay within 60 requests an
   hour. A token GitHub rejects is dropped after one request, and the plan
   says so.
+- **The DiffusionGemma runner patch as an overlay.** `fidim update --channel
+  unsloth --install --overlay`, or **Install with FIDIM runner patch** on the
+  Updates tab, installs an Unsloth release with Llama FIDIM's runner patch
+  (dgpatch5: F16 prompt-KV store with a sliding-window ring, flash attention
+  on the GPU, up to 65,536 tokens on a 32 GB card, prefill reuse across
+  blocks) laid over it, as `<tag>-unsloth-dgpatch5`. Only the llama-level
+  binaries are replaced; every file is checked against the overlay's
+  descriptor and the Unsloth zip it was built for, and an install is refused
+  when that zip has a llama-level file the overlay does not replace.
+  `--overlay-from` installs a locally built overlay, `--base-zip` reuses a
+  downloaded Unsloth zip.
+- `packaging/dg-overlay`: the patch, and the scripts and workflow that build,
+  gate, sign (when configured) and publish an overlay for an Unsloth release.
 
 ### Changed
 
@@ -64,6 +77,15 @@ build with uncommitted changes.
   llama-server fail at load.
 - Importance-matrix files (`*imatrix*.gguf`) are no longer listed as
   models.
+- **Move diffusion profiles onto it** on the Updates tab now lists the
+  profiles that would move, the patched runner build each would leave, and
+  why the others stay, and moves only the ones listed once you confirm. Its
+  tooltip no longer says profiles on a patched runner build never move: they
+  move onto a build whose patch has every feature of theirs, such as a
+  dgpatch4 profile onto dgpatch5.
+- The patched runner's profiler and split-count switches (`DG_PROFILE`,
+  `DG_SC_SPLITK`, `DG_SC_SPLITK_CHECK`) are treated as test hooks: never
+  passed to the runner, and flagged when a profile sets one.
 
 ### Fixed
 

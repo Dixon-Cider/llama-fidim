@@ -21,6 +21,7 @@ pub mod hf;
 pub mod hub;
 pub mod launch;
 pub mod live;
+pub mod overlay;
 pub mod platform;
 pub mod preflight;
 pub mod profile;

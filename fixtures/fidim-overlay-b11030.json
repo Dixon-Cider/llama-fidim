@@ -1,0 +1,776 @@
+{
+    "schema":  1,
+    "name":  "dgpatch5",
+    "overlay_repo":  "Dixon-Cider/fidim-dg-overlay",
+    "release_tag":  "dgpatch5-b11030-mix-5ff778e",
+    "zip":  "fidim-dg-overlay-b11030-mix-5ff778e-windows-x64.zip",
+    "base":  {
+                 "repo":  "unslothai/llama.cpp",
+                 "release_tag":  "b11030-mix-5ff778e",
+                 "source_commit":  "6ba30d05b140ebb0baeded27d7d9b843c5b71ff1",
+                 "source_asset":  "llama.cpp-source-commit-6ba30d05b140ebb0baeded27d7d9b843c5b71ff1.tar.gz",
+                 "source_sha256":  "44cca07c66c13315348d8bb7e2950704dcb7fc82c9bdddbbdf9dd8c29f55adfc",
+                 "upstream_tag":  "b11030",
+                 "ggml_tree":  "677df46a6800d1070bb787aaded017229583ce9b",
+                 "zips":  {
+                              "gfx103X":  "0578bdad7037a500d9abe64fd8e7da5d622d62b4192d2d03157bda611833f80e",
+                              "gfx110X":  "75f0fcb4c39560ef6505592efde7299b28ec7361a9568e8ffab6c107e5f38029",
+                              "gfx1150":  "a41ff680f7643c16245aaa640bcca4042d88b4efdfef19033740c34ef94cde4d",
+                              "gfx1151":  "22016e77913d0c1e4fea4cc8a5737f70b4c5838f58bb74fcc031fa5680ba82e8",
+                              "gfx120X":  "c780a9bda3ce315dee42e0a3045a7884dd9e2d46ec1d6d34c76e42bfecaa9557",
+                              "gfx908":  "a42fb93a6dd347b30521cd1d3278e9127a4dc9023beb16c625a302aad6d1ed2e",
+                              "gfx90a":  "d5309d048a0a36a96d7bd1f35804aa9cfcea06baf5640ca3d0bff101b05cc9c6"
+                          }
+             },
+    "patch":  {
+                  "file":  "dgpatch5.diff",
+                  "sha256":  "2822f06ef44c43751a22f8c6a4ad265d8d94b3f2bb114a8f03404c7c1282131f",
+                  "features":  [
+                                   "dg-pkv-f16",
+                                   "dg-swa-ring",
+                                   "dg-fa-pad",
+                                   "dg-fa-turn-sizing",
+                                   "dg-step-fail-err",
+                                   "dg-frame-special",
+                                   "dg-prefill-reuse",
+                                   "dg-sc-splitk"
+                               ]
+              },
+    "build":  {
+                  "runner":  "local",
+                  "toolchain":  "msvc",
+                  "c_compiler":  "MSVC 19.44.35228.0",
+                  "cxx_compiler":  "MSVC 19.44.35228.0",
+                  "msvc_toolset":  "14.44.35207",
+                  "vs_version":  "17.14.40",
+                  "cmake":  "3.31.6-msvc6",
+                  "cmake_flags":  [
+                                      "-G",
+                                      "Ninja",
+                                      "-DCMAKE_BUILD_TYPE=Release",
+                                      "-DBUILD_SHARED_LIBS=ON",
+                                      "-DGGML_HIP=OFF",
+                                      "-DGGML_NATIVE=OFF",
+                                      "-DGGML_OPENMP=OFF",
+                                      "-DGGML_RPC=ON",
+                                      "-DGGML_STATIC=OFF",
+                                      "-DLLAMA_BUILD_TESTS=OFF",
+                                      "-DCMAKE_C_COMPILER=cl",
+                                      "-DCMAKE_CXX_COMPILER=cl",
+                                      "-DLLAMA_BUILD_BORINGSSL=OFF",
+                                      "-DLLAMA_OPENSSL=OFF"
+                                  ],
+                  "boringssl":  "off",
+                  "workflow_run_url":  null,
+                  "overlay_repo_sha":  "367758c7a368236e2d4f9f1ea36c74b5d42c20b4",
+                  "built_at":  "2026-09-19T00:27:15Z"
+              },
+    "files":  [
+                  {
+                      "name":  "llama.dll",
+                      "sha256":  "8188460424c0ba579451bfd415a8d317837a00b801bf612672c22495f77f0fee",
+                      "size":  2753024
+                  },
+                  {
+                      "name":  "llama.exe",
+                      "sha256":  "125bba30f6ba11d01430f423936226f9cae352ae11c705e78926fef47dfe8048",
+                      "size":  55296
+                  },
+                  {
+                      "name":  "llama-batched.exe",
+                      "sha256":  "c2e07aa46966c1deaabb37e2014ac95e2409daad9386303c18b342ee99a9942b",
+                      "size":  38400
+                  },
+                  {
+                      "name":  "llama-batched-bench.exe",
+                      "sha256":  "01173e7f6147a6af93f964ea1e03fda67abac482f53ce5f784ee048f3eb3e39a",
+                      "size":  10752
+                  },
+                  {
+                      "name":  "llama-batched-bench-impl.dll",
+                      "sha256":  "444d12ebe81daadef83191976858435a6dba0c3eabc9c878dbaf4ad5930edcd5",
+                      "size":  129536
+                  },
+                  {
+                      "name":  "llama-bench.exe",
+                      "sha256":  "6bb8938a171657cd3d82203cbb2dead013b85c16df87e25c39b03e45ee9e3f79",
+                      "size":  10752
+                  },
+                  {
+                      "name":  "llama-bench-impl.dll",
+                      "sha256":  "6514ec4bbd0ddcbf146ab2a6cc4595b8f6857798ad902bf64b8d2b0fe89b3c37",
+                      "size":  903680
+                  },
+                  {
+                      "name":  "llama-cli.exe",
+                      "sha256":  "f81425f06422002a6f65fc9f815e733ca2efd686aa632c8b6b14c82eff4eb3d9",
+                      "size":  10752
+                  },
+                  {
+                      "name":  "llama-cli-impl.dll",
+                      "sha256":  "c67a86d6fe23e16ac3e968f720eaa19f37959a7fc89046a38c307858929af3d3",
+                      "size":  875008
+                  },
+                  {
+                      "name":  "llama-common.dll",
+                      "sha256":  "0728179dbf4e39083879c95a99821c193597696eef5d93dda78a86ae46b847d0",
+                      "size":  8248832
+                  },
+                  {
+                      "name":  "llama-completion.exe",
+                      "sha256":  "765757498463dec35a02e4970504cb1433461632513d3d7eab384aa1b2ec90f4",
+                      "size":  10752
+                  },
+                  {
+                      "name":  "llama-completion-impl.dll",
+                      "sha256":  "38364e1b6b85da682bcbb1c7eb94fbbbe82a48f8be150badb4c518159a895cfd",
+                      "size":  247808
+                  },
+                  {
+                      "name":  "llama-convert-llama2c-to-ggml.exe",
+                      "sha256":  "9d9a9d7e39278cc06d0104a8ff3648278c30fa873b914c57042d512616118acd",
+                      "size":  71168
+                  },
+                  {
+                      "name":  "llama-debug.exe",
+                      "sha256":  "b1e35e07414b36059370572ed1a4d373a7229445adc7c5b17f5d1f91bc9911b2",
+                      "size":  128000
+                  },
+                  {
+                      "name":  "llama-diffusion-cli.exe",
+                      "sha256":  "9420a23bc47977dadecea9e774f759acd31ccc09ab02eb60ab7e2714c3fb9b63",
+                      "size":  97280
+                  },
+                  {
+                      "name":  "llama-diffusion-gemma-eval.exe",
+                      "sha256":  "2ce89495ab9d508ebde450e44eaeb62bf35eb86966d1d851b605fb5b8f2fe793",
+                      "size":  19968
+                  },
+                  {
+                      "name":  "llama-diffusion-gemma-server.exe",
+                      "sha256":  "8fb345e31242d0065d2a4170fd14ca1490206e33ba736903157fdab3dfc85176",
+                      "size":  23552
+                  },
+                  {
+                      "name":  "llama-diffusion-gemma-visual-server.exe",
+                      "sha256":  "5fbc224f45f8197deb7e6c05d68695fe0664cb13be09906ffd1f1fc82d0a46fc",
+                      "size":  57344
+                  },
+                  {
+                      "name":  "llama-embedding.exe",
+                      "sha256":  "7fbc270f4779f9c919f9cf48c87d040915c073c6e4ee991d1d15e8f4bfc7cc7d",
+                      "size":  57856
+                  },
+                  {
+                      "name":  "llama-eval-callback.exe",
+                      "sha256":  "29e00d842fe7ec0b5e7a2f75e564655540a28514db649cb84ff20446b5f07cb3",
+                      "size":  31232
+                  },
+                  {
+                      "name":  "llama-export-lora.exe",
+                      "sha256":  "c4067ca9f4642da4e1da52bfc6c78c15c3ab5967ea5e66081d51fd2223a8ba5c",
+                      "size":  68608
+                  },
+                  {
+                      "name":  "llama-finetune.exe",
+                      "sha256":  "1c0abb4b670d3db884219f82010e4d4982abdebf45839d85a3b89e007898edce",
+                      "size":  31744
+                  },
+                  {
+                      "name":  "llama-fit-params.exe",
+                      "sha256":  "c8963b4648eabe219ea6328e21ac9304dc92ee46ae0782efe2b9ba8666be49de",
+                      "size":  10752
+                  },
+                  {
+                      "name":  "llama-fit-params-impl.dll",
+                      "sha256":  "91799fed002057516dc872b33986cdccd6d110ee69c654b2dcca119cf4b1b0ca",
+                      "size":  105984
+                  },
+                  {
+                      "name":  "llama-gemma3-cli.exe",
+                      "sha256":  "cc4e4d7aed63d5ca064f2c2ab8db344aff00c0420a87eed2a7f6d8785dc31f28",
+                      "size":  26624
+                  },
+                  {
+                      "name":  "llama-gen-docs.exe",
+                      "sha256":  "34a520bdcf7a69cfec808709ef5563aabdd3015494fe56b4b23a028df7a5bbfd",
+                      "size":  72704
+                  },
+                  {
+                      "name":  "llama-gguf.exe",
+                      "sha256":  "ed52d6f8c592b07209151b2b1fc00953579ae96e2451f247c0cc2c9b0f9a9a81",
+                      "size":  29696
+                  },
+                  {
+                      "name":  "llama-gguf-hash.exe",
+                      "sha256":  "10409dc018df3a58d6285dc28259c5028c2c0fc9e0dfb4a9f42456a47a618898",
+                      "size":  65536
+                  },
+                  {
+                      "name":  "llama-gguf-split.exe",
+                      "sha256":  "a795854fceef0da1640c537219850921248dd685bd5df3744e2ff4b77da6afdb",
+                      "size":  49664
+                  },
+                  {
+                      "name":  "llama-idle.exe",
+                      "sha256":  "4000d91abe14ccb8627ae6af2c199c859d67f958692351bbb6e05ab2ca5c2b66",
+                      "size":  31744
+                  },
+                  {
+                      "name":  "llama-imatrix.exe",
+                      "sha256":  "f8c9cef1995e5b9b4464911a40a282b3ce82031ecb610543efe8a67c553900dc",
+                      "size":  196096
+                  },
+                  {
+                      "name":  "llama-llava-cli.exe",
+                      "sha256":  "cc4e4d7aed63d5ca064f2c2ab8db344aff00c0420a87eed2a7f6d8785dc31f28",
+                      "size":  26624
+                  },
+                  {
+                      "name":  "llama-lookahead.exe",
+                      "sha256":  "c3ff0b1908cfd645c4ee7109438f97133f6a94cd7a3d85c21ffe5eee971f934b",
+                      "size":  42496
+                  },
+                  {
+                      "name":  "llama-lookup.exe",
+                      "sha256":  "1bd758b7e549bfecf2821fb706b545c01681150544185f27d76284f6aa215e76",
+                      "size":  41472
+                  },
+                  {
+                      "name":  "llama-lookup-create.exe",
+                      "sha256":  "e12d070a352df1da29fed502a38e3b5d5423a254f7134fb91991c7c3773ab557",
+                      "size":  32256
+                  },
+                  {
+                      "name":  "llama-lookup-merge.exe",
+                      "sha256":  "33e8dee8a53e649df2b97aa45376d6f88b3a6bbb597c3cc14b87630c86dc5ede",
+                      "size":  17920
+                  },
+                  {
+                      "name":  "llama-lookup-stats.exe",
+                      "sha256":  "9bb7da0ccc91ced6ad33931f60ed2d3834adbdb0ec23bff7a452cb0f97375452",
+                      "size":  37376
+                  },
+                  {
+                      "name":  "llama-minicpmv-cli.exe",
+                      "sha256":  "cc4e4d7aed63d5ca064f2c2ab8db344aff00c0420a87eed2a7f6d8785dc31f28",
+                      "size":  26624
+                  },
+                  {
+                      "name":  "llama-mtmd-cli.exe",
+                      "sha256":  "70e450df9beed4cac984a520b6e5d0809800b9d4dec3ac87f3c2c31a187978a0",
+                      "size":  75776
+                  },
+                  {
+                      "name":  "llama-mtmd-debug.exe",
+                      "sha256":  "a4f7d587a3804215110559762f1aa36cf8ae4069b4f5da8a5c21d7a33089cdb9",
+                      "size":  44544
+                  },
+                  {
+                      "name":  "llama-parallel.exe",
+                      "sha256":  "55ea2a26a5a96392aa14ec7815e580e158687e3df8583e15b156af8fb02240d0",
+                      "size":  75264
+                  },
+                  {
+                      "name":  "llama-passkey.exe",
+                      "sha256":  "65ac8f5d2e82bf7e2e1a1609c36d15ad5af2baec8b99dc50079dafeaca211fe6",
+                      "size":  39936
+                  },
+                  {
+                      "name":  "llama-perplexity.exe",
+                      "sha256":  "e1abb20581c35f0695d41ac4cc6630a9d1530effa5de8785ec4a701e83c91d48",
+                      "size":  10752
+                  },
+                  {
+                      "name":  "llama-perplexity-impl.dll",
+                      "sha256":  "2097afe011d1488e7f4eee8592ee52a9a431f80dbcdfdfc0fdbc2fe21b421d47",
+                      "size":  343040
+                  },
+                  {
+                      "name":  "llama-q8dot.exe",
+                      "sha256":  "04ca235929ff0289f7a84ec8e70096e91e8874492c091d8657dabec1a4d436fa",
+                      "size":  19456
+                  },
+                  {
+                      "name":  "llama-quantize.exe",
+                      "sha256":  "da48846dc79a9e7fb572689f3f66d5d5feb20f4897cc835aabb19f7ad16c80c2",
+                      "size":  10752
+                  },
+                  {
+                      "name":  "llama-quantize-impl.dll",
+                      "sha256":  "31d1bcf47744b82237a5a1fde5ed978a80f37baccf49e4a4d2143fdf0b63f6eb",
+                      "size":  332288
+                  },
+                  {
+                      "name":  "llama-qwen2vl-cli.exe",
+                      "sha256":  "cc4e4d7aed63d5ca064f2c2ab8db344aff00c0420a87eed2a7f6d8785dc31f28",
+                      "size":  26624
+                  },
+                  {
+                      "name":  "llama-results.exe",
+                      "sha256":  "01a14a1fe9bc2acc33a2aa010b08c2024830f4ff29a4f6a2d88a8cdf1708dff8",
+                      "size":  37888
+                  },
+                  {
+                      "name":  "llama-retrieval.exe",
+                      "sha256":  "24abc8b1173c804cc2fd85de3ea8f98734c84e32a2b5e97d928349357d351dac",
+                      "size":  74752
+                  },
+                  {
+                      "name":  "llama-server.exe",
+                      "sha256":  "2da081f360505c7cd1d5dbaf16aa03758dd734b2366416b58ff0e40a1ef17105",
+                      "size":  10752
+                  },
+                  {
+                      "name":  "llama-server-impl.dll",
+                      "sha256":  "e96d4412dc63885eb63de22016467932e3f33e0d0b3085962f7eb8c0d98fcd1f",
+                      "size":  6340096
+                  },
+                  {
+                      "name":  "llama-simple.exe",
+                      "sha256":  "78fbf0387c392e68427aee39fbf56d176c28ff8852794be5d26282686a7b510a",
+                      "size":  24064
+                  },
+                  {
+                      "name":  "llama-simple-chat.exe",
+                      "sha256":  "3ca626222d073c69b9767b474750b1a3f5c12a151d8e7e7f2de8eabc450dd684",
+                      "size":  27136
+                  },
+                  {
+                      "name":  "llama-speculative.exe",
+                      "sha256":  "b2c622c9ebca863d46d95479519390ef85b95a6c9f3f3b963697197b9d514a78",
+                      "size":  64000
+                  },
+                  {
+                      "name":  "llama-speculative-simple.exe",
+                      "sha256":  "23f65e73502368029d5cb82db331611baba368ad8eea5c68d9a27385c10e11cf",
+                      "size":  40448
+                  },
+                  {
+                      "name":  "llama-tokenize.exe",
+                      "sha256":  "1f260602d163d30f366fb748871ca7c9cfc6e30064071bf7b6461a390bb63a72",
+                      "size":  52224
+                  },
+                  {
+                      "name":  "llama-tts.exe",
+                      "sha256":  "78d6b489d83887dc38ac53f874005bff968bdcb1fcef4aa658fa6a1f0ef51d32",
+                      "size":  33792
+                  },
+                  {
+                      "name":  "llama-vdot.exe",
+                      "sha256":  "84f72d58c773014518cf22ae2697bc38edb1fddac087b0106807b8e4a4effa0b",
+                      "size":  25600
+                  },
+                  {
+                      "name":  "mtmd.dll",
+                      "sha256":  "a42ff55039cee55c5b3ed29af60ef4d9357c31b39b634cbea7d948fe776fde1b",
+                      "size":  2463744
+                  },
+                  {
+                      "name":  "licenses/LICENSE-cpp-httplib",
+                      "sha256":  "4b45cbe16d7b71b89ae6127e26e0d90a029198ca5e958ad8e3d0b8bbed364d8b",
+                      "size":  1075
+                  },
+                  {
+                      "name":  "licenses/LICENSE-jsonhpp",
+                      "sha256":  "c0d068392ea65358b798b8c165103560f06e9e3b38c4ab4e2d8810a7b931af86",
+                      "size":  1075
+                  },
+                  {
+                      "name":  "licenses/LICENSE-llama.cpp",
+                      "sha256":  "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+                      "size":  1078
+                  },
+                  {
+                      "name":  "licenses/LICENSE-rotate-bits.md",
+                      "sha256":  "ca0b44aec101afb6b46f4c39b23369fa06a64fb9c0add37c2689d702156fee55",
+                      "size":  1088
+                  },
+                  {
+                      "name":  "licenses/LICENSE-sha256",
+                      "sha256":  "b81d0022ca6367918c67b57e9647d3513ee58809fd4b0ef0b3492f1356bced25",
+                      "size":  41
+                  },
+                  {
+                      "name":  "licenses/LICENSE-xxhash",
+                      "sha256":  "6ffedbc0f7878612d2b23589f1ff2ab15633e1df7963a5d9fc750ec5500c7e7a",
+                      "size":  1389
+                  },
+                  {
+                      "name":  "licenses/LICENSE-fidim-dg-overlay",
+                      "sha256":  "e64248a4a5aafe6fa62ae55b13a63b0f2193075ee782274e4e50946bec60fa25",
+                      "size":  1089
+                  },
+                  {
+                      "name":  "licenses/THIRD-PARTY-NOTICES.md",
+                      "sha256":  "4c4a8e6f9238fa4699f2518c661fd19240e7e4f0b55cc667ce23a60caeeb1439",
+                      "size":  1618
+                  }
+              ],
+    "ggml_imports":  {
+                         "ggml.dll":  [
+                                          "ggml_backend_dev_by_name",
+                                          "ggml_backend_dev_by_type",
+                                          "ggml_backend_dev_count",
+                                          "ggml_backend_dev_get",
+                                          "ggml_backend_init_by_type",
+                                          "ggml_backend_load_all",
+                                          "ggml_backend_reg_by_name",
+                                          "ggml_backend_reg_count",
+                                          "ggml_backend_reg_get",
+                                          "ggml_backend_register"
+                                      ],
+                         "ggml-base.dll":  [
+                                               "ggml_abort",
+                                               "ggml_abs",
+                                               "ggml_add",
+                                               "ggml_add_id",
+                                               "ggml_add_inplace",
+                                               "ggml_arange",
+                                               "ggml_are_same_shape",
+                                               "ggml_argmax",
+                                               "ggml_argsort",
+                                               "ggml_argsort_top_k",
+                                               "ggml_backend_alloc_ctx_tensors",
+                                               "ggml_backend_alloc_ctx_tensors_from_buft",
+                                               "ggml_backend_alloc_ctx_tensors_from_buft_size",
+                                               "ggml_backend_buffer_clear",
+                                               "ggml_backend_buffer_free",
+                                               "ggml_backend_buffer_get_base",
+                                               "ggml_backend_buffer_get_size",
+                                               "ggml_backend_buffer_get_type",
+                                               "ggml_backend_buffer_is_host",
+                                               "ggml_backend_buffer_name",
+                                               "ggml_backend_buffer_set_usage",
+                                               "ggml_backend_buft_alloc_buffer",
+                                               "ggml_backend_buft_get_alignment",
+                                               "ggml_backend_buft_get_device",
+                                               "ggml_backend_buft_is_host",
+                                               "ggml_backend_buft_name",
+                                               "ggml_backend_cpu_buffer_type",
+                                               "ggml_backend_dev_backend_reg",
+                                               "ggml_backend_dev_buffer_from_host_ptr",
+                                               "ggml_backend_dev_buffer_type",
+                                               "ggml_backend_dev_description",
+                                               "ggml_backend_dev_get_props",
+                                               "ggml_backend_dev_host_buffer_type",
+                                               "ggml_backend_dev_init",
+                                               "ggml_backend_dev_memory",
+                                               "ggml_backend_dev_name",
+                                               "ggml_backend_dev_supports_op",
+                                               "ggml_backend_dev_type",
+                                               "ggml_backend_event_free",
+                                               "ggml_backend_event_new",
+                                               "ggml_backend_event_record",
+                                               "ggml_backend_event_synchronize",
+                                               "ggml_backend_free",
+                                               "ggml_backend_get_default_buffer_type",
+                                               "ggml_backend_get_device",
+                                               "ggml_backend_graph_compute",
+                                               "ggml_backend_meta_device",
+                                               "ggml_backend_name",
+                                               "ggml_backend_reg_dev_count",
+                                               "ggml_backend_reg_dev_get",
+                                               "ggml_backend_reg_get_proc_address",
+                                               "ggml_backend_reg_name",
+                                               "ggml_backend_sched_alloc_graph",
+                                               "ggml_backend_sched_free",
+                                               "ggml_backend_sched_get_buffer_size",
+                                               "ggml_backend_sched_get_buffer_type",
+                                               "ggml_backend_sched_get_n_copies",
+                                               "ggml_backend_sched_get_n_splits",
+                                               "ggml_backend_sched_get_tensor_backend",
+                                               "ggml_backend_sched_graph_compute",
+                                               "ggml_backend_sched_graph_compute_async",
+                                               "ggml_backend_sched_new",
+                                               "ggml_backend_sched_reserve",
+                                               "ggml_backend_sched_reserve_size",
+                                               "ggml_backend_sched_reset",
+                                               "ggml_backend_sched_set_eval_callback",
+                                               "ggml_backend_sched_set_tensor_backend",
+                                               "ggml_backend_sched_split_graph",
+                                               "ggml_backend_sched_synchronize",
+                                               "ggml_backend_supports_op",
+                                               "ggml_backend_tensor_alloc",
+                                               "ggml_backend_tensor_copy",
+                                               "ggml_backend_tensor_get",
+                                               "ggml_backend_tensor_get_async",
+                                               "ggml_backend_tensor_memset",
+                                               "ggml_backend_tensor_set",
+                                               "ggml_backend_tensor_set_async",
+                                               "ggml_backend_view_init",
+                                               "ggml_bf16_to_fp32",
+                                               "ggml_bf16_to_fp32_row",
+                                               "ggml_blck_size",
+                                               "ggml_build_forward_expand",
+                                               "ggml_build_forward_order",
+                                               "ggml_build_forward_select",
+                                               "ggml_cast",
+                                               "ggml_clamp",
+                                               "ggml_col2im_1d",
+                                               "ggml_concat",
+                                               "ggml_cont",
+                                               "ggml_cont_1d",
+                                               "ggml_cont_2d",
+                                               "ggml_cont_3d",
+                                               "ggml_cont_4d",
+                                               "ggml_conv_1d",
+                                               "ggml_conv_1d_dw",
+                                               "ggml_conv_1d_dw_ph",
+                                               "ggml_conv_1d_ph",
+                                               "ggml_conv_2d",
+                                               "ggml_conv_2d_direct",
+                                               "ggml_conv_2d_dw",
+                                               "ggml_conv_2d_dw_direct",
+                                               "ggml_cos",
+                                               "ggml_cpy",
+                                               "ggml_cumsum",
+                                               "ggml_diag",
+                                               "ggml_div",
+                                               "ggml_dsv4_hc_comb",
+                                               "ggml_dsv4_hc_post",
+                                               "ggml_dsv4_hc_pre",
+                                               "ggml_dsv4_hc_pre_gated",
+                                               "ggml_dup",
+                                               "ggml_dup_tensor",
+                                               "ggml_element_size",
+                                               "ggml_elu",
+                                               "ggml_exp",
+                                               "ggml_fill",
+                                               "ggml_flash_attn_ext",
+                                               "ggml_flash_attn_ext_add_sinks",
+                                               "ggml_flash_attn_ext_banded",
+                                               "ggml_flash_attn_ext_set_n_kv_max",
+                                               "ggml_fopen",
+                                               "ggml_format_name",
+                                               "ggml_fp16_to_fp32",
+                                               "ggml_fp16_to_fp32_row",
+                                               "ggml_fp32_to_bf16",
+                                               "ggml_fp32_to_fp16",
+                                               "ggml_free",
+                                               "ggml_gallocr_alloc_graph",
+                                               "ggml_gallocr_free",
+                                               "ggml_gallocr_new",
+                                               "ggml_gated_delta_net",
+                                               "ggml_gated_linear_attn",
+                                               "ggml_geglu",
+                                               "ggml_geglu_erf_split",
+                                               "ggml_geglu_quick_split",
+                                               "ggml_geglu_split",
+                                               "ggml_gelu",
+                                               "ggml_gelu_erf",
+                                               "ggml_gelu_inplace",
+                                               "ggml_gelu_quick",
+                                               "ggml_get_data_f32",
+                                               "ggml_get_first_tensor",
+                                               "ggml_get_max_tensor_size",
+                                               "ggml_get_mem_size",
+                                               "ggml_get_name",
+                                               "ggml_get_next_tensor",
+                                               "ggml_get_rows",
+                                               "ggml_get_tensor",
+                                               "ggml_get_type_traits",
+                                               "ggml_graph_get_tensor",
+                                               "ggml_graph_n_nodes",
+                                               "ggml_graph_node",
+                                               "ggml_graph_overhead",
+                                               "ggml_graph_overhead_custom",
+                                               "ggml_graph_size",
+                                               "ggml_group_norm",
+                                               "ggml_hardsigmoid",
+                                               "ggml_hardswish",
+                                               "ggml_im2col",
+                                               "ggml_init",
+                                               "ggml_interpolate",
+                                               "ggml_is_contiguous",
+                                               "ggml_is_quantized",
+                                               "ggml_l2_norm",
+                                               "ggml_lightning_indexer",
+                                               "ggml_log",
+                                               "ggml_log_get",
+                                               "ggml_log_set",
+                                               "ggml_mean",
+                                               "ggml_mul",
+                                               "ggml_mul_mat",
+                                               "ggml_mul_mat_id",
+                                               "ggml_mul_mat_set_hint",
+                                               "ggml_n_dims",
+                                               "ggml_nbytes",
+                                               "ggml_neg",
+                                               "ggml_nelements",
+                                               "ggml_new_graph",
+                                               "ggml_new_graph_custom",
+                                               "ggml_new_tensor",
+                                               "ggml_new_tensor_1d",
+                                               "ggml_new_tensor_2d",
+                                               "ggml_new_tensor_3d",
+                                               "ggml_new_tensor_4d",
+                                               "ggml_norm",
+                                               "ggml_nrows",
+                                               "ggml_op_desc",
+                                               "ggml_op_name",
+                                               "ggml_opt_alloc",
+                                               "ggml_opt_dataset_data",
+                                               "ggml_opt_dataset_get_batch_host",
+                                               "ggml_opt_dataset_init",
+                                               "ggml_opt_dataset_labels",
+                                               "ggml_opt_dataset_ndata",
+                                               "ggml_opt_default_params",
+                                               "ggml_opt_epoch_callback_progress_bar",
+                                               "ggml_opt_eval",
+                                               "ggml_opt_free",
+                                               "ggml_opt_get_default_optimizer_params",
+                                               "ggml_opt_init",
+                                               "ggml_opt_labels",
+                                               "ggml_opt_optimizer_name",
+                                               "ggml_opt_prepare_alloc",
+                                               "ggml_opt_result_free",
+                                               "ggml_opt_result_init",
+                                               "ggml_opt_result_reset",
+                                               "ggml_pad",
+                                               "ggml_pad_ext",
+                                               "ggml_pad_reflect_1d",
+                                               "ggml_permute",
+                                               "ggml_pool_1d",
+                                               "ggml_pool_2d",
+                                               "ggml_prec_set_acc",
+                                               "ggml_quantize_chunk",
+                                               "ggml_quantize_free",
+                                               "ggml_reglu",
+                                               "ggml_reglu_split",
+                                               "ggml_relu",
+                                               "ggml_relu_inplace",
+                                               "ggml_repeat",
+                                               "ggml_repeat_4d",
+                                               "ggml_reshape_1d",
+                                               "ggml_reshape_2d",
+                                               "ggml_reshape_3d",
+                                               "ggml_reshape_4d",
+                                               "ggml_rms_norm",
+                                               "ggml_roll",
+                                               "ggml_rope",
+                                               "ggml_rope_ext",
+                                               "ggml_rope_ext_back",
+                                               "ggml_rope_ext_inplace",
+                                               "ggml_rope_multi",
+                                               "ggml_rope_set_offset",
+                                               "ggml_round",
+                                               "ggml_row_size",
+                                               "ggml_rwkv_wkv6",
+                                               "ggml_rwkv_wkv7",
+                                               "ggml_scale",
+                                               "ggml_scale_bias",
+                                               "ggml_scale_inplace",
+                                               "ggml_set_1d",
+                                               "ggml_set_inplace",
+                                               "ggml_set_input",
+                                               "ggml_set_name",
+                                               "ggml_set_output",
+                                               "ggml_set_param",
+                                               "ggml_set_rows",
+                                               "ggml_set_zero",
+                                               "ggml_sgn",
+                                               "ggml_sigmoid",
+                                               "ggml_silu",
+                                               "ggml_sin",
+                                               "ggml_soft_max",
+                                               "ggml_soft_max_add_sinks",
+                                               "ggml_soft_max_ext",
+                                               "ggml_softplus",
+                                               "ggml_solve_tri",
+                                               "ggml_sqr",
+                                               "ggml_sqrt",
+                                               "ggml_ssm_conv",
+                                               "ggml_ssm_scan",
+                                               "ggml_step",
+                                               "ggml_sub",
+                                               "ggml_sum",
+                                               "ggml_sum_rows",
+                                               "ggml_swiglu",
+                                               "ggml_swiglu_clamp",
+                                               "ggml_swiglu_oai",
+                                               "ggml_swiglu_split",
+                                               "ggml_swiglu_swapped",
+                                               "ggml_tallocr_alloc",
+                                               "ggml_tallocr_new",
+                                               "ggml_tanh",
+                                               "ggml_tensor_overhead",
+                                               "ggml_threadpool_params_default",
+                                               "ggml_threadpool_params_init",
+                                               "ggml_threadpool_params_match",
+                                               "ggml_time_init",
+                                               "ggml_time_ms",
+                                               "ggml_time_us",
+                                               "ggml_top_k",
+                                               "ggml_transpose",
+                                               "ggml_tri",
+                                               "ggml_type_name",
+                                               "ggml_type_size",
+                                               "ggml_unravel_index",
+                                               "ggml_upscale",
+                                               "ggml_validate_row_data",
+                                               "ggml_view_1d",
+                                               "ggml_view_2d",
+                                               "ggml_view_3d",
+                                               "ggml_view_4d",
+                                               "ggml_xielu",
+                                               "gguf_add_tensor",
+                                               "gguf_find_key",
+                                               "gguf_find_tensor",
+                                               "gguf_free",
+                                               "gguf_get_alignment",
+                                               "gguf_get_arr_data",
+                                               "gguf_get_arr_n",
+                                               "gguf_get_arr_str",
+                                               "gguf_get_arr_type",
+                                               "gguf_get_data_offset",
+                                               "gguf_get_key",
+                                               "gguf_get_kv_type",
+                                               "gguf_get_meta_data",
+                                               "gguf_get_meta_size",
+                                               "gguf_get_n_kv",
+                                               "gguf_get_n_tensors",
+                                               "gguf_get_tensor_name",
+                                               "gguf_get_tensor_offset",
+                                               "gguf_get_tensor_size",
+                                               "gguf_get_tensor_type",
+                                               "gguf_get_val_bool",
+                                               "gguf_get_val_data",
+                                               "gguf_get_val_f32",
+                                               "gguf_get_val_i32",
+                                               "gguf_get_val_str",
+                                               "gguf_get_val_u16",
+                                               "gguf_get_val_u32",
+                                               "gguf_get_version",
+                                               "gguf_init_empty",
+                                               "gguf_init_from_file",
+                                               "gguf_init_from_file_ptr",
+                                               "gguf_remove_key",
+                                               "gguf_set_arr_data",
+                                               "gguf_set_arr_str",
+                                               "gguf_set_kv",
+                                               "gguf_set_tensor_type",
+                                               "gguf_set_val_bool",
+                                               "gguf_set_val_f32",
+                                               "gguf_set_val_f64",
+                                               "gguf_set_val_i16",
+                                               "gguf_set_val_i32",
+                                               "gguf_set_val_i64",
+                                               "gguf_set_val_i8",
+                                               "gguf_set_val_str",
+                                               "gguf_set_val_u16",
+                                               "gguf_set_val_u32",
+                                               "gguf_set_val_u64",
+                                               "gguf_set_val_u8",
+                                               "gguf_type_name",
+                                               "gguf_write_to_file"
+                                           ],
+                         "ggml-cpu.dll":  [
+                                              "ggml_backend_cpu_init",
+                                              "ggml_backend_cpu_set_n_threads",
+                                              "ggml_get_type_traits_cpu",
+                                              "ggml_set_f32_nd"
+                                          ]
+                     },
+    "signer":  null
+}

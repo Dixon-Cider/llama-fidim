@@ -30,8 +30,14 @@
   let dgInstalling = $state(false);
   let dgInstall = $state(null);  // InstallReport of the last fork install this session
   let dgPromote = $state(null);  // PromoteReport
+  let dgPreview = $state(null);  // PromotePreview, shown for confirmation before anything moves
   let dgError = $state("");
   let dgGfx = $state("");        // "" = automatic (config family, else a guess from the cards)
+  // Install with the FIDIM runner patch laid over the zip (the overlay
+  // published for the release). Offered only when it is.
+  let dgOverlay = $state(false);
+  const dgWithPatch = $derived(dgOverlay && !!dg?.overlay_available);
+  const dgTargetInstalled = $derived(dgWithPatch ? !!dg?.overlay_installed : !!dg?.already_installed);
   // Which section's action the shared progress log belongs to, so it
   // renders under the button that started it.
   let logOwner = $state("upstream");
@@ -126,7 +132,7 @@
   // Not run on load: the unauthenticated GitHub API allows 60 calls an hour,
   // shared with the upstream check.
   async function dgCheck() {
-    dgChecking = true; dgError = ""; dgPromote = null;
+    dgChecking = true; dgError = ""; dgPromote = null; dgPreview = null;
     try {
       dg = await api("unsloth_check", { tag: null, gfx: dgGfx || null });
     } catch (e) { dgError = String(e); }
@@ -134,18 +140,29 @@
   }
 
   async function dgDoInstall() {
-    dgInstalling = true; dgError = ""; log = []; logOwner = "unsloth"; dgInstall = null; dgPromote = null;
+    dgInstalling = true; dgError = ""; log = []; logOwner = "unsloth"; dgInstall = null; dgPromote = null; dgPreview = null;
     try {
-      dgInstall = await api("unsloth_install", { tag: dg?.latest?.tag ?? null, gfx: dg?.gfx ?? (dgGfx || null) });
+      dgInstall = await api("unsloth_install", { tag: dg?.latest?.tag ?? null, gfx: dg?.gfx ?? (dgGfx || null), overlay: dgWithPatch });
       await dgCheck();
     } catch (e) { dgError = String(e); }
     dgInstalling = false;
   }
 
+  // Which profiles would move, and off which runner patch, is shown first;
+  // only the ones listed there move.
+  async function dgPreviewPromote() {
+    dgError = ""; dgPromote = null;
+    try {
+      dgPreview = await api("unsloth_promote_preview", { toPath: dgInstall.dir });
+    } catch (e) { dgError = String(e); }
+  }
+
   async function dgDoPromote() {
     dgError = "";
     try {
-      dgPromote = await api("unsloth_promote", { toPath: dgInstall.dir, toVersion: dgInstall.verify.version });
+      const ids = dgPreview.moves.map((m) => m.profile_id);
+      dgPromote = await api("unsloth_promote", { toPath: dgInstall.dir, toVersion: dgInstall.verify.version, ids });
+      dgPreview = null;
       await loadHistory();
     } catch (e) { dgError = String(e); }
   }
@@ -369,8 +386,10 @@
       </button>
       {#if dg}
         <button class="btn primary" onclick={dgDoInstall} disabled={dgInstalling || !dg.asset}
-          title="Download the zip, check it against GitHub's sha256 digest, unpack it into its own folder, then run --version and --list-devices on it. No model is loaded.">
-          {dgInstalling ? "Installing…" : dg.already_installed ? "Re-verify" : "Install"}
+          title={dgWithPatch
+            ? "Download the zip and the runner patch, check both against GitHub's sha256 digests and the patch's descriptor, unpack the zip into its own folder with the patched binaries laid over it, then run --version and --list-devices on it. No model is loaded."
+            : "Download the zip, check it against GitHub's sha256 digest, unpack it into its own folder, then run --version and --list-devices on it. No model is loaded."}>
+          {dgInstalling ? "Installing…" : dgTargetInstalled ? "Re-verify" : dgWithPatch ? "Install with patch" : "Install"}
         </button>
       {/if}
     </span>
@@ -394,14 +413,28 @@
               {:else}<span class="chip warn" title="The download cannot be checked against a published hash.">no digest published</span>{/if}
             {:else}<span class="chip block">{dg.asset_error}</span>{/if}
           </td></tr>
+        <tr><th title="Llama FIDIM's DiffusionGemma runner patch ({dg.overlay_patch}), built for this exact release and laid over Unsloth's zip: F16 prompt-KV store with a sliding-window ring, flash attention on the GPU, longer context, prefill reuse across blocks. Unsloth's ggml and ROCm files stay as shipped.">Runner patch</th>
+          <td colspan="3">
+            {#if dg.overlay_available}
+              <label style="display: inline-flex; gap: 6px; align-items: center; margin-right: 10px;"
+                title="Installs into {dg.overlay_install_dir}, beside the plain build. Every file is checked against the patch's descriptor, which also names the exact Unsloth zip it was built for.">
+                <input type="checkbox" bind:checked={dgOverlay} disabled={dgInstalling} />
+                Install with FIDIM runner patch
+              </label>
+              <span class="mono faint">{dg.overlay_patch} · {dg.overlay_asset.name} ({(dg.overlay_asset.size / 1048576).toFixed(0)} MB)</span>
+              {#if dg.overlay_installed}<span class="chip pass">installed</span>{/if}
+            {:else if dg.overlay_error}<span class="chip warn" title={dg.overlay_error}>{dg.overlay_patch} unavailable</span>
+              <span class="faint small">{dg.overlay_error}</span>
+            {:else}<span class="faint">{dg.overlay_patch} is not published for this release ({dg.overlay_repo})</span>{/if}
+          </td></tr>
         <tr><th>Install target</th>
-          <td class="path" colspan="3">{dg.install_dir}</td></tr>
+          <td class="path" colspan="3">{dgWithPatch ? dg.overlay_install_dir : dg.install_dir}</td></tr>
         <tr><th>Installed</th>
           <td colspan="3">
             {#each dg.installed as b}
               <div><span class="mono">{b.tag}</span> <span class="faint mono">{b.version}</span>
                 <span class="chip accent" title="Runs on the ROCm DLLs inside the build, never a runtime from the list below.">bundled ROCm</span>
-                {#if b.patch}<span class="chip plain" title="A locally patched build of this release. Promotion never moves a diffusion profile off it onto an unpatched build.">patch: {b.patch}</span>{/if}</div>
+                {#if b.patch}<span class="chip plain" title="A build with a runner patch. Promotion moves a diffusion profile off it only onto a build whose patch has every feature this one declares.">patch: {b.patch}</span>{/if}</div>
             {:else}<span class="faint">none yet</span>{/each}
           </td></tr>
       </tbody>
@@ -421,6 +454,7 @@
   <div class="card">
     <h2 style="margin-top: 0;">
       {dgInstall.tag} <span class="chip plain">unsloth</span>
+      {#if dgInstall.source === "unsloth-overlay"}<span class="chip accent" title="Unsloth's zip with the runner patch laid over it">patch: {dg?.overlay_patch ?? "dgpatch5"}</span>{/if}
       {#if dgInstall.verify.hip_ok}<span class="chip pass">HIP backend loaded</span>
       {:else}<span class="chip block">HIP backend did not load</span>{/if}
       {#if dgInstall.verify.runner_present}<span class="chip pass">runner present</span>
@@ -442,12 +476,45 @@
     {#if dgInstall.verify.detail}<pre class="path" style="white-space: pre-wrap;">{dgInstall.verify.detail}</pre>{/if}
     {#if dgInstall.verify.hip_ok && dgInstall.verify.runner_present}
       <div class="toolbar" style="margin-top: 10px;">
-        <button class="btn primary" onclick={dgDoPromote}
-          title="Re-point every unpinned diffusion profile at this build. llama-server profiles are never moved here, and neither are diffusion profiles on a patched runner build. Roll back most recent undoes it.">
-          Move diffusion profiles onto it
+        <button class="btn primary" onclick={dgPreviewPromote} disabled={!!dgPreview}
+          title="Lists the diffusion profiles that would move onto this build, and why the others stay, before anything moves. llama-server profiles never move here and pinned ones stay. A profile on a patched runner build moves only onto a build whose patch has every feature of its own: a dgpatch4 profile moves onto dgpatch5. Roll back most recent undoes a move.">
+          Move diffusion profiles onto it…
         </button>
       </div>
     {/if}
+  </div>
+{/if}
+
+{#if dgPreview && dgInstall}
+  <div class="card" transition:slide={leave}>
+    <h2 style="margin-top: 0;">
+      {dgPreview.moves.length ? `Move ${dgPreview.moves.length} diffusion profile(s) onto ${dgInstall.tag}?` : `No diffusion profile would move onto ${dgInstall.tag}`}
+    </h2>
+    <table class="grid">
+      <tbody>
+        {#each dgPreview.moves as m}
+          <tr><td class="mono">{m.profile_id}</td>
+            <td class="mono faint">{m.from.version ?? "?"} → {dgInstall.verify.version ?? "?"}</td>
+            <td>{#if m.from_patch}<span class="chip warn" title="On a {m.from_patch} runner build today. It moves because this build's runner patch has every feature {m.from_patch} declares; it then runs on the runtime bundled here.">leaves {m.from_patch}</span>{/if}</td>
+            <td class="path">{m.from.path}</td></tr>
+        {/each}
+        {#each dgPreview.skipped as [id, why]}
+          <tr><td class="mono">{id}</td><td class="faint" colspan="3">stays: {why}</td></tr>
+        {/each}
+      </tbody>
+    </table>
+    {#if dgPreview.moves.some((m) => m.from_patch)}
+      <p class="faint small">
+        Profiles marked <span class="mono">leaves …</span> run on another patched runner today. To keep one where it is,
+        cancel and set <span class="mono">"build_pinned": true</span> on it.
+      </p>
+    {/if}
+    <div class="toolbar" style="margin-top: 10px;">
+      <button class="btn primary" onclick={dgDoPromote} disabled={!dgPreview.moves.length}>
+        Move {dgPreview.moves.length} profile(s)
+      </button>
+      <button class="btn" onclick={() => (dgPreview = null)}>Cancel</button>
+    </div>
   </div>
 {/if}
 

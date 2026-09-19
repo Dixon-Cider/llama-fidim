@@ -111,7 +111,7 @@
   const faWorks = $derived(hasFeature(selectedBuild, "dg-fa-pad"));
   const faTurnSizing = $derived(faWorks && hasFeature(selectedBuild, "dg-fa-turn-sizing"));
   // A patched runner's test hooks never reach it (the helper strips them).
-  const DG_TEST_HOOK_ENV = ["DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_RING_POISON", "DG_DUMP_LOGITS", "DG_EXIT_AFTER_DUMP"];
+  const DG_TEST_HOOK_ENV = ["DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_RING_POISON", "DG_DUMP_LOGITS", "DG_EXIT_AFTER_DUMP", "DG_PROFILE", "DG_SC_SPLITK", "DG_SC_SPLITK_CHECK"];
   const faSized = $derived(hasFeature(selectedBuild, "dg-fa-pad") && hasFeature(selectedBuild, "dg-fa-turn-sizing") && !!draft?.diffusion?.flash_attn);
   // Env keys FIDIM composes for every diffusion run (profile::DG_OWNED_ENV):
   // validate refuses them, and the editor has no env field to clear them.
@@ -941,7 +941,7 @@
             </label>
             <label class="field" style="grid-column: span 3;" title={faWorks
               ? `Sends FA=1 to the runner. This build pads keys for the flash-attention kernel of DiffusionGemma's 512-dim heads, so they run on the GPU and it is faster${faTurnSizing ? "; the runner then sizes its context by the per-request working set instead of the N² scores buffer (65,536 on a 32 GB card instead of ≈12K)" : ""}. Separate from llama-server's flash attention setting.`
-              : "Sends FA=1 to the runner. On this build DiffusionGemma's 512-dim attention heads get no flash-attention kernel (their key count is not padded to its 256-key stride) and fall back to the CPU, which is slower. A locally patched runner build fixes that. Separate from llama-server's flash attention setting."}>
+              : "Sends FA=1 to the runner. On this build DiffusionGemma's 512-dim attention heads get no flash-attention kernel (their key count is not padded to its 256-key stride) and fall back to the CPU, which is slower. A patched runner build fixes that (Updates: Install with FIDIM runner patch). Separate from llama-server's flash attention setting."}>
               <span class="k">flash attention</span>
               <span>
                 <input type="checkbox" bind:checked={draft.diffusion.flash_attn} onchange={scheduleCheck} /> FA=1

@@ -1,0 +1,2 @@
+# The patch must reach `git apply` byte for byte: no line-ending conversion.
+*.diff -text
