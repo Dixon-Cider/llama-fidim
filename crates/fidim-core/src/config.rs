@@ -67,6 +67,10 @@ pub struct Config {
     /// on (5 s measured sufficient) only if that setting cannot be Off.
     #[serde(default = "default_keep_alive")]
     pub keep_alive_seconds: u32,
+    /// Keep chat conversations in `<config-dir>/chats` (on by default). Off,
+    /// a conversation lives only while the app is open.
+    #[serde(default = "default_true")]
+    pub save_chats: bool,
     /// Preserved unknown fields from newer schema versions.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -110,6 +114,10 @@ fn lm_studio_models_dir() -> Option<PathBuf> {
 
 fn default_keep_alive() -> u32 {
     0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -218,6 +226,7 @@ impl Config {
             source_build_script: None,
             hf_token: None,
             keep_alive_seconds: default_keep_alive(),
+            save_chats: true,
             extra: serde_json::Map::new(),
         }
     }
@@ -271,5 +280,9 @@ mod tests {
         assert!(out.contains("some_future_field"));
         // Default applied for the missing patterns field.
         assert!(cfg.integrated_name_patterns.iter().any(|p| p == "Radeon(TM) Graphics"));
+        // Chats are saved unless the config says otherwise.
+        assert!(cfg.save_chats);
+        let off: Config = serde_json::from_str(&raw.replace("\"rocm_bin\": null,", "\"rocm_bin\": null, \"save_chats\": false,")).unwrap();
+        assert!(!off.save_chats);
     }
 }

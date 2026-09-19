@@ -1,0 +1,1 @@
+{"object":"list","data":[{"id":"diffusiongemma","object":"model","created":1789770548,"owned_by":"llama-fidim","meta":{"n_ctx":65536,"n_ctx_train":262144,"n_vocab":262144,"canvas":256,"diffusion":true}}]}

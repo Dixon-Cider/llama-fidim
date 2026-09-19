@@ -206,7 +206,8 @@ fn query(path: &str, model: Option<&str>) -> String {
     }
 }
 
-fn urlencode(s: &str) -> String {
+/// Percent-encode a query value (router model ids carry `/` and `:`).
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {

@@ -197,7 +197,8 @@ pub fn spawn(
 /// Minimal HTTP/1.1 GET — avoids an async client dependency for what is a
 /// localhost status poll. Returns (status code, body).
 pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<(u16, String)> {
-    let addr = format!("{host}:{port}");
+    // A server bound to 0.0.0.0 is reached over loopback; IPv6 in brackets.
+    let addr = crate::chat::host_port(host, port);
     let stream = TcpStream::connect_timeout(
         &addr
             .parse()
@@ -226,7 +227,7 @@ pub fn http_post_json(
     json: &str,
     timeout: Duration,
 ) -> Result<(u16, String)> {
-    let addr = format!("{host}:{port}");
+    let addr = crate::chat::host_port(host, port);
     let stream = TcpStream::connect_timeout(
         &addr
             .parse()
