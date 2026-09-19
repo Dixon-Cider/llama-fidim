@@ -5,15 +5,19 @@
 
 pub mod bench;
 pub mod build_info;
+pub mod catalog;
 pub mod config;
 pub mod devices;
 pub mod diffusion;
 pub mod discovery;
+pub mod disk;
 pub mod error;
 pub mod estimate;
 pub mod export;
+pub mod fetch;
 pub mod gguf;
 pub mod hf;
+pub mod hub;
 pub mod launch;
 pub mod live;
 pub mod platform;
@@ -25,5 +29,8 @@ pub mod runtime;
 pub mod supervise;
 pub mod update;
 
-pub use error::Error;
+#[cfg(test)]
+mod test_http;
+
+pub use error::{Error, HttpErrorKind};
 pub type Result<T> = std::result::Result<T, Error>;

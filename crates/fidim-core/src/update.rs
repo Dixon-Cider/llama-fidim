@@ -992,9 +992,9 @@ pub struct UnslothMeta {
 /// Classic Windows MAX_PATH less the terminator. The fork's zip nests
 /// rocBLAS/hipBLASLt kernel files ~140 characters deep; a deep install root
 /// would otherwise fail part-way through extraction, or later at load.
-const MAX_PATH_CHARS: usize = 259;
+pub(crate) const MAX_PATH_CHARS: usize = 259;
 
-fn path_chars(p: &Path) -> usize {
+pub(crate) fn path_chars(p: &Path) -> usize {
     p.as_os_str().to_string_lossy().chars().count()
 }
 

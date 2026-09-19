@@ -4,9 +4,10 @@
 //!
 //! The GGUF header names the base repo (`general.base_model.0.*`); the
 //! quantizer's repo is tried second. Gated repos (Gemma, Llama) return 401
-//! without a token — `HF_TOKEN` in the environment or `config.hf_token`
-//! is sent as a bearer when present. Results are cached for a week under
-//! `~/.fidim/hf-cache/`, because the answer does not change.
+//! without a token — the one `hub::token` finds (`HF_TOKEN`, `HF_TOKEN_PATH`,
+//! `config.hf_token`, the CLI's login when enabled) is sent as a bearer when
+//! present. Results are cached for a week under `~/.fidim/hf-cache/`,
+//! because the answer does not change.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -61,10 +62,6 @@ pub fn parse_generation_config(repo: &str, url: &str, text: &str, from_cache: bo
     })
 }
 
-fn token(cfg: &Config) -> Option<String> {
-    std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()).or_else(|| cfg.hf_token.clone())
-}
-
 fn fetch_generation_config(cfg: &Config, repo: &str) -> Result<CreatorDefaults> {
     let url = format!("https://huggingface.co/{repo}/raw/main/generation_config.json");
     let cache = cache_path(repo);
@@ -81,14 +78,15 @@ fn fetch_generation_config(cfg: &Config, repo: &str) -> Result<CreatorDefaults> 
         .timeout_read(Duration::from_secs(30))
         .build();
     let mut req = agent.get(&url).set("User-Agent", concat!("llama-fidim/", env!("CARGO_PKG_VERSION")));
-    if let Some(t) = token(cfg) {
+    if let Some(t) = crate::hub::token(cfg) {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }
     let text = match req.call() {
         Ok(resp) => resp.into_string().map_err(|e| Error::Update(format!("{url}: {e}")))?,
         Err(ureq::Error::Status(401 | 403, _)) => {
             return Err(Error::Update(format!(
-                "{repo} is gated on Hugging Face — accept its terms and set HF_TOKEN (or config.hf_token)"
+                "{repo} is gated on Hugging Face — accept its terms and set a token (HF_TOKEN, or the \
+                 Hugging Face token in Settings)"
             )))
         }
         Err(ureq::Error::Status(404, _)) => {
@@ -129,7 +127,7 @@ fn base_model_via_api(cfg: &Config, repo: &str) -> Result<Vec<String>> {
         .timeout_read(Duration::from_secs(30))
         .build();
     let mut req = agent.get(&url).set("User-Agent", concat!("llama-fidim/", env!("CARGO_PKG_VERSION")));
-    if let Some(t) = token(cfg) {
+    if let Some(t) = crate::hub::token(cfg) {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }
     let text = req
@@ -150,7 +148,8 @@ fn base_model_via_api(cfg: &Config, repo: &str) -> Result<Vec<String>> {
 
 /// Creator defaults for a GGUF on disk. Candidate repos, in order: the base
 /// model named in the GGUF header, the quant repo named in the header, the
-/// repo implied by the `<root>/<owner>/<repo>/` folder layout, and finally
+/// repo its folder's `fidim-source.json` names (a FIDIM download), the repo
+/// implied by the `<root>/<owner>/<repo>/` folder layout, and finally
 /// whatever `base_model` those quant repos declare on their model card.
 pub fn creator_defaults(cfg: &Config, model_path: &Path) -> Result<CreatorDefaults> {
     let header = gguf::read_header(model_path)?;
@@ -180,11 +179,13 @@ pub fn creator_defaults(cfg: &Config, model_path: &Path) -> Result<CreatorDefaul
     };
     push(header.source_repo.clone(), &mut candidates);
     push(header.quant_repo.clone(), &mut candidates);
+    // The repo FIDIM downloaded it from, then the folder layout.
+    push(crate::discovery::model_source(model_path).map(|s| s.repo), &mut candidates);
     push(repo_from_layout(&cfg.model_roots, model_path), &mut candidates);
     if candidates.is_empty() {
         return Err(Error::Update(
-            "no Hugging Face repo could be inferred: the GGUF carries no general.base_model / general.source keys \
-             and the file is not under <model root>/<owner>/<repo>/"
+            "no Hugging Face repo could be inferred: the GGUF carries no general.base_model / general.source keys, \
+             no fidim-source.json names one, and the file is not under <model root>/<owner>/<repo>/"
                 .into(),
         ));
     }

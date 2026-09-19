@@ -1,0 +1,8 @@
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+RateLimit: "resolvers";r=2998;t=64
+RateLimit-Policy: "fixed window";"resolvers";q=3000;w=300
+X-Error-Code: EntryNotFound
+X-Error-Message: Entry not found
+
+Entry not found
