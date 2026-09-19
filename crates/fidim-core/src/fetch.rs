@@ -8,6 +8,11 @@
 //! Hub's expire after an hour) is resolved fresh each time; a token is sent
 //! to the URL's own host only (see `hub::agent`). Failed attempts back off
 //! and retry; a cancel leaves the `.part` for a later resume.
+//!
+//! Beside the `.part`, `<dest>.part.json` records which file it is the
+//! start of (URL, size, SHA-256). A repo can replace a file under the same
+//! name, and the destination does not carry the commit, so a `.part` kept
+//! for another file is started over rather than resumed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -15,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::HttpErrorKind;
@@ -43,8 +48,8 @@ pub struct FetchReq {
     pub expected_size: Option<u64>,
     /// Hex SHA-256 (the Hub's LFS oid).
     pub expected_sha256: Option<String>,
-    /// Consecutive failed attempts allowed; an attempt that transfers
-    /// anything resets the count.
+    /// Consecutive failed attempts allowed; an attempt that gets further
+    /// into the file than any before it resets the count.
     pub attempts: u32,
     /// Delay before the first retry, doubling per failure up to a minute.
     pub backoff: Duration,
@@ -90,11 +95,51 @@ pub fn part_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
+/// `<dest>.part.json`: which file the `.part` holds the start of.
+fn part_record_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".part.json");
+    dest.with_file_name(name)
+}
+
+/// What a `.part` is a download of.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PartRecord {
+    url: String,
+    size: Option<u64>,
+    /// Lowercase hex.
+    sha256: Option<String>,
+}
+
+impl PartRecord {
+    /// Whether bytes kept for `self` can be the start of `want`: the same
+    /// content hash when both have one (the URL may differ: another commit
+    /// that left the file as it was, or a mirror), else the same URL and
+    /// size (a Hub `/resolve/` URL names its commit).
+    fn same_file(&self, want: &PartRecord) -> bool {
+        match (&self.sha256, &want.sha256) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.url == want.url && self.size == want.size,
+        }
+    }
+
+    /// The record at `path`; None when there is none or it does not parse.
+    fn read(path: &Path) -> Option<PartRecord> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_vec(self)?).map_err(|e| Error::io(path, e))
+    }
+}
+
 /// Download `req.url` to `dest`, resuming `<dest>.part` if one is there, and
 /// return the file's size. On success `dest` holds exactly the expected
-/// bytes and the `.part` is gone. On a mismatch nothing is deleted: the
-/// error names the `.part` to remove before trying again. When `dest`
-/// already exists it is verified instead of downloaded.
+/// bytes and the `.part` is gone. A `.part` of another file (an earlier
+/// revision under the same name, or bytes of unknown origin) is started
+/// over. On a mismatch of the file asked for nothing is deleted: the error
+/// names the `.part` to remove before trying again. When `dest` already
+/// exists it is verified instead of downloaded.
 pub fn download_resumable(
     req: &FetchReq,
     dest: &Path,
@@ -113,10 +158,23 @@ pub fn download_resumable(
     if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
+    // Opened first: the record is read and written only by the one writer
+    // of the `.part`.
     let mut part = Part::open(part_path(dest))?;
-    if req.expected_size.is_some_and(|size| part.have > size) {
+    let record = PartRecord { url: req.url.clone(), size: req.expected_size, sha256: expected_sha.clone() };
+    let record_path = part_record_path(dest);
+    let kept = PartRecord::read(&record_path);
+    if part.have > 0 && !kept.as_ref().is_some_and(|k| k.same_file(&record)) {
+        // Kept for another file, or of unknown origin: appending to it
+        // would fail the hash only once the rest had arrived, and every
+        // later try would fail the same way.
+        part.restart()?;
+    } else if req.expected_size.is_some_and(|size| part.have > size) {
         // Longer than the file can be: not a prefix of it.
         part.restart()?;
+    }
+    if kept.as_ref() != Some(&record) {
+        record.write(&record_path)?;
     }
     if part.have > 0 {
         part.rehash(&mut reporter, cancel)?;
@@ -130,6 +188,11 @@ pub fn download_resumable(
     };
     let mut total = req.expected_size;
     let mut failures = 0u32;
+    // The most the `.part` has held. Only getting past it is progress:
+    // bytes that merely arrived may have restarted the file (a server that
+    // ignores Range), and one that drops every connection early would
+    // otherwise be retried until the caller cancels.
+    let mut high_water = part.have;
     let outcome = loop {
         if req.expected_size.is_some_and(|size| part.have == size) {
             break Ok(());
@@ -137,12 +200,12 @@ pub fn download_resumable(
         if cancel.load(Ordering::Relaxed) {
             break Err(Error::Cancelled);
         }
-        let received_before = part.received;
         match attempt(&ctx, &mut part, &mut total, &mut reporter, cancel) {
             Ok(Attempt::Complete) => break Ok(()),
             Ok(Attempt::Cancelled) => break Err(Error::Cancelled),
             Ok(Attempt::Retry { wait, error }) => {
-                if part.received > received_before {
+                if part.have > high_water {
+                    high_water = part.have;
                     failures = 0;
                 }
                 failures += 1;
@@ -180,6 +243,9 @@ pub fn download_resumable(
         });
     }
     rename_into_place(&path, dest)?;
+    // The record matters only while there is a `.part`; a stale one is
+    // harmless (the next download rewrites it).
+    let _ = std::fs::remove_file(&record_path);
     Ok(have)
 }
 
@@ -190,9 +256,6 @@ struct Part {
     hasher: Sha256,
     /// Bytes in the file.
     have: u64,
-    /// Bytes received over the network since it was opened (a restart
-    /// lowers `have`, never this).
-    received: u64,
 }
 
 impl Part {
@@ -210,7 +273,7 @@ impl Part {
         }
         let file = opts.open(&path).map_err(|e| Error::io(&path, e))?;
         let have = file.metadata().map_err(|e| Error::io(&path, e))?.len();
-        Ok(Part { file, path, hasher: Sha256::new(), have, received: 0 })
+        Ok(Part { file, path, hasher: Sha256::new(), have })
     }
 
     /// Hash the bytes already in the file, leaving it positioned to append.
@@ -234,7 +297,6 @@ impl Part {
         self.file.write_all(bytes).map_err(|e| Error::io(&self.path, e))?;
         self.hasher.update(bytes);
         self.have += bytes.len() as u64;
-        self.received += bytes.len() as u64;
         Ok(())
     }
 
@@ -603,6 +665,14 @@ mod tests {
         |_| {}
     }
 
+    /// A `.part` holding `bytes`, recorded as the start of `req`'s file, as
+    /// an interrupted download of it leaves one.
+    fn seed_part(dest: &Path, bytes: &[u8], req: &FetchReq) {
+        std::fs::write(part_path(dest), bytes).unwrap();
+        let sha256 = req.expected_sha256.as_ref().map(|s| s.to_ascii_lowercase());
+        PartRecord { url: req.url.clone(), size: req.expected_size, sha256 }.write(&part_record_path(dest)).unwrap();
+    }
+
     #[test]
     fn downloads_verifies_and_renames() {
         let data = Arc::new(payload(3 * CHUNK + 123));
@@ -649,10 +719,11 @@ mod tests {
         let dir = tmp("resume");
         let dest = dir.join("m.gguf");
         let have = CHUNK + 5;
-        std::fs::write(part_path(&dest), &data[..have]).unwrap();
+        let req = req_for(format!("{}/f", srv.base), &data);
+        seed_part(&dest, &data[..have], &req);
         let mut stages = Vec::new();
         download_resumable(
-            &req_for(format!("{}/f", srv.base), &data),
+            &req,
             &dest,
             &mut |p| stages.push((p.stage, p.done)),
             &AtomicBool::new(false),
@@ -673,9 +744,9 @@ mod tests {
         let dir = tmp("norange");
         let dest = dir.join("m.gguf");
         // Garbage in the .part: kept, it would corrupt the result.
-        std::fs::write(part_path(&dest), vec![0xAAu8; 5000]).unwrap();
-        download_resumable(&req_for(format!("{}/f", srv.base), &data), &dest, &mut quiet(), &AtomicBool::new(false))
-            .unwrap();
+        let req = req_for(format!("{}/f", srv.base), &data);
+        seed_part(&dest, &[0xAAu8; 5000], &req);
+        download_resumable(&req, &dest, &mut quiet(), &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), *data);
         assert_eq!(srv.requests()[0].header("range"), Some("bytes=5000-"));
         std::fs::remove_dir_all(dir).ok();
@@ -699,6 +770,14 @@ mod tests {
         }
         assert!(!dest.exists());
         assert_eq!(std::fs::read(part_path(&dest)).unwrap(), *data, "the .part is left alone");
+        // Asked for the same file again, it is checked again, not restarted.
+        let asked = srv.requests().len();
+        assert!(matches!(
+            download_resumable(&req, &dest, &mut quiet(), &AtomicBool::new(false)),
+            Err(Error::Integrity { .. })
+        ));
+        assert_eq!(srv.requests().len(), asked);
+        assert_eq!(std::fs::read(part_path(&dest)).unwrap(), *data);
         // A wrong hash on a finished file is refused the same way.
         std::fs::write(&dest, &*data).unwrap();
         assert!(matches!(
@@ -863,16 +942,16 @@ mod tests {
         let dir = tmp("sizes");
         // A .part that is already whole: verified and renamed, no request.
         let dest = dir.join("whole.gguf");
-        std::fs::write(part_path(&dest), &*data).unwrap();
-        download_resumable(&req_for(format!("{}/f", srv.base), &data), &dest, &mut quiet(), &AtomicBool::new(false))
-            .unwrap();
+        let req = req_for(format!("{}/f", srv.base), &data);
+        seed_part(&dest, &data, &req);
+        download_resumable(&req, &dest, &mut quiet(), &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), *data);
         assert_eq!(srv.requests().len(), 0);
 
         // Without an expected size the server's 416 says the part is whole.
         let dest = dir.join("nosize.gguf");
-        std::fs::write(part_path(&dest), &*data).unwrap();
         let req = FetchReq { expected_size: None, ..req_for(format!("{}/f", srv.base), &data) };
+        seed_part(&dest, &data, &req);
         download_resumable(&req, &dest, &mut quiet(), &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), *data);
 
@@ -902,6 +981,92 @@ mod tests {
         // Readers are let in.
         assert!(File::open(part_path(&dest)).is_ok());
         drop(held);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A `.part` kept from an earlier revision of a file that a repo then
+    /// replaced under the same name is no prefix of the new one: it is
+    /// started over, not appended to and failed at the end every time.
+    #[test]
+    fn a_part_of_another_revision_is_not_resumed() {
+        let old: Arc<Vec<u8>> = Arc::new(payload(3 * CHUNK).iter().map(|b| b ^ 0x5a).collect());
+        let new = Arc::new(payload(4 * CHUNK));
+        let (o, n) = (old.clone(), new.clone());
+        let srv = Server::start("127.0.0.1", move |r| {
+            if r.path().contains("/resolve/aaaa/") { serve_ranges(o.clone(), r) } else { serve_ranges(n.clone(), r) }
+        })
+        .unwrap();
+        let dir = tmp("stale");
+        let dest = dir.join("K2-Horizon-32B-Q4_K_M.gguf");
+        let cancel = AtomicBool::new(false);
+        let at_a = req_for(format!("{}/IFM/K2/resolve/aaaa/K2-Horizon-32B-Q4_K_M.gguf", srv.base), &old);
+        let r = download_resumable(
+            &at_a,
+            &dest,
+            &mut |p| {
+                if p.done > 0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            &cancel,
+        );
+        assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+        let kept = std::fs::metadata(part_path(&dest)).unwrap().len();
+        assert!(kept > 0 && kept < new.len() as u64);
+
+        let at_b = req_for(format!("{}/IFM/K2/resolve/bbbb/K2-Horizon-32B-Q4_K_M.gguf", srv.base), &new);
+        let before = srv.requests().len();
+        download_resumable(&at_b, &dest, &mut quiet(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), *new);
+        let asked = &srv.requests()[before..];
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].header("range"), None, "revision B is fetched from its start");
+        assert!(!part_record_path(&dest).exists(), "the record goes with the .part");
+
+        // Bytes of unknown origin (no record) are not trusted either.
+        let dest = dir.join("foreign.gguf");
+        std::fs::write(part_path(&dest), &new[..1000]).unwrap();
+        let before = srv.requests().len();
+        download_resumable(&at_b, &dest, &mut quiet(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), *new);
+        assert_eq!(srv.requests()[before].header("range"), None);
+
+        // The same file at another commit (its content hash unchanged) or
+        // through a mirror still resumes.
+        let dest = dir.join("moved.gguf");
+        seed_part(&dest, &new[..CHUNK], &at_b);
+        let at_c = FetchReq { url: format!("{}/IFM/K2/resolve/cccc/K2-Horizon-32B-Q4_K_M.gguf", srv.base), ..at_b.clone() };
+        let before = srv.requests().len();
+        download_resumable(&at_c, &dest, &mut quiet(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), *new);
+        assert_eq!(srv.requests()[before].header("range"), Some(format!("bytes={CHUNK}-").as_str()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A server that ignores Range and drops every connection at the same
+    /// point gets no further on each attempt: the attempts run out instead
+    /// of restarting from 0 until the caller cancels.
+    #[test]
+    fn restarts_that_get_nowhere_use_up_the_attempts() {
+        let data = Arc::new(payload(10_000));
+        let d = data.clone();
+        let srv = Server::start("127.0.0.1", move |_| Resp::new(200, d.to_vec()).cut_after(1000)).unwrap();
+        let dir = tmp("noprogress");
+        let mut req = req_for(format!("{}/f", srv.base), &data);
+        req.attempts = 3;
+        req.backoff = Duration::from_millis(1);
+        // A regression fails the test instead of hanging it.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            c.store(true, Ordering::Relaxed);
+        });
+        match download_resumable(&req, &dir.join("m.gguf"), &mut quiet(), &cancel) {
+            Err(Error::Http { kind: HttpErrorKind::Network, .. }) => {}
+            other => panic!("{other:?} after {} requests", srv.requests().len()),
+        }
+        assert_eq!(srv.requests().len(), 3, "the first attempt made progress, the next two did not");
         std::fs::remove_dir_all(dir).ok();
     }
 
