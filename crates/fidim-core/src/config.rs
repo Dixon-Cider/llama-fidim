@@ -44,6 +44,9 @@ pub struct Config {
     pub profile_dir: PathBuf,
     /// Where run state + captured logs live.
     pub runs_dir: PathBuf,
+    /// SGLang on this host (Linux): venv, tools dir, env. None = no SGLang engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sglang: Option<crate::sglang::SgLangHost>,
     /// Where `fidim update` installs new builds (`<root>/<tag>-<flavor>`).
     /// Defaults to the first build root so the scan finds them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +241,7 @@ impl Config {
             allow_integrated: false,
             profile_dir: dir.join("profiles"),
             runs_dir: dir.join("runs"),
+            sglang: None,
             install_root: None,
             llama_cpp_source: None,
             fidim_source: None,

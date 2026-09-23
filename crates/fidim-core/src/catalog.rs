@@ -798,6 +798,7 @@ mod tests {
         assert_eq!(fits[0].ctx, 12_288);
     }
 
+    #[cfg(windows)]
     #[test]
     fn destinations_flatten_repo_folders() {
         let root = Path::new(r"E:\models");

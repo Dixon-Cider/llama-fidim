@@ -161,6 +161,7 @@ mod tests {
         assert!(bat.contains("set \"PATH=C:/Program Files/AMD/ROCm/7.1/bin;%PATH%\""));
     }
 
+    #[cfg(windows)]
     #[test]
     fn diffusion_header() {
         // llama-server output, byte for byte as it was before the diffusion

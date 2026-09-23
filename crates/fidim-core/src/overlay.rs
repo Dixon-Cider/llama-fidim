@@ -834,6 +834,7 @@ mod tests {
         assert!(e.contains("stay Unsloth's"), "{e}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn repo_names_and_the_config_override() {
         let mut cfg = Config::default_for_machine();

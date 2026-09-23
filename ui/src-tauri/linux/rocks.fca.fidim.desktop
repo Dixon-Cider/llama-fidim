@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Llama FIDIM
+Comment=Serve and watch llama.cpp and SGLang models on your own GPUs
+Exec=llama-fidim
+Icon=rocks.fca.fidim
+Terminal=false
+Categories=Utility;Development;
+StartupWMClass=rocks.fca.fidim

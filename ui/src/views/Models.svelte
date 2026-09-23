@@ -139,6 +139,36 @@
 
   const statusChip = (s) => ({ pending: "plain", running: "accent", done: "pass", failed: "block", stopped: "warn", skipped: "plain" }[s] ?? "plain");
   const stepIcon = (a) => (a.kind === "build" ? "build" : a.kind === "download" ? a.role : "profile");
+
+  // Hugging Face checkpoint folders the scan found under the model folders
+  // (config.json + *.safetensors): no GGUF header, `hf` from config.json,
+  // served by the SGLang engine. GGUF files are picked in Profiles as
+  // before; these get a profile through Profiles too, with the path handed
+  // over.
+  let local = $state(null);        // null = not loaded yet
+  let localError = $state("");
+  let localBusy = $state(false);
+  const checkpoints = $derived((local ?? []).filter((m) => m.format === "safetensors" || (m.engine === "sglang" && !m.header)));
+  async function loadLocal(refresh = false) {
+    localBusy = true;
+    localError = "";
+    try {
+      const s = await api("scan", refresh ? { refresh: true } : {});
+      local = (s.models ?? []).slice().sort((a, b) => a.path.localeCompare(b.path));
+    } catch (e) {
+      localError = String(e);
+      local ??= [];
+    }
+    localBusy = false;
+  }
+  loadLocal();
+  function profileFor(m) {
+    handoff.modelPath = m.path;
+    log(`models: new sglang profile for ${m.path}`);
+    go("profiles");
+  }
+  const hfWeights = (h) => (h?.quantization ? h.quantization.toUpperCase() : (h?.torch_dtype ?? "?").replace(/^torch\./, ""));
+  const hfName = (m) => base(m.path) || m.path;
 </script>
 
 <!-- Where the files go: the model folders with their free space, and a
@@ -146,7 +176,7 @@
      Choose file while there is no folder at all. -->
 {#snippet saveTo()}
   <section class="card">
-    <div class="sec">Save to <span class="faint">model folders; the scan finds what lands in them</span></div>
+    <div class="sec">Save to <span class="faint">model folders</span></div>
     <div class="roots">
       {#each wz.roots as r (r.path)}
         <label class="opt-row" class:on={wz.destRoot === r.path}>
@@ -155,14 +185,14 @@
           <span class="faint small">{r.free_bytes != null ? `${gib(r.free_bytes)} free` : "free space unknown"}{r.exists ? "" : " · created on first download"}</span>
         </label>
       {:else}
-        <div class="faint small">No model folder yet: add one, for example a folder on a drive with room for models.</div>
+        <div class="faint small">No model folder yet — add one below.</div>
       {/each}
     </div>
     <div class="addroot">
       <input class="mono" bind:value={newRoot} placeholder="D:\models" spellcheck="false"
         onkeydown={async (e) => { if (e.key === "Enter" && (await addRoot(newRoot))) newRoot = ""; }} />
       <button class="btn" disabled={!newRoot.trim() || wz.rootBusy} onclick={async () => { if (await addRoot(newRoot)) newRoot = ""; }}
-        title="Adds the folder to Settings > model folders (and creates it), then saves there.">{wz.rootBusy ? "Adding…" : "Add a folder"}</button>
+        title="Creates the folder and adds it to Settings → model folders">{wz.rootBusy ? "Adding…" : "Add a folder"}</button>
       {#if wz.rootError}<span class="chip block">{wz.rootError}</span>{/if}
     </div>
   </section>
@@ -170,7 +200,7 @@
 
 <h1>
   Get a model
-  <span class="sub">Find a model on Hugging Face, see which file fits your cards and which llama.cpp build loads it, then download it and make a profile. Nothing here loads a model.</span>
+  <span class="sub" title="Nothing here loads a model; the Done step has a Launch button for that">Find it on Hugging Face, pick the file that fits, download it, get a profile.</span>
 </h1>
 
 <nav class="stepper" aria-label="steps">
@@ -191,17 +221,15 @@
     <div class="searchbar">
       <input class="q" bind:value={wz.query} spellcheck="false" autocomplete="off"
         placeholder="Search Hugging Face, or paste owner/name or a huggingface.co link"
+        title="Matches words of the repo name; a repo id or a huggingface.co link opens it directly"
         onkeydown={(e) => e.key === "Enter" && submit()} />
-      <label class="opt" title="Only repos with .gguf files, the format llama.cpp loads. Off also lists safetensors and other formats (the wizard then points to their GGUF versions).">
+      <label class="opt" title="Only repos with .gguf files, which llama.cpp loads; off also lists safetensors and other formats">
         <input type="checkbox" checked={!wz.allFormats} onchange={(e) => (wz.allFormats = !e.target.checked)} /> GGUF only
       </label>
       <button class="btn primary" onclick={submit} disabled={wz.searching || !!wz.opening || !wz.query.trim()}>
         {#if wz.searching || wz.opening}<span class="spinner"></span>{/if}
         {looksLikeRepo(wz.query) ? "Open repo" : "Search"}
       </button>
-    </div>
-    <div class="faint small" style="margin-top: 8px;">
-      Search matches words of the repo name. A repo id (<span class="mono">IFM/K2-Horizon-7B-GGUF</span>) or a link to a repo or a file opens it directly.
     </div>
     {#if wz.findError}<div class="notice" style="margin-top: 10px;" transition:slide={leave}><span class="chip block">error</span><span class="mono">{wz.findError}</span></div>{/if}
   </section>
@@ -216,7 +244,7 @@
               <tr class="hit" in:fade={{ duration: LAYOUT, delay: stagger(i, 15) }} onclick={() => open(h.id)} title="Open {h.id}">
                 <td>
                   <span class="mono repo">{h.id}</span>
-                  {#if h.gated !== "no"}<span class="chip warn" title="Downloads need the repo's terms accepted on Hugging Face and a token in Settings.">{gatedLabel(h.gated)}</span>{/if}
+                  {#if h.gated !== "no"}<span class="chip warn" title="Downloads need the repo's terms accepted on Hugging Face and a token in Settings">{gatedLabel(h.gated)}</span>{/if}
                   {#if wz.opening === h.id}<span class="spinner"></span>{/if}
                 </td>
                 <td class="mono">{h.arch ?? "—"}</td>
@@ -225,8 +253,8 @@
                 <td class="r num">{h.likes}</td>
                 <td class="mono faint">{day(h.last_modified)}</td>
                 <td>
-                  {#if h.arch_known === true}<span class="chip pass" title="An installed build names this architecture.">installed</span>
-                  {:else if h.arch_known === false}<span class="chip warn" title="No installed build names this architecture: the wizard will look for one to install or build.">needs a build</span>
+                  {#if h.arch_known === true}<span class="chip pass" title="An installed build names this architecture">installed</span>
+                  {:else if h.arch_known === false}<span class="chip warn" title="No installed build names this architecture; the wizard finds one to install or build">needs build</span>
                   {:else}<span class="faint">—</span>{/if}
                 </td>
               </tr>
@@ -234,8 +262,42 @@
           </tbody>
         </table>
       {:else}
-        <div class="empty">Nothing on Hugging Face matches “{wz.searched}”{wz.allFormats ? "" : " with GGUF files"}.</div>
+        <div class="empty">Nothing matches “{wz.searched}”{wz.allFormats ? "" : " with GGUF files"} — try other words</div>
       {/if}
+    </section>
+  {/if}
+
+  {#if checkpoints.length || localError}
+    <section class="card flush">
+      <div class="sec pad">
+        On this PC
+        <span class="faint">safetensors checkpoints in the model folders; SGLang serves them</span>
+        <span style="margin-left: auto;"><button class="btn small" onclick={() => loadLocal(true)} disabled={localBusy}>{localBusy ? "…" : "Rescan"}</button></span>
+      </div>
+      {#if localError}<div class="notice" style="margin: 10px 18px 0;"><span class="chip block">scan failed</span><span class="mono">{localError}</span></div>{/if}
+      <table class="grid ckpts">
+        <thead><tr><th>Folder</th><th>Architecture</th><th>Weights</th><th class="r">Layers</th><th class="r">Size</th><th class="r">Trained context</th><th></th></tr></thead>
+        <tbody>
+          {#each checkpoints as m, i (m.path)}
+            {@const h = m.hf ?? {}}
+            <tr in:fade={{ duration: LAYOUT, delay: stagger(i, 15) }}>
+              <td>
+                <span class="mono lbl">{hfName(m)}</span>
+                <span class="chip note" title="A folder of config.json and *.safetensors; llama-server cannot load it, SGLang can">safetensors</span>
+                {#if h.num_experts}<span class="chip plain" title="A mixture of experts, {h.num_experts} per layer">{h.num_experts} experts</span>{/if}
+                {#if h.has_vision}<span class="chip accent" title="config.json has a vision_config; the model reads images">vision</span>{/if}
+                <div class="path">{m.path}</div>
+              </td>
+              <td class="mono">{h.architecture ?? h.model_type ?? "—"}</td>
+              <td class="mono" title={h.quantization ? `quantization_config.quant_method = ${h.quantization}` : `torch_dtype = ${h.torch_dtype ?? "?"}`}>{hfWeights(h)}</td>
+              <td class="r num">{h.num_layers ?? "—"}{#if h.attention_layers != null && h.num_layers != null && h.attention_layers !== h.num_layers}<span class="faint small" title="Layers with a KV cache; the rest are linear-attention or SSM layers"> · {h.attention_layers} attn</span>{/if}</td>
+              <td class="r num">{gib(h.weights_bytes ?? m.file_size)}</td>
+              <td class="r num">{h.max_position_embeddings ? Number(h.max_position_embeddings).toLocaleString() : "—"}</td>
+              <td class="r"><button class="btn small" onclick={() => profileFor(m)} title="Opens Profiles with a new SGLang profile on this folder">Make a profile</button></td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
     </section>
   {/if}
 
@@ -278,7 +340,7 @@
           </tbody>
         </table>
       {:else}
-        <div class="empty">None found. Search for the model's name instead.</div>
+        <div class="empty">None found — search the model's name instead</div>
       {/if}
       <div class="toolbar" style="margin: 12px 0 0;"><button class="btn" onclick={() => (wz.step = 1)}>Back to search</button></div>
     </section>
@@ -295,10 +357,10 @@
         <thead>
           <tr>
             <th></th><th>File</th><th class="r">Size</th>
-            <th class="r" title="The estimate on one card: weights + KV cache + compute buffers + overhead.">Needs</th>
-            <th title="On one card, against its whole VRAM. Tight = over 90%: no headroom for a display or another model.">One card</th>
-            <th title="Layer-split over the two largest cards.">Two-card split</th>
-            <th class="r" title="The longest context that fits one card with 10% to spare.">Max context</th>
+            <th class="r" title="Estimate on one card: weights, KV cache, compute buffers and overhead">Needs</th>
+            <th title="Against the whole card; tight is over 90%, no room for a display or another model">One card</th>
+            <th title="Layer split over the two largest cards">Two-card split</th>
+            <th class="r" title="Longest context that fits one card with 10% to spare">Max context</th>
           </tr>
         </thead>
         <tbody>
@@ -308,13 +370,13 @@
               <td><input type="radio" name="quant" checked={wz.choice === c.label} onchange={() => (wz.choice = c.label)} /></td>
               <td>
                 <span class="mono lbl">{c.label}</span>
-                {#if v.recommended === c.label}<span class="chip accent" title="The largest file that fits one card at this context.">recommended</span>{/if}
+                {#if v.recommended === c.label}<span class="chip accent" title="The largest file that fits one card at this context">recommended</span>{/if}
                 {#if c.files.length > 1}<span class="chip plain" title={c.files.map((x) => x.path).join("\n")}>{c.files.length} parts</span>{/if}
                 <div class="path">{c.first_file}</div>
               </td>
               <td class="r num">{gib(c.total_size)}</td>
               <td class="r num">{f?.one_card?.need_bytes ? gib(f.one_card.need_bytes) : "—"}</td>
-              <td>{#if f}<span class="chip {fitChip(f.one_card.fit)}" title={f.one_card.detail}>{fitWord(f.one_card.fit)}</span>{#if f.one_card.fit !== "not_applicable" && !f.one_card.fits_free_now && f.one_card.fit !== "no_fit"}<span class="faint small" title="The cards' VRAM free right now is less: another server holds some."> busy now</span>{/if}{:else}<span class="faint">—</span>{/if}</td>
+              <td>{#if f}<span class="chip {fitChip(f.one_card.fit)}" title={f.one_card.detail}>{fitWord(f.one_card.fit)}</span>{#if f.one_card.fit !== "not_applicable" && !f.one_card.fits_free_now && f.one_card.fit !== "no_fit"}<span class="faint small" title="Less VRAM is free right now; another server holds some"> busy now</span>{/if}{:else}<span class="faint">—</span>{/if}</td>
               <td>{#if f}<span class="chip {fitChip(f.two_card_split.fit)}" title={f.two_card_split.detail}>{fitWord(f.two_card_split.fit)}</span>{:else}<span class="faint">—</span>{/if}</td>
               <td class="r num">{f?.max_ctx_one_card ? Number(f.max_ctx_one_card).toLocaleString() : "—"}</td>
             </tr>
@@ -326,14 +388,14 @@
     <section class="card">
       <div class="sec">Extras <span class="faint">downloaded beside the model and paired in the profile</span></div>
       <div class="formgrid">
-        <label class="field" style="grid-column: span 2;" title="A multimodal projector lets the server read images. Its VRAM counts on the main card.">
+        <label class="field" style="grid-column: span 2;" title="Lets the server read images; its VRAM counts on the main card (--mmproj)">
           <span class="k">vision projector</span>
           <select bind:value={wz.mmproj} disabled={!v.catalog.mmproj.length}>
             <option value="">{v.catalog.mmproj.length ? "none" : "none in this repo"}</option>
             {#each v.catalog.mmproj as m}<option value={m.path}>{m.path} · {gib(m.size)}</option>{/each}
           </select>
         </label>
-        <label class="field" style="grid-column: span 2;" title="A draft model, MTP head or DFlash draft for speculative decoding; the profile turns it on in that mode. EAGLE3 and DSpark heads need speculative types profiles do not have yet.">
+        <label class="field" style="grid-column: span 2;" title="Draft model, MTP head or DFlash draft; the profile turns speculative decoding on with it (-md)">
           <span class="k">draft / MTP head</span>
           <select bind:value={wz.draft} disabled={!v.catalog.drafts.length}>
             <option value="">{v.catalog.drafts.length ? "none" : "none in this repo"}</option>
@@ -343,7 +405,7 @@
             {/each}
           </select>
         </label>
-        <label class="field" style="grid-column: span 2;" title="The new profile's context in tokens. Empty = the largest that fits one card, at most 32,768. Change it later in Profiles.">
+        <label class="field" style="grid-column: span 2;" title="Context of the new profile; empty is the largest that fits one card, up to 32,768">
           <span class="k">context</span>
           <input type="number" min="512" step="1024" bind:value={wz.ctx} placeholder={`auto (${Number(Math.min(32768, fitOf(wz.choice)?.max_ctx_one_card ?? 32768)).toLocaleString()})`} />
         </label>
@@ -370,7 +432,7 @@
       <div class="toolbar" style="margin: 14px 0 0;">
         <button class="btn" onclick={() => (wz.step = 1)}>Back</button>
         <div class="grow"></div>
-        {#if !wz.destRoot}<span class="faint small">Add a model folder above to save into first.</span>{/if}
+        {#if !wz.destRoot}<span class="faint small">Add a model folder above first.</span>{/if}
         <button class="btn primary" onclick={toBuild} disabled={!wz.choice || wz.planning || !wz.destRoot}>{#if wz.planning}<span class="spinner"></span> Planning…{:else}Continue{/if}</button>
       </div>
     </section>
@@ -387,14 +449,14 @@
     {#if plan.build?.installed && !buildStep}
       <div class="verdict pass">
         <span class="chip pass">ready</span>
-        <span><b>{plan.build.name}</b> is installed and can load this model. Nothing to install or build.</span>
+        <span><b>{plan.build.name}</b> is installed and loads this model.</span>
       </div>
     {:else if buildStep}
       <div class="verdict {buildStep.needs_consent ? 'warn' : 'accent'}">
         <div class="vt">
           <b>{actionTitle(buildStep)}</b>
-          {#if buildStep.verified}<span class="chip pass" title="Read from the source at that commit.">verified</span>{:else}<span class="chip warn">not verified</span>{/if}
-          {#if buildStep.needs_consent}<span class="chip warn">needs your consent</span>{/if}
+          {#if buildStep.verified}<span class="chip pass" title="Read from the source at that commit">verified</span>{:else}<span class="chip warn">not verified</span>{/if}
+          {#if buildStep.needs_consent}<span class="chip warn" title="Builds code nobody reviewed; tick the box below">consent</span>{/if}
         </div>
         <div class="expl">{buildStep.explanation}</div>
         {#each buildStep.warnings as w}<div class="notice small"><span class="chip warn">note</span><span>{w}</span></div>{/each}
@@ -404,14 +466,14 @@
           <dl class="kv">
             <dt>repository</dt><dd><button class="link mono" onclick={() => openUrl(source.url)}>{source.owner}/{source.repo}</button>
               {#if source.linked_as}<span class="faint"> · the card links {source.linked_as}, which GitHub now sends here</span>{/if}
-              {#if !source.is_upstream && !source.is_fork_of_upstream}<span class="chip block">not a fork of ggml-org/llama.cpp</span>{/if}</dd>
+              {#if !source.is_upstream && !source.is_fork_of_upstream}<span class="chip block" title="Not a fork of ggml-org/llama.cpp">not a fork</span>{/if}</dd>
             <dt>ref</dt><dd class="mono">{source.git_ref}</dd>
             <dt>commit</dt><dd class="mono">{source.sha}</dd>
             {#if source.ahead_by != null}<dt>distance</dt><dd>{source.ahead_by} commits ahead of upstream master, {source.behind_by} behind</dd>{/if}
             {#if source.pr}<dt>pull request</dt><dd>#{source.pr.number} “{source.pr.title}” · {source.pr.state}{source.pr.draft ? ", draft" : ""}{source.pr.mergeable_state ? `, ${source.pr.mergeable_state}` : ""}</dd>{/if}
           </dl>
           {#if source.subjects?.length}
-            <div class="k small" style="margin: 10px 0 4px;">its commits, newest first</div>
+            <div class="k small" style="margin: 10px 0 4px;">commits, newest first</div>
             <ol class="subjects">
               {#each [...source.subjects].reverse() as subj}<li class="mono">{subj}</li>{/each}
             </ol>
@@ -453,7 +515,7 @@
       {/if}
       <label class="opt-row" class:on={selected === "skip"}>
         <input type="radio" name="build" checked={selected === "skip"} onchange={() => setBuild({ kind: "skip" })} disabled={wz.planning} />
-        <span><b>No build</b>: download the files only; the profile goes on the best installed build</span>
+        <span><b>No build</b>: files only; the profile uses the best installed build</span>
       </label>
     </div>
 
@@ -467,7 +529,7 @@
 
   {#if plan.toolchain?.length}
     <section class="card">
-      <div class="sec">Toolchain <span class="faint">what a source build needs on this PC, checked with a test compile</span></div>
+      <div class="sec">Toolchain <span class="faint">checked with a test compile</span></div>
       <table class="grid">
         <tbody>
           {#each plan.toolchain as t}
@@ -493,7 +555,7 @@
     <div class="toolbar" style="margin: 14px 0 0;">
       <button class="btn" onclick={() => (wz.step = 2)}>Back</button>
       <div class="grow"></div>
-      {#if blockedByConsent}<span class="faint small">Tick the box to build code nobody reviewed, or pick another way above.</span>{/if}
+      {#if blockedByConsent}<span class="faint small">Tick the box, or pick another way above.</span>{/if}
       <button class="btn primary" onclick={() => (wz.step = 4)} disabled={blockedByConsent || wz.planning}>Continue</button>
     </div>
   </section>
@@ -536,7 +598,7 @@
             {#if status === "running" || (status === "pending" && s.action.have > 0) || status === "failed" || status === "stopped"}
               <div class="meter"><div class="fill {hashing ? 'warn' : ''}" style="width: {Math.min(100, (100 * done) / Math.max(1, total))}%;"></div></div>
               <div class="prog faint small num">
-                {#if hashing}checking SHA-256 of what is on disk: {gib(done, 2)} of {gib(total, 2)}
+                {#if hashing}SHA-256 check: {gib(done, 2)} of {gib(total, 2)}
                 {:else}{gib(done, 2)} of {gib(total, 2)}{#if status === "running" && pg?.bps} · {mbps(pg.bps)} · {eta((total - done) / pg.bps)} left{/if}{/if}
               </div>
             {:else if status === "done"}
@@ -567,7 +629,7 @@
     {#if wz.job?.finished && !wz.job.finished.ok}
       <div class="notice" style="margin-top: 12px;">
         <span class="chip {wz.job.finished.error === 'cancelled' ? 'warn' : 'block'}">{wz.job.finished.error === "cancelled" ? "stopped" : "failed"}</span>
-        <span>{wz.job.finished.error === "cancelled" ? "Stopped. Finished downloads are kept, and a partial one continues from where it stopped." : wz.job.finished.error}</span>
+        <span>{wz.job.finished.error === "cancelled" ? "Finished files are kept; Resume continues the partial one." : wz.job.finished.error}</span>
       </div>
     {/if}
     {#if wz.jobError}<div class="notice" style="margin-top: 10px;"><span class="chip block">error</span><span class="mono">{wz.jobError}</span></div>{/if}
@@ -582,7 +644,7 @@
           {#if wz.starting}<span class="spinner"></span>{/if} Start
         </button>
       {:else if running}
-        <span class="faint small">Runs in the app: switch tabs freely. Stopping keeps what is downloaded.</span>
+        <span class="faint small">Switch tabs freely; Stop keeps what is downloaded.</span>
         <div class="grow"></div>
         <button class="btn danger" onclick={cancel} disabled={wz.job.cancelling}>{wz.job.cancelling ? "Stopping…" : "Stop"}</button>
       {:else}
@@ -622,12 +684,12 @@
       </dl>
     {:else}
       {#each result.files as f}<div class="path">{f}</div>{/each}
-      <div class="faint small" style="margin-top: 8px;">No profile was made: no build can load this model yet. Make one in Profiles once a build does.</div>
+      <div class="faint small" style="margin-top: 8px;">No profile: no build loads this model yet — make one in Profiles once one does.</div>
     {/if}
     {#each result.warnings as w}<div class="notice small" style="margin-top: 6px;"><span class="chip warn">note</span><span>{w}</span></div>{/each}
     {#if result.build}
       <div class="notice small" style="margin-top: 8px;">
-        <span class="chip {result.build.verify?.hip_ok ? 'pass' : 'block'}">{result.build.verify?.hip_ok ? "HIP backend loaded" : "HIP backend did not load"}</span>
+        <span class="chip {result.build.verify?.hip_ok ? 'pass' : 'block'}" title={result.build.verify?.hip_ok ? "The HIP backend loaded in a test run" : "The HIP backend did not load in a test run"}>{result.build.verify?.hip_ok ? "HIP ok" : "no HIP"}</span>
         <span>{result.build.tag} {result.build.skipped_existing ? "was already built" : "built and installed"} at <span class="mono">{result.build.dir}</span></span>
       </div>
     {/if}
@@ -635,7 +697,7 @@
       {#if p}
         <button class="btn primary" onclick={openInProfiles}>Open in Profiles</button>
         <button class="btn" onclick={launch} disabled={launching || !!wz.check?.results?.some((r) => outcomeKind(r.outcome) === "block")}
-          title="Loads the model onto the GPU now, after the same pre-flight as Profiles. The wizard never does this by itself.">
+          title="Loads the model now, after the same pre-flight as Profiles">
           {#if launching}<span class="spinner"></span> Loading…{:else}Launch{/if}
         </button>
       {:else}
@@ -649,7 +711,7 @@
   {#if p}
     <section class="card">
       <div class="sec">
-        Pre-flight <span class="faint">the checks a launch runs, now</span>
+        Pre-flight <span class="faint">the checks a launch runs</span>
         {#if wz.checking}<span class="chip plain live" style="margin-left: auto;">checking</span>{/if}
         <span style="margin-left: {wz.checking ? '8px' : 'auto'};"><button class="btn small" onclick={runCheck} disabled={wz.checking}>Re-check</button></span>
       </div>
@@ -673,7 +735,7 @@
     </section>
   {/if}
 {:else}
-  <section class="card"><div class="empty">Nothing here yet. <button class="link" onclick={startOver}>Start from the search</button>.</div></section>
+  <section class="card"><div class="empty">Nothing here yet — <button class="link" onclick={startOver}>Start from the search</button></div></section>
 {/if}
 
 </div>
@@ -714,6 +776,9 @@
   tr.choice.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
   tr.choice .lbl { font-weight: 700; font-size: 12.5px; margin-right: 6px; }
   tr.choice .path { margin-top: 2px; }
+  table.ckpts .lbl { font-weight: 700; font-size: 12.5px; margin-right: 6px; }
+  table.ckpts .path { margin-top: 2px; }
+  table.ckpts .chip { margin-right: 4px; }
 
   .repohead { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
   .repohead .who { display: flex; gap: 10px; align-items: baseline; }

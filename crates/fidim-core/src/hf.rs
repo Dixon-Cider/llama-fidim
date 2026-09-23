@@ -230,6 +230,7 @@ mod tests {
         assert_eq!(d.raw["bos_token_id"], 2);
     }
 
+    #[cfg(windows)]
     #[test]
     fn layout_repo_needs_root_owner_repo_file() {
         let roots = vec![PathBuf::from(r"E:\models")];

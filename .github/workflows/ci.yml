@@ -27,3 +27,49 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm build
+
+  # Linux: the SGLang engine lives here (platform/linux_impl.rs, sglang.rs).
+  # x86-64 is the AMD box the engine was built on; arm64 is the DGX Spark
+  # shape (Grace + Blackwell, Ubuntu-based DGX OS). Same steps, both must pass.
+  test-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tauri build dependencies (WebKitGTK, GTK)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev pkg-config libayatana-appindicator3-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Rust tests
+        # No display and no askpass helper: a test that talks to a fake git
+        # server must fail fast, never open a dialog.
+        env:
+          DISPLAY: ""
+          SSH_ASKPASS: ""
+        run: cargo test --workspace
+      - name: Router smoke test (fake SGLang backend)
+        run: cargo test -p fidim-cli router_serve -- --ignored
+      - name: UI build
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Desktop app compiles
+        run: cargo check -p llama-fidim

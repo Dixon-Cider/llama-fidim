@@ -19,6 +19,15 @@ fidim-core = { path = "../fidim-core" }
 clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
 serde_json.workspace = true
+# `fidim router serve` (router_serve.rs): plain HTTP/1.1 reverse proxy. All of
+# these are already in the lock file through Tauri.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
+http-body = "1"
+http = "1"
+bytes = "1"
 
 [build-dependencies]
 # Version resources for both executables (build.rs). Already in the lock

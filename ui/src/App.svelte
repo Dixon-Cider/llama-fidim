@@ -38,7 +38,11 @@
   const views = groups.flatMap((g) => g.views);
   let active = $state("running");
   let alive = $state(0);
-  let setup = $state(null); // { models, builds } from the boot scan; drives the first-run banner
+  let setup = $state(null); // { models, builds, sglang, profiles, sglangHost } from boot; drives the first-run banner
+  // Where a llama.cpp build cannot exist (Linux) or the config has an
+  // sglang section, the engine to set up is SGLang, never a build. No
+  // command reports the platform, so the web view's own is used.
+  const linux = /linux/i.test(navigator.platform ?? "");
   // The active pill slides between nav items instead of appearing.
   let btns = $state({});
   let pill = $state(null);
@@ -77,11 +81,21 @@
     }
     const n = (x, k) => (x?.error ? `ERR(${x.error})` : k ? (x?.[k]?.length ?? 0) : (x?.length ?? 0));
     log(`boot: builds=${n(r.scan, "builds")} models=${n(r.scan, "models")} devices=${n(r.devices)} runtimes=${n(r.runtimes)} in ${Math.round(performance.now() - t)}ms`);
-    setup = { models: r.scan?.models?.length ?? 0, builds: r.scan?.builds?.length ?? 0 };
+    const models = r.scan?.models?.length ?? 0, builds = r.scan?.builds?.length ?? 0;
+    // The rest of the first-run picture: is SGLang configured (a venv in
+    // config.json, or a found install marked configured), and are there
+    // profiles at all.
+    const [cfgRes, installs, profiles] = await Promise.all([
+      api("get_config").catch(() => null),
+      api("sglang_installs", { roots: null }).catch(() => []),
+      api("list_profiles").catch(() => []),
+    ]);
+    const cfg = cfgRes?.config ?? {};
+    const sglang = !!String(cfg.sglang?.venv ?? "").trim() || (installs ?? []).some((i) => i.configured);
+    setup = { models, builds, sglang, profiles: profiles.length, sglangHost: linux || !!cfg.sglang };
     // Also run the editor's live check on one saved profile at boot; the
     // command logs its inputs, so a check/launch disagreement is diagnosable.
     try {
-      const profiles = await api("list_profiles");
       const pick = profiles.find((p) => p.profile.id === "daily-driver") ?? profiles[0];
       if (pick) {
         const c = await api("live_check", { p: pick.profile });
@@ -91,6 +105,15 @@
     } catch (e) { log(`boot live_check failed: ${String(e)}`); }
   })();
   const ActiveComponent = $derived(views.find((v) => v.id === active).component);
+  // The one next action for the first-run banner, or null once set up.
+  const firstRun = $derived(
+    !setup ? null
+    : setup.sglangHost && !setup.sglang ? "sglang"
+    : !setup.sglangHost && !setup.builds ? "build"
+    : !setup.models ? "models"
+    : !setup.profiles ? "profiles"
+    : null
+  );
 
   // Which build this is, under the tagline: v0.2.0+3 is three commits past
   // the 0.2.0 release, +? an unknown distance from it; the tooltip has the
@@ -104,7 +127,49 @@
         (version.commit ? " · " + version.commit : "") + (version.modified ? " · modified" : "")
       : ""
   );
+
+  // ---- hover hints ---------------------------------------------------------
+  // Every `title=` in the views is the control's one-sentence explanation.
+  // WebKitGTK does not surface them reliably inside a Tauri window, so this
+  // renders them itself: the title moves to data-tip on first hover (which
+  // also suppresses a second, native tooltip where the webview does show one)
+  // and a small panel follows the cursor after a short delay.
+  let tip = $state(null);            // { text, x, y }
+  let tipTimer = null;
+  function tipShow(el, x, y) {
+    if (el.getAttribute("title")) {
+      el.dataset.tip = el.getAttribute("title");
+      el.removeAttribute("title");
+    }
+    const text = el.dataset.tip;
+    if (!text) return;
+    clearTimeout(tipTimer);
+    tipTimer = setTimeout(() => (tip = { text, x, y }), 220);
+  }
+  function tipHide() {
+    clearTimeout(tipTimer);
+    tip = null;
+  }
+  function onTipOver(e) {
+    const el = e.target?.closest?.("[title], [data-tip]");
+    if (!el) return tipHide();
+    tipShow(el, e.clientX, e.clientY);
+  }
+  function onTipMove(e) {
+    if (tip) tip = { ...tip, x: e.clientX, y: e.clientY };
+  }
+  const tipStyle = $derived.by(() => {
+    if (!tip) return "";
+    const w = 340, pad = 14;
+    const left = Math.min(tip.x + pad, (window.innerWidth || 1200) - w - pad);
+    const below = tip.y + 22;
+    const top = below + 80 > (window.innerHeight || 800) ? tip.y - 60 : below;
+    return `left:${Math.max(8, left)}px; top:${top}px; max-width:${w}px;`;
+  });
 </script>
+<svelte:window onmouseover={onTipOver} onmousemove={onTipMove} onmouseout={(e) => { if (!e.relatedTarget?.closest?.("[data-tip], [title]")) tipHide(); }} onscroll={tipHide} onmousedown={tipHide} />
+{#if tip}<div class="tip" role="tooltip" style={tipStyle}>{tip.text}</div>{/if}
+
 
 <div class="shell">
   <nav class="nav">
@@ -126,15 +191,14 @@
     </div>
   </nav>
   <main class="view">
-    {#if setup && (!setup.models || !setup.builds) && active !== "settings" && active !== "updates" && active !== "models"}
+    {#if firstRun && active !== "settings" && active !== "updates" && active !== "models"}
       <div class="card notice" style="border-color: var(--accent-line);">
-        <span class="chip accent">first run</span>
+        <span class="chip accent" title={firstRun === "sglang" ? "No SGLang environment is configured yet" : firstRun === "build" ? "No llama.cpp build found yet" : firstRun === "models" ? "No models found yet" : "No profiles yet"}>first run</span>
         <span>
-          {#if !setup.models && !setup.builds}No models or llama.cpp builds found yet.
-          {:else if !setup.models}No models found yet.
-          {:else}No llama.cpp build found yet.{/if}
-          {#if !setup.models}Get one from Hugging Face in <button class="link" onclick={() => (active = "models")}>Models</button>, or add a model folder in <button class="link" onclick={() => (active = "settings")}>Settings</button>.{/if}
-          {#if !setup.builds}Install a build from <button class="link" onclick={() => (active = "updates")}>Updates</button>.{/if}
+          {#if firstRun === "sglang"}Set up SGLang in <button class="link" onclick={() => (active = "settings")}>Settings</button>
+          {:else if firstRun === "build"}Install a llama.cpp build in <button class="link" onclick={() => (active = "updates")}>Updates</button>
+          {:else if firstRun === "models"}Add a model folder in <button class="link" onclick={() => (active = "settings")}>Settings</button> or get one in <button class="link" onclick={() => (active = "models")}>Models</button>
+          {:else}Make a profile from a model in <button class="link" onclick={() => (active = "models")}>Models</button>{/if}
         </span>
       </div>
     {/if}
@@ -145,3 +209,14 @@
     {/key}
   </main>
 </div>
+
+<style>
+  .tip {
+    position: fixed; z-index: 1000; pointer-events: none;
+    padding: 6px 9px; border-radius: 6px;
+    background: var(--ground-raised, #23272f); color: var(--ink, #e6e6e6);
+    border: 1px solid var(--rule-strong, rgba(255,255,255,0.12));
+    box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+    font-size: 12px; line-height: 1.35; white-space: normal;
+  }
+</style>

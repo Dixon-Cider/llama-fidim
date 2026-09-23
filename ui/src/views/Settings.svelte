@@ -19,26 +19,82 @@
 
   let manualRuntimesText = $state("");
 
+  // One sentence per hover; the config.json key or flag last, in parentheses.
   const HINTS = {
-    model_roots: "Folders scanned for *.gguf, recursively. LM Studio's download folder works as one and is picked up on first run when it exists.",
-    build_roots: "Folders scanned one level deep for <dir>\\bin\\llama-server.exe. The install root below is always scanned too.",
-    install_root: "Where Updates puts llama.cpp builds and ROCm runtimes. Empty = the first build root, or the tool's own folder when there is none.",
-    llama_cpp_source: "git checkout used by Build from source. Empty = the first build root.",
-    source_build_script: "Script run as <script> <checkout> <tag> <out dir>. Empty = scripts\\build-from-tag.bat next to the exe or in the repo.",
-    profile_dir: "Where profile JSON files live.",
-    runs_dir: "Run state and captured server logs.",
-    rocm_bin: "Fallback ROCm runtime: a DLL folder prepended to PATH when a profile names no runtime and no default is picked below. Usually a HIP SDK bin folder.",
-    default_runtime: "Runtime used when a profile names none. Install more on the Updates tab.",
-    rocm_family: "GPU family for AMD's nightly ROCm index. Empty = guessed from your cards. RDNA4 (Radeon AI PRO R9700, RX 9000) is gfx120X-all; RDNA3 (RX 7000) is gfx110X-all; RDNA2 (RX 6000) is gfx103X-all; Strix Halo is gfx1151.",
-    runtimes: "Runtimes added by hand, JSON list: [{\"name\":\"x\",\"dirs\":[\"C:\\\\a\\\\bin\"],\"version\":\"9.9\"}]",
-    integrated_name_patterns: "Device names containing any of these count as integrated graphics.",
-    allow_integrated: "Let profiles bind integrated graphics. Off, pre-flight blocks it, because next to a discrete card an iGPU is a trap: it runs at a fraction of the speed and never errors. On an APU-only machine, or a Strix Halo with up to 96 GB of shared memory, turn this on.",
-    keep_alive: "Off by default. VRAM eviction on idle comes from the PCIe Link State Power Management power setting; pre-flight check 12 warns when it is not Off. If it cannot be Off, a 1-token request every N seconds keeps the GPU awake. Profiles can override.",
-    hf_token: "Hugging Face token, for gated repos (Gemma, Llama): the Models tab's downloads and the creator defaults. Read access is enough. HF_TOKEN in the environment wins.",
-    hf_use_cli_token: "When no other token is set, use the one `huggingface-cli login` (or `hf auth login`) saved in your user folder. Off by default: that file belongs to another tool.",
-    github_token: "GitHub token for the model wizard's build lookups (releases, pull requests, forks linked from model cards). Optional: without one GitHub allows 60 requests an hour, and answers are cached. Any read-only token works; GITHUB_TOKEN in the environment is used when this is empty.",
-    save_chats: "On, each Chat conversation is kept on this PC as a plain JSON file in the tool's chats folder, and listed in the Chat tab. Off, conversations last only until the app closes; files saved earlier stay until you delete them.",
+    model_roots: "Folders scanned recursively for *.gguf; LM Studio's download folder is found on first run (model_roots)",
+    build_roots: "Folders scanned one level deep for bin\\llama-server.exe; the install root is scanned too (build_roots)",
+    install_root: "Where Updates puts builds and runtimes; empty = the first build folder, or the tool's own (install_root)",
+    llama_cpp_source: "git checkout used by Build from source; empty = the first build folder (llama_cpp_source)",
+    source_build_script: "Run as <script> <checkout> <tag> <out dir>; empty = scripts\\build-from-tag.bat beside the exe",
+    profile_dir: "Where profile JSON files live (profile_dir)",
+    runs_dir: "Run state and captured server logs (runs_dir)",
+    rocm_bin: "DLL folder put on PATH when a profile names no runtime and no default is picked; a HIP SDK bin folder (rocm_bin)",
+    default_runtime: "Runtime used when a profile names none; install more in Updates (default_runtime)",
+    rocm_family: "GPU family for AMD's nightly ROCm index; empty = guessed from your cards, RDNA4 is gfx120X-all (rocm_family)",
+    runtimes: "Runtimes added by hand, a JSON list of {name, dirs, version} (runtimes)",
+    integrated_name_patterns: "Device names containing any of these count as integrated graphics (integrated_name_patterns)",
+    allow_integrated: "Let profiles bind integrated graphics, for an APU-only box or Strix Halo. Off, pre-flight blocks it: beside a discrete card an iGPU is slow and never errors",
+    keep_alive: "1-token request every N seconds, keeping the GPU awake when PCIe link power saving cannot be Off; profiles can override",
+    hf_token: "Read token for gated repos (Gemma, Llama) in Models and the creator defaults; HF_TOKEN in the environment wins",
+    hf_use_cli_token: "When no token is set here, use the one huggingface-cli login saved; off because that file belongs to another tool",
+    github_token: "Read-only token for the model wizard's build lookups; without one GitHub allows 60 an hour (GITHUB_TOKEN)",
+    save_chats: "Keep each conversation as a JSON file in the tool's chats folder; off, they last until the app closes (save_chats)",
+    sglang_venv: "Its bin/python launches every SGLang server and the router; pick one below with Use, or type its path (sglang.venv)",
+    sglang_tools_dir: "Where model_router.py and the memory guard live; empty = the copies bundled with the tool (sglang.tools_dir)",
+    sglang_env: "Environment every SGLang server and the router get, edited in config.json (sglang.env)",
+    sglang_install: "Creates the venv and pip-installs SGLang with torch for that flavor; minutes and gigabytes, pip output in Logs",
   };
+
+  // SGLang engine: the venvs found that import sglang, and an installer.
+  let sgInstalls = $state([]);
+  let sgScanning = $state(false);
+  let sgError = $state("");
+  let sgUsing = $state("");         // venv a Use click is switching to
+  let sgDir = $state("");
+  let sgFlavor = $state("rocm");
+  let sgInstalling = $state(false);
+  let sgResult = $state(null);      // the row sglang_install returned
+  const sgEnvKeys = $derived(Object.keys(cfg?.sglang?.env ?? {}));
+
+  async function sgRescan() {
+    sgScanning = true; sgError = "";
+    try { sgInstalls = await api("sglang_installs", { roots: null }); }
+    catch (e) { sgError = String(e); }
+    sgScanning = false;
+  }
+
+  async function sgUse(venv) {
+    sgUsing = venv; sgError = "";
+    try {
+      await api("sglang_use", { venv });
+      log(`settings: sglang venv -> ${venv}`);
+      // The command saved config.json itself: take its sglang block so a
+      // later Save here does not write the old venv back (other unsaved
+      // edits on this page are kept).
+      const c = await api("get_config");
+      if (cfg) cfg.sglang = c.config.sglang ?? null;
+      await sgRescan();
+    } catch (e) { sgError = String(e); }
+    sgUsing = "";
+  }
+
+  async function sgInstall() {
+    const dir = sgDir.trim();
+    if (!dir) { sgError = "Give the venv a directory first."; return; }
+    sgInstalling = true; sgError = ""; sgResult = null;
+    log(`settings: sglang install ${sgFlavor} into ${dir}`);
+    try {
+      sgResult = await api("sglang_install", { dir, flavor: sgFlavor });
+      await sgRescan();
+    } catch (e) { sgError = String(e); }
+    sgInstalling = false;
+  }
+
+  function sgEdit() {
+    // Typing a venv by hand: the config object exists once there is one.
+    cfg.sglang ??= { venv: "", pythonpath: [], env: {} };
+    touch();
+  }
 
   // Delete every saved conversation: two clicks, the first arms it.
   let chatsArmed = $state(false);
@@ -74,6 +130,7 @@
     } catch (e) { error = String(e); }
   }
   load();
+  sgRescan();
 
   const touch = () => (dirty = true);
 
@@ -90,6 +147,18 @@
     out.save_chats = out.save_chats !== false;
     out.hf_use_cli_token = !!out.hf_use_cli_token;
     if (out.default_runtime === "default") out.default_runtime = null;
+    // SGLang host: no venv = no engine configured (the field is optional in
+    // config.json); tools_dir and cwd empty = the defaults.
+    if (out.sglang) {
+      const venv = String(out.sglang.venv ?? "").trim();
+      if (!venv) out.sglang = null;
+      else {
+        out.sglang.venv = venv;
+        for (const k of ["tools_dir", "cwd"]) if (!String(out.sglang[k] ?? "").trim()) delete out.sglang[k]; else out.sglang[k] = String(out.sglang[k]).trim();
+        out.sglang.pythonpath = (out.sglang.pythonpath ?? []).map((s) => String(s).trim()).filter(Boolean);
+        out.sglang.env ??= {};
+      }
+    }
     let manual = [];
     if (manualRuntimesText.trim()) manual = JSON.parse(manualRuntimesText);
     if (!Array.isArray(manual)) throw new Error("manual runtimes must be a JSON list");
@@ -103,7 +172,7 @@
       const c = assembled();
       await api("save_config", { config: c });
       chat.saving = c.save_chats;
-      saved = "Saved. Models, builds and devices will rescan.";
+      saved = "saved";
       log("settings saved");
       await load();
       setTimeout(() => (saved = ""), 2500);
@@ -133,14 +202,14 @@
 
 <h1>
   Settings
-  <span class="sub">Llama FIDIM's own settings. Hover a label for help.</span>
+  <span class="sub">Hover a label for help.</span>
 </h1>
 
 {#if cfg}
   <div class="savebar">
     <span class="path">{path}</span>
-    {#if saved}<span class="chip pass" in:scale={{ duration: LAYOUT, start: 0.7 }} out:fade={{ duration: LAYOUT }}>{saved}</span>
-    {:else if dirty}<span class="chip warn" in:scale={{ duration: LAYOUT, start: 0.7 }}>unsaved changes</span>{/if}
+    {#if saved}<span class="chip pass" title="Models, builds and devices rescan now" in:scale={{ duration: LAYOUT, start: 0.7 }} out:fade={{ duration: LAYOUT }}>{saved}</span>
+    {:else if dirty}<span class="chip warn" title="Edits not yet written to config.json" in:scale={{ duration: LAYOUT, start: 0.7 }}>unsaved</span>{/if}
     {#if error}<span class="chip block shake">{error}</span>{/if}
     <span style="margin-left: auto; display: flex; gap: 8px;">
       <button class="btn" onclick={load} disabled={saving}>Reload</button>
@@ -149,7 +218,7 @@
   </div>
 
   <section class="card">
-    <div class="sec">Folders <span class="faint">where models and builds are found, and where new ones go</span></div>
+    <div class="sec">Folders <span class="faint">where models and builds are found</span></div>
     <div class="grid2">
       <label class="field" title={HINTS.model_roots}>
         <span class="k">model folders <span class="faint">({cfg.model_roots.length})</span></span>
@@ -162,22 +231,22 @@
     </div>
     <div class="formgrid" style="margin-top: 16px;">
       <label class="field" style="grid-column: span 3;" title={HINTS.install_root}>
-        <span class="k">install root for Updates</span>
+        <span class="k">install root</span>
         <input bind:value={cfg.install_root} oninput={touch} placeholder="(first build folder, or the tool's own folder)" />
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.profile_dir}>
-        <span class="k">profiles</span>
+        <span class="k">profile folder</span>
         <input bind:value={cfg.profile_dir} oninput={touch} />
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.runs_dir}>
-        <span class="k">run state and server logs</span>
+        <span class="k">runs folder</span>
         <input bind:value={cfg.runs_dir} oninput={touch} />
       </label>
     </div>
   </section>
 
   <section class="card">
-    <div class="sec">ROCm <span class="faint">which DLLs a server runs against</span></div>
+    <div class="sec">ROCm <span class="faint">which runtime a server loads</span></div>
     <div class="formgrid">
       <label class="field" style="grid-column: span 3;" title={HINTS.default_runtime}>
         <span class="k">default runtime</span>
@@ -193,44 +262,44 @@
         <input bind:value={cfg.rocm_bin} oninput={touch} placeholder="C:\Program Files\AMD\ROCm\7.1\bin" />
       </label>
       <label class="field" style="grid-column: span 2;" title={HINTS.rocm_family}>
-        <span class="k">GPU family for AMD downloads</span>
+        <span class="k">GPU family</span>
         <input bind:value={cfg.rocm_family} oninput={touch} placeholder="guessed from your cards" list="rocm-families" />
         <datalist id="rocm-families"><option value="gfx120X-all"></option><option value="gfx110X-all"></option><option value="gfx103X-all"></option><option value="gfx1151"></option><option value="gfx1150"></option></datalist>
       </label>
       <label class="field" style="grid-column: span 4;" title={HINTS.runtimes}>
-        <span class="k">runtimes added by hand (JSON)</span>
+        <span class="k">manual runtimes</span>
         <textarea rows="2" bind:value={manualRuntimesText} oninput={touch} spellcheck="false"></textarea>
       </label>
     </div>
-    <div class="faint small" style="margin-top: 10px;">
-      Found now, newest first: {runtimes.map((r) => r.name + (r.is_latest ? " (latest)" : "") + (r.available ? "" : " (missing)")).join(" · ") || "none"}. Install more on the Updates tab.
+    <div class="faint small" style="margin-top: 10px;" title="Runtimes found now, newest first; install more in Updates">
+      found: {runtimes.map((r) => r.name + (r.is_latest ? " (latest)" : "") + (r.available ? "" : " (missing)")).join(" · ") || "none"}
     </div>
   </section>
 
   <section class="card">
-    <div class="sec">GPUs <span class="faint">{devices.length ? `${devices.length} adapters seen, ${igpus.length} integrated` : "no devices enumerated yet"}</span></div>
+    <div class="sec">GPUs <span class="faint">{devices.length ? `${devices.length} adapters, ${igpus.length} integrated` : "none seen yet"}</span></div>
     <div class="grid2">
       <label class="field" title={HINTS.integrated_name_patterns}>
-        <span class="k">integrated graphics name patterns</span>
+        <span class="k">integrated name patterns</span>
         <PathList bind:value={cfg.integrated_name_patterns} placeholder="Radeon(TM) Graphics" addLabel="Add pattern" mono={false} />
       </label>
       <div style="display: flex; flex-direction: column; gap: 14px;">
         <label class="field" title={HINTS.allow_integrated}>
           <span class="k">integrated graphics</span>
-          <span><input type="checkbox" checked={!!cfg.allow_integrated} onchange={(e) => { cfg.allow_integrated = e.target.checked; touch(); }} /> allow profiles to bind it (pre-flight warns instead of blocking)</span>
+          <span><input type="checkbox" checked={!!cfg.allow_integrated} onchange={(e) => { cfg.allow_integrated = e.target.checked; touch(); }} /> allow profiles to bind it</span>
         </label>
         <div class="formgrid" style="grid-template-columns: 1fr;">
-          <Range bind:value={cfg.keep_alive_seconds} label="keep-alive interval (seconds, 0 = off)" title={HINTS.keep_alive} min={0} max={60} step={1} span={1} onchange={touch} />
+          <Range bind:value={cfg.keep_alive_seconds} label="keep-alive, seconds (0 = off)" title={HINTS.keep_alive} min={0} max={60} step={1} span={1} onchange={touch} />
         </div>
       </div>
     </div>
     {#if igpus.length}
-      <div class="faint small" style="margin-top: 10px;">Classified as integrated right now: {igpus.map((d) => d.name).join(", ")}.</div>
+      <div class="faint small" style="margin-top: 10px;" title="Devices the patterns above classify as integrated">integrated now: {igpus.map((d) => d.name).join(", ")}</div>
     {/if}
   </section>
 
   <section class="card">
-    <div class="sec">Source builds, Hugging Face and GitHub <span class="faint">for Updates and the Models tab</span></div>
+    <div class="sec">Sources <span class="faint">source builds, Hugging Face, GitHub</span></div>
     <div class="formgrid">
       <label class="field" style="grid-column: span 3;" title={HINTS.llama_cpp_source}>
         <span class="k">llama.cpp checkout</span>
@@ -241,18 +310,90 @@
         <input bind:value={cfg.source_build_script} oninput={touch} placeholder="(scripts\build-from-tag.bat)" />
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.hf_token}>
-        <span class="k">Hugging Face token (gated repos only)</span>
+        <span class="k">Hugging Face token</span>
         <input type="password" bind:value={cfg.hf_token} oninput={touch} placeholder="hf_…" autocomplete="off" />
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.hf_use_cli_token}>
         <span class="k">Hugging Face CLI login</span>
-        <span><input type="checkbox" checked={!!cfg.hf_use_cli_token} onchange={(e) => { cfg.hf_use_cli_token = e.target.checked; touch(); }} /> use the token huggingface-cli saved when none is set here</span>
+        <span><input type="checkbox" checked={!!cfg.hf_use_cli_token} onchange={(e) => { cfg.hf_use_cli_token = e.target.checked; touch(); }} /> use the CLI's saved token</span>
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.github_token}>
-        <span class="k">GitHub token (build lookups, optional)</span>
+        <span class="k">GitHub token</span>
         <input type="password" bind:value={cfg.github_token} oninput={touch} placeholder="github_pat_… or ghp_…" autocomplete="off" />
       </label>
     </div>
+  </section>
+
+  <section class="card">
+    <div class="sec">
+      SGLang
+      <span class="faint">the Python engine behind SGLang profiles (Linux)</span>
+      <span style="margin-left: auto;"><button class="btn" onclick={sgRescan} disabled={sgScanning || sgInstalling}>{sgScanning ? "Scanning…" : "Rescan"}</button></span>
+    </div>
+    <div class="formgrid">
+      <label class="field" style="grid-column: span 3;" title={HINTS.sglang_venv}>
+        <span class="k">Python environment</span>
+        <input value={cfg.sglang?.venv ?? ""} oninput={(e) => { sgEdit(); cfg.sglang.venv = e.target.value; }} placeholder="/home/me/venvs/sglang (none configured)" spellcheck="false" />
+      </label>
+      <label class="field" style="grid-column: span 3;" title={HINTS.sglang_tools_dir}>
+        <span class="k">Router and guard scripts</span>
+        <input value={cfg.sglang?.tools_dir ?? ""} oninput={(e) => { sgEdit(); cfg.sglang.tools_dir = e.target.value; }} placeholder="(bundled copies)" spellcheck="false" />
+      </label>
+      <div class="field" style="grid-column: 1 / -1;" title={HINTS.sglang_env}>
+        <span class="k">environment</span>
+        <span class="faint small">
+          {#if sgEnvKeys.length}<span class="mono">{sgEnvKeys.join(", ")}</span>
+          {:else}none{/if}
+          {#if cfg.sglang?.pythonpath?.length} · PYTHONPATH +{cfg.sglang.pythonpath.length}{/if}
+          {#if cfg.sglang?.cwd} · cwd <span class="mono">{cfg.sglang.cwd}</span>{/if}
+        </span>
+      </div>
+    </div>
+
+    {#if sgError}<div class="notice" style="margin-top: 12px;" transition:fade={{ duration: LAYOUT }}><span class="chip block">error</span> <span class="mono">{sgError}</span></div>{/if}
+
+    <div class="k small" style="margin: 14px 0 6px;" title="Environments that import sglang, under the config dir, model and build folders, and ~/venvs">installs found</div>
+    <table class="grid sgtab">
+      <thead><tr><th>path</th><th>version</th><th>torch</th><th>device</th><th></th></tr></thead>
+      <tbody>
+        {#each sgInstalls as i (i.venv)}
+          <tr class:on={i.configured}>
+            <td><span class="mono">{i.venv}</span>{#if i.configured} <span class="chip pass">configured</span>{/if}</td>
+            <td class="mono">{i.sglang_version ?? "—"}</td>
+            <td class="mono">{i.torch_version ?? "—"}</td>
+            <td class="mono">{i.device ?? "cpu"}</td>
+            <td class="r">
+              {#if !i.configured}
+                <button class="btn small" onclick={() => sgUse(i.venv)} disabled={!!sgUsing || sgInstalling} title="Point profiles at this environment; saves config.json">{sgUsing === i.venv ? "…" : "Use"}</button>
+              {/if}
+            </td>
+          </tr>
+        {:else}
+          <tr><td colspan="5"><div class="empty" style="padding: 8px 0;">{sgScanning ? "Scanning…" : "None found — install one below, or type a path above"}</div></td></tr>
+        {/each}
+      </tbody>
+    </table>
+
+    <div class="k small" style="margin: 14px 0 6px;">install <span class="faint">a new environment</span></div>
+    <div class="sginstall">
+      <input class="mono" bind:value={sgDir} placeholder="/home/me/venvs/sglang-rocm" spellcheck="false" disabled={sgInstalling} title="Directory the new environment is created in"
+        onkeydown={(e) => { if (e.key === "Enter" && !sgInstalling) sgInstall(); }} />
+      <select bind:value={sgFlavor} disabled={sgInstalling} title="Which torch build pip installs">
+        <option value="rocm">AMD ROCm</option>
+        <option value="cuda">NVIDIA CUDA</option>
+        <option value="cpu">CPU only</option>
+      </select>
+      <button class="btn primary" onclick={sgInstall} disabled={sgInstalling || !sgDir.trim()} title={HINTS.sglang_install}>
+        {#if sgInstalling}<span class="spinner"></span> installing…{:else}Install{/if}
+      </button>
+    </div>
+    {#if sgResult}
+      <div class="notice" style="margin-top: 10px;" in:scale={{ duration: LAYOUT, start: 0.95 }}>
+        <span class="chip pass">installed</span>
+        <span><span class="mono">{sgResult.venv}</span> · sglang {sgResult.sglang_version ?? "?"} · torch {sgResult.torch_version ?? "?"} · {sgResult.device ?? "cpu"}
+          {#if !sgResult.configured}<button class="link" onclick={() => sgUse(sgResult.venv)} disabled={!!sgUsing}>Use it</button>{/if}</span>
+      </div>
+    {/if}
   </section>
 
   <section class="card">
@@ -260,7 +401,7 @@
     <div class="formgrid" style="align-items: end;">
       <label class="field" style="grid-column: span 4;" title={HINTS.save_chats}>
         <span class="k">save chats</span>
-        <span><input type="checkbox" checked={cfg.save_chats !== false} onchange={(e) => { cfg.save_chats = e.target.checked; touch(); }} /> keep conversations on this PC (plain JSON, deletable)</span>
+        <span><input type="checkbox" checked={cfg.save_chats !== false} onchange={(e) => { cfg.save_chats = e.target.checked; touch(); }} /> keep conversations on this PC</span>
       </label>
       <div style="grid-column: span 2; display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: wrap;">
         {#if chatsNote}<span class="faint small">{chatsNote}</span>{/if}
@@ -272,7 +413,7 @@
   <section class="card">
     <div class="sec">
       Diagnostics
-      <span class="faint">rescan everything and report what the tool can see</span>
+      <span class="faint">rescan and report what the tool sees</span>
       <span style="margin-left: auto;"><button class="btn" onclick={diagnose} disabled={diagBusy}>{diagBusy ? "Running…" : "Run diagnostics"}</button></span>
     </div>
     {#if diag}
@@ -283,7 +424,7 @@
         <div class="stat" class:dim={!diag.devices.length}><span class="v">{diag.devices.length}</span><span class="l">devices{diag.devices.length ? ": " + diag.devices.map((d) => `${d.backend}${d.hip_index}`).join(", ") : ""}</span></div>
         <div class="stat" class:dim={!diag.runtimes.length}><span class="v">{diag.runtimes.filter((r) => r.available).length}</span><span class="l">runtimes usable</span></div>
       </div>
-      <div class="faint small" style="margin-top: 10px;">{diag.ms} ms · also written to ui.log in the tool's folder</div>
+      <div class="faint small" style="margin-top: 10px;" title="The same numbers went to ui.log in the tool's folder">{diag.ms} ms</div>
     {:else}
       <div class="empty" style="padding: 12px 0;">Not run yet</div>
     {/if}
@@ -301,4 +442,9 @@
   @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px 20px; }
   section.card { padding: 18px 20px; }
+  .k { font-weight: 600; color: var(--ink-muted); }
+  .sgtab td.r { text-align: right; }
+  .sgtab tr.on td { background: var(--accent-soft); }
+  .sginstall { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .sginstall input { flex: 1; min-width: 260px; }
 </style>

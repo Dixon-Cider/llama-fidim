@@ -10,6 +10,14 @@ use crate::Result;
 mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::{process_descendants, WindowsPlatform};
+#[cfg(windows)]
+pub use windows_impl::WindowsPlatform as HostPlatform;
+#[cfg(not(windows))]
+mod linux_impl;
+#[cfg(not(windows))]
+pub use linux_impl::{card_busy_percent, card_vram_bytes, kfd_evicted_ms, process_descendants, LinuxPlatform};
+#[cfg(not(windows))]
+pub use linux_impl::LinuxPlatform as HostPlatform;
 
 /// System memory state (R-05).
 ///
@@ -104,7 +112,6 @@ pub trait Platform {
 /// (its runner child does), and a router's model instances are its children.
 pub fn run_pids(root: u32) -> Vec<u32> {
     let mut pids = vec![root];
-    #[cfg(windows)]
     pids.extend(process_descendants(root));
     pids
 }

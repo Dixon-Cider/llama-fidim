@@ -124,7 +124,7 @@ impl Value {
 
 /// Everything Llama FIDIM needs from a model file, plus the raw scalar metadata
 /// for display and future estimator refinements.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GgufHeader {
     pub path: PathBuf,
     pub file_size: u64,

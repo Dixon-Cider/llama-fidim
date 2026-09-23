@@ -6,13 +6,14 @@ use clap::{Parser, Subcommand};
 use fidim_core::config::Config;
 use fidim_core::discovery::{self, Build};
 use fidim_core::launch;
-use fidim_core::platform::{Platform, WindowsPlatform};
+use fidim_core::platform::{Platform, HostPlatform};
 use fidim_core::preflight::{self, Outcome};
 use fidim_core::profile::{self, Profile};
 use fidim_core::supervise::{self, Health};
 use fidim_core::{export, gguf};
 
 mod models;
+mod router_serve;
 
 #[derive(Parser)]
 #[command(name = "fidim", version = fidim_core::build_info::LONG, about = "llama.cpp build/config manager")]
@@ -107,6 +108,25 @@ enum RouterCmd {
     Load { model_id: String },
     /// Unload a model from the running router.
     Unload { model_id: String },
+    /// One OpenAI-compatible port in front of several SGLang servers, with
+    /// a llama-server-shaped live view (/slots, /metrics, /models) for the
+    /// Running tab. Routes by the JSON `model` field; runs until killed.
+    /// (The Rust port of assets/sglang/model_router.py.)
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value = "1234")]
+        port: u16,
+        /// A backend: model=http://host:port (repeat for each).
+        #[arg(long, value_name = "MODEL=URL")]
+        route: Vec<String>,
+        /// Another name for a route: alias=model (repeat for each).
+        #[arg(long, value_name = "ALIAS=MODEL")]
+        alias: Vec<String>,
+        /// The route for requests whose model is unknown or missing.
+        #[arg(long, value_name = "MODEL")]
+        default: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -146,6 +166,11 @@ enum Cmd {
     Router {
         #[command(subcommand)]
         cmd: RouterCmd,
+    },
+    /// The SGLang engine: find installs (venvs with sglang importable) or create one.
+    Sglang {
+        #[command(subcommand)]
+        cmd: SglangCmd,
     },
     /// (internal) keep a server's VRAM resident: 1-token request every --interval s until --server-pid exits.
     #[command(hide = true)]
@@ -300,7 +325,7 @@ fn main() -> anyhow::Result<()> {
         return cmd_path(dir.as_deref(), cmd, cli.json);
     }
     let cfg = Config::load_or_init().context("loading Llama FIDIM config")?;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     match cli.command {
         Cmd::Scan => cmd_scan(&cfg, cli.json),
         Cmd::Devices { build } => cmd_devices(&cfg, build.as_deref(), cli.json),
@@ -312,6 +337,10 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Live => cmd_live(&cfg, cli.json),
         Cmd::Router { cmd } => cmd_router(&cfg, cli.json, cmd),
+        Cmd::Sglang { cmd } => {
+            let mut cfg = cfg.clone();
+            cmd_sglang(&mut cfg, cli.json, cmd)
+        }
         Cmd::Gguf { path } => {
             let t = std::time::Instant::now();
             let h = gguf::read_header(&path)?;
@@ -1010,7 +1039,7 @@ fn cmd_update_unsloth(
     if all {
         bail!("--all does not apply to --channel unsloth: its promotion already looks at every profile and moves only diffusion ones");
     }
-    let names: Vec<String> = WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect();
+    let names: Vec<String> = HostPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect();
     let c = update::check_unsloth(cfg, &names, gfx, tag)?;
     let patched = overlay.source.is_some();
     if !json {
@@ -1170,7 +1199,14 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
                 h.file_type.map(gguf::file_type_name).unwrap_or_else(|| "?".into()),
                 h.block_count.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
             ),
-            None => ("PARSE-ERROR".into(), "-".into(), "-".into()),
+            None => match &m.hf {
+                Some(hf) => (
+                    hf.architecture.clone().or_else(|| hf.model_type.clone()).unwrap_or_else(|| "safetensors".into()),
+                    hf.quantization.clone().or_else(|| hf.torch_dtype.clone()).unwrap_or_else(|| "?".into()),
+                    hf.num_layers.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
+                ),
+                None => ("PARSE-ERROR".into(), "-".into(), "-".into()),
+            },
         };
         let extras = format!(
             "{}{}{}",
@@ -1190,10 +1226,15 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
 // ---------------------------------------------------------------- devices ----
 
 fn cmd_devices(cfg: &Config, build_tag: Option<&str>, json: bool) -> anyhow::Result<()> {
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-    let build = pick_build(&builds, build_tag)?;
-    let devices = launch::enumerate_devices(cfg, &build.server_exe, &platform)?;
+    let devices = if builds.is_empty() && build_tag.is_none() {
+        // No llama.cpp build (Linux serving SGLang): the OS adapters are the device list.
+        fidim_core::devices::from_adapters(&platform.video_adapters()?, &cfg.integrated_name_patterns)
+    } else {
+        let build = pick_build(&builds, build_tag)?;
+        launch::enumerate_devices(cfg, &build.server_exe, &platform)?
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&devices)?);
         return Ok(());
@@ -1367,6 +1408,21 @@ fn cmd_check(
     profile_id: &str,
     json: bool,
 ) -> anyhow::Result<()> {
+    let sg_profile = load_profile(cfg, profile_id)?;
+    if sg_profile.engine.is_sglang() {
+        let devices = fidim_core::sglang::devices_now(cfg, platform)?;
+        let device = fidim_core::sglang::resolve_device(&sg_profile, &devices);
+        let results = fidim_core::sglang::preflight(cfg, &sg_profile, device, platform, &fidim_core::sglang::running_aliases(cfg));
+        if json {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            print_results(&results);
+            if let Some(d) = device {
+                println!("\n  {}", fidim_core::sglang::compose(cfg, &sg_profile, d, &cfg.runs_dir)?.command_line());
+            }
+        }
+        return Ok(());
+    }
     let (_, prepared) = prepare(cfg, platform, profile_id)?;
     let results = preflight::run_all(&prepared.context);
     if json {
@@ -1427,6 +1483,23 @@ fn cmd_launch(
     override_blocks: bool,
     ready_timeout: u64,
 ) -> anyhow::Result<()> {
+    if load_profile(cfg, profile_id)?.engine.is_sglang() {
+        let profile = load_profile(cfg, profile_id)?;
+        let findings = profile::validate(&profile);
+        for f in &findings {
+            println!("  [{:?}] {} ({})", f.severity, f.message, f.code);
+        }
+        if findings.iter().any(|f| f.severity == profile::Severity::Error) {
+            bail!("profile {profile_id} has validation errors — fix the profile JSON first");
+        }
+        let r = fidim_core::sglang::launch(cfg, &profile, platform, override_blocks, Duration::from_secs(ready_timeout))?;
+        print_results(&r.results);
+        if let Some(x) = &r.replaced {
+            println!("replaced {x} on port {}", profile.server.port);
+        }
+        println!("launched {} (pid {}, port {}) — ready\n  {}", profile.id, r.state.pid, r.state.port, r.plan.command_line());
+        return Ok(());
+    }
     let (mut profile, prepared) = prepare(cfg, platform, profile_id)?;
     let results = preflight::run_all(&prepared.context);
     print_results(&results);
@@ -1854,14 +1927,82 @@ fn router_build_dir(rc: &fidim_core::router::RouterConfig, builds: &[Build]) -> 
     })
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum SglangCmd {
+    /// List python environments that can run SGLang (the configured venv, ~/.venvs, ~/*env*, PATH).
+    List {
+        /// Extra directories to look in (each may be a venv or a folder of venvs).
+        #[arg(long)]
+        root: Vec<PathBuf>,
+    },
+    /// Create a venv and pip-install SGLang into it.
+    Install {
+        /// Where to create the venv.
+        dir: PathBuf,
+        /// `rocm` (AMD wheels index), `cuda` (default torch index) or `cpu`.
+        #[arg(long, default_value = "cuda")]
+        flavor: String,
+        /// Extra pip arguments (e.g. --extra-index-url ...).
+        #[arg(long)]
+        pip_arg: Vec<String>,
+    },
+    /// Make a listed install the one profiles launch with (config.json → sglang.venv).
+    Use { venv: PathBuf },
+}
+
+fn cmd_sglang(cfg: &mut Config, json: bool, cmd: SglangCmd) -> anyhow::Result<()> {
+    use fidim_core::sglang as sg;
+    match cmd {
+        SglangCmd::List { root } => {
+            let installs = sg::discover_installs(cfg, &root);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&installs)?);
+            } else if installs.is_empty() {
+                println!("no SGLang installs found (fidim sglang install <dir> creates one)");
+            } else {
+                for i in &installs {
+                    println!(
+                        "  {:<48} sglang {:<10} torch {:<14} {}{}",
+                        i.venv.display(),
+                        i.sglang_version.as_deref().unwrap_or("-"),
+                        i.torch_version.as_deref().unwrap_or("-"),
+                        i.device.as_deref().unwrap_or("cpu"),
+                        if i.configured { "  (configured)" } else { "" }
+                    );
+                }
+            }
+        }
+        SglangCmd::Install { dir, flavor, pip_arg } => {
+            let venv = sg::install(&dir, &flavor, &pip_arg, &mut |line| println!("{line}"))?;
+            println!("installed into {}; select it with: fidim sglang use {}", venv.display(), venv.display());
+        }
+        SglangCmd::Use { venv } => {
+            let probe = sg::probe_install(&venv).ok_or_else(|| anyhow::anyhow!("{} has no python that imports sglang", venv.display()))?;
+            let mut host = cfg.sglang.clone().unwrap_or(sg::SgLangHost { venv: venv.clone(), tools_dir: None, pythonpath: vec![], env: Default::default(), cwd: None });
+            host.venv = probe.venv.clone();
+            cfg.sglang = Some(host);
+            cfg.save(&Config::config_dir().join("config.json"))?;
+            println!("config.json: sglang.venv = {}", probe.venv.display());
+        }
+    }
+    Ok(())
+}
+
 fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
     use fidim_core::router::{self, RouterMember};
+    // `serve` is the router process itself: it needs no router config.
+    let cmd = match cmd {
+        RouterCmd::Serve { host, port, route, alias, default } => {
+            return router_serve::run(router_serve::Opts::parse_args(&host, port, &route, &alias, &default)?);
+        }
+        other => other,
+    };
     let mut rc = router::load_config()?;
     match cmd {
         RouterCmd::Show => {
             let profiles = Profile::load_all(&cfg.profile_dir)?;
             let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-            let platform = WindowsPlatform;
+            let platform = HostPlatform;
             // Same build as Launch: device indices are per build (a local
             // gfx1201-only build has no iGPU entry), so a preview rendered
             // with any other build shows the wrong `device = ROCmN`.
@@ -1905,9 +2046,14 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
         }
         RouterCmd::Launch { ready_timeout } => {
             let profiles = Profile::load_all(&cfg.profile_dir)?;
+            if fidim_core::sglang::is_sglang_router(&rc, &profiles) {
+                let (state, started, replaced) = fidim_core::sglang::launch_router(cfg, &rc, &profiles, &HostPlatform, Duration::from_secs(ready_timeout))?;
+                println!("router up on :{} (pid {}); members started: {:?}; replaced: {:?}", state.port, state.pid, started, replaced);
+                return Ok(());
+            }
             let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
             let build_dir = router_build_dir(&rc, &builds)?;
-            let platform = WindowsPlatform;
+            let platform = HostPlatform;
             let devices = launch::enumerate_devices(cfg, &build_dir.join("bin").join("llama-server.exe"), &platform)?;
             let r = router::launch(cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(ready_timeout))?;
             if json {
@@ -1936,6 +2082,7 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
         }
         RouterCmd::Load { model_id } => { router::load_model(&rc.host, rc.port, &model_id)?; println!("loading {model_id}"); }
         RouterCmd::Unload { model_id } => { router::unload_model(&rc.host, rc.port, &model_id)?; println!("unloaded {model_id}"); }
+        RouterCmd::Serve { .. } => unreachable!("handled before the router config loads"),
     }
     Ok(())
 }
@@ -1944,10 +2091,12 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
 
 fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
     use fidim_core::live;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let util = platform.gpu_utilization().unwrap_or_default();
     let mut rows = Vec::new();
-    for r in supervise::reattach(&cfg.runs_dir).into_iter().filter(|r| r.alive) {
+    let all_runs = supervise::reattach(&cfg.runs_dir);
+    let router_run = all_runs.iter().find(|x| x.alive && x.state.profile_id == fidim_core::router::ROUTER_ID).map(|x| x.state.clone());
+    for r in all_runs.into_iter().filter(|r| r.alive) {
         let samples: Vec<live::LiveSample> = if r.state.profile_id == fidim_core::router::ROUTER_ID {
             fidim_core::router::models(&r.state.host, r.state.port)
                 .unwrap_or_default()
@@ -1955,6 +2104,12 @@ fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
                 .filter(|m| m.status == "loaded")
                 .map(|m| live::sample(&r.state.host, r.state.port, Some(&m.id)))
                 .collect()
+        } else if r.state.engine.is_sglang() {
+            // an SGLang member has no /slots; the router answers by served name
+            match &router_run {
+                Some(rt) => vec![live::sample(&rt.host, rt.port, Some(&r.state.alias))],
+                None => vec![],
+            }
         } else {
             vec![live::sample(&r.state.host, r.state.port, None)]
         };

@@ -1172,6 +1172,10 @@ pub(crate) fn git_command() -> Command {
 /// The environment half of `git_command`, for the build script (which
 /// adds the `-c` options to each git call itself).
 fn no_git_prompts(c: &mut Command) {
+    // No GUI prompt either: KDE exports SSH_ASKPASS=ksshaskpass system-wide
+    // and git falls back to it when the terminal prompt is off, so a test
+    // server that answers 401 would pop a password dialog on the desktop.
+    c.env_remove("SSH_ASKPASS").env_remove("GIT_ASKPASS").env("SSH_ASKPASS_REQUIRE", "never");
     c.env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .env_remove("GIT_ASKPASS")
@@ -2587,6 +2591,7 @@ mod tests {
 
     /// Studio's llama.cpp folder as the first build root, no install_root:
     /// every channel refuses to install into it, not only the Unsloth one.
+    #[cfg(windows)]
     #[test]
     fn install_dir_refuses_the_studio_tree_for_every_channel() {
         let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else { return };
@@ -3123,6 +3128,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn source_ref_labels_and_directories() {
         let lbl = SourceRef::default_label;
@@ -3302,6 +3308,7 @@ mod tests {
         p
     }
 
+    #[cfg(windows)]
     #[test]
     fn build_script_output_and_exit() {
         let dir = std::env::temp_dir().join(format!("fidim-runscript-{}", std::process::id()));
@@ -3338,6 +3345,7 @@ mod tests {
 
     /// Cancel kills the whole tree: a grandchild the script started in the
     /// background never gets to write its file.
+    #[cfg(windows)]
     #[test]
     fn build_script_cancel_kills_the_tree() {
         let dir = std::env::temp_dir().join(format!("fidim-cancel-{}", std::process::id()));
@@ -3457,6 +3465,7 @@ mod tests {
     /// fetched into a ref of its own and checked against the pin, a branch
     /// and a tag of the same name kept apart by their full names, and
     /// everything it made removed again.
+    #[cfg(windows)]
     #[test]
     fn build_script_git_steps() {
         let root = std::env::temp_dir().join(format!("fidim-gitsteps-{}", std::process::id()));
@@ -3615,7 +3624,10 @@ mod tests {
         drop(held);
         assert!(!path.exists());
         // Another live process holds it.
+        #[cfg(windows)]
         let mut other = Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1 >nul"]).stdout(Stdio::null()).spawn().unwrap();
+        #[cfg(not(windows))]
+        let mut other = Command::new("sleep").arg("30").stdout(Stdio::null()).spawn().unwrap();
         std::fs::write(&path, other.id().to_string()).unwrap();
         let e = BuildLock::take(&path, "a llama.cpp source build").map(|_| ()).unwrap_err().to_string();
         assert!(e.contains(&format!("pid {}", other.id())), "{e}");
@@ -3662,6 +3674,13 @@ mod tests {
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GCM_INTERACTIVE", "never")
                 .env("GIT_TERMINAL_PROMPT", "0")
+                // The control run must still not open a window on the developer's
+                // desktop: KDE exports SSH_ASKPASS=ksshaskpass and git falls back
+                // to it once the helper yields nothing. The helper marker is what
+                // this test measures, not the prompt.
+                .env_remove("SSH_ASKPASS")
+                .env_remove("GIT_ASKPASS")
+                .env("SSH_ASKPASS_REQUIRE", "never")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());

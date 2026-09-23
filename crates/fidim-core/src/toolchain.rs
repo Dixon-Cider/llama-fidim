@@ -578,6 +578,7 @@ fn wait_with_timeout(mut child: std::process::Child, limit: Duration) -> std::io
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn vswhere_installs_newest_first() {
         let json = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/toolchain/vswhere.json")).unwrap();

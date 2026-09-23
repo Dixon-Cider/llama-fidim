@@ -1137,6 +1137,7 @@ fn a_download_that_no_longer_fits_stops_before_it_starts() {
     std::fs::remove_dir_all(&f.root).ok();
 }
 
+#[cfg(windows)]
 #[test]
 fn a_source_build_counts_its_scratch_drive() {
     let f = Fake::k2("plan-scratch");

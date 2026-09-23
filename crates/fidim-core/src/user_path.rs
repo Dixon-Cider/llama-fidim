@@ -668,6 +668,7 @@ mod tests {
         assert_eq!(found[0].dir, PathBuf::from(r"C:\Users\me\AppData\Local\Programs\LlamaFIDIM"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn unusable_folders() {
         assert!(unusable(Path::new(DIR)).is_none());

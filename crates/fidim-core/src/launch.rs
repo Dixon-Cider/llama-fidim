@@ -762,17 +762,90 @@ pub fn port_holder(host: &str, port: u16, runs_dir: &Path) -> Option<PortHolder>
 }
 
 /// PID of the process LISTENING on a TCP port (netstat -ano).
+#[cfg(windows)]
 pub fn listening_pid(port: u16) -> Option<u32> {
     parse_netstat_listener(&netstat_tcp()?, port)
+}
+
+/// Linux: the pid whose fd table holds the LISTEN socket on `port`.
+#[cfg(not(windows))]
+pub fn listening_pid(port: u16) -> Option<u32> {
+    let inodes = listening_inodes(port);
+    if inodes.is_empty() {
+        return None;
+    }
+    let rd = std::fs::read_dir("/proc").ok()?;
+    for e in rd.flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(fds) = std::fs::read_dir(e.path().join("fd")) else { continue };
+        for fd in fds.flatten() {
+            if let Ok(l) = std::fs::read_link(fd.path()) {
+                let l = l.to_string_lossy();
+                if l.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')).and_then(|s| s.parse::<u64>().ok()).is_some_and(|i| inodes.contains(&i)) {
+                    return Some(pid);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Whether `pid` has a LISTENING socket on `port`. Checks every listener
 /// rather than the first: one process on 127.0.0.1:N and another on [::1]:N
 /// can coexist. False when netstat cannot run.
+#[cfg(windows)]
 pub fn listens_on(port: u16, pid: u32) -> bool {
     netstat_tcp().is_some_and(|t| parse_netstat_listeners(&t, port).contains(&pid))
 }
 
+/// Linux: a LISTEN socket on `port` in `/proc/net/tcp{,6}` whose inode is
+/// among the open fds of `pid` or one of its descendants (a python launcher
+/// binds in a child).
+#[cfg(not(windows))]
+pub fn listens_on(port: u16, pid: u32) -> bool {
+    let inodes = listening_inodes(port);
+    if inodes.is_empty() {
+        return false;
+    }
+    let mut pids = vec![pid];
+    pids.extend(crate::platform::process_descendants(pid));
+    pids.iter().any(|p| {
+        std::fs::read_dir(format!("/proc/{p}/fd")).ok().is_some_and(|rd| {
+            rd.flatten().any(|e| {
+                std::fs::read_link(e.path()).ok().is_some_and(|l| {
+                    let l = l.to_string_lossy();
+                    l.strip_prefix("socket:[")
+                        .and_then(|s| s.strip_suffix(']'))
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .is_some_and(|ino| inodes.contains(&ino))
+                })
+            })
+        })
+    })
+}
+
+#[cfg(not(windows))]
+fn listening_inodes(port: u16) -> Vec<u64> {
+    let mut out = Vec::new();
+    for f in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || cols[3] != "0A" {
+                continue;
+            }
+            let Some((_, p)) = cols[1].rsplit_once(':') else { continue };
+            if u16::from_str_radix(p, 16).ok() == Some(port) {
+                if let Ok(ino) = cols[9].parse::<u64>() {
+                    out.push(ino);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
 fn netstat_tcp() -> Option<String> {
     // No `-p tcp`: that lists IPv4 sockets only, and a server bound to
     // "localhost" or "::1" listens on IPv6. Without `-p` both families print
@@ -808,6 +881,12 @@ pub fn parse_netstat_listeners(text: &str, port: u16) -> Vec<u32> {
         .collect()
 }
 
+#[cfg(not(windows))]
+fn process_name(pid: u32) -> Option<String> {
+    crate::supervise::process_image(pid)
+}
+
+#[cfg(windows)]
 fn process_name(pid: u32) -> Option<String> {
     let mut cmd = std::process::Command::new("tasklist");
     cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);

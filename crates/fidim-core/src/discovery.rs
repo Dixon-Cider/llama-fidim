@@ -328,6 +328,118 @@ pub fn parse_version_output(text: &str) -> Option<(String, String)> {
 
 // ---------------------------------------------------------------- models ----
 
+/// What a Hugging Face checkpoint directory says about itself (config.json),
+/// for the SGLang engine: architecture and the numbers the KV-cache estimate
+/// needs. Vision-language configs nest the text model under `text_config`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HfModelInfo {
+    pub architecture: Option<String>,
+    pub model_type: Option<String>,
+    pub hidden_size: Option<u64>,
+    pub num_layers: Option<u64>,
+    pub num_attention_heads: Option<u64>,
+    pub num_kv_heads: Option<u64>,
+    pub head_dim: Option<u64>,
+    pub vocab_size: Option<u64>,
+    pub max_position_embeddings: Option<u64>,
+    pub torch_dtype: Option<String>,
+    /// Layers that carry a KV cache (hybrid GDN/SSM models attend on a
+    /// fraction of their layers: `layer_types` or `full_attention_interval`).
+    pub attention_layers: Option<u64>,
+    pub num_experts: Option<u64>,
+    /// `quantization_config.quant_method` (awq, fp8, gguf, ...).
+    pub quantization: Option<String>,
+    /// Bytes of `*.safetensors` in the directory.
+    pub weights_bytes: u64,
+    pub has_vision: bool,
+}
+
+impl HfModelInfo {
+    /// Parse a config.json (the whole value) plus the weights size.
+    pub fn from_config(cfg: &serde_json::Value, weights_bytes: u64) -> Self {
+        let text = cfg.get("text_config").filter(|t| t.is_object()).unwrap_or(cfg);
+        let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64());
+        let s = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        let num_layers = u(text, "num_hidden_layers").or_else(|| u(cfg, "num_hidden_layers"));
+        let attention_layers = text
+            .get("layer_types")
+            .and_then(|l| l.as_array())
+            .map(|l| l.iter().filter(|x| x.as_str().is_some_and(|t| t.contains("full_attention") || t == "attention")).count() as u64)
+            .or_else(|| u(text, "full_attention_interval").zip(num_layers).map(|(i, n)| if i == 0 { n } else { n / i }))
+            .or(num_layers);
+        let hidden = u(text, "hidden_size");
+        let heads = u(text, "num_attention_heads");
+        Self {
+            architecture: cfg.get("architectures").and_then(|a| a.get(0)).and_then(|x| x.as_str()).map(str::to_string),
+            model_type: s(cfg, "model_type"),
+            hidden_size: hidden,
+            num_layers,
+            num_attention_heads: heads,
+            num_kv_heads: u(text, "num_key_value_heads").or(heads),
+            head_dim: u(text, "head_dim").or_else(|| hidden.zip(heads).filter(|(_, h)| *h > 0).map(|(d, h)| d / h)),
+            vocab_size: u(text, "vocab_size").or_else(|| u(cfg, "vocab_size")),
+            max_position_embeddings: u(text, "max_position_embeddings"),
+            torch_dtype: s(cfg, "torch_dtype").or_else(|| s(text, "torch_dtype")),
+            attention_layers,
+            num_experts: u(text, "num_experts").or_else(|| u(text, "num_local_experts")),
+            quantization: cfg.get("quantization_config").and_then(|q| q.get("quant_method")).and_then(|x| x.as_str()).map(str::to_string),
+            weights_bytes,
+            has_vision: cfg.get("vision_config").is_some(),
+        }
+    }
+}
+
+fn default_format() -> String {
+    "gguf".into()
+}
+
+/// A Hugging Face checkpoint directory: config.json plus the standard weight
+/// files (`model.safetensors`, `model-0000N-of-0000M.safetensors` or the
+/// index). A GGUF sidecar directory (config.json next to a .gguf, with only a
+/// `visual.safetensors`) is not one.
+pub fn hf_model_dir(dir: &Path) -> Option<Model> {
+    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut weights = 0u64;
+    let mut standard = false;
+    let mut newest = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if name == "model.safetensors.index.json" {
+            standard = true;
+        }
+        if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("safetensors")) {
+            if name.starts_with("model") {
+                standard = true;
+            }
+            if let Ok(md) = p.metadata() {
+                weights += md.len();
+                let m = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+                newest = newest.max(m);
+            }
+        }
+    }
+    if !standard {
+        return None;
+    }
+    let hf = HfModelInfo::from_config(&cfg, weights);
+    Some(Model {
+        path: dir.to_path_buf(),
+        file_size: weights,
+        modified_unix: newest,
+        header: None,
+        header_error: None,
+        engine: crate::profile::Engine::SgLang,
+        format: "safetensors".into(),
+        hf: Some(hf),
+        mmproj_candidates: vec![],
+        draft_candidates: vec![],
+        shards: vec![],
+        source: None,
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Model {
     /// The file llama.cpp is given: the file, or the first shard of a split
@@ -344,6 +456,11 @@ pub struct Model {
     /// The engine this model needs, from its header (llama-server when the
     /// header is unreadable). The profile editor switches engine on it.
     pub engine: crate::profile::Engine,
+    /// `gguf` (a file) or `safetensors` (a Hugging Face directory).
+    #[serde(default = "default_format")]
+    pub format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf: Option<HfModelInfo>,
     /// Paired multimodal projectors found beside the model (R-02).
     pub mmproj_candidates: Vec<PathBuf>,
     /// Paired speculative-decoding draft models (R-02): `MTP/` subdirectory
@@ -412,6 +529,9 @@ pub fn scan_models_and_aux(roots: &[PathBuf]) -> (Vec<Model>, AuxFiles) {
                 } else if is_gguf(&p) && !is_imatrix(&p) {
                     ggufs.push(p);
                 }
+            }
+            if let Some(m) = hf_model_dir(&dir) {
+                models.push(m);
             }
             let (aux, main): (Vec<_>, Vec<_>) = ggufs.into_iter().partition(|p| is_aux(p));
             let mmproj: Vec<PathBuf> =
@@ -634,6 +754,8 @@ fn load_model(files: ModelFiles, mmproj: &[PathBuf], drafts: &[PathBuf], sidecar
         file_size,
         modified_unix,
         engine: header.as_ref().map(|h| h.engine()).unwrap_or_default(),
+        format: "gguf".into(),
+        hf: None,
         header,
         header_error,
         mmproj_candidates: mmproj.to_vec(),

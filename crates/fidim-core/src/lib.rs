@@ -29,6 +29,7 @@ pub mod profile;
 pub mod rocm;
 pub mod router;
 pub mod runtime;
+pub mod sglang;
 pub mod selfupdate;
 pub mod supervise;
 pub mod toolchain;

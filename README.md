@@ -100,6 +100,29 @@ welcome, and a report that includes your card, driver version and the
   slot text, the profile editor and the chat are GUI only; profiles are
   plain JSON.
 
+## Linux and SGLang
+
+The same app and CLI build on Linux (Ubuntu 24.04, WebKitGTK), where FIDIM
+runs **SGLang** instead of llama.cpp: a profile with `"engine": "sglang"`
+names a model (a GGUF file with its sidecar config, or a Hugging Face
+safetensors folder), one card, a port and the SGLang settings; FIDIM launches
+`python -m sglang.launch_server` from the venv chosen in Settings, puts every
+member behind its own router on one port, and the Running tab reads slots,
+throughput and speculative acceptance from that router. `fidim router launch`
+brings up every member marked *load on startup* and then the router;
+`fidim launch`, `stop`, `check`, `status` and `live` work per profile.
+Pre-flight knows the Linux traps: a card that drives a display must keep
+about 1.5 GB of VRAM free or the desktop evicts the server (the Running tab
+shows an *evicting* chip when it happens), and the weights plus the KV cache
+for the chosen context must fit the static pool.
+
+Build: `sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+libssl-dev pkg-config libayatana-appindicator3-dev`, then
+`cargo build --release -p fidim-cli` for the CLI and, in `ui/`,
+`pnpm install && pnpm tauri build -b deb,appimage` for the desktop app
+(`run-linux.sh` starts a `--no-bundle` build). Releases ship a `.deb`, an
+AppImage and the CLI for x86-64 and arm64.
+
 ## Requirements
 
 - Windows 11 with an AMD Radeon card that upstream's Windows ROCm build

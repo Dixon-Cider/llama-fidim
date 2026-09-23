@@ -11,7 +11,7 @@ use fidim_core::chat::{self, store as chat_store};
 use fidim_core::config::Config;
 use fidim_core::devices::Device;
 use fidim_core::launch::{self, PrepareInputs};
-use fidim_core::platform::{Platform, WindowsPlatform};
+use fidim_core::platform::{Platform, HostPlatform};
 use fidim_core::profile::{self, Engine, Profile};
 use fidim_core::supervise;
 use fidim_core::update::{self, PromoteScope};
@@ -24,6 +24,8 @@ use tauri::Emitter;
 /// per R-03.
 struct UiCache {
     devices: Option<(Instant, Vec<Device>)>,
+    /// profile id -> (when, cumulative KFD evicted ms) for the eviction rate.
+    evict: HashMap<String, (Instant, u64)>,
     build_probes: HashMap<PathBuf, Option<String>>,
     /// Build + model scan; probing every build costs ~0.3 s each.
     scan: Option<(Instant, serde_json::Value)>,
@@ -184,12 +186,14 @@ fn cached_devices(
             .filter(|b| b.version.is_some())
             .max_by_key(|b| b.version.as_deref().and_then(fidim_core::update::version_number).unwrap_or(0))
     };
-    let build = newest(true)
-        .or_else(|| newest(false))
-        .or(builds.first())
-        .ok_or("no builds found under configured build_roots")?;
-    let devices = launch::enumerate_devices(cfg, &build.server_exe, &WindowsPlatform)
-        .map_err(|e| e.to_string())?;
+    let devices = match newest(true).or_else(|| newest(false)).or(builds.first()) {
+        Some(build) => launch::enumerate_devices(cfg, &build.server_exe, &HostPlatform).map_err(|e| e.to_string())?,
+        // No llama.cpp build (Linux serving SGLang): the OS adapters are the device list.
+        None => fidim_core::devices::from_adapters(
+            &HostPlatform.video_adapters().map_err(|e| e.to_string())?,
+            &cfg.integrated_name_patterns,
+        ),
+    };
     let mut cache = cache_arc.lock().unwrap();
     cache.devices = Some((Instant::now(), devices.clone()));
     Ok(devices)
@@ -347,11 +351,29 @@ fn live_check_blocking(
 ) -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
     let findings = profile::validate(&p);
+    if p.engine.is_sglang() {
+        let devices = fidim_core::sglang::devices_now(&cfg, &HostPlatform).map_err(|e| e.to_string())?;
+        let device = fidim_core::sglang::resolve_device(&p, &devices);
+        let results = fidim_core::sglang::preflight(&cfg, &p, device, &HostPlatform, &fidim_core::sglang::running_aliases(&cfg));
+        let plan = device.and_then(|d| fidim_core::sglang::compose(&cfg, &p, d, &cfg.runs_dir).ok());
+        let s = fidim_core::sglang::cfg_of(&p);
+        let estimate = device.map(|d| serde_json::json!({ "total_bytes": fidim_core::sglang::estimated_bytes(&s, d), "per_device": [], "assumptions": ["SGLang static pool = mem_fraction x card VRAM; +~3 GB activations under long-context load"] }));
+        return Ok(serde_json::json!({
+            "findings": findings,
+            "results": results,
+            "estimate": estimate,
+            "resolved": device.map(|d| vec![serde_json::json!({ "profile_key": p.devices.first().map(|x| x.key.clone()).unwrap_or_default(), "device": d, "fraction": 1.0, "rebound": false })]).unwrap_or_default(),
+            "command_line": plan.as_ref().map(|pl| pl.command_line()).unwrap_or_default(),
+            "env": plan.as_ref().map(|pl| pl.env.clone()).unwrap_or_default(),
+            "commit": HostPlatform.system_commit().ok(),
+            "diffusion": serde_json::Value::Null,
+        }));
+    }
     let devices_now = cached_devices(cache, &cfg, false).unwrap_or_default();
     let build_version_output = cached_build_probe(cache, &cfg, &p.build.path);
     let inputs = PrepareInputs { devices_now, build_version_output };
     let prepared =
-        launch::prepare_with_inputs(&cfg, &p, &WindowsPlatform, running_aliases(&cfg), inputs)
+        launch::prepare_with_inputs(&cfg, &p, &HostPlatform, running_aliases(&cfg), inputs)
             .map_err(|e| e.to_string())?;
     let results = preflight::run_all(&prepared.context);
     // Trace what the editor's check saw, so a PASS here that a real launch
@@ -414,12 +436,17 @@ async fn launch_profile(id: String, override_blocks: bool) -> Result<serde_json:
 
 fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let path = cfg.profile_dir.join(format!("{id}.json"));
     let mut profile = Profile::load(&path).map_err(|e| e.to_string())?;
     let findings = profile::validate(&profile);
     if findings.iter().any(|f| f.severity == profile::Severity::Error) {
         return Err("profile has validation errors — fix them in the editor first".into());
+    }
+    if profile.engine.is_sglang() {
+        let r = fidim_core::sglang::launch(&cfg, &profile, &platform, override_blocks, Duration::from_secs(900))
+            .map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({ "blocked": false, "results": r.results, "state": r.state, "replaced": r.replaced }));
     }
     let prepared = launch::prepare(&cfg, &profile, &platform, running_aliases(&cfg))
         .map_err(|e| e.to_string())?;
@@ -623,7 +650,7 @@ async fn bench_profile(
 
 fn do_bench(id: &str, concurrency: Option<u32>, tokens: u32) -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let profile =
         Profile::load(&cfg.profile_dir.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
     bench::ensure_benchable(&profile).map_err(|e| e.to_string())?;
@@ -737,7 +764,7 @@ async fn export_profile(id: String, format: String) -> Result<serde_json::Value,
 
 fn export_blocking(id: &str, format: &str) -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let profile =
         Profile::load(&cfg.profile_dir.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
     let prepared = launch::prepare(&cfg, &profile, &platform, running_aliases(&cfg))
@@ -833,7 +860,7 @@ async fn update_rollback() -> Result<serde_json::Value, String> {
 
 /// Card names for the Unsloth GPU-target guess. WMI, so blocking pool only.
 fn adapter_names() -> Vec<String> {
-    WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect()
+    HostPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect()
 }
 
 /// Latest (or `tag`) Unsloth fork release, the zip for this machine's GPU
@@ -1073,12 +1100,17 @@ async fn router_launch() -> Result<serde_json::Value, String> {
         let cfg = cfg()?;
         let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
         let profiles = Profile::load_all(&cfg.profile_dir).map_err(|e| e.to_string())?;
+        if fidim_core::sglang::is_sglang_router(&rc, &profiles) {
+            let (state, started, replaced) = fidim_core::sglang::launch_router(&cfg, &rc, &profiles, &HostPlatform, Duration::from_secs(900))
+                .map_err(|e| e.to_string())?;
+            return Ok(serde_json::json!({ "state": state, "ini_path": "", "replaced": replaced, "env_conflicts": [], "sections": started }));
+        }
         let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
         let build_dir = match &rc.build {
             Some(b) => b.clone(),
             None => update::newest_installed(&builds).ok_or("no installed build")?.path,
         };
-        let devices = launch::enumerate_devices(&cfg, &build_dir.join("bin").join("llama-server.exe"), &WindowsPlatform)
+        let devices = launch::enumerate_devices(&cfg, &build_dir.join("bin").join("llama-server.exe"), &HostPlatform)
             .map_err(|e| e.to_string())?;
         let r = fidim_core::router::launch(&cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(180))
             .map_err(|e| e.to_string())?;
@@ -1134,7 +1166,7 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
     let cache = state.cache.clone();
     blocking(move || {
         let cfg = cfg()?;
-        let platform = WindowsPlatform;
+        let platform = HostPlatform;
         let devices = cached_devices(&cache, &cfg, false).unwrap_or_default();
         let card_of = |luid: u64| devices.iter().find(|d| d.luid_low == Some(luid)).map(|d| d.stable_key.clone());
         let util = platform.gpu_utilization().unwrap_or_default();
@@ -1149,11 +1181,16 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
         // only with it; Copy endpoint tells other programs they need one.
         let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
         let member = |id: &str| profiles.iter().find(|p| fidim_core::router::model_id(p) == id);
-        let runs: Vec<serde_json::Value> = supervise::reattach(&cfg.runs_dir)
+        let all_runs = supervise::reattach(&cfg.runs_dir);
+        let runs: Vec<serde_json::Value> = all_runs
+            .clone()
             .into_iter()
             .map(|r| {
                 let mut samples = Vec::new();
                 let mut keyed_models = Vec::new();
+                // SGLang members are runs of their own with their own cards; the
+                // router card just names them instead of repeating their slots.
+                let mut fronting: Vec<String> = Vec::new();
                 let profile = profiles.iter().find(|p| p.id == r.state.profile_id);
                 if r.alive {
                     if r.state.profile_id == fidim_core::router::ROUTER_ID {
@@ -1164,9 +1201,19 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                                 }
                             }
                             for m in ms.iter().filter(|m| m.status == "loaded") {
+                                if r.state.engine.is_sglang() && all_runs.iter().any(|x| x.alive && x.state.alias == m.id && x.state.profile_id != fidim_core::router::ROUTER_ID) {
+                                    fronting.push(m.id.clone());
+                                    continue;
+                                }
                                 let key = member(&m.id).and_then(chat::api_key);
                                 samples.push(fidim_core::live::sample_with_key(&r.state.host, r.state.port, Some(&m.id), key.as_deref()));
                             }
+                        }
+                    } else if r.state.engine.is_sglang() {
+                        // An SGLang member has no /slots of its own: the router
+                        // (model_router.py) answers for it by served name.
+                        if let Some(router) = all_runs.iter().find(|x| x.alive && x.state.profile_id == fidim_core::router::ROUTER_ID) {
+                            samples.push(fidim_core::live::sample_with_key(&router.state.host, router.state.port, Some(&r.state.alias), None));
                         }
                     } else {
                         let key = profile.and_then(chat::api_key);
@@ -1179,6 +1226,27 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                 let mut pids = vec![r.state.pid];
                 if r.alive {
                     pids.extend(fidim_core::platform::process_descendants(r.state.pid));
+                    if r.state.engine.is_sglang() && r.state.profile_id == fidim_core::router::ROUTER_ID {
+                        // model_router.py fronts servers it did not spawn. A backend
+                        // that is itself a FIDIM run reports its own VRAM and busy on
+                        // its own card; only an adopted/foreign backend is charged here.
+                        if let Ok((200, body)) = fidim_core::supervise::http_get(&r.state.host, r.state.port, "/fidim/state", std::time::Duration::from_secs(3)) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                                for (_, m) in v.as_object().into_iter().flatten() {
+                                    let port = m["url"].as_str().and_then(|u| u.rsplit(':').next()).and_then(|p| p.trim_end_matches('/').parse::<u16>().ok());
+                                    if port.is_some_and(|pt| all_runs.iter().any(|x| x.alive && x.state.port == pt)) {
+                                        continue;
+                                    }
+                                    if let Some(pid) = port.and_then(launch::listening_pid) {
+                                        if !pids.contains(&pid) {
+                                            pids.push(pid);
+                                            pids.extend(fidim_core::platform::process_descendants(pid));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 let mut resident: Vec<serde_json::Value> = Vec::new();
                 for pid in &pids {
@@ -1187,11 +1255,36 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                     }
                 }
                 let busy: f64 = util.iter().filter(|u| pids.contains(&u.pid)).map(|u| u.percent).sum();
+                // KFD eviction: cumulative ms and the rate over the last poll.
+                #[cfg(not(windows))]
+                let evicted_ms: u64 = pids.iter().map(|p| fidim_core::platform::kfd_evicted_ms(*p)).sum();
+                #[cfg(windows)]
+                let evicted_ms: u64 = 0;
+                let evict_rate = {
+                    let mut c = cache.lock().unwrap();
+                    let now = Instant::now();
+                    let rate = match c.evict.get(&r.state.profile_id) {
+                        Some((t, prev)) if now > *t && evicted_ms >= *prev => {
+                            let dt = now.duration_since(*t).as_secs_f64();
+                            if dt > 0.2 { (evicted_ms - prev) as f64 / dt } else { -1.0 }
+                        }
+                        _ => 0.0,
+                    };
+                    if rate >= 0.0 {
+                        c.evict.insert(r.state.profile_id.clone(), (now, evicted_ms));
+                        rate
+                    } else {
+                        0.0
+                    }
+                };
                 serde_json::json!({
                     "run": r,
                     "pids": pids,
                     "samples": samples,
                     "resident": resident,
+                    "fronting": fronting,
+                    "evicted_ms": evicted_ms,
+                    "evicting_ms_per_s": evict_rate,
                     "gpu_busy_percent": if busy <= 0.0 { 0.0 } else { busy.min(100.0) },
                     "has_api_key": has_api_key,
                     "keyed_models": keyed_models,
@@ -1201,7 +1294,15 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
         let cards_json: Vec<serde_json::Value> = devices
             .iter()
             .filter(|d| !d.integrated)
-            .map(|d| serde_json::json!({ "key": d.stable_key, "name": d.name, "busy_percent": cards.get(&d.stable_key).copied().unwrap_or(0.0).clamp(0.0, 100.0), "total_mib": d.total_mib }))
+            .map(|d| {
+                // free VRAM read now, not from the device cache: headroom is
+                // what decides whether the desktop evicts a server.
+                #[cfg(not(windows))]
+                let free_mib = d.bus_number.and_then(fidim_core::platform::card_vram_bytes).map(|(t, u)| t.saturating_sub(u) / (1024 * 1024)).unwrap_or(d.free_mib);
+                #[cfg(windows)]
+                let free_mib = d.free_mib;
+                serde_json::json!({ "key": d.stable_key, "name": d.name, "busy_percent": cards.get(&d.stable_key).copied().unwrap_or(0.0).clamp(0.0, 100.0), "total_mib": d.total_mib, "free_mib": free_mib, "display": d.display.is_some() })
+            })
             .collect();
         Ok(serde_json::json!({ "runs": runs, "cards": cards_json }))
     })
@@ -1210,6 +1311,43 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
 
 /// One server's slots and metrics, for a view that follows it faster than
 /// the whole-app `live` poll (the diffusion canvas refreshes ~5x a second).
+/// SGLang installs on this machine (venvs that import sglang), configured one first.
+#[tauri::command]
+async fn sglang_installs(roots: Option<Vec<String>>) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let roots: Vec<PathBuf> = roots.unwrap_or_default().into_iter().map(PathBuf::from).collect();
+        serde_json::to_value(fidim_core::sglang::discover_installs(&cfg, &roots)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Create a venv with SGLang; lines of pip output go to the UI log.
+#[tauri::command]
+async fn sglang_install(dir: String, flavor: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let venv = fidim_core::sglang::install(std::path::Path::new(&dir), &flavor, &[], &mut |l| { let _ = ui_log(format!("sglang install: {l}")); })
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(fidim_core::sglang::probe_install(&venv)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Point profiles at this install (config.json → sglang.venv).
+#[tauri::command]
+async fn sglang_use(venv: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let mut cfg = cfg()?;
+        let probe = fidim_core::sglang::probe_install(std::path::Path::new(&venv)).ok_or("that venv does not import sglang")?;
+        let mut host = cfg.sglang.clone().unwrap_or(fidim_core::sglang::SgLangHost { venv: probe.venv.clone(), tools_dir: None, pythonpath: vec![], env: Default::default(), cwd: None });
+        host.venv = probe.venv.clone();
+        cfg.sglang = Some(host);
+        cfg.save(&Config::config_dir().join("config.json")).map_err(|e| e.to_string())?;
+        serde_json::to_value(probe).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 async fn live_one(host: String, port: u16) -> Result<serde_json::Value, String> {
     blocking(move || serde_json::to_value(fidim_core::live::sample(&host, port, None)).map_err(|e| e.to_string())).await
@@ -1746,7 +1884,7 @@ pub fn run() {
         // Open action; the plugin's click interception stays off.
         .plugin(tauri_plugin_opener::Builder::new().open_js_links_on_click(false).build())
         .manage(AppState {
-            cache: Arc::new(Mutex::new(UiCache { devices: None, build_probes: HashMap::new(), scan: None })),
+            cache: Arc::new(Mutex::new(UiCache { devices: None, evict: HashMap::new(), build_probes: HashMap::new(), scan: None })),
             chats: Arc::new(Mutex::new(HashMap::new())),
             wizard: Arc::new(Mutex::new(HashMap::new())),
             wizard_made: Arc::new(Mutex::new(WizardMade::default())),
@@ -1822,6 +1960,9 @@ pub fn run() {
             wizard_forget,
             wizard_roots,
             wizard_add_root,
+            sglang_installs,
+            sglang_install,
+            sglang_use,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Llama FIDIM UI");

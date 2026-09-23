@@ -657,6 +657,7 @@ fn k2_inputs() -> PlanInputs {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn plan_for_k2_horizon_is_the_card_fork() {
     let plan = plan_build(&cfg(), &k2(), &k2_inputs());
@@ -686,6 +687,7 @@ fn plan_for_k2_horizon_is_the_card_fork() {
     assert_eq!(back, plan);
 }
 
+#[cfg(windows)]
 #[test]
 fn plan_prefers_what_needs_no_build() {
     let c = cfg();

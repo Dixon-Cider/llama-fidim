@@ -15,6 +15,43 @@ build with uncommitted changes.
 
 ### Added
 
+- **4-bit KV option.** The SGLang profile form offers `fp4_mx_block16`
+  (needs the gfx1201 kernel patch in `sglang-gfx1201`); the pre-flight
+  KV budget counts it at 9/16 byte per value.
+- **Pre-flight sizes hybrid-model state from the model.** The KV budget check
+  reserved a flat 150 MiB per GatedDeltaNet state slot (the 27B's value) and
+  wrongly blocked a 35B-A3B MoE with 40 slots; it now reads
+  `ssm.inner_size` x `ssm.state_size` x linear layers from the GGUF header.
+- **The router advertises the real per-request limit.** `/v1/models` and
+  `/v1/models/{name}` (alias resolved) carry `n_ctx` and `context_length` =
+  SGLang's `max_req_input_len`, the KV pool's bound, not the model's nominal
+  window (`max_model_len` stays as the backend reports it). Clients that size
+  their compaction from the model list (Hermes probes `/v1/models/{name}`
+  first) stop growing a conversation past what the server accepts; the
+  Running tab's context is the same number.
+- **SGLang engine, and Linux.** A third engine beside llama-server and
+  DiffusionGemma: profiles with `"engine": "sglang"` launch
+  `python -m sglang.launch_server` from a venv (`Settings → SGLang engine`
+  finds installs, creates one, or picks the one to use), one card each,
+  fronted by FIDIM's own router (`fidim router serve`, in the CLI binary) so
+  the Running tab's slots, throughput, loop detector and sparklines work
+  unchanged. The profile editor has the SGLang form (memory fraction,
+  prefill chunk, slots, GatedDeltaNet state slots, KV dtype, attention
+  backend, speculation with a hot-token map, parsers, memguard, metrics,
+  idle sleep, aliases, extra args, env). The catalog lists Hugging Face
+  safetensors checkpoints beside GGUF files, with a KV-cache estimate from
+  config.json. Pre-flight on Linux checks the venv and tools, the model and
+  sidecar files, the card, that the static pool fits, that a display-driving
+  card keeps 1.5 GB of headroom (the desktop otherwise evicts the compute
+  process and decode collapses), the weights-plus-KV budget for the context,
+  the port and the served name. New Running-tab tiles: free VRAM per card,
+  an "evicting" chip with the KFD eviction counter, draft acceptance, prefix
+  cache hit rate, KV pool use, retractions, time to first token. Linux gets
+  a platform implementation from sysfs, procfs and KFD (cards, displays,
+  per-process VRAM, busy), a `run-linux.sh` launcher, and deb/AppImage
+  packages for x86-64 and arm64 from the release workflow. Benchmarks and
+  Chat work against SGLang servers as they do against llama-server.
+
 - **Update the app from the app.** The Updates tab opens with Llama FIDIM
   itself: which build this is, the newest release on GitHub with its notes,
   and an Update button that downloads the release zip, checks it against

@@ -408,6 +408,23 @@ const MOCK_MODELS = [
       diffusion_canvas_length: 256, attention_causal: false, vocab_size: 262144,
     },
   },
+  // A Hugging Face checkpoint folder (config.json + *.safetensors): no GGUF
+  // header, `hf` from config.json, served by the SGLang engine.
+  {
+    path: "/models/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8", file_size: 31.8e9, modified_unix: 1790000000, header_error: null,
+    engine: "sglang", format: "safetensors", header: null, mmproj_candidates: [], draft_candidates: [],
+    hf: {
+      architecture: "Qwen3MoeForCausalLM", model_type: "qwen3_moe", hidden_size: 2048, num_layers: 48, num_attention_heads: 32,
+      num_kv_heads: 4, head_dim: 128, vocab_size: 151936, max_position_embeddings: 262144, torch_dtype: "bfloat16",
+      attention_layers: 48, num_experts: 128, quantization: "fp8", weights_bytes: 31.8e9, has_vision: false,
+    },
+  },
+];
+
+// SGLang venvs the browser preview "finds" (Settings > SGLang engine).
+const MOCK_SGLANG_INSTALLS = [
+  { venv: "/home/me/venvs/sglang-rocm", python: "/home/me/venvs/sglang-rocm/bin/python", sglang_version: "0.5.4", torch_version: "2.9.0+rocm7.1", device: "rocm 7.1.25424", configured: true },
+  { venv: "/home/me/venvs/sglang-cpu", python: "/home/me/venvs/sglang-cpu/bin/python", sglang_version: "0.5.2", torch_version: "2.8.0+cpu", device: null, configured: false },
 ];
 
 const MOCK_DG_PROFILE = {
@@ -759,7 +776,7 @@ async function mock(cmd, args) {
     case "app_version":
       return { version: "0.2.0", long: "0.2.0+3 (4f2a1c9 2026-09-20)", commit: "4f2a1c9", commit_date: "2026-09-20", commits_ahead: 3, modified: false };
     case "get_config":
-      mockConfigState ??= { hf_use_cli_token: false, github_token: null, build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models", "E:\\models"],rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.fidim\\profiles", runs_dir: "C:\\Users\\me\\.fidim\\runs", keep_alive_seconds: 0, save_chats: true, runtimes: [] };
+      mockConfigState ??= { hf_use_cli_token: false, github_token: null, build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models", "E:\\models"],rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.fidim\\profiles", runs_dir: "C:\\Users\\me\\.fidim\\runs", keep_alive_seconds: 0, save_chats: true, runtimes: [], sglang: { venv: MOCK_SGLANG_INSTALLS[0].venv, pythonpath: [], env: { SGLANG_USE_AITER: "0", GPU_ARCHS: "gfx1201" } } };
       return { path: "C:\\Users\\me\\.fidim\\config.json", config: structuredClone(mockConfigState) };
     case "save_config":
       mockConfigState = structuredClone(args.config);
@@ -903,6 +920,24 @@ async function mock(cmd, args) {
       return { path: "C:\\Users\\me\\.fidim\\profiles\\worker-pool.bat", text: "@echo off\r\nset \"HIP_VISIBLE_DEVICES=2\"\r\n\"llama-server.exe\" -m ..." };
     case "scan":
       return { builds: MOCK_BUILDS, models: MOCK_MODELS, drafts: [MOCK_PROFILE.model.draft.path], mmproj: [] };
+    case "sglang_installs": {
+      const configured = mockConfigState?.sglang?.venv ?? null;
+      return MOCK_SGLANG_INSTALLS.map((i) => ({ ...i, configured: i.venv === configured }));
+    }
+    case "sglang_use": {
+      const hit = MOCK_SGLANG_INSTALLS.find((i) => i.venv === args.venv);
+      if (!hit) throw new Error("that venv does not import sglang");
+      mockConfigState ??= (await mock("get_config")).config;
+      mockConfigState.sglang = { ...(mockConfigState.sglang ?? { pythonpath: [], env: {} }), venv: hit.venv };
+      return { ...hit, configured: true };
+    }
+    case "sglang_install": {
+      await new Promise((r) => setTimeout(r, 2500));
+      if (!String(args.dir ?? "").trim()) throw new Error("a directory is needed");
+      const row = { venv: args.dir, python: args.dir + "/bin/python", sglang_version: "0.5.4", torch_version: args.flavor === "rocm" ? "2.9.0+rocm7.1" : args.flavor === "cuda" ? "2.9.0+cu128" : "2.9.0+cpu", device: args.flavor === "rocm" ? "rocm 7.1.25424" : args.flavor === "cuda" ? "cuda 12.8" : null, configured: false };
+      if (!MOCK_SGLANG_INSTALLS.some((i) => i.venv === row.venv)) MOCK_SGLANG_INSTALLS.push(row);
+      return row;
+    }
     default:
       throw new Error("unmocked command: " + cmd);
   }

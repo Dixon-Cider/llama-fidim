@@ -252,6 +252,7 @@ mod tests {
     /// A copy made in Explorer keeps the id inside: it must not show as a
     /// second row that cannot be opened, and Delete saved chats must take
     /// it (and a crash's temporary file) off the disk too.
+    #[cfg(windows)]
     #[test]
     fn copies_and_renamed_files_are_not_listed_but_are_deleted() {
         let dir = temp("copies");

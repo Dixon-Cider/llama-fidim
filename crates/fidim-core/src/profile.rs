@@ -52,6 +52,9 @@ pub struct Profile {
     /// auto-sizes) and `n_gpu_layers` is NGL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion: Option<DiffusionCfg>,
+    /// SGLang engine settings (engine = "sglang"); None = engine defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sglang: Option<crate::sglang::SgLangCfg>,
     #[serde(default)]
     pub chat: Chat,
     /// Arbitrary env passthrough — hardware workarounds change without
@@ -76,6 +79,11 @@ pub enum Engine {
     LlamaServer,
     /// Unsloth's DiffusionGemma runner behind FIDIM's `fidim-dg.exe` shim.
     DiffusionGemma,
+    /// An SGLang server (Linux): launched through sglang-gfx1201's guarded
+    /// launcher, fronted by model_router.py, which answers `/slots` and
+    /// `/metrics` in llama-server's shape.
+    #[serde(rename = "sglang")]
+    SgLang,
     /// A value this build does not know (a typo, or a newer FIDIM). Kept so
     /// the profile still loads; it never launches and is never re-saved.
     #[serde(other)]
@@ -89,10 +97,14 @@ impl Engine {
     pub fn is_diffusion(&self) -> bool {
         *self == Engine::DiffusionGemma
     }
+    pub fn is_sglang(&self) -> bool {
+        *self == Engine::SgLang
+    }
     pub fn label(&self) -> &'static str {
         match self {
             Engine::LlamaServer => "llama-server",
             Engine::DiffusionGemma => "diffusion-gemma",
+            Engine::SgLang => "sglang",
             Engine::Unknown => "unknown",
         }
     }
@@ -672,6 +684,7 @@ pub fn new_for_model(
         sampling: Sampling::default(),
         speculative,
         diffusion: diffusion_cfg,
+        sglang: None,
         chat: Chat::default(),
         env: BTreeMap::new(),
         baseline: None,
@@ -710,7 +723,7 @@ pub fn validate(p: &Profile) -> Vec<Finding> {
         out.push(finding(
             Severity::Error,
             "engine-unknown",
-            "engine is not one this build knows (expected \"llama-server\" or \"diffusion-gemma\"); \
+            "engine is not one this build knows (expected \"llama-server\", \"diffusion-gemma\" or \"sglang\"); \
              fix the \"engine\" field by hand: the profile cannot launch or be saved until then"
                 .into(),
         ));
@@ -718,6 +731,11 @@ pub fn validate(p: &Profile) -> Vec<Finding> {
     }
     if p.engine.is_diffusion() {
         validate_diffusion(p, &mut out);
+        validate_server(p, &mut out);
+        return out;
+    }
+    if p.engine.is_sglang() {
+        validate_sglang(p, &mut out);
         validate_server(p, &mut out);
         return out;
     }
@@ -879,6 +897,25 @@ fn validate_server(p: &Profile, out: &mut Vec<Finding>) {
 /// DiffusionGemma rules. Batch, slot and KV rules do not apply to the
 /// runner; instead a few settings that are harmless for llama-server break
 /// every prompt here, and those are Errors.
+fn validate_sglang(p: &Profile, out: &mut Vec<Finding>) {
+    let s = crate::sglang::cfg_of(p);
+    if p.devices.len() != 1 {
+        out.push(finding(Severity::Error, "sglang-one-device", format!("an SGLang profile runs on exactly one card ({} listed)", p.devices.len())));
+    }
+    if p.runtime.ctx_total == 0 {
+        out.push(finding(Severity::Error, "sglang-context", "runtime.ctx_total (the --context-length) is 0".into()));
+    }
+    if !(0.3..=0.98).contains(&s.mem_fraction) {
+        out.push(finding(Severity::Error, "sglang-mem-fraction", format!("sglang.mem_fraction {} is outside 0.30..0.98", s.mem_fraction)));
+    }
+    if s.max_running_requests == 0 {
+        out.push(finding(Severity::Error, "sglang-slots", "sglang.max_running_requests is 0".into()));
+    }
+    if p.model.path.as_os_str().is_empty() {
+        out.push(finding(Severity::Error, "sglang-model", "model.path is empty".into()));
+    }
+}
+
 fn validate_diffusion(p: &Profile, out: &mut Vec<Finding>) {
     let err = Severity::Error;
     let warn = Severity::Warning;
@@ -1585,6 +1622,8 @@ mod tests {
                 file_size: 1,
                 modified_unix: None,
                 engine: header.engine(),
+                format: "gguf".into(),
+                hf: None,
                 header: Some(header),
                 header_error: None,
                 mmproj_candidates: vec![PathBuf::from(r"E:\m\mmproj-F16.gguf")],
@@ -1616,6 +1655,7 @@ mod tests {
             Config::default_for_machine()
         }
 
+        #[cfg(windows)]
         #[test]
         fn a_new_profile_mirrors_the_editors_defaults() {
             let m = model(r"E:\m\IFM\K2-Horizon-7B-GGUF\K2-Horizon-7B-Q4_K_M.gguf", "k2-horizon", 524_288, 36);
@@ -1643,6 +1683,7 @@ mod tests {
             assert_eq!(back.id, p.id);
         }
 
+        #[cfg(windows)]
         #[test]
         fn ids_and_ports_are_unique() {
             let m = model(r"E:\m\a\K2-Horizon-7B-Q4_K_M.gguf", "k2-horizon", 524_288, 36);

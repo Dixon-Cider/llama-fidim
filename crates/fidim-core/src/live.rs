@@ -175,10 +175,23 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
 pub fn parse_metrics(text: &str) -> BTreeMap<String, f64> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
-        let Some(rest) = line.strip_prefix("llamacpp:") else { continue };
+        // llama-server's family, and SGLang's (passed through model_router.py
+        // with labels already stripped; strip any that survive).
+        let Some(rest) = line.strip_prefix("llamacpp:").or_else(|| line.strip_prefix("sglang:")) else { continue };
+        let rest = match (rest.find('{'), rest.find('}')) {
+            (Some(a), Some(b)) if b > a => format!("{}{}", &rest[..a], &rest[b + 1..]),
+            _ => rest.to_string(),
+        };
+        let sglang = line.starts_with("sglang:");
         let mut it = rest.split_whitespace();
         if let (Some(k), Some(v)) = (it.next(), it.next()) {
             if let Ok(f) = v.parse::<f64>() {
+                // Both families share names (prompt_tokens_total): the router's
+                // llamacpp figures are what the UI rates are built on, so an
+                // SGLang line never overwrites one that is already there.
+                if sglang && out.contains_key(k) {
+                    continue;
+                }
                 out.insert(k.to_string(), f);
             }
         }

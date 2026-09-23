@@ -4,7 +4,7 @@
   import { fly, fade, slide, scale } from "svelte/transition";
   import { flip } from "svelte/animate";
   import { arrive, leave, flipParams, toastFly, stagger, LAYOUT } from "../motion.js";
-  import { takeProfileId } from "../lib/handoff.js";
+  import { takeProfileId, takeModelPath } from "../lib/handoff.js";
 
   // App passes `go(viewId)` so a missing build can link straight to Updates.
   let { go = () => {} } = $props();
@@ -71,9 +71,12 @@
     allMmproj = s.mmproj ?? [];
     loadErrors = errs;
     loading = false;
-    // A profile the Models view just made opens here.
+    // A profile the Models view just made opens here; a checkpoint path it
+    // handed over starts a new SGLang profile on it.
     const handed = takeProfileId();
+    const handedPath = takeModelPath();
     if (handed && profiles.some((r) => r.profile.id === handed)) select(handed);
+    else if (handedPath) newSgLangProfile(handedPath);
     else if (!selectedId && profiles.length) select(profiles[0].profile.id);
   }
   load();
@@ -92,9 +95,16 @@
   }
 
   // ---- model-derived limits ------------------------------------------------
+  // The scan lists GGUF files and Hugging Face checkpoint folders
+  // (format "safetensors", hf facts instead of a header); only SGLang loads
+  // the latter, so the llama-server picker never shows them.
+  const isHf = (m) => m?.format === "safetensors";
+  const ggufModels = $derived(models.filter((m) => !isHf(m)));
+  const hfModels = $derived(models.filter(isHf));
   const selectedModel = $derived(models.find((m) => samePath(m.path, draft?.model?.path)));
   const header = $derived(selectedModel?.header ?? null);
-  const ctxMax = $derived(header?.context_length ?? 262144);
+  const hf = $derived(isHf(selectedModel) ? selectedModel.hf ?? {} : null);
+  const ctxMax = $derived(header?.context_length ?? hf?.max_position_embeddings ?? 262144);
   const layerMax = $derived(header?.block_count ?? 99);
   const selectedBuild = $derived(builds.find((b) => samePath(b.path, draft?.build?.path)));
 
@@ -102,8 +112,129 @@
   // A profile carries `engine` only when it is not llama-server; the model's
   // header decides which one it needs (discovery sets Model.engine).
   const isDiffusion = $derived(draft?.engine === "diffusion-gemma");
+  const isSgLang = $derived(draft?.engine === "sglang");
   const modelEngine = $derived(selectedModel?.engine ?? "llama-server");
-  const engineMismatch = $derived(!!selectedModel && modelEngine !== (draft?.engine ?? "llama-server"));
+  // A GGUF header never names SGLang (it serves GGUF and safetensors alike),
+  // so only a diffusion header contradicts an SGLang profile.
+  const engineMismatch = $derived(!!selectedModel && modelEngine !== (draft?.engine ?? "llama-server") &&
+    !(draft?.engine === "sglang" && modelEngine === "llama-server"));
+
+  // ---- sglang ----------------------------------------------------------------
+  // Mirrors SgLangCfg (crates/fidim-core/src/sglang.rs): serde fills every
+  // absent field with these, so a profile saved with them is byte-stable.
+  const SG_DEFAULTS = {
+    mem_fraction: 0.85, chunked_prefill: 8192, max_running_requests: 2, mamba_slots: null,
+    kv_cache_dtype: "fp8_e4m3", attention_backend: "triton", dtype: "bfloat16", spec: null,
+    reasoning_parser: "", tool_call_parser: "", memguard_gb: 12, enable_metrics: true,
+    sleep_on_idle: true, compile_threads: 2, aliases: [], extra_args: [],
+  };
+  const SG_SPEC_DEFAULTS = { algorithm: "NEXTN", steps: 3, topk: 1, draft_tokens: 4, token_map: "" };
+  const SG_KV_DTYPES = ["fp8_e4m3", "fp4_mx_block16", "fp8_e5m2", "bf16", "auto"];
+  const SG_ATTN_BACKENDS = ["triton", "flashinfer", "fa3", "trtllm_mha", "torch_native"];
+  const SG_DTYPES = ["bfloat16", "float16", "auto"];
+  const SG_SPEC_ALGOS = ["NEXTN", "EAGLE", "EAGLE3", "NGRAM"];
+  const SG_REASONING_PARSERS = ["qwen3-thinking", "qwen3", "deepseek-r1", "deepseek-v3", "glm45", "kimi", "gpt-oss", "step3"];
+  const SG_TOOL_PARSERS = ["qwen3_coder", "qwen25", "hermes", "llama3", "mistral", "deepseekv3", "glm45", "kimi_k2", "pythonic", "gpt-oss"];
+  // The one card an SGLang profile runs on, from the device list.
+  const sgDevice = $derived(isSgLang ? devices.find((d) => d.stable_key === draft?.devices?.[0]?.key) ?? null : null);
+  // Text of the env map while it is being edited (parsing every keystroke
+  // back into the map would drop the line being typed).
+  let sgEnvText = $state("");
+  // Parser selects: "other…" shows a free-text input.
+  let sgCustomParser = $state({ reasoning_parser: false, tool_call_parser: false });
+
+  function sgFill(s) {
+    s ??= {};
+    for (const [k, v] of Object.entries(SG_DEFAULTS)) s[k] ??= Array.isArray(v) ? [] : v;
+    if (s.spec) for (const [k, v] of Object.entries(SG_SPEC_DEFAULTS)) s.spec[k] ??= v;
+    return s;
+  }
+  function envToText(env) {
+    return Object.entries(env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n");
+  }
+  function parseEnvText(text) {
+    const out = {};
+    for (const line of String(text ?? "").split(/\r?\n/)) {
+      const s = line.trim();
+      if (!s || s.startsWith("#")) continue;
+      const i = s.indexOf("=");
+      if (i <= 0) continue;
+      out[s.slice(0, i).trim()] = s.slice(i + 1).trim();
+    }
+    return out;
+  }
+  function onEnvText(text) {
+    sgEnvText = text;
+    draft.env = parseEnvText(text);
+    scheduleCheck();
+  }
+  const listOf = (v, sep) => (Array.isArray(v) ? v : String(v ?? "").split(sep)).map((x) => String(x).trim()).filter(Boolean);
+  const intOr = (v, d) => (v === "" || v === null || v === undefined || !Number.isFinite(Number(v)) ? d : Math.max(0, Math.round(Number(v))));
+  function parserSel(k, list) {
+    const v = draft?.sglang?.[k] ?? "";
+    return sgCustomParser[k] || (v && !list.includes(v)) ? "__custom" : v;
+  }
+  function onParserPick(k, v, list) {
+    if (v === "__custom") {
+      sgCustomParser[k] = true;
+      if (list.includes(draft.sglang[k])) draft.sglang[k] = "";
+    } else {
+      sgCustomParser[k] = false;
+      draft.sglang[k] = v;
+    }
+    scheduleCheck();
+  }
+  function onSgSpecToggle(on) {
+    draft.sglang.spec = on ? { ...SG_SPEC_DEFAULTS } : null;
+    scheduleCheck();
+  }
+
+  function enterSgLang() {
+    draft.engine = "sglang";
+    delete draft.diffusion;
+    // No llama.cpp build: the venv from Settings launches it.
+    draft.build = { path: "", version: null };
+    draft.rocm_runtime = null;
+    draft.sglang = sgFill(draft.sglang);
+    // One card: keep the profile's first discrete one, else an empty one, else the first.
+    const discrete = devices.filter((d) => !d.integrated);
+    const keep = draft.devices.find((x) => discrete.some((d) => d.stable_key === x.key));
+    const pick = discrete.find((d) => !occupancy[d.stable_key]?.length) ?? discrete[0];
+    draft.devices = keep ? [keep] : pick ? [{ key: pick.stable_key, split_fraction: null, resolved_index_last_launch: null }] : [];
+    draft.split_mode = null;
+    draft.main_device = 0;
+    // Kept as an "off" object so nothing hidden reads null; normalized() drops it.
+    draft.speculative = { mode: "off", n_max: null, n_min: null, p_min: null };
+    draft.model.mmproj = null;
+    draft.model.draft = null;
+    draft.keep_alive_seconds = null;
+    draft.runtime.extra_flags = [];
+    if (!draft.runtime.ctx_total) draft.runtime.ctx_total = 32768;
+    sgEnvText = envToText(draft.env);
+  }
+
+  function leaveSgLang(h) {
+    delete draft.engine;
+    delete draft.sglang;
+    if (!draft.runtime.ctx_total) draft.runtime.ctx_total = Math.min(32768, h?.context_length ?? 262144);
+    if (!draft.build?.path) {
+      const b = newestUpstreamBuild();
+      if (b) onBuildPick(b.path);
+      else draft.build = { path: "", version: null };
+    }
+  }
+
+  // The engine select (shown unless a diffusion header decides it).
+  function onEnginePick(v) {
+    const cur = draft.engine ?? "llama-server";
+    if (v === cur) return;
+    if (cur === "diffusion-gemma") leaveDiffusion(header);
+    if (cur === "sglang") leaveSgLang(header);
+    if (v === "sglang") enterSgLang();
+    else if (v === "diffusion-gemma") enterDiffusion();
+    creator = null;
+    scheduleCheck();
+  }
   const DG_DEFAULTS = { hipblaslt_safeguard: true, default_max_tokens: 2048 };
   const canvas = $derived(header?.diffusion_canvas_length ?? 256);
   const dgSizing = $derived(check?.diffusion?.sizing ?? null);
@@ -207,8 +338,14 @@
   }
   function base(p) { return String(p ?? "").split(/[\\/]/).pop(); }
   function modelLabel(m) {
-    const h = m.header;
     const bits = [base(m.path)];
+    if (isHf(m)) {
+      // A checkpoint folder: name · quantization or dtype · weights size.
+      bits.push(m.hf?.quantization || m.hf?.torch_dtype || "safetensors");
+      bits.push(fmtGib(m.hf?.weights_bytes ?? m.file_size ?? 0));
+      return bits.join(" · ");
+    }
+    const h = m.header;
     if (h?.architecture) bits.push(h.architecture);
     if (h?.file_type != null) bits.push(quantName(h.file_type));
     bits.push(fmtGib(m.file_size));
@@ -229,7 +366,17 @@
     // The header decides the engine; switching resets what the other one
     // cannot use.
     const engine = m?.engine ?? "llama-server";
-    if (engine !== (draft.engine ?? "llama-server")) {
+    if (engine === "sglang") {
+      // A safetensors checkpoint: only SGLang loads it.
+      if (!isSgLang) {
+        if (isDiffusion) leaveDiffusion(h);
+        enterSgLang();
+      }
+    } else if (isSgLang) {
+      // SGLang serves this GGUF as it is; only a diffusion header pulls the
+      // profile off it.
+      if (engine === "diffusion-gemma") { leaveSgLang(h); enterDiffusion(); }
+    } else if (engine !== (draft.engine ?? "llama-server")) {
       if (engine === "diffusion-gemma") enterDiffusion();
       else leaveDiffusion(h);
     }
@@ -238,7 +385,8 @@
       // block_count + 1 (the output layer) for a full offload: no clamps.
       draft.model.mmproj = null;
     } else {
-      if (h?.context_length && draft.runtime.ctx_total > h.context_length) draft.runtime.ctx_total = h.context_length;
+      const trained = h?.context_length ?? m?.hf?.max_position_embeddings;
+      if (trained && draft.runtime.ctx_total > trained) draft.runtime.ctx_total = trained;
       if (h?.block_count && draft.runtime.n_gpu_layers > h.block_count) draft.runtime.n_gpu_layers = h.block_count;
     }
     creator = null;
@@ -271,6 +419,8 @@
       draft = row ? withDefaults(JSON.parse(JSON.stringify(row.profile))) : null;
       check = null;
       creator = null;
+      sgEnvText = envToText(draft?.env);
+      sgCustomParser = { reasoning_parser: false, tool_call_parser: false };
       log(`select ${id}: engine=${draft?.engine ?? "llama-server"} model=${base(draft?.model?.path)} build=${draft?.build?.version} ctx=${draft?.runtime?.ctx_total} slots=${draft?.runtime?.slots} kv=${draft?.runtime?.kv_type_k} spec=${draft?.speculative?.mode} port=${draft?.server?.port}`);
       scheduleCheck();
     } catch (e) {
@@ -283,6 +433,8 @@
     p.sampling ??= {};
     p.chat ??= {};
     p.env ??= {};
+    p.build ??= { path: "", version: null };
+    p.server.host ??= "127.0.0.1";
     p.runtime.extra_flags ??= [];
     p.runtime.threads ??= null;
     p.runtime.cache_reuse ??= null;
@@ -308,6 +460,8 @@
       p.diffusion.flash_attn ??= false;
       p.diffusion.seed ??= null;
     }
+    // Same for an absent sglang section (cfg_of() = SgLangCfg::default()).
+    if (p.engine === "sglang") p.sglang = sgFill(p.sglang);
     return p;
   }
 
@@ -359,7 +513,22 @@
     selectedId = null;
     check = null;
     creator = null;
+    sgEnvText = "";
+    sgCustomParser = { reasoning_parser: false, tool_call_parser: false };
     scheduleCheck();
+  }
+
+  // A new SGLang profile on a checkpoint the Models view handed over: id and
+  // name from the folder (or file stem), alias = id.
+  function newSgLangProfile(path) {
+    newProfile();
+    enterSgLang();
+    const stem = base(String(path).replace(/[\\/]+$/, "")).replace(/\.gguf$/i, "") || "sglang";
+    draft.id = stem.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "sglang";
+    draft.name = stem;
+    draft.server.alias = draft.id;
+    draft.server.port = 30000;
+    onModelPick(path);
   }
 
   function duplicate() {
@@ -368,6 +537,7 @@
     draft.server.port += 1;
     draft.server.alias = draft.id;
     selectedId = null;
+    sgEnvText = envToText(draft.env);
     scheduleCheck();
   }
 
@@ -436,7 +606,48 @@
       // Never send `engine: null`: it does not parse.
       delete copy.engine;
       delete copy.diffusion;
+      delete copy.sglang;
+    } else if (copy.engine === "sglang") {
+      // No llama.cpp build or runtime; one card; nothing of the hidden
+      // llama-server cards is kept, so validate has nothing to report on them.
+      copy.build = { path: "", version: null };
+      copy.rocm_runtime = null;
+      copy.devices = copy.devices.slice(0, 1);
+      copy.split_mode = null;
+      copy.main_device = 0;
+      copy.model.mmproj = null;
+      copy.model.draft = null;
+      r.extra_flags = [];
+      delete copy.speculative;
+      delete copy.keep_alive_seconds;
+      delete copy.diffusion;
+      const s = (copy.sglang = sgFill(copy.sglang));
+      s.mem_fraction = Number(s.mem_fraction);
+      if (!Number.isFinite(s.mem_fraction)) s.mem_fraction = SG_DEFAULTS.mem_fraction;
+      for (const k of ["chunked_prefill", "max_running_requests", "memguard_gb", "compile_threads"]) s[k] = intOr(s[k], SG_DEFAULTS[k]);
+      // Optionals are absent, never null: that is how serde writes them back.
+      s.mamba_slots = numOrNull(s.mamba_slots);
+      if (s.mamba_slots === null || !(s.mamba_slots > 0)) delete s.mamba_slots;
+      else s.mamba_slots = Math.round(s.mamba_slots);
+      if (s.spec) {
+        const sp = s.spec;
+        sp.algorithm = String(sp.algorithm || SG_SPEC_DEFAULTS.algorithm);
+        for (const k of ["steps", "topk", "draft_tokens"]) sp[k] = Math.max(1, intOr(sp[k], SG_SPEC_DEFAULTS[k]));
+        sp.token_map = String(sp.token_map ?? "").trim();
+        if (!sp.token_map) delete sp.token_map;
+      } else {
+        delete s.spec;
+      }
+      for (const k of ["reasoning_parser", "tool_call_parser"]) {
+        s[k] = String(s[k] ?? "").trim();
+        if (!s[k]) delete s[k];
+      }
+      s.aliases = listOf(s.aliases, /[,\s]+/);
+      s.extra_args = listOf(s.extra_args, /\r?\n/);
+      s.enable_metrics = !!s.enable_metrics;
+      s.sleep_on_idle = !!s.sleep_on_idle;
     } else if (copy.engine === "diffusion-gemma") {
+      delete copy.sglang;
       copy.devices = copy.devices.slice(0, 1);
       copy.split_mode = null;
       // e.g. a profile promoted onto a bundled build keeps its old runtime,
@@ -456,9 +667,10 @@
   }
 
   function toggleDevice(dev) {
-    if (isDiffusion) {
+    if (isDiffusion || isSgLang) {
       // Radio: a second visible device makes the runner abort every prompt,
-      // and the bundle has no kernels for the iGPU.
+      // and the bundle has no kernels for the iGPU. SGLang runs one card per
+      // server (a tensor-parallel pair would be a second profile's job).
       if (dev.integrated || (draft.devices.length === 1 && draft.devices[0].key === dev.stable_key)) return;
       draft.devices = [{ key: dev.stable_key, split_fraction: null, resolved_index_last_launch: null }];
       draft.split_mode = null;
@@ -511,6 +723,25 @@
         detail: `weights ${(est.weights_bytes / GIB).toFixed(2)} + kv ${(est.kv_bytes / GIB).toFixed(2)} + compute ${(est.compute_bytes / GIB).toFixed(2)} + overhead ${(est.overhead_bytes / GIB).toFixed(2)}`,
       };
     });
+  });
+
+  // SGLang's estimate is one number for the one card (per_device is empty):
+  // the static pool = mem_fraction x the card's VRAM, against what is free now.
+  const sgBudget = $derived.by(() => {
+    if (!isSgLang || !check?.estimate) return null;
+    const dev = check.resolved?.[0]?.device;
+    const totalBytes = (dev?.total_mib ?? 0) * 1024 * 1024;
+    const freeBytes = (dev?.free_mib ?? 0) * 1024 * 1024;
+    const est = check.estimate.total_bytes ?? 0;
+    const frac = totalBytes > 0 ? est / totalBytes : 0;
+    return {
+      name: dev?.name ?? draft?.devices?.[0]?.key ?? "?",
+      key: dev?.stable_key ?? draft?.devices?.[0]?.key ?? "",
+      estGib: est / GIB, totalGib: totalBytes / GIB, freeGib: freeBytes / GIB,
+      frac, freeFrac: totalBytes > 0 ? freeBytes / totalBytes : 0,
+      kind: est > freeBytes ? "block" : frac > 0.9 ? "warn" : "pass",
+      assumptions: check.estimate.assumptions ?? [],
+    };
   });
 
   // ---- creator defaults ----------------------------------------------------
@@ -624,7 +855,7 @@
 </script>
 <h1>
   Profiles
-  <span class="sub">A saved launch: model, build, GPU placement and server flags. Pre-flight here is the same check launch runs.</span>
+  <span class="sub" title="Pre-flight here is the same check a launch runs">One saved launch: model, build, GPUs and flags.</span>
 </h1>
 {#if loadErrors.length}
   <div class="card">
@@ -635,11 +866,8 @@
   </div>
 {:else if !loading && (!models.length || !builds.length || !devices.length)}
   <div class="card notice">
-    <span class="chip warn">nothing to pick from</span>
-    <span>
-      {models.length} models · {builds.length} builds · {devices.length} GPUs.
-      Set the model and build roots on the <b>Settings</b> tab{models.length ? "" : " (no GGUF files found)"}{!builds.length ? (models.length ? "" : "; ") + " no bin\\llama-server.exe found" : ""}.
-    </span>
+    <span class="chip warn" title="Nothing to pick from: no models, builds or GPUs were found under the roots">empty</span>
+    <span>{models.length} models · {builds.length} builds · {devices.length} GPUs — set the roots in <b>Settings</b>, then Rescan.</span>
   </div>
 {/if}
 
@@ -650,7 +878,7 @@
       <button class="btn" onclick={newProfile}>New</button>
       <button class="btn" onclick={duplicate} disabled={!draft}>Duplicate</button>
       <div class="grow"></div>
-      <button class="btn small" onclick={rescan} disabled={busy === "scan"} title="rescan build and model roots">{busy === "scan" ? "…" : "Rescan"}</button>
+      <button class="btn small" onclick={rescan} disabled={busy === "scan"} title="Scan the build and model roots again">{busy === "scan" ? "…" : "Rescan"}</button>
     </div>
     <div class="rows">
       {#each profiles as row, i (row.profile.id)}
@@ -659,16 +887,17 @@
           <div class="r1"><span class="id">{p.id}</span><span class="mono faint">:{p.server.port}</span></div>
           <div class="r2">{base(p.model.path) || "no model"}</div>
           <div class="r3">
-            <span class="mono">{p.build.version ?? "?"}</span>
+            <span class="mono">{p.engine === "sglang" ? "venv" : p.build.version ?? "?"}</span>
             <span>{p.devices.length} GPU{p.devices.length === 1 ? "" : "s"}{p.split_mode ? `, ${p.split_mode} split` : ""}</span>
-            {#if p.engine === "diffusion-gemma"}<span class="chip note" title="Runs on the DiffusionGemma engine (fidim-dg.exe and Unsloth's runner), not llama-server.">diffusion</span>
-            {:else if p.engine && p.engine !== "llama-server"}<span class="chip block" title="This file names an engine this version of Llama FIDIM does not know. Fix the engine field by hand; the editor will not save it.">unknown engine</span>{/if}
+            {#if p.engine === "diffusion-gemma"}<span class="chip note" title="Runs on the DiffusionGemma runner, not llama-server">diffusion</span>
+            {:else if p.engine === "sglang"}<span class="chip note" title="Runs on SGLang from the venv in Settings, behind model_router.py">sglang</span>
+            {:else if p.engine && p.engine !== "llama-server"}<span class="chip block" title="This file names an engine this version does not know; fix the engine field by hand">unknown</span>{/if}
             {#if p.baseline}<span class="tok num">{p.baseline.serial_tok_s} tok/s</span>{/if}
-            {#if row.findings.length}<span class="chip warn">{row.findings.length}</span>{/if}
+            {#if row.findings.length}<span class="chip warn" title="Problems in the profile file; open it to see them">{row.findings.length}</span>{/if}
           </div>
         </button>
       {:else}
-        <div class="empty">No profiles yet. New, or get a model in <button class="link" onclick={() => go("models")}>Models</button>.</div>
+        <div class="empty">No profiles yet — New, or <button class="link" onclick={() => go("models")}>Models</button> → Get a model</div>
       {/each}
     </div>
   </aside>
@@ -684,7 +913,7 @@
         <div class="who">
           <span class="name">{draft.name || draft.id}</span>
           <span class="meta"><span class="mono muted">{draft.id} · :{draft.server.port} · {draft.server.alias}</span>{#if savedFlash}<span class="chip pass" in:scale={{ duration: LAYOUT, start: 0.7 }} out:fade={{ duration: LAYOUT }}>saved</span>{:else if !selectedId}<span class="chip accent" in:scale={{ duration: LAYOUT, start: 0.7 }}>unsaved</span>{/if}
-          <span class="pfsum" title="pre-flight, re-run on every edit">
+          <span class="pfsum" title="Pre-flight, re-run on every edit">
           {#if checking}<span class="chip plain live">checking</span>
           {:else if check?.error}<span class="chip block">check failed</span>
           {:else if kinds.length}
@@ -700,36 +929,74 @@
           {#if anyBlock}
             <button class="btn danger" onclick={() => launch(true)} disabled={!!busy}>Override blocks &amp; load</button>
           {/if}
-          <button class="btn" onclick={() => exportScript("bat")} disabled={!!busy} title="write a standalone .bat that launches this profile">Export .bat</button>
-          <button class="btn" onclick={() => exportScript("ps1")} disabled={!!busy} title="write a standalone .ps1 that launches this profile">Export .ps1</button>
+          <button class="btn" onclick={() => exportScript("bat")} disabled={!!busy} title="Write a standalone .bat that launches this profile">Export .bat</button>
+          <button class="btn" onclick={() => exportScript("ps1")} disabled={!!busy} title="Write a standalone .ps1 that launches this profile">Export .ps1</button>
           <button class="btn danger" onclick={remove} disabled={!!busy || !selectedId}>Delete</button>
         </div>
       </div>
 
       <!-- identity -->
       <section class="card">
-        <div class="sec">Identity <span class="faint">names the CLI, the router and clients use</span></div>
+        <div class="sec">Identity</div>
         <div class="formgrid">
-          <label class="field" title="Profile identifier: the file name under the profile directory and what the CLI uses (fidim launch <id>). Letters, digits, dashes."><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
-          <label class="field" style="grid-column: span 2;" title="Free-text display name."><span class="k">name</span><input bind:value={draft.name} /></label>
-          <label class="field" title="TCP port the server listens on. Each running profile needs its own; pre-flight checks it is free."><span class="k">port</span><input type="number" bind:value={draft.server.port} oninput={scheduleCheck} /></label>
-          <label class="field" style="grid-column: span 2;" title="Model name the server reports on /v1/models and what clients pass as 'model'. Unique across running servers; the router uses it as the model id."><span class="k">alias</span><input bind:value={draft.server.alias} oninput={scheduleCheck} /></label>
+          <label class="field" title="File name of the profile and what the CLI launches; letters, digits, dashes (fidim launch <id>)"><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
+          <label class="field" style="grid-column: span 2;" title="Display name, free text"><span class="k">name</span><input bind:value={draft.name} /></label>
+          <label class="field" title="Port the server listens on; pre-flight checks it is free (--port)"><span class="k">port</span><input type="number" bind:value={draft.server.port} oninput={scheduleCheck} /></label>
+          <label class="field" style="grid-column: span 2;" title={`Name clients pass as 'model', unique across running servers (${isSgLang ? "--served-model-name" : "--alias"})`}><span class="k">served name</span><input bind:value={draft.server.alias} oninput={scheduleCheck} /></label>
+          {#if isSgLang}
+            <label class="field" style="grid-column: span 2;" title="Interface to bind; 127.0.0.1 stays local, 0.0.0.0 is every interface (--host)"><span class="k">host</span><input bind:value={draft.server.host} oninput={scheduleCheck} placeholder="127.0.0.1" /></label>
+          {/if}
         </div>
       </section>
 
       <!-- model + build -->
       <section class="card">
-        <div class="sec">Model <span class="faint">{models.length} GGUF files under the model roots</span></div>
+        <div class="sec">Model <span class="faint">{isSgLang ? "a .gguf file or a Hugging Face safetensors folder" : `${ggufModels.length} GGUF files in the roots`}</span></div>
         <div class="formgrid">
-          <label class="field" style="grid-column: 1 / -1;">
+          {#if modelEngine !== "diffusion-gemma"}
+            <label class="field" style="grid-column: span 2;" title="Which server runs this profile: a llama.cpp build, or SGLang from the venv in Settings">
+              <span class="k">engine</span>
+              <select value={draft.engine ?? "llama-server"} onchange={(e) => onEnginePick(e.target.value)}>
+                <option value="llama-server">llama-server (llama.cpp build)</option>
+                <option value="sglang">SGLang (Python venv)</option>
+                {#if isDiffusion}<option value="diffusion-gemma">DiffusionGemma</option>{/if}
+              </select>
+            </label>
+          {/if}
+          {#if isSgLang}
+            <label class="field" style="grid-column: span 4;" title="A .gguf file or a Hugging Face checkpoint folder, inside the roots or not (--model-path)">
+              <span class="k">model path</span>
+              <input bind:value={draft.model.path} oninput={() => { creator = null; scheduleCheck(); }} placeholder="/models/Qwen3-27B-GGUF/model.gguf, or /models/Qwen3-27B (safetensors)" />
+            </label>
+            {#if models.length}
+              <label class="field" style="grid-column: 1 / -1;" title="Fills the path from the scan: GGUF files and Hugging Face checkpoint folders">
+                <span class="k">scanned models</span>
+                <select value={selectedModel?.path ?? ""} onchange={(e) => { if (e.target.value) onModelPick(e.target.value); }}>
+                  <option value="">— pick one —</option>
+                  {#if hfModels.length}
+                    <optgroup label="Hugging Face checkpoints (safetensors)">
+                      {#each hfModels as m}<option value={m.path}>{modelLabel(m)}</option>{/each}
+                    </optgroup>
+                  {/if}
+                  {#if ggufModels.length}
+                    <optgroup label="GGUF files">
+                      {#each ggufModels as m}<option value={m.path}>{modelLabel(m)}</option>{/each}
+                    </optgroup>
+                  {/if}
+                </select>
+              </label>
+            {/if}
+          {:else}
+          <label class="field" style="grid-column: {modelEngine !== 'diffusion-gemma' ? 'span 4' : '1 / -1'};" title="GGUF file the server loads (-m)">
             <span class="k">weights</span>
-            <select value={models.find((m) => samePath(m.path, draft.model.path))?.path ?? ""} onchange={(e) => onModelPick(e.target.value)}>
+            <select value={ggufModels.find((m) => samePath(m.path, draft.model.path))?.path ?? ""} onchange={(e) => onModelPick(e.target.value)}>
               <option value="" disabled>choose a model…</option>
-              {#each models as m}
+              {#each ggufModels as m}
                 <option value={m.path}>{modelLabel(m)}</option>
               {/each}
             </select>
           </label>
+          {/if}
           {#if header}
             <div class="facts" style="grid-column: 1 / -1;">
               <span><b>{header.model_name ?? base(draft.model.path)}</b></span>
@@ -737,28 +1004,43 @@
               {#if header.size_label}<span>{header.size_label}</span>{/if}
               <span>{header.block_count} layers</span>
               <span>trained context {fmtInt(header.context_length ?? 0)}</span>
-              {#if header.source_repo}<span title="from GGUF general.base_model">{header.source_repo}</span>{/if}
-              {#if mtpBuiltIn}<span class="chip pass">MTP built in</span>{/if}
-              {#if isDiffusion}<span class="chip note" title="A diffusion LM: each reply is denoised in whole blocks of this many tokens, by Unsloth's DiffusionGemma runner behind fidim-dg.exe.">diffusion · canvas {canvas}</span>{/if}
+              {#if header.source_repo}<span title="Source repo from the GGUF header (general.base_model)">{header.source_repo}</span>{/if}
+              {#if mtpBuiltIn}<span class="chip pass" title="The header has next-token predict layers; MTP needs no draft file">MTP</span>{/if}
+              {#if isDiffusion}<span class="chip note" title="A diffusion LM: each reply is denoised in whole blocks of this many tokens">canvas {canvas}</span>{/if}
               <span class="path" style="flex-basis: 100%;">{draft.model.path}</span>
             </div>
+          {:else if hf}
+            <div class="facts" style="grid-column: 1 / -1;">
+              <span><b>{base(String(draft.model.path).replace(/[\\/]+$/, ""))}</b></span>
+              {#if hf.architecture || hf.model_type}<span>{hf.architecture ?? hf.model_type}{hf.architecture && hf.model_type && hf.architecture !== hf.model_type ? ` (${hf.model_type})` : ""}</span>{/if}
+              <span title="Quantization from config.json, else the checkpoint's torch_dtype">{hf.quantization || hf.torch_dtype || "safetensors"}</span>
+              {#if hf.num_layers != null}<span title="Transformer layers; on a hybrid model only the attention count carries a KV cache">{hf.num_layers} layers{hf.attention_layers != null && hf.attention_layers !== hf.num_layers ? ` (${hf.attention_layers} attention)` : ""}</span>{/if}
+              {#if hf.num_experts}<span>{hf.num_experts} experts</span>{/if}
+              {#if hf.max_position_embeddings}<span>trained context {fmtInt(hf.max_position_embeddings)}</span>{/if}
+              {#if hf.weights_bytes}<span>{fmtGib(hf.weights_bytes)} weights</span>{/if}
+              {#if hf.has_vision}<span class="chip note" title="The checkpoint carries a vision tower; SGLang serves images through it">vision</span>{/if}
+              {#if !isSgLang}<span class="chip warn" title="A safetensors checkpoint loads only on SGLang; pick that engine above">needs sglang</span>{/if}
+              <span class="path" style="flex-basis: 100%;">{draft.model.path}</span>
+            </div>
+          {:else if draft.model.path && isSgLang}
+            <div class="facts" style="grid-column: 1 / -1;"><span class="chip note" title="Not under the roots or not scanned yet; pre-flight checks that it exists">not in scan</span><span class="path">{draft.model.path}</span></div>
           {:else if draft.model.path}
-            <div class="facts" style="grid-column: 1 / -1;"><span class="chip warn">not in scan</span><span class="path">{draft.model.path}</span></div>
+            <div class="facts" style="grid-column: 1 / -1;"><span class="chip warn" title="Not under the roots or not scanned yet; pre-flight checks that it exists">not in scan</span><span class="path">{draft.model.path}</span></div>
           {/if}
           {#if engineMismatch}
-            <div class="notice" style="grid-column: 1 / -1;" title="The engine is set when a model is picked. This profile names one engine but its model needs the other; pre-flight blocks the launch until they agree.">
+            <div class="notice" style="grid-column: 1 / -1;" title="The model needs the other engine; pre-flight blocks the launch until they agree">
               <span class="chip block">needs {modelEngine}</span>
-              <span>this profile runs {draft.engine ?? "llama-server"}. <button class="link" onclick={() => onModelPick(draft.model.path)}>Switch the engine</button> to match the model.</span>
+              <span>runs {draft.engine ?? "llama-server"} · <button class="link" onclick={() => onModelPick(draft.model.path)}>Switch</button></span>
             </div>
           {/if}
-          {#if !isDiffusion}
-          <label class="field" style="grid-column: span 3;" title="Multimodal projector paired with the weights; lets the server read images.">
-            <span class="k">vision projector (mmproj)</span>
+          {#if !isDiffusion && !isSgLang}
+          <label class="field" style="grid-column: span 3;" title="Multimodal projector paired with the weights so the server can read images (--mmproj)">
+            <span class="k">vision projector</span>
             <select bind:value={draft.model.mmproj} onchange={scheduleCheck}>
               <option value={null}>none</option>
               {#each selectedModel?.mmproj_candidates ?? [] as c}<option value={c}>{base(c)}</option>{/each}
               {#if allMmproj.some((p) => !(selectedModel?.mmproj_candidates ?? []).includes(p))}
-                <optgroup label="elsewhere under your model folders">
+                <optgroup label="elsewhere in the roots">
                   {#each allMmproj.filter((p) => !(selectedModel?.mmproj_candidates ?? []).includes(p)) as c}<option value={c}>{base(c)} — {c.split(/[\\/]/).slice(-2, -1)[0]}</option>{/each}
                 </optgroup>
               {/if}
@@ -767,13 +1049,13 @@
               {/if}
             </select>
           </label>
-          <label class="field" style="grid-column: span 3;" title="A small draft model or MTP sidecar file for speculative decoding. Files beside the model come first, then any whose name matches this model, then everything else under your model folders. Turned on in the Speculative decoding section.">
-            <span class="k">speculative draft file</span>
+          <label class="field" style="grid-column: span 3;" title="Small draft model or MTP sidecar for speculative decoding, turned on below (-md)">
+            <span class="k">draft file</span>
             <select value={draft.model.draft?.path ?? ""} onchange={(e) => onDraftPick(e.target.value)}>
               <option value="">none</option>
               {#each selectedModel?.draft_candidates ?? [] as c}<option value={c}>{base(c)}</option>{/each}
               {#if allDrafts.some((p) => !(selectedModel?.draft_candidates ?? []).includes(p))}
-                <optgroup label="elsewhere under your model folders">
+                <optgroup label="elsewhere in the roots">
                   {#each allDrafts.filter((p) => !(selectedModel?.draft_candidates ?? []).includes(p)) as c}<option value={c}>{base(c)} — {c.split(/[\\/]/).slice(-2, -1)[0]}</option>{/each}
                 </optgroup>
               {/if}
@@ -783,10 +1065,11 @@
             </select>
           </label>
           {/if}
+          {#if !isSgLang}
           <label class="field" style="grid-column: span 3;" title={isDiffusion
-            ? "Which build supplies the DiffusionGemma runner (llama-diffusion-gemma-visual-server.exe). Unsloth's builds carry it (install one from the Updates tab), and so does a locally patched build of Unsloth's source, labelled with its patch name."
-            : "Which llama.cpp build launches this profile. Updates installs new builds side by side and can promote profiles to them."}>
-            <span class="k">llama.cpp build</span>
+            ? "Build that carries the DiffusionGemma runner; Unsloth's builds and patched builds of them do"
+            : "llama.cpp build that launches this profile; Updates installs more side by side"}>
+            <span class="k">build</span>
             <select value={selectedBuild?.path ?? ""} onchange={(e) => onBuildPick(e.target.value)}>
               <option value="" disabled>choose a build…</option>
               {#each builds as b}
@@ -797,12 +1080,12 @@
             </select>
           </label>
           {#if selectedBuild?.bundled_runtime}
-            <label class="field" style="grid-column: span 3;" title="This build ships its own ROCm DLLs and runs with nothing added to PATH, so the runtime picker does not apply to it.">
+            <label class="field" style="grid-column: span 3;" title="This build ships its own ROCm, so no runtime applies">
               <span class="k">ROCm runtime</span>
               <select disabled><option>bundled with this build</option></select>
             </label>
           {:else}
-          <label class="field" style="grid-column: span 3;" title="ROCm runtime this server runs against; its DLL folders go first on PATH. Newest first; install more from the Updates tab.">
+          <label class="field" style="grid-column: span 3;" title="ROCm whose libraries go first on PATH; install more from Updates">
             <span class="k">ROCm runtime</span>
             <select bind:value={draft.rocm_runtime} onchange={scheduleCheck}>
               <option value={null}>config default ({runtimes.find((r) => r.is_default)?.name ?? "default"}{runtimes.find((r) => r.is_default)?.version ? ` · ${runtimes.find((r) => r.is_default).version}` : ""})</option>
@@ -815,58 +1098,60 @@
           {#if isDiffusion && !runnerBuilds.length}
             <div class="notice" style="grid-column: 1 / -1;">
               <span class="chip block">no runner</span>
-              <span>No installed build carries the DiffusionGemma runner. Save this profile, then <button class="link" onclick={() => go("updates")} title="Opens the Updates tab; unsaved edits here are dropped when you leave this tab.">install an Unsloth build from Updates</button>.</span>
+              <span>Save, then <button class="link" onclick={() => go("updates")} title="Opens Updates; unsaved edits here are dropped">install an Unsloth build from Updates</button></span>
             </div>
+          {/if}
           {/if}
         </div>
       </section>
 
       <!-- devices -->
       <section class="card">
-        <div class="sec">GPU placement <span class="faint">{isDiffusion ? "exactly one card for the diffusion engine" : "one card, or a layer split across two"}</span></div>
+        <div class="sec">GPU placement <span class="faint">{isDiffusion || isSgLang ? "one card" : "one card, or a layer split across two"}</span></div>
         <div class="devrows">
           {#each devices.filter((d) => !d.integrated) as dev}
-            {@const entry = isDiffusion
+            {@const entry = isDiffusion || isSgLang
               ? (draft.devices[0]?.key === dev.stable_key ? draft.devices[0] : undefined)
               : draft.devices.find((x) => x.key === dev.stable_key)}
             {@const used = dev.total_mib - dev.free_mib}
             {@const users = occupancy[dev.stable_key] ?? []}
             <label class="devrow" class:on={!!entry}>
               {#if isDiffusion}
-                <input type="radio" name="dg-device" checked={!!entry} onchange={() => toggleDevice(dev)} title="The diffusion runner gets this one card; picking another moves it." />
+                <input type="radio" name="dg-device" checked={!!entry} onchange={() => toggleDevice(dev)} title="The runner gets this one card; picking another moves it" />
+              {:else if isSgLang}
+                <input type="radio" name="sg-device" checked={!!entry} onchange={() => toggleDevice(dev)} title="SGLang gets this one card; picking another moves it (HIP_VISIBLE_DEVICES)" />
               {:else}
                 <input type="checkbox" checked={!!entry} onchange={() => toggleDevice(dev)} />
               {/if}
               <span class="dname">
                 <b>{dev.name.replace(/^AMD /, "")}</b>
                 <span class="mono faint">{dev.stable_key.split(":").pop()} · {dev.backend}{dev.hip_index}</span>
-                {#if dev.display}<span class="chip warn">display attached</span>{/if}
-                {#if isDiffusion && users.length}<span class="chip warn" title="The runner sizes its context to the VRAM it believes is free, and Windows hides other processes' allocations from it, so sharing a card can push either model into shared memory. Pick an empty card when you can.">in use: {users.join(", ")}</span>{/if}
+                {#if dev.display}<span class="chip warn" title="This card drives a display; the desktop needs about 1.5 GB of it">display</span>{/if}
+                {#if isDiffusion && users.length}<span class="chip warn" title="Running here: {users.join(", ")}. The runner cannot see their VRAM and may spill into shared memory; prefer an empty card">in use</span>
+                {:else if isSgLang && users.length}<span class="chip warn" title="Running here: {users.join(", ")}. SGLang takes its VRAM share up front; they must fit in the rest">in use</span>{/if}
               </span>
               <span class="dmeter">
                 <span class="meter"><span class="fill {used / dev.total_mib > 0.9 ? 'block' : used / dev.total_mib > 0.7 ? 'warn' : 'pass'}" style="width: {Math.round(100 * used / Math.max(1, dev.total_mib))}%;"></span></span>
                 <span class="mono faint num">{(dev.free_mib / 1024).toFixed(1)} of {(dev.total_mib / 1024).toFixed(0)} GiB free</span>
               </span>
               {#if entry && !isDiffusion && draft.devices.length > 1}
-                <span class="frac" title="Share of the layers placed on this card. Blank = split evenly.">
-                  <span class="k">fraction</span>
+                <span class="frac" title="Share of the layers on this card; blank splits evenly (--tensor-split)">
+                  <span class="k">share</span>
                   <input type="number" step="0.05" min="0" max="1" placeholder="auto" bind:value={entry.split_fraction} oninput={scheduleCheck} />
                 </span>
               {/if}
             </label>
           {/each}
         </div>
-        {#if isDiffusion}
-          <div class="faint small" style="margin-top: 8px;">One card only: more than one visible device makes the runner abort every prompt. The iGPU is never used.</div>
-        {:else if draft.devices.length > 1}
+        {#if draft.devices.length > 1 && !isDiffusion && !isSgLang}
           <div class="formgrid" style="margin-top: 14px;">
-            <label class="field" style="grid-column: span 2;" title="layer: whole layers per card (supported, no cross-GPU collectives). row: split each tensor across cards (experimental on this stack)."><span class="k">split mode</span>
+            <label class="field" style="grid-column: span 2;" title="layer puts whole layers on each card; row splits every tensor, experimental (--split-mode)"><span class="k">split mode</span>
               <select bind:value={draft.split_mode} onchange={scheduleCheck}>
                 <option value="layer">layer (supported)</option>
                 <option value="row">row (experimental)</option>
               </select>
             </label>
-            <label class="field" style="grid-column: span 2;" title="Which selected card holds the KV cache and small tensors — index into the checked cards above, in order."><span class="k">main device (list index)</span>
+            <label class="field" style="grid-column: span 2;" title="Index, in order, of the checked card that holds the KV cache and small tensors (--main-gpu)"><span class="k">main device</span>
               <input type="number" min="0" bind:value={draft.main_device} oninput={scheduleCheck} />
             </label>
           </div>
@@ -876,16 +1161,32 @@
             {#each budgets as b}
               <div>
                 <div class="cap">
-                  <span>estimated need on {b.name.replace(/^AMD /, "")} <span class="faint">({b.key.split(":").pop()})</span></span>
+                  <span>estimate on {b.name.replace(/^AMD /, "")} <span class="faint">({b.key.split(":").pop()})</span></span>
                   <span><span class="num">{b.estGib.toFixed(2)}</span> of <span class="num">{b.freeGib.toFixed(2)}</span> GiB free · {Math.round(b.frac * 100)}%</span>
                 </div>
                 <div class="bar" title={b.detail}>
                   <div class="fill {b.kind}" style="width: {Math.min(100, b.frac * 100)}%;"></div>
                   <div class="mark" style="left: 90%;"></div>
                 </div>
-                <div class="faint small" style="margin-top: 4px;">{b.detail}</div>
               </div>
             {/each}
+          </div>
+        {/if}
+        {#if sgBudget}
+          <div class="budget">
+            <div>
+              <div class="cap">
+                <span>static pool on {sgBudget.name.replace(/^AMD /, "")} <span class="faint">({sgBudget.key.split(":").pop()})</span></span>
+                <span><span class="num">{sgBudget.estGib.toFixed(2)}</span> of <span class="num">{sgBudget.totalGib.toFixed(2)}</span> GiB · {Math.round(sgBudget.frac * 100)}% · <span class="num">{sgBudget.freeGib.toFixed(2)}</span> GiB free now</span>
+              </div>
+              <div class="bar" title="The bar is the card, the mark what is free now; the pool must fit in the free part">
+                <div class="fill {sgBudget.kind}" style="width: {Math.min(100, sgBudget.frac * 100)}%;"></div>
+                <div class="mark" style="left: {Math.min(100, sgBudget.freeFrac * 100)}%;"></div>
+              </div>
+              {#each sgBudget.assumptions as a}
+                <div class="faint small" style="margin-top: 4px;">{a}</div>
+              {/each}
+            </div>
           </div>
         {/if}
       </section>
@@ -897,25 +1198,30 @@
           {#if isDiffusion}
             {@const predicted = dgSizing?.predicted_auto_maxtok ?? null}
             <Range bind:value={() => draft.runtime.ctx_total || null, (v) => (draft.runtime.ctx_total = v ?? 0)}
-              label="context budget (MAXTOK)" min={2048} max={65536} step={256} nullable offLabel="auto"
+              label="context budget" min={2048} max={65536} step={256} nullable offLabel="auto"
               placeholder={predicted ?? (faSized ? 65536 : 12288)} format={fmtInt} onchange={scheduleCheck} span={3}
               hint={`auto = largest that fits VRAM at load${predicted ? ` (≈ ${fmtInt(predicted)})` : ""}; one reply uses ceil(max_tokens/${canvas}) blocks`}
-              title={`Prompt plus reply, in tokens (the runner's MAXTOK). Off = auto: the runner picks the largest budget that fits the card's VRAM when it loads. ${faSized
-                ? "With flash attention on this patched runner it sizes by the per-request working set (a 32 GB card reaches the 65,536 ceiling); an explicit budget above the ceiling is ignored."
-                : "With flash attention off its scores buffer grows with the square of the budget, so a 32 GB card lands near 12K."} A reply is denoised in whole ${canvas}-token blocks, so ceil(max_tokens/${canvas}) blocks of this budget go to the answer and the rest bounds the prompt.`} />
-            <Range bind:value={draft.runtime.n_gpu_layers} label="GPU offload (layers, NGL)" min={0} max={layerMax + 1} step={1}
+              title={`Prompt plus reply in tokens; auto is the largest that fits the card at load${faSized ? ", up to 65,536 with flash attention" : ""} (MAXTOK)`} />
+            <Range bind:value={draft.runtime.n_gpu_layers} label="layers on GPU" min={0} max={layerMax + 1} step={1}
               hint={header ? `≥ ${layerMax + 1} = all, incl. the output layer; runner default is 0 = CPU` : "runner default is 0 = CPU; FIDIM always sends NGL"} onchange={scheduleCheck} span={3}
-              title={`Layers on the GPU, sent to the runner as NGL. Full offload needs the ${header ? layerMax : "model's"} blocks plus the output layer${header ? ` (${layerMax + 1})` : ""}; below that the runner is slow and sizes its context against system RAM. The runner's own default is 0 = CPU only, so Llama FIDIM always sends NGL.`} />
+              title={`Full offload needs all ${header ? layerMax : "the model's"} blocks plus the output layer${header ? ` (${layerMax + 1})` : ""}; the runner's own default is CPU (NGL)`} />
+          {:else if isSgLang && draft.sglang}
+            <Range bind:value={draft.runtime.ctx_total} label="context length" min={512} max={ctxMax} step={256}
+              hint={header || hf ? `model supports up to ${fmtInt(ctxMax)} tokens` : "not in scan — default cap"} format={fmtInt} onchange={scheduleCheck} span={3}
+              title="Longest prompt plus reply for one request; the KV pool itself is shared by all (--context-length)" />
+            <Range bind:value={draft.sglang.max_running_requests} label="concurrent requests" min={1} max={64} step={1}
+              hint="the router reports them as slots" onchange={scheduleCheck} span={3}
+              title="Requests decoded at once, each holding pool KV and a state slot (--max-running-requests)" />
           {:else}
-          <Range bind:value={draft.runtime.ctx_total} label="context length" title="Total tokens of context, split across slots. On sliding-window models VRAM barely grows with context; on dense models it grows linearly." min={512} max={ctxMax} step={256}
-            hint={header ? `model supports up to ${fmtInt(ctxMax)} tokens` : "no model header — default cap"} format={fmtInt} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.n_gpu_layers} label="GPU offload (layers)" title="How many transformer layers live on the GPU. Anything at or above the model's layer count = everything on GPU (fastest). Lower it only when the model does not fit." min={0} max={layerMax} step={1}
+          <Range bind:value={draft.runtime.ctx_total} label="context length" title="Total context tokens, divided across the slots (-c)" min={512} max={ctxMax} step={256}
+            hint={header ? `model supports up to ${fmtInt(ctxMax)} tokens` : "not in scan — default cap"} format={fmtInt} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.n_gpu_layers} label="layers on GPU" title="Layers held on the GPU; at or above the model's count is a full offload (-ngl)" min={0} max={layerMax} step={1}
             hint={header ? `${layerMax} layers; ≥ ${layerMax} = all` : "99 = all"} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.slots} label="max concurrent requests (slots)" title="-np: parallel request slots. Context divides evenly across them." min={1} max={16} step={1}
+          <Range bind:value={draft.runtime.slots} label="request slots" title="Parallel request slots; the context divides evenly across them (-np)" min={1} max={16} step={1}
             hint={`per-slot context = ${fmtInt(Math.floor(draft.runtime.ctx_total / Math.max(1, draft.runtime.slots)))}`} onchange={scheduleCheck} span={3} />
-          <label class="field" style="grid-column: span 3; justify-content: end;" title="One shared KV pool across slots instead of a fixed share per slot. Experimental.">
-            <span class="k">unified KV cache</span>
-            <span><input type="checkbox" bind:checked={draft.runtime.kv_unified} onchange={scheduleCheck} /> one shared KV pool across slots</span>
+          <label class="field" style="grid-column: span 3; justify-content: end;" title="One KV pool shared by all slots instead of a fixed share each; experimental (-kvu)">
+            <span class="k">unified cache</span>
+            <span><input type="checkbox" bind:checked={draft.runtime.kv_unified} onchange={scheduleCheck} /> on</span>
           </label>
           {/if}
         </div>
@@ -925,61 +1231,186 @@
         {@const maxTok = Number(draft.diffusion.default_max_tokens) || 0}
         <!-- diffusion -->
         <section class="card">
-          <div class="sec">Diffusion <span class="faint">settings of the DiffusionGemma runner; sampling, speculative decoding and batching do not apply</span></div>
+          <div class="sec">Diffusion <span class="faint">runner settings; sampling and batching do not apply</span></div>
           <div class="formgrid">
-            <Range bind:value={draft.diffusion.default_max_tokens} label="default reply budget (max_tokens)" min={256} max={8192} step={256}
+            <Range bind:value={draft.diffusion.default_max_tokens} label="reply budget" min={256} max={8192} step={256}
               hint={`= ${Math.ceil(maxTok / canvas)} blocks; a client's max_tokens overrides; the thought channel uses blocks too`}
               format={fmtInt} onchange={scheduleCheck} span={3}
-              title={`Reply budget when a request sends no max_tokens. The runner denoises whole ${canvas}-token blocks, so this is spent in ceil(max_tokens/${canvas}) blocks, and the model's thinking comes out of the same budget. Bigger budgets leave less of the context for the prompt.`} />
-            <label class="field" style="grid-column: span 3;" title="Seed for requests that do not send one. Empty = a random seed per request; a fixed seed makes replies to the same prompt repeat.">
+              title={`Reply tokens when a request sends none, spent in whole ${canvas}-token blocks together with the thinking (max_tokens)`} />
+            <label class="field" style="grid-column: span 3;" title="Seed for requests that send none; empty is random per request">
               <span class="k">seed</span>
               <input type="number" step="1" placeholder="random per request" value={draft.diffusion.seed ?? ""}
                 oninput={(e) => { draft.diffusion.seed = e.target.value === "" ? null : e.target.value; scheduleCheck(); }} />
             </label>
-            <label class="field" style="grid-column: span 3;" title="Sets ROCBLAS_USE_HIPBLASLT=0 and ROCBLAS_USE_HIPBLASLT_BATCHED=0 for the runner. Without it the first denoise step intermittently fails with 'MUL_MAT failed / ROCm error: invalid argument'. Measured no speed cost; leave it on.">
+            <label class="field" style="grid-column: span 3;" title="Keeps rocBLAS off hipBLASLt at no cost (ROCBLAS_USE_HIPBLASLT=0). Off, the first denoise step sometimes fails.">
               <span class="k">hipBLASLt safeguard</span>
               <span>
-                <input type="checkbox" bind:checked={draft.diffusion.hipblaslt_safeguard} onchange={scheduleCheck} /> keep rocBLAS off hipBLASLt
-                {#if !draft.diffusion.hipblaslt_safeguard}<span class="chip warn">intermittent MUL_MAT failures</span>{/if}
+                <input type="checkbox" bind:checked={draft.diffusion.hipblaslt_safeguard} onchange={scheduleCheck} /> on
+                {#if !draft.diffusion.hipblaslt_safeguard}<span class="chip warn" title="Without the safeguard the first denoise step intermittently fails with MUL_MAT / invalid argument">unsafe</span>{/if}
               </span>
             </label>
             <label class="field" style="grid-column: span 3;" title={faWorks
-              ? `Sends FA=1 to the runner. This build pads keys for the flash-attention kernel of DiffusionGemma's 512-dim heads, so they run on the GPU and it is faster${faTurnSizing ? "; the runner then sizes its context by the per-request working set instead of the N² scores buffer (65,536 on a 32 GB card instead of ≈12K)" : ""}. Separate from llama-server's flash attention setting.`
-              : "Sends FA=1 to the runner. On this build DiffusionGemma's 512-dim attention heads get no flash-attention kernel (their key count is not padded to its 256-key stride) and fall back to the CPU, which is slower. A patched runner build fixes that (Updates: Install with FIDIM runner patch). Separate from llama-server's flash attention setting."}>
+              ? `This patched build runs the 512-dim heads on the GPU${faTurnSizing ? " and sizes the context by working set" : ""} (FA=1)`
+              : "On this build the 512-dim heads fall back to the CPU; a patched runner from Updates fixes that (FA=1)"}>
               <span class="k">flash attention</span>
               <span>
-                <input type="checkbox" bind:checked={draft.diffusion.flash_attn} onchange={scheduleCheck} /> FA=1
-                {#if draft.diffusion.flash_attn && !faWorks}<span class="chip warn">512-dim heads fall back to CPU on this build</span>
-                {:else if !draft.diffusion.flash_attn && faWorks}<span class="chip accent">recommended on this build</span>{/if}
+                <input type="checkbox" bind:checked={draft.diffusion.flash_attn} onchange={scheduleCheck} /> on
+                {#if draft.diffusion.flash_attn && !faWorks}<span class="chip warn" title="The 512-dim heads have no flash kernel on this build and fall back to the CPU">slower</span>
+                {:else if !draft.diffusion.flash_attn && faWorks}<span class="chip accent" title="This build pads keys so flash attention runs the heads on the GPU">recommended</span>{/if}
               </span>
             </label>
           </div>
           {#if dgEnvConflicts.length}
-            <div class="notice" style="margin-top: 12px;" title="Llama FIDIM sets these itself for every diffusion run (card pinning, NGL, MAXTOK, FA, memory sizing, the hipBLASLt safeguard); a profile env entry would override them.">
+            <div class="notice" style="margin-top: 12px;" title="Llama FIDIM sets these itself for every diffusion run; a profile env entry would override them">
               <span class="chip block">env conflict</span>
-              <span>the profile env sets <span class="mono">{dgEnvConflicts.join(", ")}</span>.</span>
-              <button class="btn small" onclick={dropEnvConflicts}>Remove from env</button>
+              <span class="mono">{dgEnvConflicts.join(", ")}</span>
+              <button class="btn small" onclick={dropEnvConflicts}>Remove</button>
             </div>
           {/if}
-          <div class="faint small" style="margin-top: 10px;">
-            The model always thinks; its reasoning arrives as <span class="mono">reasoning_content</span>. Tool calls come back as raw text in the reply.
-            Diffusion profiles run standalone: no keep-alive, no router membership, no benchmarks.
-            Llama FIDIM also sends <span class="mono">GPU_RESOURCE_CACHE_SIZE=0</span>, so the runner does not keep freed memory after long prompts; a profile env entry overrides it.
+          <div class="faint small" style="margin-top: 10px;" title="Also sends GPU_RESOURCE_CACHE_SIZE=0 so freed memory is returned; a profile env entry overrides it">
+            Reasoning arrives as <span class="mono">reasoning_content</span>, tool calls as text; no keep-alive, router or benchmarks.
           </div>
         </section>
       {/if}
 
-      {#if !isDiffusion}
+      {#if isSgLang && draft.sglang}
+        <!-- sglang -->
+        <section class="card">
+          <div class="sec">SGLang <span class="faint">server flags; sampling comes from each request</span></div>
+          <div class="formgrid">
+            <Range bind:value={draft.sglang.mem_fraction} label="VRAM share" min={0.3} max={0.98} step={0.01}
+              hint={sgDevice?.display ? "display on this card: keep ≥ 1.5 GB free (0.85 on 32 GB)" : "weights + KV pool"}
+              format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3}
+              title="Share of the card SGLang reserves for weights and cache; leave 1.5 GB when the card drives a display (--mem-fraction-static)" />
+            <Range bind:value={draft.sglang.chunked_prefill} label="prompt chunk" min={512} max={32768} step={512}
+              hint="tokens per forward pass" format={fmtInt} onchange={scheduleCheck} span={3}
+              title="Prompt tokens per prefill pass; larger is faster but takes more VRAM (--chunked-prefill-size)" />
+            <Range bind:value={draft.sglang.mamba_slots} label="state slots" min={1} max={256} step={1} nullable offLabel="auto"
+              placeholder={Math.max(1, Number(draft.sglang.max_running_requests) || 1) * 5}
+              hint="hybrid (GatedDeltaNet) models; auto = 5 × concurrent requests" onchange={scheduleCheck} span={3}
+              title="Recurrent-state slots on a hybrid model, one per running or queued request (--max-mamba-cache-size)" />
+            <Range bind:value={draft.sglang.memguard_gb} label="host RAM guard" min={0} max={128} step={1}
+              hint="GB per process" onchange={scheduleCheck} span={3}
+              title="Aborts the server when its host RSS passes this GB, ahead of the OOM killer (memguard). A GGUF needs file size plus margin." />
+            <label class="field" style="grid-column: span 2;" title="KV pool storage type; fp8_e4m3 halves it against bf16, fp4_mx_block16 halves it again and needs the gfx1201 kernel patch (--kv-cache-dtype)">
+              <span class="k">cache precision</span>
+              <select bind:value={draft.sglang.kv_cache_dtype} onchange={scheduleCheck}>
+                {#each SG_KV_DTYPES as t}<option value={t}>{t}</option>{/each}
+                {#if !SG_KV_DTYPES.includes(draft.sglang.kv_cache_dtype)}<option value={draft.sglang.kv_cache_dtype}>{draft.sglang.kv_cache_dtype}</option>{/if}
+              </select>
+            </label>
+            <label class="field" style="grid-column: span 2;" title="triton is the one that runs on gfx1201; the others are for other cards (--attention-backend)">
+              <span class="k">attention kernel</span>
+              <select bind:value={draft.sglang.attention_backend} onchange={scheduleCheck}>
+                {#each SG_ATTN_BACKENDS as t}<option value={t}>{t}</option>{/each}
+                {#if !SG_ATTN_BACKENDS.includes(draft.sglang.attention_backend)}<option value={draft.sglang.attention_backend}>{draft.sglang.attention_backend}</option>{/if}
+              </select>
+            </label>
+            <label class="field" style="grid-column: span 2;" title="Type for unquantised weights and activations; bfloat16 is safe, float16 can overflow (--dtype)">
+              <span class="k">compute precision</span>
+              <select bind:value={draft.sglang.dtype} onchange={scheduleCheck}>
+                {#each SG_DTYPES as t}<option value={t}>{t}</option>{/each}
+                {#if !SG_DTYPES.includes(draft.sglang.dtype)}<option value={draft.sglang.dtype}>{draft.sglang.dtype}</option>{/if}
+              </select>
+            </label>
+            <label class="field" style="grid-column: span 3;" title="Splits thinking into reasoning_content; other… takes any name SGLang knows (--reasoning-parser)">
+              <span class="k">reasoning parser</span>
+              <select value={parserSel("reasoning_parser", SG_REASONING_PARSERS)} onchange={(e) => onParserPick("reasoning_parser", e.target.value, SG_REASONING_PARSERS)}>
+                <option value="">none</option>
+                {#each SG_REASONING_PARSERS as v}<option value={v}>{v}</option>{/each}
+                <option value="__custom">other…</option>
+              </select>
+              {#if parserSel("reasoning_parser", SG_REASONING_PARSERS) === "__custom"}
+                <input bind:value={draft.sglang.reasoning_parser} oninput={scheduleCheck} placeholder="parser name as SGLang spells it" />
+              {/if}
+            </label>
+            <label class="field" style="grid-column: span 3;" title="Turns tool-call markup into tool_calls; other… takes any name SGLang knows (--tool-call-parser)">
+              <span class="k">tool call parser</span>
+              <select value={parserSel("tool_call_parser", SG_TOOL_PARSERS)} onchange={(e) => onParserPick("tool_call_parser", e.target.value, SG_TOOL_PARSERS)}>
+                <option value="">none</option>
+                {#each SG_TOOL_PARSERS as v}<option value={v}>{v}</option>{/each}
+                <option value="__custom">other…</option>
+              </select>
+              {#if parserSel("tool_call_parser", SG_TOOL_PARSERS) === "__custom"}
+                <input bind:value={draft.sglang.tool_call_parser} oninput={scheduleCheck} placeholder="parser name as SGLang spells it" />
+              {/if}
+            </label>
+            <Range bind:value={draft.sglang.compile_threads} label="compile workers" min={1} max={32} step={1}
+              hint="a small pool only slows the first launch" onchange={scheduleCheck} span={3}
+              title="Kernel compile processes, each a torch import in host RAM (TORCHINDUCTOR_COMPILE_THREADS)" />
+            <div style="grid-column: span 3;"></div>
+            <label class="field" style="grid-column: span 3;" title="Prometheus counters on /metrics for the Running tab and the router; leave on (--enable-metrics)">
+              <span class="k">metrics endpoint</span>
+              <span><input type="checkbox" bind:checked={draft.sglang.enable_metrics} onchange={scheduleCheck} /> on</span>
+            </label>
+            <label class="field" style="grid-column: span 3;" title="Blocks in a socket poll between requests instead of spinning a full CPU core (--sleep-on-idle)">
+              <span class="k">sleep when idle</span>
+              <span><input type="checkbox" bind:checked={draft.sglang.sleep_on_idle} onchange={scheduleCheck} /> on</span>
+            </label>
+            <label class="field" style="grid-column: 1 / -1;" title="More model names the router maps to this server, comma-separated">
+              <span class="k">extra names</span>
+              <input value={Array.isArray(draft.sglang.aliases) ? draft.sglang.aliases.join(", ") : draft.sglang.aliases}
+                oninput={(e) => { draft.sglang.aliases = e.target.value; scheduleCheck(); }} placeholder="ddg, qwen-daily" />
+            </label>
+            <label class="field" style="grid-column: 1 / -1;" title="Passed to sglang.launch_server unchanged, one per line; a flag and its value are two lines">
+              <span class="k">extra arguments</span>
+              <textarea rows="3" value={Array.isArray(draft.sglang.extra_args) ? draft.sglang.extra_args.join("\n") : draft.sglang.extra_args}
+                oninput={(e) => { draft.sglang.extra_args = e.target.value; scheduleCheck(); }} placeholder={"--disable-radix-cache\n--schedule-policy\nfcfs"}></textarea>
+            </label>
+            <label class="field" style="grid-column: 1 / -1;" title="KEY=VALUE per line for the server process, on top of what Settings sets for every run">
+              <span class="k">environment</span>
+              <textarea rows="3" value={sgEnvText} oninput={(e) => onEnvText(e.target.value)} placeholder={"SGLANG_TORCH_PROFILER_DIR=/tmp/prof\nHSA_OVERRIDE_GFX_VERSION=12.0.1"}></textarea>
+            </label>
+          </div>
+        </section>
+
+        <!-- sglang speculative decoding -->
+        <section class="card">
+          <div class="sec">
+            Speculative decoding
+            {#if mtpBuiltIn}<span class="chip pass" title="The checkpoint has its own draft head (next-token predict layers)">MTP</span>{/if}
+          </div>
+          <div class="formgrid">
+            <label class="field" style="grid-column: span 3;" title="On sends --speculative-algorithm with the settings below">
+              <span class="k">enabled</span>
+              <span><input type="checkbox" checked={!!draft.sglang.spec} onchange={(e) => onSgSpecToggle(e.target.checked)} /> {draft.sglang.spec ? "on" : "off"}</span>
+            </label>
+            {#if draft.sglang.spec}
+              <label class="field" style="grid-column: span 3;" title="NEXTN uses the model's own draft head, EAGLE a draft model from extra arguments, NGRAM prompt lookup">
+                <span class="k">algorithm</span>
+                <select bind:value={draft.sglang.spec.algorithm} onchange={scheduleCheck}>
+                  {#each SG_SPEC_ALGOS as a}<option value={a}>{a === "NEXTN" ? "the model's own draft head (NEXTN)" : a === "NGRAM" ? "prompt lookup, no model (NGRAM)" : a}</option>{/each}
+                  {#if !SG_SPEC_ALGOS.includes(draft.sglang.spec.algorithm)}<option value={draft.sglang.spec.algorithm}>{draft.sglang.spec.algorithm}</option>{/if}
+                </select>
+              </label>
+              <Range bind:value={draft.sglang.spec.steps} label="draft steps" min={1} max={8} step={1} hint="SGLang default 3" onchange={scheduleCheck} span={2}
+                title="Draft head runs per verify pass (--speculative-num-steps)" />
+              <Range bind:value={draft.sglang.spec.topk} label="draft top-k" min={1} max={8} step={1} hint="SGLang default 1" onchange={scheduleCheck} span={2}
+                title="Branches kept per step; 1 is what an MTP head is trained for (--speculative-eagle-topk)" />
+              <Range bind:value={draft.sglang.spec.draft_tokens} label="draft tokens" min={1} max={16} step={1} hint="SGLang default 4" onchange={scheduleCheck} span={2}
+                title="Tokens verified per pass; more is faster if accepted, wasted if not (--speculative-num-draft-tokens)" />
+              <label class="field" style="grid-column: 1 / -1;" title="Torch-saved id tensor limiting the draft head to hot tokens; empty is full (--speculative-token-map)">
+                <span class="k">hot-token map</span>
+                <input bind:value={draft.sglang.spec.token_map} oninput={scheduleCheck} placeholder="/models/hot_tokens.pt" />
+              </label>
+            {/if}
+          </div>
+          {#if draft.sglang.spec?.algorithm === "NEXTN" && header && !mtpBuiltIn}
+            <div class="notice" style="margin-top: 10px;"><span class="chip warn" title="NEXTN needs a checkpoint with next-token predict layers; this header reports none">no head</span><span>pick another algorithm</span></div>
+          {/if}
+        </section>
+      {/if}
+
+      {#if !isDiffusion && !isSgLang}
       <!-- speculative decoding -->
       <section class="card">
         <div class="sec">
           Speculative decoding
-          {#if mtpBuiltIn}<span class="chip pass">model supports MTP</span>{/if}
-          <span class="faint">guess several tokens per step, verify them in one pass</span>
-          <span style="margin-left: auto;"><button class="btn small" onclick={applySpecDefaults} disabled={draft.speculative.mode === "off"} title="engine defaults: 3 max, 0 min, 0.0 probability">Engine defaults</button></span>
+          {#if mtpBuiltIn}<span class="chip pass" title="The model has its own draft head (next-token predict layers)">MTP</span>{/if}
+          <span style="margin-left: auto;"><button class="btn small" onclick={applySpecDefaults} disabled={draft.speculative.mode === "off"} title="Sets llama-server's own defaults: 3 max, 0 min, 0.00 confidence">Engine defaults</button></span>
         </div>
         <div class="formgrid">
-          <label class="field" style="grid-column: span 3;" title="How drafts are produced. MTP uses the model's own multi-token head (built in for Qwen 3.5+/3.8, a sidecar file for Gemma 4). draft = a separate small model. DFlash = a DFlash draft file. n-gram = prompt lookup, no model.">
+          <label class="field" style="grid-column: span 3;" title="MTP uses the model's own head, draft a small model, DFlash a DFlash file, n-gram prompt lookup">
             <span class="k">mode</span>
             <select value={draft.speculative.mode} onchange={(e) => onSpecMode(e.target.value)}>
               {#each specModes as m}<option value={m.v}>{m.l}</option>{/each}
@@ -989,17 +1420,17 @@
             <div style="grid-column: span 3;"></div>
             <Range bind:value={draft.speculative.n_max} label="max draft tokens" min={1} max={16} step={1} nullable placeholder={3}
               hint="engine default 3" onchange={scheduleCheck} span={3}
-              title="--spec-draft-n-max: how many tokens the draft proposes per step. Higher = more speed when accepted, more waste when rejected." />
+              title="Tokens proposed per step; more is faster when accepted, wasted when rejected (--spec-draft-n-max)" />
             <Range bind:value={draft.speculative.n_min} label="min draft tokens" min={0} max={16} step={1} nullable placeholder={0}
               hint="engine default 0" onchange={scheduleCheck} span={3}
-              title="--spec-draft-n-min: skip speculation entirely when fewer than this many draft tokens are available." />
-            <Range bind:value={draft.speculative.p_min} label="draft probability" min={0} max={1} step={0.01} nullable placeholder={0}
+              title="Skip speculation when fewer draft tokens than this are available (--spec-draft-n-min)" />
+            <Range bind:value={draft.speculative.p_min} label="draft confidence" min={0} max={1} step={0.01} nullable placeholder={0}
               hint="engine default 0.00" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3}
-              title="--spec-draft-p-min: only keep draft tokens the draft itself is at least this confident in (greedy). 0 = keep all." />
+              title="Keep only draft tokens at least this likely; 0 keeps all (--spec-draft-p-min)" />
           {/if}
         </div>
         {#if draft.speculative.mode === "mtp" && !mtpBuiltIn && !draft.model.draft?.path}
-          <div class="notice" style="margin-top: 10px;"><span class="chip block">needs a head</span><span>MTP needs either a model with a built-in head or an MTP sidecar chosen above.</span></div>
+          <div class="notice" style="margin-top: 10px;"><span class="chip block" title="MTP needs a built-in head or an MTP sidecar in the draft file above">no head</span><span>pick an MTP sidecar as the draft file</span></div>
         {/if}
       </section>
 
@@ -1009,11 +1440,11 @@
           Inference
           <span class="faint">unchecked = the engine's own default</span>
           <span style="margin-left: auto; display: flex; gap: 8px;">
-            <button class="btn small" onclick={fetchCreator} disabled={creatorBusy || !draft.model.path} title="look up generation_config.json on Hugging Face">
+            <button class="btn small" onclick={fetchCreator} disabled={creatorBusy || !draft.model.path} title="Looks up generation_config.json on Hugging Face">
               {creatorBusy ? "Fetching…" : embedded ? "Re-check on Hugging Face" : "Creator defaults"}
             </button>
             {#if creatorShown}
-              <button class="btn small primary" onclick={applyCreator}>Apply creator defaults</button>
+              <button class="btn small primary" onclick={applyCreator} title="Copies the creator defaults into the fields below">Apply</button>
             {/if}
           </span>
         </div>
@@ -1030,34 +1461,34 @@
                 <span>top_k <b class="num">{creatorShown.top_k ?? "—"}</b></span>
                 <span>min_p <b class="num">{creatorShown.min_p ?? "—"}</b></span>
                 <span>repetition_penalty <b class="num">{creatorShown.repetition_penalty ?? "—"}</b></span>
-                <span class="faint">{creatorShown.embedded ? "embedded in the GGUF header by the converter" : (creatorShown.from_cache ? "cached" : "fetched") + " from generation_config.json"}</span>
+                <span class="faint">{creatorShown.embedded ? "from the GGUF header" : (creatorShown.from_cache ? "cached" : "fetched") + " from generation_config.json"}</span>
               </div>
             {/if}
           </div>
         {/if}
         <div class="formgrid">
-          <label class="field" style="grid-column: span 3;" title="Sets enable_thinking in the chat template. Off avoids the agentic loops some models fall into with thinking on; on gives reasoning traces."><span class="k">thinking</span>
+          <label class="field" style="grid-column: span 3;" title="Sets enable_thinking in the chat template; off avoids the agentic loops some models fall into"><span class="k">thinking</span>
             <select bind:value={draft.chat.enable_thinking} onchange={scheduleCheck}>
               <option value={null}>model default</option>
               <option value={true}>on</option>
-              <option value={false}>off (recommended for agentic use)</option>
+              <option value={false}>off</option>
             </select>
           </label>
           <div style="grid-column: span 3;"></div>
-          <Range bind:value={draft.sampling.temperature} label="temperature" title="Randomness of sampling. 0 = greedy, 1 = the model's raw distribution. Creator default shown as the hint when known." min={0} max={2} step={0.05} nullable placeholder={creatorShown?.temperature ?? 0.8}
+          <Range bind:value={draft.sampling.temperature} label="temperature" title="Randomness; 0 is greedy, 1 the model's raw distribution (--temp)" min={0} max={2} step={0.05} nullable placeholder={creatorShown?.temperature ?? 0.8}
             hint={creatorShown?.temperature != null ? `creator: ${creatorShown.temperature}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.sampling.top_k} label="top K sampling" title="Keep only the K most likely tokens before sampling. 0 = disabled." min={0} max={200} step={1} nullable placeholder={creatorShown?.top_k ?? 40}
+          <Range bind:value={draft.sampling.top_k} label="top K" title="Keep only the K most likely tokens; 0 is off (--top-k)" min={0} max={200} step={1} nullable placeholder={creatorShown?.top_k ?? 40}
             hint={creatorShown?.top_k != null ? `creator: ${creatorShown.top_k}` : "0 = off"} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.sampling.top_p} label="top P sampling" title="Nucleus sampling: keep the smallest set of tokens whose probabilities sum to P." min={0} max={1} step={0.01} nullable placeholder={creatorShown?.top_p ?? 0.95}
+          <Range bind:value={draft.sampling.top_p} label="top P" title="Keep the smallest set of tokens whose probabilities sum to P (--top-p)" min={0} max={1} step={0.01} nullable placeholder={creatorShown?.top_p ?? 0.95}
             hint={creatorShown?.top_p != null ? `creator: ${creatorShown.top_p}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.sampling.min_p} label="min P sampling" title="Drop tokens whose probability is below P × the top token's probability. Stronger and more stable than top-p at high temperature." min={0} max={1} step={0.01} nullable placeholder={creatorShown?.min_p ?? 0.05}
+          <Range bind:value={draft.sampling.min_p} label="min P" title="Drop tokens below P × the top token's probability; steadier than top P when hot (--min-p)" min={0} max={1} step={0.01} nullable placeholder={creatorShown?.min_p ?? 0.05}
             hint={creatorShown?.min_p != null ? `creator: ${creatorShown.min_p}` : ""} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.sampling.repeat_penalty} label="repeat penalty" title="Multiplicative penalty on tokens already seen in the context. 1.0 = off; 1.1 is a common mild setting." min={1} max={2} step={0.01} nullable placeholder={creatorShown?.repetition_penalty ?? 1.0}
+          <Range bind:value={draft.sampling.repeat_penalty} label="repeat penalty" title="Penalty on tokens already in the context; 1.0 is off (--repeat-penalty)" min={1} max={2} step={0.01} nullable placeholder={creatorShown?.repetition_penalty ?? 1.0}
             hint={creatorShown?.repetition_penalty != null ? `creator: ${creatorShown.repetition_penalty}` : "1.0 = off"} format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.sampling.presence_penalty} label="presence penalty" title="Flat penalty on any token that has appeared at all. 0 = off." min={0} max={2} step={0.05} nullable placeholder={0}
+          <Range bind:value={draft.sampling.presence_penalty} label="presence penalty" title="Flat penalty on any token seen before; 0 is off (--presence-penalty)" min={0} max={2} step={0.05} nullable placeholder={0}
             hint="0 = off" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.sampling.dry_multiplier} label="DRY multiplier" title="DRY (Don't Repeat Yourself) sampler strength: penalises repeating whole sequences, not single tokens. 0 = off." min={0} max={2} step={0.05} nullable placeholder={0}
-            hint="0 = off; repetition suppression" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.sampling.dry_multiplier} label="DRY multiplier" title="Penalises repeating whole sequences, not single tokens; 0 is off (--dry-multiplier)" min={0} max={2} step={0.05} nullable placeholder={0}
+            hint="0 = off" format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3} />
         </div>
       </section>
 
@@ -1065,59 +1496,56 @@
       <section class="card">
         <div class="sec">Advanced <span class="faint">batching, KV storage and pass-through flags</span></div>
         <div class="formgrid">
-          <Range bind:value={draft.runtime.batch_logical} label="evaluation batch size (-b)" title="-b: logical batch, the per-iteration token budget shared by prefill and decode." min={64} max={8192} step={64}
-            hint="shared per-iteration budget" format={fmtInt} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.batch_physical} label="physical batch size (-ub)" title="-ub: micro-batch pushed through the GPU; sizes the compute buffer. 256 measured best on an R9700 at long context; larger buys prefill speed at short context." min={32} max={2048} step={32}
+          <Range bind:value={draft.runtime.batch_logical} label="batch" title="Logical batch, the per-iteration token budget shared by prefill and decode (-b)" min={64} max={8192} step={64}
+            hint="tokens per iteration" format={fmtInt} onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.batch_physical} label="micro-batch" title="Tokens per GPU pass, which sizes the compute buffer; 256 measured best at long context (-ub)" min={32} max={2048} step={32}
             hint="sizes the compute buffer" format={fmtInt} onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse (min chunk)" title="--cache-reuse: reuse KV cache for a prompt that shares a prefix with a previous one, in chunks of at least this many tokens. 0 = off." min={0} max={2048} step={32} nullable placeholder={256}
-            hint="--cache-reuse" onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.runtime.threads} label="CPU thread pool size" title="-t: CPU threads for layers not offloaded and for tokenisation. Irrelevant when everything is on the GPU." min={1} max={32} step={1} nullable placeholder={8}
+          <Range bind:value={draft.runtime.cache_reuse} label="prompt cache reuse" title="Reuse KV for a shared prompt prefix, in chunks at least this long; 0 is off (--cache-reuse)" min={0} max={2048} step={32} nullable placeholder={256}
+            hint="min chunk, tokens" onchange={scheduleCheck} span={3} />
+          <Range bind:value={draft.runtime.threads} label="CPU threads" title="Threads for layers left on the CPU and for tokenising (-t)" min={1} max={32} step={1} nullable placeholder={8}
             hint="only matters for layers left on CPU" onchange={scheduleCheck} span={3} />
-          <Range bind:value={draft.keep_alive_seconds} label="keep model resident (keep-alive, seconds)" min={0} max={30} step={1} nullable placeholder={keepAliveDefault}
-            hint={`config default ${keepAliveDefault} s · 0 = off`} onchange={scheduleCheck} span={3}
-            title="Off by default. VRAM eviction on idle comes from the PCIe Link State Power Management power setting (pre-flight check 12). If it cannot be Off, a 1-token request this often keeps the GPU awake; about 70 ms of GPU time per ping." />
+          <Range bind:value={draft.keep_alive_seconds} label="keep-alive" min={0} max={30} step={1} nullable placeholder={keepAliveDefault}
+            hint={`seconds · config default ${keepAliveDefault} · 0 = off`} onchange={scheduleCheck} span={3}
+            title="Seconds between 1-token pings keeping the GPU awake when PCIe power saving cannot be off (≈70 ms each)" />
           <div style="grid-column: span 3;"></div>
-          <label class="field" style="grid-column: span 2;" title="Fused attention kernel: less VRAM, faster prefill. Required for V-cache quantisation. auto lets llama.cpp decide."><span class="k">flash attention</span>
+          <label class="field" style="grid-column: span 2;" title="Fused attention kernel: less VRAM, faster prefill, required for V-cache quantisation (-fa)"><span class="k">flash attention</span>
             <select bind:value={draft.runtime.flash_attn} onchange={scheduleCheck}>
               <option value="on">on</option><option value="off">off</option><option value="auto">auto</option>
             </select>
           </label>
-          <label class="field" title="Storage type of the attention key cache. q8_0 halves KV VRAM with little visible cost; q4_0 quarters it with some quality cost."><span class="k">K cache quant</span>
+          <label class="field" title="Storage type of the key cache; q8_0 halves its VRAM at little cost (-ctk)"><span class="k">K cache</span>
             <select bind:value={draft.runtime.kv_type_k} onchange={scheduleCheck}>
               {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
             </select>
           </label>
-          <label class="field" title="Storage type of the attention value cache. Needs flash attention on for anything but f16."><span class="k">V cache quant</span>
+          <label class="field" title="Storage type of the value cache; anything but f16 needs flash attention on (-ctv)"><span class="k">V cache</span>
             <select bind:value={draft.runtime.kv_type_v} onchange={scheduleCheck}>
               {#each ["f16", "q8_0", "q4_0"] as t}<option value={t}>{t}</option>{/each}
             </select>
           </label>
-          <label class="field" style="grid-column: span 2;" title="Serve concurrent requests inside one forward pass instead of queueing them. Leave on."><span class="k">continuous batching</span>
-            <span><input type="checkbox" bind:checked={draft.runtime.cont_batching} onchange={scheduleCheck} /> on (-cb)</span>
+          <label class="field" style="grid-column: span 2;" title="Serves concurrent requests in one forward pass instead of queueing them; leave on (-cb)"><span class="k">continuous batching</span>
+            <span><input type="checkbox" bind:checked={draft.runtime.cont_batching} onchange={scheduleCheck} /> on</span>
           </label>
-          <label class="field" style="grid-column: span 4;" title="Sets LLAMA_SERVER_SLOTS_DEBUG=1 for the server, so /slots carries each slot's last prompt and the text generated so far. The Running tab shows both per slot and flags endless loops. Costs the server one detokenize per poll; the router inherits it from any member. Takes effect on the next load."><span class="k">trace tokens</span>
-            <span><input type="checkbox" checked={draft.env?.LLAMA_SERVER_SLOTS_DEBUG === "1"} onchange={(e) => { if (e.target.checked) draft.env.LLAMA_SERVER_SLOTS_DEBUG = "1"; else delete draft.env.LLAMA_SERVER_SLOTS_DEBUG; scheduleCheck(); }} /> show each slot's last prompt and generated text on the Running tab, with loop detection</span>
+          <label class="field" style="grid-column: span 4;" title="Puts each slot's prompt and text on the Running tab, with loop detection (LLAMA_SERVER_SLOTS_DEBUG=1). One detokenize per poll."><span class="k">trace tokens</span>
+            <span><input type="checkbox" checked={draft.env?.LLAMA_SERVER_SLOTS_DEBUG === "1"} onchange={(e) => { if (e.target.checked) draft.env.LLAMA_SERVER_SLOTS_DEBUG = "1"; else delete draft.env.LLAMA_SERVER_SLOTS_DEBUG; scheduleCheck(); }} /> on</span>
           </label>
-          <label class="field" style="grid-column: 1 / -1;" title="Anything this editor does not model, e.g. --no-mmap. Passed to llama-server unchanged."><span class="k">extra llama-server flags (space-separated, passed through verbatim)</span>
+          <label class="field" style="grid-column: 1 / -1;" title="Passed to llama-server unchanged, space-separated, e.g. --no-mmap"><span class="k">extra flags</span>
             <input value={Array.isArray(draft.runtime.extra_flags) ? draft.runtime.extra_flags.join(" ") : draft.runtime.extra_flags}
               oninput={(e) => { draft.runtime.extra_flags = e.target.value; scheduleCheck(); }} placeholder="--no-mmap" />
           </label>
-        </div>
-        <div class="faint small" style="margin-top: 10px;">
-          KV quantisation is the big VRAM lever (q8_0 is as good as f16 in practice); flash attention must be on for V-cache quant.
         </div>
       </section>
       {/if}
 
       <!-- notes -->
       <section class="card">
-        <div class="sec">Notes <span class="faint">free text, saved with the profile</span></div>
+        <div class="sec">Notes</div>
         <textarea rows="3" bind:value={draft.notes} placeholder="What was measured, what to remember."></textarea>
       </section>
 
       {#if check?.findings?.length}
         <section class="card" transition:slide={leave}>
-          <div class="sec">Findings <span class="faint">problems with the profile itself</span></div>
+          <div class="sec">Findings <span class="faint">in the profile file</span></div>
           {#each check.findings as f}
             <div class="notice" style="padding: 4px 0;">
               <span class="chip {f.severity === 'error' ? 'block' : 'warn'}">{f.severity}</span>
@@ -1167,7 +1595,7 @@
           <div class="stats">
             <div class="stat"><span class="v">{draft.baseline.serial_tok_s}<small>tok/s</small></span><span class="l">serial decode</span></div>
             {#if draft.baseline.concurrent}
-              <div class="stat"><span class="v">{draft.baseline.concurrent.decode_aggregate_tok_s ?? draft.baseline.concurrent.aggregate_tok_s}<small>tok/s</small></span><span class="l">aggregate at n = {draft.baseline.concurrent.n}</span></div>
+              <div class="stat"><span class="v">{draft.baseline.concurrent.decode_aggregate_tok_s ?? draft.baseline.concurrent.aggregate_tok_s}<small>tok/s</small></span><span class="l">aggregate · n = {draft.baseline.concurrent.n}</span></div>
               <div class="stat"><span class="v">{draft.baseline.concurrent.per_stream_tok_s}<small>tok/s</small></span><span class="l">per stream</span></div>
             {/if}
             <div class="stat"><span class="v">{draft.baseline.vram_gb}<small>GiB</small></span><span class="l">resident</span></div>
@@ -1176,7 +1604,7 @@
       {/if}
     </div>
   {:else}
-    <div class="card" style="flex: 1;"><div class="empty">Select a profile on the left, or create one.</div></div>
+    <div class="card" style="flex: 1;"><div class="empty">Pick a profile on the left, or New</div></div>
   {/if}
 </div>
 

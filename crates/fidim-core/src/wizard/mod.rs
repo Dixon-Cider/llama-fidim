@@ -711,7 +711,7 @@ pub fn machine_gpu_targets(cfg: &Config) -> Option<String> {
     #[cfg(windows)]
     let names: Vec<String> = {
         use crate::platform::Platform;
-        crate::platform::WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect()
+        crate::platform::HostPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect()
     };
     #[cfg(not(windows))]
     let names: Vec<String> = Vec::new();
@@ -774,7 +774,7 @@ impl Env for LiveEnv {
             let builds = self.builds();
             let build = enumeration_build(&builds)
                 .ok_or_else(|| Error::Config("no llama.cpp build is installed to list the GPUs with".into()))?;
-            crate::launch::enumerate_devices(&self.cfg, &build.server_exe, &crate::platform::WindowsPlatform)
+            crate::launch::enumerate_devices(&self.cfg, &build.server_exe, &crate::platform::HostPlatform)
         }
         #[cfg(not(windows))]
         Ok(Vec::new())
@@ -2114,6 +2114,8 @@ fn planned_model(
         }),
         header_error: None,
         engine,
+        format: "gguf".into(),
+        hf: None,
         mmproj_candidates: mmproj.into_iter().collect(),
         draft_candidates: draft.into_iter().collect(),
         shards: if model_files.len() > 1 { model_files } else { Vec::new() },
