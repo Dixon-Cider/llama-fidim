@@ -6,11 +6,14 @@ use clap::{Parser, Subcommand};
 use fidim_core::config::Config;
 use fidim_core::discovery::{self, Build};
 use fidim_core::launch;
-use fidim_core::platform::{Platform, WindowsPlatform};
+use fidim_core::platform::{Platform, HostPlatform};
 use fidim_core::preflight::{self, Outcome};
 use fidim_core::profile::{self, Profile};
 use fidim_core::supervise::{self, Health};
 use fidim_core::{export, gguf};
+
+mod models;
+mod router_serve;
 
 #[derive(Parser)]
 #[command(name = "fidim", version = fidim_core::build_info::LONG, about = "llama.cpp build/config manager")]
@@ -20,6 +23,52 @@ struct Cli {
     json: bool,
     #[command(subcommand)]
     command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum SelfUpdateCmd {
+    /// Compare this build with the newest release of Llama FIDIM. Downloads nothing.
+    Check,
+    /// Get the newest release (or --tag), check its SHA-256, then replace the
+    /// installed files and reopen the desktop app. With --source, build a
+    /// checkout instead and install what it built.
+    Install {
+        /// A release tag, e.g. v0.3.0 (default: the newest with a Windows zip).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Build from a checkout of this repository (cargo, then pnpm tauri
+        /// build) instead of downloading a release.
+        #[arg(long)]
+        source: bool,
+        /// With --source: the checkout (default: config.fidim_source).
+        #[arg(long, value_name = "DIR")]
+        source_dir: Option<PathBuf>,
+        /// Download or build and verify only; print the staged folder and
+        /// replace nothing.
+        #[arg(long)]
+        stage_only: bool,
+        /// Leave the desktop app closed afterwards.
+        #[arg(long)]
+        no_relaunch: bool,
+        /// Install into this folder (default: the folder this fidim.exe runs from).
+        #[arg(long, value_name = "DIR")]
+        install_dir: Option<PathBuf>,
+    },
+    /// Replace the installed files from a staged folder. Install starts this
+    /// from the staged copy of fidim.exe; not for use by hand.
+    #[command(hide = true)]
+    Apply {
+        #[arg(long)]
+        stage: PathBuf,
+        #[arg(long)]
+        install_dir: PathBuf,
+        /// Wait for this process to exit first (the copy that started the update).
+        #[arg(long)]
+        wait_pid: Option<u32>,
+        /// Reopen the desktop app when done.
+        #[arg(long)]
+        relaunch: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -59,6 +108,25 @@ enum RouterCmd {
     Load { model_id: String },
     /// Unload a model from the running router.
     Unload { model_id: String },
+    /// One OpenAI-compatible port in front of several SGLang servers, with
+    /// a llama-server-shaped live view (/slots, /metrics, /models) for the
+    /// Running tab. Routes by the JSON `model` field; runs until killed.
+    /// (The Rust port of assets/sglang/model_router.py.)
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value = "1234")]
+        port: u16,
+        /// A backend: model=http://host:port (repeat for each).
+        #[arg(long, value_name = "MODEL=URL")]
+        route: Vec<String>,
+        /// Another name for a route: alias=model (repeat for each).
+        #[arg(long, value_name = "ALIAS=MODEL")]
+        alias: Vec<String>,
+        /// The route for requests whose model is unknown or missing.
+        #[arg(long, value_name = "MODEL")]
+        default: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -79,6 +147,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RocmCmd,
     },
+    /// Put the folder holding this fidim.exe on your user PATH (or take it
+    /// off), so `fidim` works in every new terminal.
+    Path {
+        /// The folder to act on instead (an absolute path; it need not exist).
+        #[arg(long, global = true)]
+        dir: Option<PathBuf>,
+        #[command(subcommand)]
+        cmd: PathCmd,
+    },
     /// The model author's published sampling defaults (Hugging Face generation_config.json).
     CreatorDefaults { model_path: PathBuf },
     /// Parse one GGUF header and report what the scanner would see (and how long it took).
@@ -89,6 +166,11 @@ enum Cmd {
     Router {
         #[command(subcommand)]
         cmd: RouterCmd,
+    },
+    /// The SGLang engine: find installs (venvs with sglang importable) or create one.
+    Sglang {
+        #[command(subcommand)]
+        cmd: SglangCmd,
     },
     /// (internal) keep a server's VRAM resident: 1-token request every --interval s until --server-pid exits.
     #[command(hide = true)]
@@ -159,9 +241,23 @@ enum Cmd {
         /// Download + verify the prebuilt Windows ROCm build (latest, or --tag).
         #[arg(long)]
         install: bool,
-        /// Build from source with config.source_build_script instead of prebuilt.
+        /// Build from source with config.source_build_script instead of prebuilt;
+        /// with --remote/--ref, build any git ref (a fork, a pull request, a commit).
         #[arg(long)]
         source: bool,
+        /// With --source: the git remote to build from, e.g.
+        /// https://github.com/ifm-ai/llama.cpp (runs that repository's code).
+        #[arg(long)]
+        remote: Option<String>,
+        /// With --remote: a branch, a tag, pull/<n>/head, or a full commit (a
+        /// name that is both a branch and a tag means the branch; write
+        /// refs/tags/<name> for the tag).
+        #[arg(long = "ref", value_name = "REF")]
+        git_ref: Option<String>,
+        /// With --remote: a name for the build (default from the remote and ref,
+        /// e.g. "ifm-ai K2Horizon fork").
+        #[arg(long)]
+        label: Option<String>,
         /// Re-point profiles onto the installed build (default scope: profiles
         /// on the previous newest build; --all for every unpinned profile).
         #[arg(long)]
@@ -178,8 +274,44 @@ enum Cmd {
         /// the fork that carries the DiffusionGemma runner).
         #[arg(long, default_value = "upstream")]
         channel: String,
-        /// GPU target of the Unsloth zip (e.g. gfx120X, gfx1151); default:
-        /// config.rocm_family, else guessed from the cards.
+        /// GPU target of the Unsloth zip (e.g. gfx120X, gfx1151; default:
+        /// config.rocm_family, else guessed from the cards), or of a --remote
+        /// build (e.g. gfx1201; default: what hipInfo reports for the cards).
+        #[arg(long)]
+        gfx: Option<String>,
+        /// Unsloth channel: the build with Llama FIDIM's runner patch
+        /// (dgpatch5) laid over it, from the overlay published for the
+        /// release. Installs beside the plain build as <tag>-unsloth-dgpatch5.
+        #[arg(long)]
+        overlay: bool,
+        /// Like --overlay, from a local overlay instead: the folder
+        /// packaging/dg-overlay/scripts/build-local.ps1 writes, or its zip
+        /// with fidim-overlay.json beside it.
+        #[arg(long, value_name = "PATH")]
+        overlay_from: Option<PathBuf>,
+        /// With --overlay/--overlay-from: an already downloaded Unsloth zip to
+        /// use instead of downloading it; checked the same way.
+        #[arg(long, value_name = "ZIP")]
+        base_zip: Option<PathBuf>,
+    },
+    /// Get a model from Hugging Face: search, look at a repo (its files,
+    /// what fits the cards, which build loads it), then download it and the
+    /// build it needs and create a profile. Never launches a model.
+    Models {
+        #[command(subcommand)]
+        cmd: models::ModelsCmd,
+    },
+    /// Update Llama FIDIM itself (the CLI, the DiffusionGemma server and the
+    /// desktop app) in the folder they run from, from a GitHub release or a
+    /// checkout of this repository.
+    SelfUpdate {
+        #[command(subcommand)]
+        cmd: SelfUpdateCmd,
+    },
+    /// Check the toolchain a source build needs: Visual Studio C++ tools, git,
+    /// CMake, Ninja, the HIP SDK, and a test compile for the GPU target.
+    Toolchain {
+        /// GPU target for the test compile (default: what hipInfo reports).
         #[arg(long)]
         gfx: Option<String>,
     },
@@ -187,8 +319,13 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // PATH edits need no config: they work before the first run and with a
+    // config that no longer parses.
+    if let Cmd::Path { dir, cmd } = &cli.command {
+        return cmd_path(dir.as_deref(), cmd, cli.json);
+    }
     let cfg = Config::load_or_init().context("loading Llama FIDIM config")?;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     match cli.command {
         Cmd::Scan => cmd_scan(&cfg, cli.json),
         Cmd::Devices { build } => cmd_devices(&cfg, build.as_deref(), cli.json),
@@ -200,6 +337,10 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Live => cmd_live(&cfg, cli.json),
         Cmd::Router { cmd } => cmd_router(&cfg, cli.json, cmd),
+        Cmd::Sglang { cmd } => {
+            let mut cfg = cfg.clone();
+            cmd_sglang(&mut cfg, cli.json, cmd)
+        }
         Cmd::Gguf { path } => {
             let t = std::time::Instant::now();
             let h = gguf::read_header(&path)?;
@@ -251,10 +392,251 @@ fn main() -> anyhow::Result<()> {
             cmd_bench(&cfg, &platform, &profile_id, concurrency, tokens, warmups, no_save)
         }
         Cmd::Rocm { cmd } => cmd_rocm(&cfg, cli.json, cmd),
-        Cmd::Update { install, source, promote, all, rollback, tag, channel, gfx } => {
-            cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag, &channel, gfx)
+        Cmd::Path { .. } => unreachable!("handled before the config loads"),
+        Cmd::Update { install, source, remote, git_ref, label, promote, all, rollback, tag, channel, gfx, overlay, overlay_from, base_zip } => {
+            if let Some(remote) = remote {
+                if !source {
+                    bail!("--remote builds from source: add --source");
+                }
+                if install
+                    || promote
+                    || all
+                    || rollback
+                    || tag.is_some()
+                    || channel != "upstream"
+                    || overlay
+                    || overlay_from.is_some()
+                    || base_zip.is_some()
+                {
+                    bail!(
+                        "--remote builds one git ref; it does not combine with --install, --promote, --all, \
+                         --rollback, --tag, --channel, --overlay, --overlay-from or --base-zip (a git build is never \
+                         promoted: pick it in the profile editor)"
+                    );
+                }
+                let git_ref = git_ref.context("--remote needs --ref <branch|pull/N/head|commit>")?;
+                return cmd_update_ref(&cfg, cli.json, &remote, &git_ref, label, gfx);
+            }
+            if git_ref.is_some() || label.is_some() {
+                bail!("--ref and --label go with --source --remote <url>");
+            }
+            let overlay = match overlay_from {
+                Some(p) => Some(fidim_core::overlay::OverlaySource::Local(p)),
+                None => overlay.then_some(fidim_core::overlay::OverlaySource::Published),
+            };
+            cmd_update(&cfg, cli.json, install, source, promote, all, rollback, tag, &channel, gfx, overlay, base_zip)
+        }
+        Cmd::Toolchain { gfx } => cmd_toolchain(&cfg, cli.json, gfx),
+        Cmd::SelfUpdate { cmd } => cmd_self_update(&cfg, cli.json, cmd),
+        Cmd::Models { cmd } => models::cmd_models(&cfg, cli.json, cmd),
+    }
+}
+
+/// The GPU target(s) of this machine's discrete cards: hipInfo, else the
+/// card names.
+fn detect_gpu_targets(cfg: &Config) -> Option<String> {
+    fidim_core::wizard::machine_gpu_targets(cfg)
+}
+
+fn cmd_self_update(cfg: &Config, json: bool, cmd: SelfUpdateCmd) -> anyhow::Result<()> {
+    use fidim_core::selfupdate as su;
+    match cmd {
+        SelfUpdateCmd::Check => {
+            let c = su::check(cfg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&c)?);
+                return Ok(());
+            }
+            println!("this build : {}  ({})", c.current.long, c.current.install_dir.display());
+            match &c.latest {
+                Some(l) => println!("newest     : {}  published {}  {}", l.tag, l.published_at.get(..10).unwrap_or(&l.published_at), l.html_url),
+                None => println!("newest     : (no release with a Windows zip)"),
+            }
+            if c.update_available {
+                println!("update available: run `fidim self-update install`");
+            } else if let Some(n) = &c.note {
+                println!("{n}");
+            }
+            match (&c.source_dir, c.source_ok) {
+                (Some(d), true) => println!("checkout   : {}  (`fidim self-update install --source` builds it)", d.display()),
+                (Some(d), false) => println!("checkout   : {} is not a checkout of Llama FIDIM", d.display()),
+                (None, _) => {}
+            }
+            for s in &c.staged {
+                println!("staged     : {}  {}", s.version, s.dir.display());
+            }
+            if let Some(h) = c.history.first() {
+                println!("last update: {} -> {} ({}){}", h.from, h.to, h.source, if h.ok { "" } else { " FAILED" });
+            }
+        }
+        SelfUpdateCmd::Install { tag, source, source_dir, stage_only, no_relaunch, install_dir } => {
+            let current = su::current()?;
+            let install_dir = install_dir.unwrap_or_else(|| current.install_dir.clone());
+            let mut progress = |line: String| println!("{line}");
+            let staged = if source {
+                let dir = source_dir
+                    .or_else(|| cfg.fidim_source.clone())
+                    .context("no checkout to build: pass --source-dir or set config.fidim_source")?;
+                su::stage_from_checkout(&dir, &mut progress)?
+            } else {
+                let rel = match &tag {
+                    Some(t) => su::app_release_by_tag(t)?,
+                    None => su::latest_app_release()?.context(format!("{} has no release with a Windows zip", su::REPO))?,
+                };
+                if tag.is_none() && !su::check(cfg)?.update_available {
+                    println!("note: {} is not newer than this build ({}); installing it anyway", rel.tag, current.long);
+                }
+                su::stage_release(&rel, &mut progress)?
+            };
+            if stage_only {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&staged)?);
+                } else {
+                    println!("staged {} in {}  (nothing replaced)", staged.version, staged.dir.display());
+                }
+                return Ok(());
+            }
+            let pid = su::spawn_apply(&staged.dir, &install_dir, Some(std::process::id()), !no_relaunch)?;
+            let log = su::updates_dir().join("apply.log");
+            if json {
+                println!("{}", serde_json::json!({ "staged": staged, "install_dir": install_dir, "updater_pid": pid, "log": log }));
+            } else {
+                println!(
+                    "updater started (pid {pid}); it replaces {} with {} as soon as this process exits{}. Log: {}",
+                    install_dir.display(),
+                    staged.version,
+                    if no_relaunch { "" } else { ", then reopens the desktop app" },
+                    log.display()
+                );
+            }
+        }
+        SelfUpdateCmd::Apply { stage, install_dir, wait_pid, relaunch } => {
+            let mut log = |line: String| {
+                println!("{line}");
+                su::append_log(&line);
+            };
+            let r = su::apply(&stage, &install_dir, wait_pid, relaunch, &mut log)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("installed {} over {} in {}", r.to, r.from, r.install_dir.display());
+            }
         }
     }
+    Ok(())
+}
+
+fn cmd_toolchain(cfg: &Config, json: bool, gfx: Option<String>) -> anyhow::Result<()> {
+    let gfx = match gfx {
+        Some(g) => g,
+        None => detect_gpu_targets(cfg)
+            .and_then(|g| g.split(',').next().map(str::to_string))
+            .context("could not tell this machine's GPU target: pass --gfx (e.g. gfx1201)")?,
+    };
+    let tc = fidim_core::toolchain::detect(cfg);
+    let findings = fidim_core::toolchain::doctor_with(&tc, &gfx);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "gfx": gfx, "toolchain": tc, "findings": findings }))?);
+        return Ok(());
+    }
+    for f in &findings {
+        println!("{}", f.with_fix());
+    }
+    if findings.iter().any(|f| f.blocks()) {
+        bail!("the toolchain cannot build llama.cpp for {gfx} yet (see the fixes above)");
+    }
+    println!("\nready to build llama.cpp from source for {gfx} (`fidim update --source --remote <url> --ref <ref>`).");
+    Ok(())
+}
+
+/// `fidim update --source --remote <url> --ref <ref>`: pin the ref to a
+/// commit, then compile it into its own build directory. Nothing is
+/// promoted or launched.
+fn cmd_update_ref(
+    cfg: &Config,
+    json: bool,
+    remote: &str,
+    git_ref: &str,
+    label: Option<String>,
+    gfx: Option<String>,
+) -> anyhow::Result<()> {
+    use fidim_core::update::{self, SourceRef};
+    use std::sync::atomic::AtomicBool;
+
+    let remote = remote.trim().trim_end_matches('/').to_string();
+    // The full ref name (refs/heads/..., refs/tags/...), so the build
+    // fetches exactly what was pinned.
+    let (git_ref, sha) = update::pin_ref(&remote, git_ref.trim())?;
+    let label = label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
+    let src = SourceRef {
+        label: label.unwrap_or_else(|| SourceRef::default_label(&remote, &git_ref)),
+        remote_url: remote,
+        git_ref,
+        sha,
+    };
+    src.validate()?;
+    let gpus = match gfx {
+        Some(g) => g,
+        None => detect_gpu_targets(cfg).context("could not tell this machine's GPU target: pass --gfx (e.g. gfx1201)")?,
+    };
+    let gpus = update::normalize_gpu_targets(&gpus)?;
+    let dir = update::source_install_dir(cfg, &src)?;
+    if !json {
+        println!("building       : {}", src.git_source().display());
+        println!("from           : {} {} @ {}", src.remote_url, src.git_ref, src.sha);
+        println!("gpu targets    : {gpus}");
+        println!("install dir    : {}", dir.display());
+        println!("this compiles and later runs code from {}; nothing is launched here.", src.remote_url);
+    }
+    let cancel = AtomicBool::new(false);
+    let mut last_step = String::new();
+    let mut last_done = 0u32;
+    let mut progress = |p: update::BuildProgress| {
+        if json {
+            return;
+        }
+        if p.step != last_step {
+            last_step = p.step.clone();
+            println!("== {}", p.step);
+        }
+        match (p.done, p.total) {
+            // Ninja prints one line per edge: show every 5%.
+            (Some(d), Some(t)) => {
+                if d == t || d < last_done || (d - last_done) * 20 >= t {
+                    last_done = d;
+                    println!("  [{d}/{t}] {}%", d * 100 / t);
+                }
+            }
+            // The compilers' own warnings run to thousands of lines; a
+            // failure's last lines come back in the error anyway.
+            _ if p.step == "build" && !(p.line.contains("error") || p.line.contains("FAILED")) => {}
+            _ => println!("  {}", p.line),
+        }
+    };
+    let started = std::time::Instant::now();
+    let r = update::build_from_ref(cfg, &src, &gpus, &mut progress, &cancel)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+    let v = &r.verify;
+    println!(
+        "{} {} at {} in {:.1} min — binary reports {}; HIP {}",
+        if r.skipped_existing { "already built:" } else { "built" },
+        r.tag,
+        r.dir.display(),
+        started.elapsed().as_secs_f64() / 60.0,
+        v.version.as_deref().unwrap_or("?"),
+        if v.hip_ok { "OK" } else { "NOT LOADED" }
+    );
+    for d in &v.devices {
+        println!("    {}{}  {}  {} MiB", d.backend, d.index, d.name, d.total_mib);
+    }
+    if !v.detail.is_empty() {
+        println!("    {}", v.detail.trim().replace('\n', "\n    "));
+    }
+    println!("never promoted automatically: pick it for a profile in the editor (its --version build number is the ref's own count, not an upstream release).");
+    Ok(())
 }
 
 // -------------------------------------------------------------- runtimes ----
@@ -338,6 +720,84 @@ fn cmd_runtimes(cfg: &Config, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------ path ----
+
+#[derive(Subcommand, Debug)]
+enum PathCmd {
+    /// Add this folder to the end of the user PATH.
+    Add,
+    /// Take this folder off the user PATH.
+    Remove,
+    /// Whether this folder is on PATH, and which other fidim.exe a terminal could find.
+    Status,
+}
+
+/// `fidim path`: the folder is the one holding the running fidim.exe, so an
+/// installed copy puts its own folder on PATH. `--dir` names another one;
+/// install.ps1 uses it to take a retired install folder off PATH.
+fn cmd_path(dir: Option<&std::path::Path>, cmd: &PathCmd, json: bool) -> anyhow::Result<()> {
+    use fidim_core::user_path::{self, Change};
+    let dir = match dir {
+        Some(d) if d.is_absolute() => d.to_path_buf(),
+        Some(d) => bail!("--dir needs an absolute path, not {}", d.display()),
+        None => user_path::this_dir()?,
+    };
+    let change = match cmd {
+        PathCmd::Status => None,
+        PathCmd::Add => Some(user_path::add(&dir)?),
+        PathCmd::Remove => Some(user_path::remove(&dir)?),
+    };
+    let notified = change.is_some_and(Change::changed) && user_path::notify_changed();
+    let status = user_path::status(&dir)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "change": change, "notified": notified, "status": status }))?
+        );
+        return Ok(());
+    }
+    match change {
+        Some(Change::Added) => println!("added {} to the user PATH", dir.display()),
+        Some(Change::AlreadyThere) => println!("{} is already on the user PATH", dir.display()),
+        Some(Change::Removed(n)) => {
+            println!("removed {} from the user PATH{}", dir.display(), if n > 1 { format!(" ({n} entries)") } else { String::new() })
+        }
+        Some(Change::NotThere) => println!("{} is not on the user PATH; nothing to remove", dir.display()),
+        None => {}
+    }
+    if change.is_some_and(Change::changed) {
+        if notified {
+            println!("  new terminals see the change; terminals already open keep their old PATH");
+        } else {
+            println!("  running programs were not told (the broadcast failed); sign out and back in to pick it up");
+        }
+    }
+    if change.is_none() {
+        let yes_no = |b: bool| if b { "yes" } else { "no" };
+        println!("folder      {}", status.dir.display());
+        println!("user PATH   {:<4} ({}, {} of {} characters)", yes_no(status.user), user_path::USER_PATH_KEY, status.user_chars, user_path::MAX_CHARS);
+        println!("system PATH {}", yes_no(status.system));
+        println!(
+            "this shell  {}{}",
+            yes_no(status.this_shell),
+            if status.this_shell != (status.user || status.system) { "   (a new terminal differs)" } else { "" }
+        );
+    }
+    if status.system && matches!(change, Some(Change::Removed(_) | Change::NotThere)) {
+        println!("  note: the system PATH also lists it; only an administrator can change that one");
+    }
+    for o in &status.others {
+        println!(
+            "  {} {} ({} PATH) also holds fidim.exe{}",
+            if o.first { "!!" } else { "  " },
+            o.dir.display(),
+            o.from,
+            if o.first { " and is found first: `fidim` in a new terminal runs that copy" } else { "" }
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- update ----
 
 #[allow(clippy::too_many_arguments)]
@@ -352,6 +812,8 @@ fn cmd_update(
     tag: Option<String>,
     channel: &str,
     gfx: Option<String>,
+    overlay: Option<fidim_core::overlay::OverlaySource>,
+    base_zip: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use fidim_core::update::{self, PromoteScope};
 
@@ -361,6 +823,12 @@ fn cmd_update(
     }
     if gfx.is_some() && channel != "unsloth" {
         bail!("--gfx picks the GPU target of an Unsloth build; add --channel unsloth");
+    }
+    if overlay.is_some() && channel != "unsloth" {
+        bail!("--overlay and --overlay-from lay the runner patch over an Unsloth build; add --channel unsloth");
+    }
+    if base_zip.is_some() && overlay.is_none() {
+        bail!("--base-zip goes with --overlay or --overlay-from");
     }
     // Rollback undoes the last promotion batch whichever channel made it.
     if rollback {
@@ -379,7 +847,8 @@ fn cmd_update(
         return Ok(());
     }
     if channel == "unsloth" {
-        return cmd_update_unsloth(cfg, json, install, source, promote, all, tag.as_deref(), gfx.as_deref());
+        let o = UnslothOverlay { source: overlay, base_zip };
+        return cmd_update_unsloth(cfg, json, install, source, promote, all, tag.as_deref(), gfx.as_deref(), o);
     }
 
     let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
@@ -506,8 +975,47 @@ fn print_promote(json: bool, r: &fidim_core::update::PromoteReport, to_dir: &std
     Ok(())
 }
 
+/// The line `fidim update --channel unsloth` ends a check with (no
+/// --install, no --promote): what would work next. `--install` is suggested
+/// for the published overlay only when one is published.
+fn unsloth_next_step(c: &fidim_core::update::UnslothCheck, overlay: Option<&fidim_core::overlay::OverlaySource>) -> String {
+    use fidim_core::overlay::OverlaySource;
+    let installed = if overlay.is_some() { c.overlay_installed } else { c.already_installed };
+    if installed {
+        return "installed. --promote moves diffusion profiles onto it.".into();
+    }
+    match overlay {
+        Some(OverlaySource::Published) if !c.overlay_available => {
+            let patch = &c.overlay_patch;
+            match &c.overlay_error {
+                Some(e) => format!(
+                    "the {patch} overlay for {} is unavailable ({e}); --overlay-from <folder> installs one built locally.",
+                    c.latest.tag
+                ),
+                None => format!(
+                    "no {patch} overlay is published for {} in {}: build one with packaging/dg-overlay and pass \
+                     --overlay-from <folder>, or pick a --tag that has one.",
+                    c.latest.tag, c.overlay_repo
+                ),
+            }
+        }
+        Some(_) => "run with --install to fetch it and lay the runner patch over it.".into(),
+        None => format!(
+            "run with --install to fetch it (--gfx picks another GPU target{}).",
+            if c.overlay_available { ", --overlay adds the runner patch" } else { "" }
+        ),
+    }
+}
+
+/// What `--overlay`, `--overlay-from` and `--base-zip` asked for.
+struct UnslothOverlay {
+    source: Option<fidim_core::overlay::OverlaySource>,
+    base_zip: Option<PathBuf>,
+}
+
 /// `fidim update --channel unsloth`: unslothai/llama.cpp's prebuilt Windows
-/// ROCm zip, the build that carries the DiffusionGemma runner. Installed
+/// ROCm zip, the build that carries the DiffusionGemma runner, optionally
+/// with Llama FIDIM's runner patch laid over it (`--overlay`). Installed
 /// side by side like upstream builds; its promotion considers every profile
 /// and moves only diffusion ones (`update::promote_skip_reason`).
 #[allow(clippy::too_many_arguments)]
@@ -520,7 +1028,9 @@ fn cmd_update_unsloth(
     all: bool,
     tag: Option<&str>,
     gfx: Option<&str>,
+    overlay: UnslothOverlay,
 ) -> anyhow::Result<()> {
+    use fidim_core::overlay::{self as ov, OverlaySource};
     use fidim_core::update::{self, PromoteScope};
 
     if source {
@@ -529,8 +1039,9 @@ fn cmd_update_unsloth(
     if all {
         bail!("--all does not apply to --channel unsloth: its promotion already looks at every profile and moves only diffusion ones");
     }
-    let names: Vec<String> = WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect();
+    let names: Vec<String> = HostPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect();
     let c = update::check_unsloth(cfg, &names, gfx, tag)?;
+    let patched = overlay.source.is_some();
     if !json {
         println!("unsloth latest  : {} ({})", c.latest.tag, c.latest.published_at);
         println!("upstream base   : {}", c.upstream_tag.as_deref().unwrap_or("?"));
@@ -551,6 +1062,19 @@ fn cmd_update_unsloth(
             (None, None) => {}
         }
         println!("install dir     : {}{}", c.install_dir.display(), if c.already_installed { "  [present]" } else { "" });
+        match (&c.overlay_asset, &c.overlay_error) {
+            (Some(a), _) => println!("runner patch    : {} published in {} ({}, {} MB)", c.overlay_patch, c.overlay_repo, a.name, a.size >> 20),
+            (None, Some(e)) => println!("runner patch    : {} unavailable — {e}", c.overlay_patch),
+            (None, None) => println!("runner patch    : {} not published for this release in {}", c.overlay_patch, c.overlay_repo),
+        }
+        if let Some(OverlaySource::Local(p)) = &overlay.source {
+            println!("overlay from    : {}", p.display());
+        }
+        println!(
+            "patched dir     : {}{}",
+            c.overlay_install_dir.display(),
+            if c.overlay_installed { "  [present]" } else { "" }
+        );
         if c.installed.is_empty() {
             println!("installed       : none");
         }
@@ -559,13 +1083,14 @@ fn cmd_update_unsloth(
             println!("installed       : {} ({}) at {}{patch}", i.tag, i.version, i.path.display());
         }
     }
+    // The build this command acts on: the plain one, or the patched one.
+    let (target_dir, target_installed) =
+        if patched { (&c.overlay_install_dir, c.overlay_installed) } else { (&c.install_dir, c.already_installed) };
     if !install && !promote {
         if json {
             println!("{}", serde_json::to_string_pretty(&c)?);
-        } else if c.already_installed {
-            println!("installed. --promote moves diffusion profiles onto it.");
         } else {
-            println!("run with --install to fetch it (--gfx picks another GPU target).");
+            println!("{}", unsloth_next_step(&c, overlay.source.as_ref()));
         }
         return Ok(());
     }
@@ -576,12 +1101,16 @@ fn cmd_update_unsloth(
         }
     };
     let report = if install {
-        let r = update::install_unsloth(cfg, &c.latest, &c.gfx, &mut progress)?;
+        let r = match &overlay.source {
+            Some(src) => ov::install_unsloth_overlay(cfg, &c.latest, &c.gfx, src, overlay.base_zip.as_deref(), &mut progress)?,
+            None => update::install_unsloth(cfg, &c.latest, &c.gfx, &mut progress)?,
+        };
         if !json {
             let v = &r.verify;
             println!(
-                "installed {} at {} — bundled llama-server reports {}; HIP {}; runner {}",
+                "installed {}{} at {} — bundled llama-server reports {}; HIP {}; runner {}",
                 r.tag,
+                if patched { format!(" with {}", c.overlay_patch) } else { String::new() },
                 r.dir.display(),
                 v.version.as_deref().unwrap_or("?"),
                 if v.hip_ok { "OK" } else { "NOT LOADED" },
@@ -602,13 +1131,14 @@ fn cmd_update_unsloth(
     if promote {
         let (dir, verify) = match &report {
             Some(r) => (r.dir.clone(), r.verify.clone()),
-            None if c.already_installed => {
+            None if target_installed => {
                 if !json {
-                    println!("verifying {} (--version and --list-devices, no model load)", c.install_dir.display());
+                    println!("verifying {} (--version and --list-devices, no model load)", target_dir.display());
                 }
-                (c.install_dir.clone(), update::verify_unsloth(&c.install_dir))
+                let v = if patched { ov::verify_overlay(target_dir) } else { update::verify_unsloth(target_dir) };
+                (target_dir.clone(), v)
             }
-            None => bail!("{} is not installed; add --install", c.latest.tag),
+            None => bail!("{}{} is not installed; add --install", c.latest.tag, if patched { " with the runner patch" } else { "" }),
         };
         if !verify.hip_ok {
             bail!("refusing to promote onto {}: the bundled HIP backend did not load\n{}", dir.display(), verify.detail.trim());
@@ -647,9 +1177,10 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
             .as_deref()
             .map(|e| format!("  [BROKEN: {e}]"))
             .unwrap_or_default();
-        let channel = match b.channel {
-            discovery::Channel::Upstream => "",
-            discovery::Channel::Unsloth => "  [unsloth]",
+        let channel = match (b.channel, &b.git) {
+            (discovery::Channel::Upstream, _) => String::new(),
+            (discovery::Channel::Git, Some(g)) => format!("  [git: {}]", g.display()),
+            (c, _) => format!("  [{}]", c.as_str()),
         };
         let dg = if b.runner_exe.is_some() { " +dg" } else { "" };
         let patch = b
@@ -668,7 +1199,14 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
                 h.file_type.map(gguf::file_type_name).unwrap_or_else(|| "?".into()),
                 h.block_count.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
             ),
-            None => ("PARSE-ERROR".into(), "-".into(), "-".into()),
+            None => match &m.hf {
+                Some(hf) => (
+                    hf.architecture.clone().or_else(|| hf.model_type.clone()).unwrap_or_else(|| "safetensors".into()),
+                    hf.quantization.clone().or_else(|| hf.torch_dtype.clone()).unwrap_or_else(|| "?".into()),
+                    hf.num_layers.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
+                ),
+                None => ("PARSE-ERROR".into(), "-".into(), "-".into()),
+            },
         };
         let extras = format!(
             "{}{}{}",
@@ -688,10 +1226,15 @@ fn cmd_scan(cfg: &Config, json: bool) -> anyhow::Result<()> {
 // ---------------------------------------------------------------- devices ----
 
 fn cmd_devices(cfg: &Config, build_tag: Option<&str>, json: bool) -> anyhow::Result<()> {
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-    let build = pick_build(&builds, build_tag)?;
-    let devices = launch::enumerate_devices(cfg, &build.server_exe, &platform)?;
+    let devices = if builds.is_empty() && build_tag.is_none() {
+        // No llama.cpp build (Linux serving SGLang): the OS adapters are the device list.
+        fidim_core::devices::from_adapters(&platform.video_adapters()?, &cfg.integrated_name_patterns)
+    } else {
+        let build = pick_build(&builds, build_tag)?;
+        launch::enumerate_devices(cfg, &build.server_exe, &platform)?
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&devices)?);
         return Ok(());
@@ -865,6 +1408,21 @@ fn cmd_check(
     profile_id: &str,
     json: bool,
 ) -> anyhow::Result<()> {
+    let sg_profile = load_profile(cfg, profile_id)?;
+    if sg_profile.engine.is_sglang() {
+        let devices = fidim_core::sglang::devices_now(cfg, platform)?;
+        let device = fidim_core::sglang::resolve_device(&sg_profile, &devices);
+        let results = fidim_core::sglang::preflight(cfg, &sg_profile, device, platform, &fidim_core::sglang::running_aliases(cfg));
+        if json {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            print_results(&results);
+            if let Some(d) = device {
+                println!("\n  {}", fidim_core::sglang::compose(cfg, &sg_profile, d, &cfg.runs_dir)?.command_line());
+            }
+        }
+        return Ok(());
+    }
     let (_, prepared) = prepare(cfg, platform, profile_id)?;
     let results = preflight::run_all(&prepared.context);
     if json {
@@ -925,6 +1483,23 @@ fn cmd_launch(
     override_blocks: bool,
     ready_timeout: u64,
 ) -> anyhow::Result<()> {
+    if load_profile(cfg, profile_id)?.engine.is_sglang() {
+        let profile = load_profile(cfg, profile_id)?;
+        let findings = profile::validate(&profile);
+        for f in &findings {
+            println!("  [{:?}] {} ({})", f.severity, f.message, f.code);
+        }
+        if findings.iter().any(|f| f.severity == profile::Severity::Error) {
+            bail!("profile {profile_id} has validation errors — fix the profile JSON first");
+        }
+        let r = fidim_core::sglang::launch(cfg, &profile, platform, override_blocks, Duration::from_secs(ready_timeout))?;
+        print_results(&r.results);
+        if let Some(x) = &r.replaced {
+            println!("replaced {x} on port {}", profile.server.port);
+        }
+        println!("launched {} (pid {}, port {}) — ready\n  {}", profile.id, r.state.pid, r.state.port, r.plan.command_line());
+        return Ok(());
+    }
     let (mut profile, prepared) = prepare(cfg, platform, profile_id)?;
     let results = preflight::run_all(&prepared.context);
     print_results(&results);
@@ -1342,16 +1917,97 @@ fn cmd_bench(
 /// baseline for the export acceptance test.
 // ---------------------------------------------------------------- router ----
 
+/// The build the router runs on: its configured one, else the newest
+/// installed upstream build. Show and Launch must agree on this, because
+/// the `device = ROCmN` a preset carries is that build's enumeration.
+fn router_build_dir(rc: &fidim_core::router::RouterConfig, builds: &[Build]) -> anyhow::Result<PathBuf> {
+    Ok(match &rc.build {
+        Some(b) => b.clone(),
+        None => fidim_core::update::newest_installed(builds).context("no installed build")?.path,
+    })
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum SglangCmd {
+    /// List python environments that can run SGLang (the configured venv, ~/.venvs, ~/*env*, PATH).
+    List {
+        /// Extra directories to look in (each may be a venv or a folder of venvs).
+        #[arg(long)]
+        root: Vec<PathBuf>,
+    },
+    /// Create a venv and pip-install SGLang into it.
+    Install {
+        /// Where to create the venv.
+        dir: PathBuf,
+        /// `rocm` (AMD wheels index), `cuda` (default torch index) or `cpu`.
+        #[arg(long, default_value = "cuda")]
+        flavor: String,
+        /// Extra pip arguments (e.g. --extra-index-url ...).
+        #[arg(long)]
+        pip_arg: Vec<String>,
+    },
+    /// Make a listed install the one profiles launch with (config.json → sglang.venv).
+    Use { venv: PathBuf },
+}
+
+fn cmd_sglang(cfg: &mut Config, json: bool, cmd: SglangCmd) -> anyhow::Result<()> {
+    use fidim_core::sglang as sg;
+    match cmd {
+        SglangCmd::List { root } => {
+            let installs = sg::discover_installs(cfg, &root);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&installs)?);
+            } else if installs.is_empty() {
+                println!("no SGLang installs found (fidim sglang install <dir> creates one)");
+            } else {
+                for i in &installs {
+                    println!(
+                        "  {:<48} sglang {:<10} torch {:<14} {}{}",
+                        i.venv.display(),
+                        i.sglang_version.as_deref().unwrap_or("-"),
+                        i.torch_version.as_deref().unwrap_or("-"),
+                        i.device.as_deref().unwrap_or("cpu"),
+                        if i.configured { "  (configured)" } else { "" }
+                    );
+                }
+            }
+        }
+        SglangCmd::Install { dir, flavor, pip_arg } => {
+            let venv = sg::install(&dir, &flavor, &pip_arg, &mut |line| println!("{line}"))?;
+            println!("installed into {}; select it with: fidim sglang use {}", venv.display(), venv.display());
+        }
+        SglangCmd::Use { venv } => {
+            let probe = sg::probe_install(&venv).ok_or_else(|| anyhow::anyhow!("{} has no python that imports sglang", venv.display()))?;
+            let mut host = cfg.sglang.clone().unwrap_or(sg::SgLangHost { venv: venv.clone(), tools_dir: None, pythonpath: vec![], env: Default::default(), cwd: None });
+            host.venv = probe.venv.clone();
+            cfg.sglang = Some(host);
+            cfg.save(&Config::config_dir().join("config.json"))?;
+            println!("config.json: sglang.venv = {}", probe.venv.display());
+        }
+    }
+    Ok(())
+}
+
 fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
     use fidim_core::router::{self, RouterMember};
+    // `serve` is the router process itself: it needs no router config.
+    let cmd = match cmd {
+        RouterCmd::Serve { host, port, route, alias, default } => {
+            return router_serve::run(router_serve::Opts::parse_args(&host, port, &route, &alias, &default)?);
+        }
+        other => other,
+    };
     let mut rc = router::load_config()?;
     match cmd {
         RouterCmd::Show => {
             let profiles = Profile::load_all(&cfg.profile_dir)?;
             let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-            let platform = WindowsPlatform;
-            let exe = pick_build(&builds, None)?.server_exe.clone();
-            let devices = launch::enumerate_devices(cfg, &exe, &platform)?;
+            let platform = HostPlatform;
+            // Same build as Launch: device indices are per build (a local
+            // gfx1201-only build has no iGPU entry), so a preview rendered
+            // with any other build shows the wrong `device = ROCmN`.
+            let build_dir = router_build_dir(&rc, &builds)?;
+            let devices = launch::enumerate_devices(cfg, &build_dir.join("bin").join("llama-server.exe"), &platform)?;
             let ini = router::render_ini(&rc, &profiles, &devices);
             if json {
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "config": rc, "ini": ini.as_ref().map(|r| r.text.clone()).ok() }))?);
@@ -1390,12 +2046,14 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
         }
         RouterCmd::Launch { ready_timeout } => {
             let profiles = Profile::load_all(&cfg.profile_dir)?;
+            if fidim_core::sglang::is_sglang_router(&rc, &profiles) {
+                let (state, started, replaced) = fidim_core::sglang::launch_router(cfg, &rc, &profiles, &HostPlatform, Duration::from_secs(ready_timeout))?;
+                println!("router up on :{} (pid {}); members started: {:?}; replaced: {:?}", state.port, state.pid, started, replaced);
+                return Ok(());
+            }
             let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
-            let build_dir = match &rc.build {
-                Some(b) => b.clone(),
-                None => fidim_core::update::newest_installed(&builds).context("no installed build")?.path,
-            };
-            let platform = WindowsPlatform;
+            let build_dir = router_build_dir(&rc, &builds)?;
+            let platform = HostPlatform;
             let devices = launch::enumerate_devices(cfg, &build_dir.join("bin").join("llama-server.exe"), &platform)?;
             let r = router::launch(cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(ready_timeout))?;
             if json {
@@ -1424,6 +2082,7 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
         }
         RouterCmd::Load { model_id } => { router::load_model(&rc.host, rc.port, &model_id)?; println!("loading {model_id}"); }
         RouterCmd::Unload { model_id } => { router::unload_model(&rc.host, rc.port, &model_id)?; println!("unloaded {model_id}"); }
+        RouterCmd::Serve { .. } => unreachable!("handled before the router config loads"),
     }
     Ok(())
 }
@@ -1432,10 +2091,12 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
 
 fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
     use fidim_core::live;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let util = platform.gpu_utilization().unwrap_or_default();
     let mut rows = Vec::new();
-    for r in supervise::reattach(&cfg.runs_dir).into_iter().filter(|r| r.alive) {
+    let all_runs = supervise::reattach(&cfg.runs_dir);
+    let router_run = all_runs.iter().find(|x| x.alive && x.state.profile_id == fidim_core::router::ROUTER_ID).map(|x| x.state.clone());
+    for r in all_runs.into_iter().filter(|r| r.alive) {
         let samples: Vec<live::LiveSample> = if r.state.profile_id == fidim_core::router::ROUTER_ID {
             fidim_core::router::models(&r.state.host, r.state.port)
                 .unwrap_or_default()
@@ -1443,6 +2104,12 @@ fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
                 .filter(|m| m.status == "loaded")
                 .map(|m| live::sample(&r.state.host, r.state.port, Some(&m.id)))
                 .collect()
+        } else if r.state.engine.is_sglang() {
+            // an SGLang member has no /slots; the router answers by served name
+            match &router_run {
+                Some(rt) => vec![live::sample(&rt.host, rt.port, Some(&r.state.alias))],
+                None => vec![],
+            }
         } else {
             vec![live::sample(&r.state.host, r.state.port, None)]
         };
@@ -1488,4 +2155,114 @@ fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
     }
     if rows.is_empty() { println!("nothing running"); }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fidim_core::overlay::{self as ov, OverlayLookup, OverlaySource};
+    use fidim_core::update;
+
+    const TAG: &str = "b11030-mix-5ff778e";
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("fidim").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn models_commands_parse() {
+        use models::ModelsCmd;
+        let cli = parse(&["models", "search", "K2-Horizon", "--limit", "5", "--json"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Cmd::Models { cmd: ModelsCmd::Search { query, limit, all, sort } } => {
+                assert_eq!((query.as_str(), limit, all, sort.as_str()), ("K2-Horizon", 5, false, "downloads"));
+            }
+            _ => panic!("not models search"),
+        }
+        match parse(&["models", "show", "https://huggingface.co/IFM/K2-Horizon-7B-GGUF", "--rev", "main"]).unwrap().command {
+            Cmd::Models { cmd: ModelsCmd::Show { repo, rev, gfx } } => {
+                assert_eq!(repo, "https://huggingface.co/IFM/K2-Horizon-7B-GGUF");
+                assert_eq!(rev.as_deref(), Some("main"));
+                assert_eq!(gfx, None);
+            }
+            _ => panic!("not models show"),
+        }
+        assert!(matches!(
+            parse(&["models", "needs", r"E:\models\x.gguf"]).unwrap().command,
+            Cmd::Models { cmd: ModelsCmd::Needs { .. } }
+        ));
+        let get = parse(&[
+            "models", "get", "ngquocvinh/K2-Horizon-7B-GGUF", "--quant", "Q4_K_M", "--mmproj", "--draft", "mtp.gguf",
+            "--dest", r"D:\m", "--build", "none", "--allow-fork", "--yes", "--ctx", "65536", "--gfx", "gfx1201",
+        ])
+        .unwrap();
+        let dbg = format!("{:?}", match get.command { Cmd::Models { cmd } => cmd, _ => panic!("not models get") });
+        for want in [
+            "quant: Some(\"Q4_K_M\")", "mmproj: Some(\"auto\")", "draft: Some(\"mtp.gguf\")", "build: \"none\"",
+            "allow_fork: true", "yes: true", "ctx: Some(65536)", "no_profile: false", "file: None", "gfx: Some(\"gfx1201\")",
+        ] {
+            assert!(dbg.contains(want), "{want} in {dbg}");
+        }
+        // Defaults: the recommendation, no extras, auto build, and it asks.
+        let dbg = format!("{:?}", match parse(&["models", "get", "a/b"]).unwrap().command { Cmd::Models { cmd } => cmd, _ => unreachable!() });
+        for want in ["quant: None", "mmproj: None", "draft: None", "build: \"auto\"", "allow_fork: false", "yes: false", "gfx: None"] {
+            assert!(dbg.contains(want), "{want} in {dbg}");
+        }
+        // One file choice at a time; a repo is required.
+        assert!(parse(&["models", "get", "a/b", "--quant", "Q4_K_M", "--file", "x.gguf"]).is_err());
+        assert!(parse(&["models", "get"]).is_err());
+        assert!(parse(&["models", "show"]).is_err());
+    }
+
+    fn release(json_assets: &str, tag: &str) -> update::Release {
+        update::parse_release(&format!(
+            r#"{{"tag_name":"{tag}","published_at":"2026-09-18T15:36:14Z","html_url":"","assets":[{json_assets}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn unsloth_hint_offers_install_only_for_an_overlay_that_exists() {
+        let mut cfg = Config::default_for_machine();
+        let root = std::env::temp_dir().join(format!("fidim-cli-hint-{}", std::process::id()));
+        cfg.install_root = Some(root.clone());
+        let z = "0".repeat(64);
+        let latest = release(
+            &format!(r#"{{"name":"app-{TAG}-windows-x64-rocm-gfx120X.zip","browser_download_url":"https://x/b","size":1,"digest":"sha256:{z}"}}"#),
+            TAG,
+        );
+        let mut c = update::check_unsloth_against(&cfg, &[], latest, "gfx120X").unwrap();
+        let published = OverlaySource::Published;
+        let local = OverlaySource::Local(PathBuf::from(r"C:\dgo\out"));
+
+        // Nothing published: say so and point at --overlay-from, not --install.
+        ov::apply_lookup(&mut c, OverlayLookup::Missing);
+        let h = unsloth_next_step(&c, Some(&published));
+        assert!(h.contains("no dgpatch5 overlay is published for b11030-mix-5ff778e in Dixon-Cider/fidim-dg-overlay"), "{h}");
+        assert!(h.contains("--overlay-from") && !h.contains("--install"), "{h}");
+        assert!(!unsloth_next_step(&c, None).contains("--overlay"), "the plain build does not offer it either");
+        // The lookup failed: the reason, not advice that cannot work.
+        ov::apply_lookup(&mut c, OverlayLookup::Failed("GitHub API: rate limited".into()));
+        let h = unsloth_next_step(&c, Some(&published));
+        assert!(h.contains("unavailable (GitHub API: rate limited)") && !h.contains("--install"), "{h}");
+        // A local overlay installs whatever is published.
+        assert_eq!(unsloth_next_step(&c, Some(&local)), "run with --install to fetch it and lay the runner patch over it.");
+
+        // Published: --install for the patched build, --overlay offered for the plain one.
+        let overlay_release = release(
+            &format!(
+                r#"{{"name":"fidim-dg-overlay-{TAG}-windows-x64.zip","browser_download_url":"https://x/o","size":1,"digest":"sha256:{z}"}},
+                   {{"name":"fidim-overlay.json","browser_download_url":"https://x/d","size":1,"digest":"sha256:{z}"}}"#
+            ),
+            &format!("dgpatch5-{TAG}"),
+        );
+        ov::apply_lookup(&mut c, OverlayLookup::Found(overlay_release));
+        assert_eq!(unsloth_next_step(&c, Some(&published)), "run with --install to fetch it and lay the runner patch over it.");
+        assert!(unsloth_next_step(&c, None).contains("--overlay adds the runner patch"));
+        c.overlay_installed = true;
+        assert!(unsloth_next_step(&c, Some(&published)).starts_with("installed."));
+        assert!(unsloth_next_step(&c, None).starts_with("run with --install"), "the plain build is not installed");
+        std::fs::remove_dir_all(root).ok();
+    }
 }

@@ -13,6 +13,242 @@ build with uncommitted changes.
 
 ## [Unreleased]
 
+### Added
+
+- **4-bit KV option.** The SGLang profile form offers `fp4_mx_block16`
+  (needs the gfx1201 kernel patch in `sglang-gfx1201`); the pre-flight
+  KV budget counts it at 9/16 byte per value.
+- **Pre-flight sizes hybrid-model state from the model.** The KV budget check
+  reserved a flat 150 MiB per GatedDeltaNet state slot (the 27B's value) and
+  wrongly blocked a 35B-A3B MoE with 40 slots; it now reads
+  `ssm.inner_size` x `ssm.state_size` x linear layers from the GGUF header.
+- **The router advertises the real per-request limit.** `/v1/models` and
+  `/v1/models/{name}` (alias resolved) carry `n_ctx` and `context_length` =
+  SGLang's `max_req_input_len`, the KV pool's bound, not the model's nominal
+  window (`max_model_len` stays as the backend reports it). Clients that size
+  their compaction from the model list (Hermes probes `/v1/models/{name}`
+  first) stop growing a conversation past what the server accepts; the
+  Running tab's context is the same number.
+- **SGLang engine, and Linux.** A third engine beside llama-server and
+  DiffusionGemma: profiles with `"engine": "sglang"` launch
+  `python -m sglang.launch_server` from a venv (`Settings → SGLang engine`
+  finds installs, creates one, or picks the one to use), one card each,
+  fronted by FIDIM's own router (`fidim router serve`, in the CLI binary) so
+  the Running tab's slots, throughput, loop detector and sparklines work
+  unchanged. The profile editor has the SGLang form (memory fraction,
+  prefill chunk, slots, GatedDeltaNet state slots, KV dtype, attention
+  backend, speculation with a hot-token map, parsers, memguard, metrics,
+  idle sleep, aliases, extra args, env). The catalog lists Hugging Face
+  safetensors checkpoints beside GGUF files, with a KV-cache estimate from
+  config.json. Pre-flight on Linux checks the venv and tools, the model and
+  sidecar files, the card, that the static pool fits, that a display-driving
+  card keeps 1.5 GB of headroom (the desktop otherwise evicts the compute
+  process and decode collapses), the weights-plus-KV budget for the context,
+  the port and the served name. New Running-tab tiles: free VRAM per card,
+  an "evicting" chip with the KFD eviction counter, draft acceptance, prefix
+  cache hit rate, KV pool use, retractions, time to first token. Linux gets
+  a platform implementation from sysfs, procfs and KFD (cards, displays,
+  per-process VRAM, busy), a `run-linux.sh` launcher, and deb/AppImage
+  packages for x86-64 and arm64 from the release workflow. Benchmarks and
+  Chat work against SGLang servers as they do against llama-server.
+
+- **Update the app from the app.** The Updates tab opens with Llama FIDIM
+  itself: which build this is, the newest release on GitHub with its notes,
+  and an Update button that downloads the release zip, checks it against
+  the published SHA-256, closes the app, replaces `fidim.exe`,
+  `fidim-dg.exe` and `llama-fidim.exe` in place and reopens it. A file a
+  running server still holds (a diffusion server's `fidim-dg.exe`) is moved
+  aside and that server keeps running; llama-server processes are never
+  touched. The same card builds and installs a checkout of this repository
+  when Settings names one (`fidim_source`), which is what
+  `scripts\install.ps1` used to be for. `fidim self-update check` and
+  `fidim self-update install [--tag vX.Y.Z | --source]` do the same from a
+  terminal. Updates and what they replaced are listed in a history.
+- **Get a model.** A Models tab finds a model on Hugging Face (search, or
+  paste a repo or a link to one of its files), lists its files by quant
+  with each one's size, estimated VRAM, whether it fits one card or a
+  split over two and the longest context that fits, and recommends one. It
+  checks which installed llama.cpp build knows the model's architecture,
+  pre-tokenizer and tensor types; when none does, it plans how to get one
+  (the newest upstream release, an Unsloth build, an upstream pull request
+  or a fork the model card links) and shows that fork's repository, commit,
+  distance from upstream and newest commits. Building a pull request's or
+  a fork's code needs a tick in a consent box. It then downloads the file,
+  and a vision projector or a draft if asked (an MTP head, a DFlash draft
+  or a draft model, each in its own speculative mode; EAGLE3 and DSpark
+  heads are shown but not offered, as profiles cannot run them yet), into
+  `<model folder>\<owner>\<repo>` (a whole drive such as `E:\` can be
+  one), resumable and checked against the size and SHA-256 the Hub lists,
+  with the free space checked again when it starts and before each file,
+  and makes a profile (an idle card or a
+  split, the first free port from 9710, the context that fits up to
+  32,768), with its pre-flight shown. It never loads the model: Launch is
+  a separate button. A download keeps running, and shows, while you use
+  other tabs; Stop keeps what has arrived and Resume continues it, and Stop
+  also ends a build or a prebuilt install in progress. A repo
+  llama.cpp cannot run (safetensors, a LoRA adapter, FP8, AWQ, GPTQ, MLX)
+  is explained, with the GGUF versions of it the Hub knows.
+- `fidim models search`, `show`, `needs` and `get` do the same from the
+  command line. `get` prints the plan and asks first (`--yes` skips the
+  question); a fork or pull-request build also needs `--allow-fork`;
+  Ctrl+C stops it and keeps a partial download for the next run. With
+  `--json`, `get` without `--yes` prints the plan and does nothing, and
+  with `--yes` prints the result as one JSON document. `--gfx` gives the
+  GPU target a source build compiles for when the machine does not say.
+  Text that comes from a model file or its card (an architecture name,
+  gating terms) is printed with control characters escaped, so it cannot
+  rewrite what the terminal shows.
+- The core library under both: a Hugging Face Hub client (search, a
+  repo's files with their SHA-256s, and a model's GGUF header read with
+  HTTP range requests before anything is downloaded), a downloader that
+  resumes and checks size and SHA-256 before a file is used, a catalog
+  that groups a repo's files by quant and estimates each one on your
+  cards, free-space and path checks, and one planner the app and the CLI
+  share.
+- Settings has fields for the GitHub token and for using the token
+  `huggingface-cli login` saved.
+- A Hugging Face token can come from the file `HF_TOKEN_PATH` names, and
+  with `"hf_use_cli_token": true` in `config.json`, from the token
+  `huggingface-cli login` saved.
+- **Builds of any git ref.** `fidim update --source --remote <url> --ref
+  <branch|pull/N/head|commit>` compiles a llama.cpp fork's branch, an
+  upstream pull request or any commit for this machine's GPU. The commit
+  is pinned first and checked after the fetch; the build runs in FIDIM's
+  own clone under `~/.fidim/src`, never in your checkouts, one build at a
+  time; stopping it (Ctrl+C) stops every process it started; and the
+  result is labelled by where it came from (`ifm-ai K2Horizon fork
+  @42adf01`) and never ranked or promoted as an upstream release. The ref
+  is fetched by its full name, so a branch and a tag of the same name are
+  never confused; git never opens a credential prompt; trees from every
+  upstream layout configure; and one too old for the ROCm 7 HIP SDK
+  (before b5872) stops after configure with that reason.
+- **Toolchain doctor.** `fidim toolchain` checks Visual Studio's C++ tools,
+  git, CMake, Ninja and the HIP SDK, and compiles a test file to catch the
+  MSVC `<cmath>` clash with HIP clang (llama.cpp#22570) before a build
+  spends minutes finding it. Every source build runs it first.
+- **Which build can load a model.** The core can now tell whether a build
+  knows a model's architecture, pre-tokenizer and tensor types, from the
+  tables in its `llama.dll` or from llama.cpp's source at any commit, and
+  plan how to get one that does: an installed build, the newest upstream
+  release, an Unsloth mix, an upstream pull request, or a fork the model
+  card links. The model wizard builds on this.
+- **Pre-flight check 16.** A launch on a build that does not know the
+  model's architecture is blocked before llama-server fails with "unknown
+  model architecture", and points to the Models tab (or `fidim models
+  get`) for a build that does; a pre-tokenizer or tensor type it could not
+  confirm is a warning.
+- `github_token` in `config.json` (or `GITHUB_TOKEN`) for GitHub API
+  lookups; without one, answers are cached to stay within 60 requests an
+  hour. A token GitHub rejects is dropped after one request, and the plan
+  says so.
+- **The DiffusionGemma runner patch as an overlay.** `fidim update --channel
+  unsloth --install --overlay`, or **Install with FIDIM runner patch** on the
+  Updates tab, installs an Unsloth release with Llama FIDIM's runner patch
+  (dgpatch5: F16 prompt-KV store with a sliding-window ring, flash attention
+  on the GPU, up to 65,536 tokens on a 32 GB card, prefill reuse across
+  blocks) laid over it, as `<tag>-unsloth-dgpatch5`. Only the llama-level
+  binaries are replaced; every file is checked against the overlay's
+  descriptor and the Unsloth zip it was built for, and an install is refused
+  when that zip has a llama-level file the overlay does not replace.
+  `--overlay-from` installs a locally built overlay, `--base-zip` reuses a
+  downloaded Unsloth zip.
+- `packaging/dg-overlay`: the patch, and the scripts and workflow that build,
+  gate, sign (when configured) and publish an overlay for an Unsloth release.
+- **Chat.** A Chat tab talks to any server Llama FIDIM started: a
+  standalone llama-server, a model behind the router (loaded on the first
+  message) or a DiffusionGemma run. Replies stream with their reasoning in
+  a fold, prefill progress, live decode speed, draft acceptance and a
+  context gauge; Stop frees a llama-server slot at once. Messages can be
+  copied, regenerated, edited and resent, or deleted. The app sends a
+  profile's API key itself, from `--api-key`, `--api-key-file` or their
+  environment variables.
+- A DiffusionGemma reply shows its block denoising beside the text while
+  it streams, including its place in the queue, and can be replayed step
+  by step afterwards.
+- Per-conversation system prompt, thinking on or off, and sampler
+  overrides; every field shows the server's effective default and, on
+  request, the model author's. "Save as default for this profile" keeps
+  them for new chats.
+- Conversations are saved on this PC under `~\.fidim\chats` and can be
+  deleted one by one or all at once; a Settings switch turns saving off.
+- **Copy endpoint** in Running, for every server and router model: the
+  OpenAI base URL, the model id, and curl and environment snippets for
+  PowerShell, cmd or Git Bash, plus Python.
+- fidim-dg names the job in a streamed reply with an SSE comment,
+  `: dg task <id>`, matching `/slots` and `/frames`. OpenAI clients skip
+  comments.
+- **Installer.** Releases include `llama-fidim-vX.Y.Z-win-x64-setup.exe`
+  next to the zip: a per-user installer that needs no administrator
+  rights, installs into `%LOCALAPPDATA%\Llama FIDIM` with a Start Menu
+  entry, and uninstalls from Settings > Apps. Installing, upgrading and
+  uninstalling leave a running DiffusionGemma server or keep-alive helper
+  running, and never touch `~\.fidim`. Declining to close the app stops
+  them before anything has changed. It also retires the old
+  `%LOCALAPPDATA%\Programs\LlamaFIDIM` install that `install.ps1` made.
+- `fidim path add|remove|status`: put the folder holding `fidim.exe` on the
+  user PATH, take it off, or see what a new terminal would find. A long
+  PATH is never cut short, and its registry type and other entries stay as
+  they were.
+- `fidim.exe` and `fidim-dg.exe` carry version details (product,
+  publisher, description, version) and the app icon.
+- Release signing through Azure Artifact Signing, off until the repository
+  is set up for it ([docs/signing.md](docs/signing.md)). Every release run
+  now tests the installer: it installs it, upgrades to it from an older
+  build both ways an upgrade happens (silently over the old version, and
+  through the old version's uninstaller as the interactive installer
+  does), and uninstalls it.
+
+### Changed
+
+- A model split into several files (`-00001-of-00003.gguf` ...) is listed
+  once, and its VRAM estimate counts every part, not just the first.
+  Pre-flight blocks a launch when a part is missing, instead of letting
+  llama-server fail at load.
+- Importance-matrix files (`*imatrix*.gguf`) are no longer listed as
+  models.
+- **Move diffusion profiles onto it** on the Updates tab now lists the
+  profiles that would move, the patched runner build each would leave, and
+  why the others stay, and moves only the ones listed once you confirm. Its
+  tooltip no longer says profiles on a patched runner build never move: they
+  move onto a build whose patch has every feature of theirs, such as a
+  dgpatch4 profile onto dgpatch5.
+- The patched runner's profiler and split-count switches (`DG_PROFILE`,
+  `DG_SC_SPLITK`, `DG_SC_SPLITK_CHECK`) are treated as test hooks: never
+  passed to the runner, and flagged when a profile sets one.
+- The app runs under a content security policy: no remote scripts,
+  styles, images or connections. Links in chat replies open in the default
+  browser, http and https only, and only when chosen.
+- Health checks, readiness and the live view reach a server bound to
+  0.0.0.0 over loopback; connecting to the wildcard address fails on
+  Windows.
+- `scripts\install.ps1` installs into `%LOCALAPPDATA%\Llama FIDIM`, the
+  installer's folder, and retires `%LOCALAPPDATA%\Programs\LlamaFIDIM`:
+  helpers running from there keep running, and a user PATH entry for it
+  moves to the new folder. Pin the taskbar icon again once. `-AddToPath`
+  now uses `fidim path add`, which keeps the PATH value's type.
+- The app's version details name Dixon-Cider as publisher (they said
+  "fca").
+
+### Fixed
+
+- `fidim router show` renders the preset with the router's build, the one
+  `fidim router launch` uses. It used the newest build, whose device
+  numbering can differ: a local gfx1201-only build has no iGPU entry, so
+  the preview said `device = ROCm2` for a card the launch correctly
+  passed as `ROCm1`.
+- Radio buttons in the app (the diffusion engine's card picker) are drawn
+  at the size of the checkboxes, not as full-width inputs.
+- `fidim scan` named quantizations after the wrong table: IQ4_XS files
+  read as BF16 and BF16 files as `file_type 32`.
+- fidim-dg skips a queued streamed request within a quarter second of its
+  client leaving. It used to notice only when a keep-alive comment failed
+  to write, 2 to 4 s later, and could run the abandoned reply on the GPU.
+- The live view never loads a router model: its per-model polls ask with
+  `autoload=false`, so a model evicted between the router's list and the
+  poll is reported, not loaded again.
+- The live view shows slots and metrics of a server started with an API
+  key; it sends the profile's key.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added

@@ -1,0 +1,396 @@
+{
+ "_id": "6a99ea1dfbc747b5a10f1b5f",
+ "id": "NANI-Nithin/K2-Horizon-MoVA-36B-A4B-GGUF",
+ "author": "NANI-Nithin",
+ "sha": "345b2b44f6fa6c1de0afd7a4e32d2ffb3db3a08a",
+ "lastModified": "2026-09-05T02:52:05.000Z",
+ "private": false,
+ "disabled": false,
+ "gated": false,
+ "downloads": 44003,
+ "likes": 37,
+ "tags": [
+  "gguf",
+  "llama-cpp",
+  "moe",
+  "mixture-of-experts",
+  "mova",
+  "mixture-of-values",
+  "k2-horizon",
+  "reasoning",
+  "long-context",
+  "ifm",
+  "mbzuai",
+  "text-generation",
+  "en",
+  "base_model:IFM/K2-Horizon-MoVA-36B-A4B",
+  "base_model:quantized:IFM/K2-Horizon-MoVA-36B-A4B",
+  "license:apache-2.0",
+  "endpoints_compatible",
+  "region:us",
+  "conversational"
+ ],
+ "pipeline_tag": "text-generation",
+ "cardData": {
+  "base_model": "IFM/K2-Horizon-MoVA-36B-A4B",
+  "base_model_relation": "quantized",
+  "language": [
+   "en"
+  ],
+  "license": "apache-2.0",
+  "tags": [
+   "llama-cpp",
+   "gguf",
+   "moe",
+   "mixture-of-experts",
+   "mova",
+   "mixture-of-values",
+   "k2-horizon",
+   "reasoning",
+   "long-context",
+   "ifm",
+   "mbzuai"
+  ],
+  "pipeline_tag": "text-generation"
+ },
+ "gguf": {
+  "total": 37444792020,
+  "architecture": "k2-horizon",
+  "context_length": 524288,
+  "chat_template": "(trimmed: 43040 characters)",
+  "bos_token": "<|ifm|begin_of_text|>",
+  "eos_token": "<|ifm|endoftext|>",
+  "totalFileSize": 74924627296
+ },
+ "baseModels": {
+  "relation": "quantized",
+  "models": [
+   {
+    "_id": "6a975945e31ed8d0050e3c5f",
+    "id": "IFM/K2-Horizon-MoVA-36B-A4B"
+   }
+  ]
+ },
+ "siblings": [
+  {
+   "rfilename": ".gitattributes",
+   "blobId": "bac8fd9097cf8a3a4eec0c24406dfb528d335466",
+   "size": 3730
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-BF16.gguf",
+   "blobId": "dd1074e6da7486d39eae1729cdd36119ee19b73e",
+   "size": 74924627296,
+   "lfs": {
+    "sha256": "6289baf9e00cfad7584c20fed17eaa34b46336adaf0e1a108145eab024f27bd0",
+    "size": 74924627296,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ1_M.gguf",
+   "blobId": "0c6adf1ae7ff17dca8b6ac92494cef9900375a1a",
+   "size": 8688739008,
+   "lfs": {
+    "sha256": "4f1efe8a8b9137842e6c3f4cb33b824165f024454280cceea7f0893315bfc1fc",
+    "size": 8688739008,
+    "pointerSize": 135
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ1_S.gguf",
+   "blobId": "786ecd52c9c0e27604be045ccdd12914d544f365",
+   "size": 7863826368,
+   "lfs": {
+    "sha256": "5b8da61117cd5133dc7412effe43bbd974caa3c966057779911d1ae1f79c02fc",
+    "size": 7863826368,
+    "pointerSize": 135
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ2_M.gguf",
+   "blobId": "a26ed81a20915c26c9b66f736f4d850e56aa7e2a",
+   "size": 12459958144,
+   "lfs": {
+    "sha256": "80083264e700836b8fd6671da5e6ceebbd9c07b809854561729db70dde157ec3",
+    "size": 12459958144,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ2_S.gguf",
+   "blobId": "db3e0723349d80db51a507fad82b428b78704f13",
+   "size": 11360074688,
+   "lfs": {
+    "sha256": "a701c01170b4f3112d5dbb277ea5ed325296d7ac823c83e9315a315b5b53d0da",
+    "size": 11360074688,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ2_XS.gguf",
+   "blobId": "2c8c28c5914e50373f3afa9f6095691ec8fcc69e",
+   "size": 11179205568,
+   "lfs": {
+    "sha256": "18899389d224751de3e4fde39106d44e4011afd66ee323a8edf3623b90b5f58f",
+    "size": 11179205568,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ2_XXS.gguf",
+   "blobId": "b6650855aa98189121f8791e8a7bbcc19ea3a7b5",
+   "size": 10063593408,
+   "lfs": {
+    "sha256": "0d7ae74b94efd56e219e1a7e6d81312d43999f79e2a6364a22872895c935b33e",
+    "size": 10063593408,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ3_M.gguf",
+   "blobId": "e93f4496f72cb8bf551fd53ded3deddfd4833075",
+   "size": 16546995648,
+   "lfs": {
+    "sha256": "9d24a0b8ca01cf567a64c2f0cb846683ae5e5e93ff59ddcc7324d9013e32cf9c",
+    "size": 16546995648,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ3_S.gguf",
+   "blobId": "7140e33c408f6e46dcfc532af93bb9e23b5a742a",
+   "size": 16394762688,
+   "lfs": {
+    "sha256": "265946ac50a1ad9bbebe2c8d8e4bde22d46955c05c08b13d5648daa87bc440e9",
+    "size": 16394762688,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ3_XS.gguf",
+   "blobId": "3890b227e85159550bbb8a8baf58a853ced5d3cc",
+   "size": 15695083968,
+   "lfs": {
+    "sha256": "765216fa982259fa72ada1758d17268a272c418bb2bc41724181bd4cde8cb6f0",
+    "size": 15695083968,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ3_XXS.gguf",
+   "blobId": "4b5d39a5a3680c6b5c0017318080251c42be5b59",
+   "size": 14599667584,
+   "lfs": {
+    "sha256": "744352e78eee548f243d6506bdefe9992d951a40e0b48077674923bc4be7535a",
+    "size": 14599667584,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ4_NL.gguf",
+   "blobId": "6d79a86b343865c929f8852ffdc3bceaad071194",
+   "size": 21281061568,
+   "lfs": {
+    "sha256": "7c1bb31a690d2ed94bb52fe2481bd02bb49bbfa4ac05b32280f1402c4e391562",
+    "size": 21281061568,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-IQ4_XS.gguf",
+   "blobId": "2890ab1075c2d0d90fa77c90f6fab3457d68efca",
+   "size": 20131575488,
+   "lfs": {
+    "sha256": "c0da95504e3155f0b335d496a8a5d3fded08fd3d2aaf4f6b6a0d6109836bc3aa",
+    "size": 20131575488,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-MXFP4_MOE.gguf",
+   "blobId": "bf4c05fc95d88ebff1dc894bf1009862cd922284",
+   "size": 21719891296,
+   "lfs": {
+    "sha256": "69ffea2247be89307c6b7d1f132c30be9493a3abe33634b45d192a248c6d7657",
+    "size": 21719891296,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q1_0.gguf",
+   "blobId": "68214d791c81e49c3a7c20ac945235a322b1e399",
+   "size": 5758698688,
+   "lfs": {
+    "sha256": "2d952179ee86f720c449c7c7c1266d7e795e1cc2e76fd8071f26f111915f1025",
+    "size": 5758698688,
+    "pointerSize": 135
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q2_0.gguf",
+   "blobId": "8017c0188ef2f6115e55dde11de1ce5b40dc37cd",
+   "size": 11112941248,
+   "lfs": {
+    "sha256": "f0b6c3ed643c3d9d6e5445e11d3661e67278f982ed40080f1778736638fa462a",
+    "size": 11112941248,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q2_K.gguf",
+   "blobId": "c7cc3a162a233fb9d779003ecefe7a0497f480d4",
+   "size": 13622388576,
+   "lfs": {
+    "sha256": "1f5320f317db5d4cba38cc3e04a683522c26d6604101937161f50cc350561294",
+    "size": 13622388576,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q2_K_S.gguf",
+   "blobId": "bf5f3baafe723bd0deec6244046d1dab38c6dda6",
+   "size": 11102740736,
+   "lfs": {
+    "sha256": "dd9239d19328d392decf2251c87b7746ff984266033d6fec9892890ca378fc99",
+    "size": 11102740736,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q3_K_L.gguf",
+   "blobId": "b541b1fb4d4e39cb0fff0d641563a5a9f8c2ade7",
+   "size": 18841441376,
+   "lfs": {
+    "sha256": "13767a2d0ccb3c5556b4640d15906d8f6b648a2cc407cda2eede108db634bcf4",
+    "size": 18841441376,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q3_K_M.gguf",
+   "blobId": "50fafb4851a935fb25bd9943157322b587cd200b",
+   "size": 17661219936,
+   "lfs": {
+    "sha256": "662610e09a7fe40af111c8b80c905510e84d747dfa11eec29c4a9e221f35f1b0",
+    "size": 17661219936,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q3_K_S.gguf",
+   "blobId": "5432366121b6927db0321f3570cb929f5774c8d0",
+   "size": 16393717856,
+   "lfs": {
+    "sha256": "4607d921ca5045720b531712251d008e8ccd0109a19c0a0cb32ddd59ac68646a",
+    "size": 16393717856,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q4_0.gguf",
+   "blobId": "74a984fda7e4b292b896aedcd2ea9e412394e2b5",
+   "size": 21280078176,
+   "lfs": {
+    "sha256": "9904de4ca4ad8b34f49e189de5459418821895f3bd7cf8289bf20660cd844369",
+    "size": 21280078176,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q4_1.gguf",
+   "blobId": "67a7a76c129f0442bbf20d7cc2dfc560d9b25ce2",
+   "size": 23579541856,
+   "lfs": {
+    "sha256": "38a04a64e6700dcb6a54163ca428d6125709cd831fe6a6d9bf981ba1b327ff3b",
+    "size": 23579541856,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf",
+   "blobId": "12d8c496e235f0e23241d458ba82f5ef462b0c78",
+   "size": 22368011616,
+   "lfs": {
+    "sha256": "513dd78590ac29135a7cea5a99865d57d65291b1f857a8904fb9b1878d4f4cbd",
+    "size": 22368011616,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q4_K_S.gguf",
+   "blobId": "14303a1a14ae7f2ee81bcc780b2e6ddd98db9f1d",
+   "size": 21361424736,
+   "lfs": {
+    "sha256": "8e061d3b8578e57d7bb7b130e6b5fd9e6c29997b1e60e4a07f8affd3f81cf5d0",
+    "size": 21361424736,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q5_0.gguf",
+   "blobId": "3ceaf2d6743ac7c7274e122d92c7808bf82c4321",
+   "size": 25879005536,
+   "lfs": {
+    "sha256": "ca8875ed7cf7b251ed6e1f2c46e8c269f44c49339bf186034c9ff3c0624ee263",
+    "size": 25879005536,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q5_1.gguf",
+   "blobId": "7df0f4070636c93a90513e0e9c078924989b9b10",
+   "size": 28178469216,
+   "lfs": {
+    "sha256": "a8417f73fc06cbd31e2b38c66cd3ba5ebd918600ac7d1313b0172c22cd3585f0",
+    "size": 28178469216,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q5_K_M.gguf",
+   "blobId": "733c40896b8327939bc198bcec1682e7a49b187a",
+   "size": 26439456096,
+   "lfs": {
+    "sha256": "8f0d54bade503e800293885356ebd42334068a262176b3d32d7c06e7e0659707",
+    "size": 26439456096,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q5_K_S.gguf",
+   "blobId": "769a287c1815c1b9f4d912a100cb9f5c2ae71d02",
+   "size": 25879005536,
+   "lfs": {
+    "sha256": "eac806f4bfe0dfcd72176bfc8985cb36c6834c9628a415084f5f09de550f4e63",
+    "size": 25879005536,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q6_K.gguf",
+   "blobId": "25db02263b63b8cff943f64d17ba6fe02bd97b29",
+   "size": 30765365856,
+   "lfs": {
+    "sha256": "d37a53f1898e348535263da89097c610c54d9de9c5349e25e82a757f04f78603",
+    "size": 30765365856,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "K2-Horizon-MoVA-36B-A4B-Q8_0.gguf",
+   "blobId": "ed6e19b6518990458dae29286e563611742927a3",
+   "size": 39831174496,
+   "lfs": {
+    "sha256": "ccdf597eaeb0bf5c00eb97253c06f9424fb5599cc5991feea21f235fa0aaf982",
+    "size": 39831174496,
+    "pointerSize": 136
+   }
+  },
+  {
+   "rfilename": "README.md",
+   "blobId": "fe56e4c7b203072a41ebe9cf2850f4785dbe50cd",
+   "size": 10612
+  }
+ ]
+}

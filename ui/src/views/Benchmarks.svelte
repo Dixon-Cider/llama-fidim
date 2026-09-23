@@ -20,6 +20,14 @@
   }
   load();
 
+  // Any engine that answers /v1/completions on the profile's port can be
+  // swept: llama-server and SGLang (behind model_router.py). The diffusion
+  // engine cannot (core's ensure_benchable says why).
+  const current = $derived(profiles.find((p) => p.id === selected) ?? null);
+  const engineOf = (p) => p?.engine ?? "llama-server";
+  const benchable = (p) => engineOf(p) !== "diffusion-gemma";
+  const live = $derived(liveRunIds.includes(selected));
+
   async function sweep() {
     running = true;
     message = "";
@@ -44,14 +52,18 @@
 </p>
 
 <div class="toolbar">
-  <select style="width: 240px;" bind:value={selected} onchange={loadHistory}>
-    {#each profiles as p}<option value={p.id}>{p.id}</option>{/each}
+  <select style="width: 280px;" bind:value={selected} onchange={loadHistory}>
+    {#each profiles as p}<option value={p.id}>{p.id}{engineOf(p) !== "llama-server" ? ` · ${engineOf(p)}` : ""}</option>{/each}
   </select>
-  <button class="btn primary" onclick={sweep} disabled={running || !liveRunIds.includes(selected)}>
+  <button class="btn primary" onclick={sweep} disabled={running || !live || !benchable(current)}>
     {running ? "Sweeping…" : "Run sweep"}
   </button>
-  {#if !liveRunIds.includes(selected)}
+  {#if current && !benchable(current)}
+    <span class="chip warn" title="Every diffusion request denoises whole 256-token blocks serially; use the timings in the chat response instead.">diffusion engine: not benchmarked</span>
+  {:else if !live}
     <span class="chip plain">server not running</span>
+  {:else if engineOf(current) === "sglang"}
+    <span class="chip note" title="Swept through model_router.py on the profile's port, the same /v1/completions calls as llama-server.">sglang</span>
   {/if}
   {#if message}<span class="muted">{message}</span>{/if}
 </div>

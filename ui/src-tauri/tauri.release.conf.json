@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "homepage": "https://github.com/Dixon-Cider/llama-fidim",
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "../../target/release/fidim.exe": "fidim.exe",
+      "../../target/release/fidim-dg.exe": "fidim-dg.exe"
+    },
+    "windows": {
+      "allowDowngrades": true,
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "./windows/hooks.nsh"
+      }
+    }
+  }
+}

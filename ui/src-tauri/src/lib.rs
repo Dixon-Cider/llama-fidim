@@ -7,14 +7,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use fidim_core::chat::{self, store as chat_store};
 use fidim_core::config::Config;
 use fidim_core::devices::Device;
 use fidim_core::launch::{self, PrepareInputs};
-use fidim_core::platform::{Platform, WindowsPlatform};
-use fidim_core::profile::{self, Profile};
+use fidim_core::platform::{Platform, HostPlatform};
+use fidim_core::profile::{self, Engine, Profile};
 use fidim_core::supervise;
 use fidim_core::update::{self, PromoteScope};
 use fidim_core::{bench, discovery, export, preflight};
+use tauri::ipc::Channel;
 use tauri::Emitter;
 
 /// Cached slow inputs for live pre-flight (device enumeration ~2-4s, build
@@ -22,6 +24,8 @@ use tauri::Emitter;
 /// per R-03.
 struct UiCache {
     devices: Option<(Instant, Vec<Device>)>,
+    /// profile id -> (when, cumulative KFD evicted ms) for the eviction rate.
+    evict: HashMap<String, (Instant, u64)>,
     build_probes: HashMap<PathBuf, Option<String>>,
     /// Build + model scan; probing every build costs ~0.3 s each.
     scan: Option<(Instant, serde_json::Value)>,
@@ -35,7 +39,113 @@ struct AppState {
     /// STA COM for WebView2, and CoInitializeEx(MTA) on it fails with
     /// RPC_E_CHANGED_MODE (observed live).
     cache: Arc<Mutex<UiCache>>,
+    /// Chat streams in flight, by the id the web view gave each, so Stop
+    /// (and a reload's cancel-all) can reach them.
+    chats: ChatStreams,
+    /// Model wizard jobs, running and finished, so the Models view can
+    /// come back to one after navigating away.
+    wizard: WizardJobs,
+    /// The repo views and plans the wizard made, by id: the web view gets
+    /// copies to draw and sends back only the id, so what runs is exactly
+    /// what the core planned (its consent flags, sources, sizes and
+    /// hashes), never an edited copy.
+    wizard_made: Arc<Mutex<WizardMade>>,
 }
+
+type WizardJobs = Arc<Mutex<HashMap<String, WizardJob>>>;
+
+/// Views and plans kept for the web view to refer to. A few are enough:
+/// each view is one opened repo, each plan one set of picks.
+#[derive(Default)]
+struct WizardMade {
+    next: u64,
+    views: Kept<fidim_core::wizard::RepoView>,
+    plans: Kept<fidim_core::wizard::WizardPlan>,
+}
+
+const WIZARD_KEEP: usize = 16;
+
+impl WizardMade {
+    fn id(&mut self, prefix: &str) -> String {
+        self.next += 1;
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        format!("{prefix}{t:x}-{}", self.next)
+    }
+    fn keep_view(&mut self, v: fidim_core::wizard::RepoView) -> String {
+        let id = self.id("v");
+        self.views.keep(id.clone(), v);
+        id
+    }
+    fn keep_plan(&mut self, p: fidim_core::wizard::WizardPlan) -> String {
+        let id = self.id("p");
+        self.plans.keep(id.clone(), p);
+        id
+    }
+    fn view(&self, id: &str) -> Option<&fidim_core::wizard::RepoView> {
+        self.views.get(id)
+    }
+    fn plan(&self, id: &str) -> Option<&fidim_core::wizard::WizardPlan> {
+        self.plans.get(id)
+    }
+}
+
+/// The newest `WIZARD_KEEP` values by id; older ones are dropped.
+struct Kept<T>(std::collections::VecDeque<(String, T)>);
+
+impl<T> Default for Kept<T> {
+    fn default() -> Self {
+        Kept(std::collections::VecDeque::new())
+    }
+}
+
+impl<T> Kept<T> {
+    fn keep(&mut self, id: String, v: T) {
+        self.0.push_back((id, v));
+        while self.0.len() > WIZARD_KEEP {
+            self.0.pop_front();
+        }
+    }
+    fn get(&self, id: &str) -> Option<&T> {
+        self.0.iter().find(|(k, _)| k == id).map(|(_, v)| v)
+    }
+}
+
+/// `value` (a view or a plan as JSON) with the id the web view refers to it by.
+fn with_id(value: impl serde::Serialize, key: &str, id: &str) -> Result<serde_json::Value, String> {
+    let mut v = serde_json::to_value(value).map_err(|e| e.to_string())?;
+    v[key] = id.into();
+    Ok(v)
+}
+
+/// One wizard run: its plan, the latest state of each step (rebuilt from
+/// the same events the view gets), and how it ended.
+struct WizardJob {
+    plan: fidim_core::wizard::WizardPlan,
+    /// The id of the plan it runs; a job keeps its plan reachable by it
+    /// for a resume after the web view reloaded.
+    plan_id: String,
+    progress: fidim_core::wizard::JobProgress,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    started_unix: u64,
+    consent: bool,
+    finished: Option<serde_json::Value>,
+}
+
+impl WizardJob {
+    fn snapshot(&self, id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "job": id,
+            "plan": with_id(&self.plan, "plan_id", &self.plan_id).unwrap_or_default(),
+            "progress": self.progress,
+            "started_unix": self.started_unix,
+            "consent": self.consent,
+            "cancelling": self.cancel.load(std::sync::atomic::Ordering::Relaxed) && self.finished.is_none(),
+            "finished": self.finished,
+        })
+    }
+}
+
+type ChatStreams = Arc<Mutex<HashMap<String, Arc<chat::Cancel>>>>;
 
 const DEVICE_TTL: Duration = Duration::from_secs(15);
 
@@ -76,12 +186,14 @@ fn cached_devices(
             .filter(|b| b.version.is_some())
             .max_by_key(|b| b.version.as_deref().and_then(fidim_core::update::version_number).unwrap_or(0))
     };
-    let build = newest(true)
-        .or_else(|| newest(false))
-        .or(builds.first())
-        .ok_or("no builds found under configured build_roots")?;
-    let devices = launch::enumerate_devices(cfg, &build.server_exe, &WindowsPlatform)
-        .map_err(|e| e.to_string())?;
+    let devices = match newest(true).or_else(|| newest(false)).or(builds.first()) {
+        Some(build) => launch::enumerate_devices(cfg, &build.server_exe, &HostPlatform).map_err(|e| e.to_string())?,
+        // No llama.cpp build (Linux serving SGLang): the OS adapters are the device list.
+        None => fidim_core::devices::from_adapters(
+            &HostPlatform.video_adapters().map_err(|e| e.to_string())?,
+            &cfg.integrated_name_patterns,
+        ),
+    };
     let mut cache = cache_arc.lock().unwrap();
     cache.devices = Some((Instant::now(), devices.clone()));
     Ok(devices)
@@ -90,6 +202,7 @@ fn cached_devices(
 /// Forget everything derived from the installed builds, so a build that
 /// was just installed shows up in the pickers without waiting for a TTL.
 fn invalidate_build_caches(cache: &Arc<Mutex<UiCache>>) {
+    fidim_core::wizard::forget_builds();
     let mut c = cache.lock().unwrap();
     c.scan = None;
     c.devices = None;
@@ -238,11 +351,29 @@ fn live_check_blocking(
 ) -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
     let findings = profile::validate(&p);
+    if p.engine.is_sglang() {
+        let devices = fidim_core::sglang::devices_now(&cfg, &HostPlatform).map_err(|e| e.to_string())?;
+        let device = fidim_core::sglang::resolve_device(&p, &devices);
+        let results = fidim_core::sglang::preflight(&cfg, &p, device, &HostPlatform, &fidim_core::sglang::running_aliases(&cfg));
+        let plan = device.and_then(|d| fidim_core::sglang::compose(&cfg, &p, d, &cfg.runs_dir).ok());
+        let s = fidim_core::sglang::cfg_of(&p);
+        let estimate = device.map(|d| serde_json::json!({ "total_bytes": fidim_core::sglang::estimated_bytes(&s, d), "per_device": [], "assumptions": ["SGLang static pool = mem_fraction x card VRAM; +~3 GB activations under long-context load"] }));
+        return Ok(serde_json::json!({
+            "findings": findings,
+            "results": results,
+            "estimate": estimate,
+            "resolved": device.map(|d| vec![serde_json::json!({ "profile_key": p.devices.first().map(|x| x.key.clone()).unwrap_or_default(), "device": d, "fraction": 1.0, "rebound": false })]).unwrap_or_default(),
+            "command_line": plan.as_ref().map(|pl| pl.command_line()).unwrap_or_default(),
+            "env": plan.as_ref().map(|pl| pl.env.clone()).unwrap_or_default(),
+            "commit": HostPlatform.system_commit().ok(),
+            "diffusion": serde_json::Value::Null,
+        }));
+    }
     let devices_now = cached_devices(cache, &cfg, false).unwrap_or_default();
     let build_version_output = cached_build_probe(cache, &cfg, &p.build.path);
     let inputs = PrepareInputs { devices_now, build_version_output };
     let prepared =
-        launch::prepare_with_inputs(&cfg, &p, &WindowsPlatform, running_aliases(&cfg), inputs)
+        launch::prepare_with_inputs(&cfg, &p, &HostPlatform, running_aliases(&cfg), inputs)
             .map_err(|e| e.to_string())?;
     let results = preflight::run_all(&prepared.context);
     // Trace what the editor's check saw, so a PASS here that a real launch
@@ -305,12 +436,17 @@ async fn launch_profile(id: String, override_blocks: bool) -> Result<serde_json:
 
 fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let path = cfg.profile_dir.join(format!("{id}.json"));
     let mut profile = Profile::load(&path).map_err(|e| e.to_string())?;
     let findings = profile::validate(&profile);
     if findings.iter().any(|f| f.severity == profile::Severity::Error) {
         return Err("profile has validation errors — fix them in the editor first".into());
+    }
+    if profile.engine.is_sglang() {
+        let r = fidim_core::sglang::launch(&cfg, &profile, &platform, override_blocks, Duration::from_secs(900))
+            .map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({ "blocked": false, "results": r.results, "state": r.state, "replaced": r.replaced }));
     }
     let prepared = launch::prepare(&cfg, &profile, &platform, running_aliases(&cfg))
         .map_err(|e| e.to_string())?;
@@ -514,7 +650,7 @@ async fn bench_profile(
 
 fn do_bench(id: &str, concurrency: Option<u32>, tokens: u32) -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let profile =
         Profile::load(&cfg.profile_dir.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
     bench::ensure_benchable(&profile).map_err(|e| e.to_string())?;
@@ -628,7 +764,7 @@ async fn export_profile(id: String, format: String) -> Result<serde_json::Value,
 
 fn export_blocking(id: &str, format: &str) -> Result<serde_json::Value, String> {
     let cfg = cfg()?;
-    let platform = WindowsPlatform;
+    let platform = HostPlatform;
     let profile =
         Profile::load(&cfg.profile_dir.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
     let prepared = launch::prepare(&cfg, &profile, &platform, running_aliases(&cfg))
@@ -724,11 +860,12 @@ async fn update_rollback() -> Result<serde_json::Value, String> {
 
 /// Card names for the Unsloth GPU-target guess. WMI, so blocking pool only.
 fn adapter_names() -> Vec<String> {
-    WindowsPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect()
+    HostPlatform.video_adapters().unwrap_or_default().into_iter().map(|a| a.name).collect()
 }
 
 /// Latest (or `tag`) Unsloth fork release, the zip for this machine's GPU
-/// target, and the fork builds already installed. Network + a build scan.
+/// target, whether the runner-patch overlay is published for it, and the
+/// fork builds already installed. Network + a build scan.
 #[tauri::command]
 async fn unsloth_check(tag: Option<String>, gfx: Option<String>) -> Result<serde_json::Value, String> {
     blocking(move || {
@@ -740,14 +877,16 @@ async fn unsloth_check(tag: Option<String>, gfx: Option<String>) -> Result<serde
     .await
 }
 
-/// Download, digest-check, install and verify an Unsloth fork build.
-/// Progress streams as `update-progress`. Never starts the runner.
+/// Download, digest-check, install and verify an Unsloth fork build; with
+/// `overlay`, the build with the published runner-patch overlay laid over
+/// it. Progress streams as `update-progress`. Never starts the runner.
 #[tauri::command]
 async fn unsloth_install(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     tag: Option<String>,
     gfx: Option<String>,
+    overlay: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let cache = state.cache.clone();
     blocking(move || {
@@ -761,21 +900,41 @@ async fn unsloth_install(
         let mut progress = |line: String| {
             let _ = app.emit("update-progress", line);
         };
-        let r = update::install_unsloth(&cfg, &release, &gfx, &mut progress).map_err(|e| e.to_string())?;
+        let r = if overlay.unwrap_or(false) {
+            let source = fidim_core::overlay::OverlaySource::Published;
+            fidim_core::overlay::install_unsloth_overlay(&cfg, &release, &gfx, &source, None, &mut progress)
+        } else {
+            update::install_unsloth(&cfg, &release, &gfx, &mut progress)
+        }
+        .map_err(|e| e.to_string())?;
         invalidate_build_caches(&cache);
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
     .await
 }
 
-/// Move diffusion profiles onto a fork build. Every profile is considered;
-/// the promote rules skip llama-server ones and anything pinned.
+/// Which diffusion profiles `unsloth_promote` would move onto a fork build,
+/// off which runner patch, and why the others stay. Changes nothing; the
+/// Updates view shows it for confirmation.
 #[tauri::command]
-async fn unsloth_promote(to_path: String, to_version: Option<String>) -> Result<serde_json::Value, String> {
+async fn unsloth_promote_preview(to_path: String) -> Result<serde_json::Value, String> {
     blocking(move || {
         let cfg = cfg()?;
-        let r = update::promote(&cfg, &PathBuf::from(to_path), to_version, PromoteScope::All)
-            .map_err(|e| e.to_string())?;
+        let r = update::promote_preview(&cfg, &PathBuf::from(to_path), &PromoteScope::All).map_err(|e| e.to_string())?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Move diffusion profiles onto a fork build: the confirmed `ids` of a
+/// preview, or (without ids) every profile the promote rules allow; they
+/// skip llama-server ones and anything pinned.
+#[tauri::command]
+async fn unsloth_promote(to_path: String, to_version: Option<String>, ids: Option<Vec<String>>) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let scope = ids.map(PromoteScope::Ids).unwrap_or(PromoteScope::All);
+        let r = update::promote(&cfg, &PathBuf::from(to_path), to_version, scope).map_err(|e| e.to_string())?;
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
     .await
@@ -806,6 +965,76 @@ fn save_config(state: tauri::State<'_, AppState>, config: Config) -> Result<(), 
 #[tauri::command]
 fn app_version() -> serde_json::Value {
     fidim_core::build_info::json()
+}
+
+// ------------------------------------------------------- updating the app ----
+
+/// This build against the newest release of Llama FIDIM, plus the checkout
+/// configured for source builds and any sets staged earlier. Network.
+#[tauri::command]
+async fn app_update_check() -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let c = fidim_core::selfupdate::check(&cfg).map_err(|e| e.to_string())?;
+        serde_json::to_value(c).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Download and verify a release (`tag`, or the newest), or with `source`
+/// build the configured checkout, into a staged folder. Progress lines
+/// stream as `update-progress`. Replaces nothing.
+#[tauri::command]
+async fn app_update_stage(app: tauri::AppHandle, tag: Option<String>, source: bool) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        use fidim_core::selfupdate as su;
+        let cfg = cfg()?;
+        let mut progress = |line: String| {
+            let _ = app.emit("update-progress", line);
+        };
+        let staged = if source {
+            let dir = cfg.fidim_source.clone().ok_or("set the checkout folder first")?;
+            su::stage_from_checkout(&dir, &mut progress)
+        } else {
+            let rel = match &tag {
+                Some(t) => su::app_release_by_tag(t),
+                None => su::latest_app_release().and_then(|r| r.ok_or_else(|| fidim_core::Error::Update(format!("{} has no release with a Windows zip", su::REPO)))),
+            }
+            .map_err(|e| e.to_string())?;
+            su::stage_release(&rel, &mut progress)
+        }
+        .map_err(|e| e.to_string())?;
+        serde_json::to_value(staged).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Start the detached updater for a staged set, then quit: it waits for
+/// this process to exit, replaces the installed files and reopens the app.
+/// Servers keep running; they are not this process's children in any job.
+#[tauri::command]
+async fn app_update_apply(app: tauri::AppHandle, stage: std::path::PathBuf) -> Result<serde_json::Value, String> {
+    use fidim_core::selfupdate as su;
+    let current = su::current().map_err(|e| e.to_string())?;
+    let pid = su::spawn_apply(&stage, &current.install_dir, Some(std::process::id()), true).map_err(|e| e.to_string())?;
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        // Long enough for the web view to paint its "restarting" state.
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        handle.exit(0);
+    });
+    Ok(serde_json::json!({ "updater_pid": pid, "install_dir": current.install_dir, "log": su::updates_dir().join("apply.log") }))
+}
+
+/// Remember the checkout to build the app from (`config.fidim_source`).
+#[tauri::command]
+fn app_update_set_source(state: tauri::State<'_, AppState>, dir: Option<std::path::PathBuf>) -> Result<serde_json::Value, String> {
+    let mut c = cfg()?;
+    c.fidim_source = dir.filter(|d| !d.as_os_str().is_empty());
+    c.save(&Config::config_path()).map_err(|e| e.to_string())?;
+    invalidate_build_caches(&state.cache);
+    let ok = c.fidim_source.as_deref().is_some_and(fidim_core::selfupdate::is_checkout);
+    Ok(serde_json::json!({ "source_dir": c.fidim_source, "source_ok": ok }))
 }
 
 /// Append a line from the web view to `~/.fidim/ui.log` — the only way
@@ -871,12 +1100,17 @@ async fn router_launch() -> Result<serde_json::Value, String> {
         let cfg = cfg()?;
         let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
         let profiles = Profile::load_all(&cfg.profile_dir).map_err(|e| e.to_string())?;
+        if fidim_core::sglang::is_sglang_router(&rc, &profiles) {
+            let (state, started, replaced) = fidim_core::sglang::launch_router(&cfg, &rc, &profiles, &HostPlatform, Duration::from_secs(900))
+                .map_err(|e| e.to_string())?;
+            return Ok(serde_json::json!({ "state": state, "ini_path": "", "replaced": replaced, "env_conflicts": [], "sections": started }));
+        }
         let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
         let build_dir = match &rc.build {
             Some(b) => b.clone(),
             None => update::newest_installed(&builds).ok_or("no installed build")?.path,
         };
-        let devices = launch::enumerate_devices(&cfg, &build_dir.join("bin").join("llama-server.exe"), &WindowsPlatform)
+        let devices = launch::enumerate_devices(&cfg, &build_dir.join("bin").join("llama-server.exe"), &HostPlatform)
             .map_err(|e| e.to_string())?;
         let r = fidim_core::router::launch(&cfg, &rc, &profiles, &devices, &build_dir, Duration::from_secs(180))
             .map_err(|e| e.to_string())?;
@@ -932,7 +1166,7 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
     let cache = state.cache.clone();
     blocking(move || {
         let cfg = cfg()?;
-        let platform = WindowsPlatform;
+        let platform = HostPlatform;
         let devices = cached_devices(&cache, &cfg, false).unwrap_or_default();
         let card_of = |luid: u64| devices.iter().find(|d| d.luid_low == Some(luid)).map(|d| d.stable_key.clone());
         let util = platform.gpu_utilization().unwrap_or_default();
@@ -943,26 +1177,76 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                 *cards.entry(k).or_insert(0.0) += u.percent;
             }
         }
-        let runs: Vec<serde_json::Value> = supervise::reattach(&cfg.runs_dir)
+        // A server started with an API key answers /slots and /metrics
+        // only with it; Copy endpoint tells other programs they need one.
+        let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
+        let member = |id: &str| profiles.iter().find(|p| fidim_core::router::model_id(p) == id);
+        let all_runs = supervise::reattach(&cfg.runs_dir);
+        let runs: Vec<serde_json::Value> = all_runs
+            .clone()
             .into_iter()
             .map(|r| {
                 let mut samples = Vec::new();
+                let mut keyed_models = Vec::new();
+                // SGLang members are runs of their own with their own cards; the
+                // router card just names them instead of repeating their slots.
+                let mut fronting: Vec<String> = Vec::new();
+                let profile = profiles.iter().find(|p| p.id == r.state.profile_id);
                 if r.alive {
                     if r.state.profile_id == fidim_core::router::ROUTER_ID {
                         if let Ok(ms) = fidim_core::router::models(&r.state.host, r.state.port) {
+                            for m in &ms {
+                                if member(&m.id).is_some_and(chat::requires_api_key) {
+                                    keyed_models.push(m.id.clone());
+                                }
+                            }
                             for m in ms.iter().filter(|m| m.status == "loaded") {
-                                samples.push(fidim_core::live::sample(&r.state.host, r.state.port, Some(&m.id)));
+                                if r.state.engine.is_sglang() && all_runs.iter().any(|x| x.alive && x.state.alias == m.id && x.state.profile_id != fidim_core::router::ROUTER_ID) {
+                                    fronting.push(m.id.clone());
+                                    continue;
+                                }
+                                let key = member(&m.id).and_then(chat::api_key);
+                                samples.push(fidim_core::live::sample_with_key(&r.state.host, r.state.port, Some(&m.id), key.as_deref()));
                             }
                         }
+                    } else if r.state.engine.is_sglang() {
+                        // An SGLang member has no /slots of its own: the router
+                        // (model_router.py) answers for it by served name.
+                        if let Some(router) = all_runs.iter().find(|x| x.alive && x.state.profile_id == fidim_core::router::ROUTER_ID) {
+                            samples.push(fidim_core::live::sample_with_key(&router.state.host, router.state.port, Some(&r.state.alias), None));
+                        }
                     } else {
-                        samples.push(fidim_core::live::sample(&r.state.host, r.state.port, None));
+                        let key = profile.and_then(chat::api_key);
+                        samples.push(fidim_core::live::sample_with_key(&r.state.host, r.state.port, None, key.as_deref()));
                     }
                 }
+                let has_api_key = r.state.profile_id != fidim_core::router::ROUTER_ID && profile.is_some_and(chat::requires_api_key);
                 // The router's model instances are child processes; their
                 // VRAM and GPU time belong to the router run.
                 let mut pids = vec![r.state.pid];
                 if r.alive {
                     pids.extend(fidim_core::platform::process_descendants(r.state.pid));
+                    if r.state.engine.is_sglang() && r.state.profile_id == fidim_core::router::ROUTER_ID {
+                        // model_router.py fronts servers it did not spawn. A backend
+                        // that is itself a FIDIM run reports its own VRAM and busy on
+                        // its own card; only an adopted/foreign backend is charged here.
+                        if let Ok((200, body)) = fidim_core::supervise::http_get(&r.state.host, r.state.port, "/fidim/state", std::time::Duration::from_secs(3)) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                                for (_, m) in v.as_object().into_iter().flatten() {
+                                    let port = m["url"].as_str().and_then(|u| u.rsplit(':').next()).and_then(|p| p.trim_end_matches('/').parse::<u16>().ok());
+                                    if port.is_some_and(|pt| all_runs.iter().any(|x| x.alive && x.state.port == pt)) {
+                                        continue;
+                                    }
+                                    if let Some(pid) = port.and_then(launch::listening_pid) {
+                                        if !pids.contains(&pid) {
+                                            pids.push(pid);
+                                            pids.extend(fidim_core::platform::process_descendants(pid));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 let mut resident: Vec<serde_json::Value> = Vec::new();
                 for pid in &pids {
@@ -971,19 +1255,54 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                     }
                 }
                 let busy: f64 = util.iter().filter(|u| pids.contains(&u.pid)).map(|u| u.percent).sum();
+                // KFD eviction: cumulative ms and the rate over the last poll.
+                #[cfg(not(windows))]
+                let evicted_ms: u64 = pids.iter().map(|p| fidim_core::platform::kfd_evicted_ms(*p)).sum();
+                #[cfg(windows)]
+                let evicted_ms: u64 = 0;
+                let evict_rate = {
+                    let mut c = cache.lock().unwrap();
+                    let now = Instant::now();
+                    let rate = match c.evict.get(&r.state.profile_id) {
+                        Some((t, prev)) if now > *t && evicted_ms >= *prev => {
+                            let dt = now.duration_since(*t).as_secs_f64();
+                            if dt > 0.2 { (evicted_ms - prev) as f64 / dt } else { -1.0 }
+                        }
+                        _ => 0.0,
+                    };
+                    if rate >= 0.0 {
+                        c.evict.insert(r.state.profile_id.clone(), (now, evicted_ms));
+                        rate
+                    } else {
+                        0.0
+                    }
+                };
                 serde_json::json!({
                     "run": r,
                     "pids": pids,
                     "samples": samples,
                     "resident": resident,
+                    "fronting": fronting,
+                    "evicted_ms": evicted_ms,
+                    "evicting_ms_per_s": evict_rate,
                     "gpu_busy_percent": if busy <= 0.0 { 0.0 } else { busy.min(100.0) },
+                    "has_api_key": has_api_key,
+                    "keyed_models": keyed_models,
                 })
             })
             .collect();
         let cards_json: Vec<serde_json::Value> = devices
             .iter()
             .filter(|d| !d.integrated)
-            .map(|d| serde_json::json!({ "key": d.stable_key, "name": d.name, "busy_percent": cards.get(&d.stable_key).copied().unwrap_or(0.0).clamp(0.0, 100.0), "total_mib": d.total_mib }))
+            .map(|d| {
+                // free VRAM read now, not from the device cache: headroom is
+                // what decides whether the desktop evicts a server.
+                #[cfg(not(windows))]
+                let free_mib = d.bus_number.and_then(fidim_core::platform::card_vram_bytes).map(|(t, u)| t.saturating_sub(u) / (1024 * 1024)).unwrap_or(d.free_mib);
+                #[cfg(windows)]
+                let free_mib = d.free_mib;
+                serde_json::json!({ "key": d.stable_key, "name": d.name, "busy_percent": cards.get(&d.stable_key).copied().unwrap_or(0.0).clamp(0.0, 100.0), "total_mib": d.total_mib, "free_mib": free_mib, "display": d.display.is_some() })
+            })
             .collect();
         Ok(serde_json::json!({ "runs": runs, "cards": cards_json }))
     })
@@ -992,6 +1311,43 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
 
 /// One server's slots and metrics, for a view that follows it faster than
 /// the whole-app `live` poll (the diffusion canvas refreshes ~5x a second).
+/// SGLang installs on this machine (venvs that import sglang), configured one first.
+#[tauri::command]
+async fn sglang_installs(roots: Option<Vec<String>>) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let roots: Vec<PathBuf> = roots.unwrap_or_default().into_iter().map(PathBuf::from).collect();
+        serde_json::to_value(fidim_core::sglang::discover_installs(&cfg, &roots)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Create a venv with SGLang; lines of pip output go to the UI log.
+#[tauri::command]
+async fn sglang_install(dir: String, flavor: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let venv = fidim_core::sglang::install(std::path::Path::new(&dir), &flavor, &[], &mut |l| { let _ = ui_log(format!("sglang install: {l}")); })
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(fidim_core::sglang::probe_install(&venv)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Point profiles at this install (config.json → sglang.venv).
+#[tauri::command]
+async fn sglang_use(venv: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let mut cfg = cfg()?;
+        let probe = fidim_core::sglang::probe_install(std::path::Path::new(&venv)).ok_or("that venv does not import sglang")?;
+        let mut host = cfg.sglang.clone().unwrap_or(fidim_core::sglang::SgLangHost { venv: probe.venv.clone(), tools_dir: None, pythonpath: vec![], env: Default::default(), cwd: None });
+        host.venv = probe.venv.clone();
+        cfg.sglang = Some(host);
+        cfg.save(&Config::config_dir().join("config.json")).map_err(|e| e.to_string())?;
+        serde_json::to_value(probe).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 async fn live_one(host: String, port: u16) -> Result<serde_json::Value, String> {
     blocking(move || serde_json::to_value(fidim_core::live::sample(&host, port, None)).map_err(|e| e.to_string())).await
@@ -1006,6 +1362,467 @@ async fn dg_frames(host: String, port: u16) -> Result<serde_json::Value, String>
             Ok((code, _)) => Err(format!("/frames HTTP {code} (a diffusion server from an older Llama FIDIM?)")),
             Err(e) => Err(format!("/frames: {e}")),
         }
+    })
+    .await
+}
+
+// ------------------------------------------------------------------- chat ----
+
+/// Which server a chat talks to: a run Llama FIDIM started, and a model
+/// when the run is the router. The web view never sends an address: Rust
+/// resolves host, port and any API key from the run and its profile, so
+/// script in the page cannot aim a request anywhere else.
+#[derive(serde::Deserialize)]
+struct ChatTarget {
+    run: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+struct ResolvedTarget {
+    host: String,
+    port: u16,
+    engine: Engine,
+    /// The model id the server expects.
+    model: String,
+    api_key: Option<String>,
+    router: bool,
+}
+
+fn resolve_target(cfg: &Config, t: &ChatTarget) -> Result<ResolvedTarget, String> {
+    let run = supervise::reattach(&cfg.runs_dir)
+        .into_iter()
+        .find(|r| r.alive && r.state.profile_id == t.run)
+        .ok_or_else(|| format!("{} is not running", t.run))?;
+    let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
+    let s = &run.state;
+    let host = chat::connect_host(&s.host).to_string();
+    if s.profile_id == fidim_core::router::ROUTER_ID {
+        let model = t.model.clone().filter(|m| !m.trim().is_empty()).ok_or("pick a model on the router")?;
+        let member = profiles.iter().find(|p| fidim_core::router::model_id(p) == model);
+        Ok(ResolvedTarget {
+            host,
+            port: s.port,
+            engine: Engine::LlamaServer,
+            api_key: member.and_then(chat::api_key),
+            model,
+            router: true,
+        })
+    } else {
+        let profile = profiles.iter().find(|p| p.id == s.profile_id);
+        Ok(ResolvedTarget {
+            host,
+            port: s.port,
+            engine: s.engine,
+            model: s.alias.clone(),
+            api_key: profile.and_then(chat::api_key),
+            router: false,
+        })
+    }
+}
+
+/// Removes a stream's cancel handle however the command ends, but never a
+/// newer stream that reused the id.
+struct StreamGuard {
+    streams: ChatStreams,
+    id: String,
+    cancel: Arc<chat::Cancel>,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let mut m = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        if m.get(&self.id).is_some_and(|c| Arc::ptr_eq(c, &self.cancel)) {
+            m.remove(&self.id);
+        }
+    }
+}
+
+/// Stream one reply. Events go to `on_event` in order and always end with
+/// done, error or cancelled; the return value summarises the same. Only the
+/// shape of a stream is logged, never its text.
+#[tauri::command]
+async fn chat_send(
+    state: tauri::State<'_, AppState>,
+    stream_id: String,
+    target: ChatTarget,
+    body: serde_json::Value,
+    on_event: Channel<chat::ChatEvent>,
+) -> Result<serde_json::Value, String> {
+    let cancel = Arc::new(chat::Cancel::new());
+    {
+        let mut m = state.chats.lock().unwrap_or_else(|e| e.into_inner());
+        if m.contains_key(&stream_id) {
+            return Err(format!("chat stream {stream_id} is already running"));
+        }
+        m.insert(stream_id.clone(), cancel.clone());
+    }
+    let guard = StreamGuard { streams: state.chats.clone(), id: stream_id, cancel: cancel.clone() };
+    blocking(move || {
+        let _guard = guard;
+        let cfg = cfg()?;
+        let t = resolve_target(&cfg, &target)?;
+        let n_msgs = body.get("messages").and_then(|m| m.as_array()).map_or(0, Vec::len);
+        let body = chat::request_body(&body, &t.model, t.engine).map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        let sum = chat::stream_chat(&t.host, t.port, &body, t.api_key.as_deref(), &cancel, chat::DEFAULT_IDLE, &mut |ev| {
+            // A reloaded web view no longer listens; the stream still ends
+            // on its own, and a reload cancels every stream at boot.
+            let _ = on_event.send(ev);
+        });
+        let outcome = if sum.cancelled {
+            "stopped".to_string()
+        } else if sum.error.is_some() {
+            format!("error {}", sum.status.map_or("-".into(), |s| s.to_string()))
+        } else {
+            format!("finish={}", sum.finish_reason.as_deref().unwrap_or("-"))
+        };
+        let _ = ui_log(format!(
+            "chat {}{} messages={n_msgs} -> {outcome} in {} ms",
+            target.run,
+            if t.router { format!("/{}", t.model) } else { String::new() },
+            started.elapsed().as_millis()
+        ));
+        serde_json::to_value(sum).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Stop one stream. False when it had already ended.
+#[tauri::command]
+fn chat_cancel(state: tauri::State<'_, AppState>, stream_id: String) -> bool {
+    let m = state.chats.lock().unwrap_or_else(|e| e.into_inner());
+    match m.get(&stream_id) {
+        Some(c) => {
+            c.cancel();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Stop every stream: the web view calls this once at boot, so a reload
+/// does not leave replies streaming to nobody.
+#[tauri::command]
+fn chat_cancel_all(state: tauri::State<'_, AppState>) -> usize {
+    let m = state.chats.lock().unwrap_or_else(|e| e.into_inner());
+    m.values().for_each(|c| c.cancel());
+    m.len()
+}
+
+/// Everything the chat can talk to right now.
+#[tauri::command]
+async fn chat_targets() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let cfg = cfg()?;
+        let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
+        let runs = supervise::reattach(&cfg.runs_dir);
+        serde_json::to_value(chat::targets(&runs, &profiles)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// A target's server-side facts: context, default sampler, capabilities.
+/// A router model that is not loaded is not asked; one evicted between the
+/// check and the question gets an error, not a load (`autoload=false`).
+#[tauri::command]
+async fn chat_props(target: ChatTarget) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let t = resolve_target(&cfg, &target)?;
+        if t.router {
+            let status = fidim_core::router::models(&t.host, t.port)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|m| m.id == t.model)
+                .map(|m| m.status)
+                .unwrap_or_else(|| "unknown".into());
+            if status != "loaded" {
+                return Ok(serde_json::json!({ "loaded": false, "status": status }));
+            }
+        }
+        let mut v = chat::props(&t.host, t.port, t.engine, t.router.then_some(t.model.as_str()), t.api_key.as_deref())
+            .map_err(|e| e.to_string())?;
+        v["loaded"] = true.into();
+        Ok(v)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn chat_list() -> Result<serde_json::Value, String> {
+    blocking(|| serde_json::to_value(chat_store::list(&chat_store::chats_dir())).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn chat_load(id: String) -> Result<serde_json::Value, String> {
+    blocking(move || chat_store::load(&chat_store::chats_dir(), &id).map_err(|e| e.to_string())).await
+}
+
+/// Save a conversation; false (nothing written) when Settings has saving off.
+#[tauri::command]
+async fn chat_save(conv: serde_json::Value) -> Result<bool, String> {
+    blocking(move || {
+        if !cfg()?.save_chats {
+            return Ok(false);
+        }
+        chat_store::save(&chat_store::chats_dir(), &conv).map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn chat_delete(id: String) -> Result<bool, String> {
+    blocking(move || chat_store::delete(&chat_store::chats_dir(), &id).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn chat_delete_all() -> Result<usize, String> {
+    blocking(|| chat_store::delete_all(&chat_store::chats_dir()).map_err(|e| e.to_string())).await
+}
+
+/// Per-profile chat defaults (system prompt, sampler overrides, thinking).
+#[tauri::command]
+async fn chat_presets_get() -> Result<serde_json::Value, String> {
+    blocking(|| Ok(chat_store::load_presets(&chat_store::presets_path()))).await
+}
+
+#[tauri::command]
+async fn chat_presets_save(presets: serde_json::Value) -> Result<(), String> {
+    blocking(move || chat_store::save_presets(&chat_store::presets_path(), &presets).map_err(|e| e.to_string())).await
+}
+
+// ----------------------------------------------------------------- wizard ----
+
+/// Hugging Face search, each hit marked with whether an installed build
+/// knows its architecture.
+#[tauri::command]
+async fn hub_search(query: String, limit: Option<u32>, all: Option<bool>) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let q = fidim_core::hub::SearchQuery {
+            text: query,
+            limit: limit.unwrap_or(30),
+            gguf_only: !all.unwrap_or(false),
+            ..Default::default()
+        };
+        let hits = fidim_core::wizard::search(&cfg, &q).map_err(|e| e.to_string())?;
+        serde_json::to_value(hits).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// A repo's files, the fit of each on these cards, and which build loads
+/// it (or the plan for one). Header range reads only; nothing downloads.
+/// The view comes with a `view_id` for `wizard_plan`.
+#[tauri::command]
+async fn wizard_inspect(
+    state: tauri::State<'_, AppState>,
+    input: String,
+    rev: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
+    let made = state.wizard_made.clone();
+    blocking(move || {
+        let cfg = cfg()?;
+        let env = fidim_core::wizard::LiveEnv::with_devices(cfg.clone(), cached_devices(&cache, &cfg, false).ok());
+        let view = fidim_core::wizard::inspect_with(&env, &cfg, &input, rev.as_deref()).map_err(|e| e.to_string())?;
+        let _ = ui_log(format!(
+            "wizard inspect {} @ {}: {:?}, {} choices, usable={}",
+            view.repo,
+            view.sha.get(..7).unwrap_or(&view.sha),
+            view.kind,
+            view.catalog.choices.len(),
+            view.usable_build.is_some()
+        ));
+        let id = made.lock().unwrap_or_else(|e| e.into_inner()).keep_view(view.clone());
+        with_id(&view, "view_id", &id)
+    })
+    .await
+}
+
+/// The exact steps for a choice of the view `view_id` (from
+/// `wizard_inspect`): build or install, downloads, the profile. The plan
+/// comes with a `plan_id` for `wizard_start`.
+#[tauri::command]
+async fn wizard_plan(
+    state: tauri::State<'_, AppState>,
+    view_id: String,
+    request: fidim_core::wizard::PlanRequest,
+) -> Result<serde_json::Value, String> {
+    let made = state.wizard_made.clone();
+    blocking(move || {
+        let cfg = cfg()?;
+        let view = made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .view(&view_id)
+            .cloned()
+            .ok_or("this repo's page is out of date: open the repo again")?;
+        let plan = fidim_core::wizard::plan(&cfg, &view, &request).map_err(|e| e.to_string())?;
+        let id = made.lock().unwrap_or_else(|e| e.into_inner()).keep_plan(plan.clone());
+        with_id(&plan, "plan_id", &id)
+    })
+    .await
+}
+
+/// Start the plan `plan_id` (from `wizard_plan`, or the plan of an earlier
+/// job) on its own thread; progress arrives as `wizard-progress` events and
+/// the end as `wizard-done`. The job outlives the view that started it
+/// (`wizard_jobs` finds it again). A plan that needs consent is refused
+/// here, before anything runs, unless `consent` is true.
+#[tauri::command]
+fn wizard_start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    plan_id: String,
+    consent: bool,
+) -> Result<String, String> {
+    // The core's own copy: the web view names a plan, it never supplies one.
+    let plan = {
+        let made = state.wizard_made.lock().unwrap_or_else(|e| e.into_inner());
+        let jobs = state.wizard.lock().unwrap_or_else(|e| e.into_inner());
+        made.plan(&plan_id)
+            .or_else(|| jobs.values().find(|j| j.plan_id == plan_id).map(|j| &j.plan))
+            .cloned()
+            .ok_or("this plan is out of date: plan it again")?
+    };
+    fidim_core::wizard::check_runnable(&plan, consent).map_err(|e| e.to_string())?;
+    let jobs = state.wizard.clone();
+    let cache = state.cache.clone();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let id = {
+        let mut m = jobs.lock().unwrap_or_else(|e| e.into_inner());
+        // Two jobs never write the same file.
+        let mine = plan.download_dests();
+        for (other, job) in m.iter().filter(|(_, j)| j.finished.is_none()) {
+            let theirs = job.plan.download_dests();
+            if let Some((d, _)) = mine.iter().find(|(d, _)| theirs.iter().any(|(t, _)| t == d)) {
+                return Err(format!("job {other} is already downloading {}", d.display()));
+            }
+        }
+        let started_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let id = format!("w{started_unix}-{}", m.len() + 1);
+        m.insert(
+            id.clone(),
+            WizardJob {
+                progress: fidim_core::wizard::JobProgress::new(&plan),
+                plan: plan.clone(),
+                plan_id: plan_id.clone(),
+                cancel: cancel.clone(),
+                started_unix,
+                consent,
+                finished: None,
+            },
+        );
+        id
+    };
+    let _ = ui_log(format!("wizard start {id}: {} {} ({} steps, consent={consent})", plan.repo, plan.choice.label, plan.steps.len()));
+    let job = id.clone();
+    std::thread::spawn(move || {
+        let outcome = (|| -> Result<fidim_core::wizard::WizardResult, String> {
+            let cfg = cfg()?;
+            let devices = cached_devices(&cache, &cfg, false).ok();
+            fidim_core::wizard::run(
+                &cfg,
+                devices,
+                &plan,
+                consent,
+                &mut |e| {
+                    if let Some(j) = jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&job) {
+                        j.progress.apply(e);
+                    }
+                    let mut payload = serde_json::to_value(e).unwrap_or_default();
+                    payload["job"] = job.clone().into();
+                    let _ = app.emit("wizard-progress", payload);
+                },
+                &cancel,
+            )
+            .map_err(|e| e.to_string())
+        })();
+        // A download or a build changes what the pickers should list.
+        invalidate_build_caches(&cache);
+        let done = match &outcome {
+            Ok(r) => serde_json::json!({ "job": job, "ok": true, "result": r }),
+            Err(e) => serde_json::json!({ "job": job, "ok": false, "error": e }),
+        };
+        let _ = ui_log(format!(
+            "wizard {job} {}",
+            match &outcome {
+                Ok(r) => format!("done: profile {}", r.profile.as_ref().map(|p| p.id.as_str()).unwrap_or("none")),
+                Err(e) => format!("failed: {e}"),
+            }
+        ));
+        if let Some(j) = jobs.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&job) {
+            j.finished = Some(done.clone());
+        }
+        let _ = app.emit("wizard-done", done);
+    });
+    Ok(id)
+}
+
+/// Ask a job to stop: a download keeps its `.part` for a resume, a build
+/// stops its compilers and cleans up. False when it had already ended.
+#[tauri::command]
+fn wizard_cancel(state: tauri::State<'_, AppState>, job: String) -> bool {
+    let m = state.wizard.lock().unwrap_or_else(|e| e.into_inner());
+    match m.get(&job) {
+        Some(j) if j.finished.is_none() => {
+            j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Every job this session, oldest first, with its plan and progress.
+#[tauri::command]
+fn wizard_jobs(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    let m = state.wizard.lock().unwrap_or_else(|e| e.into_inner());
+    let mut jobs: Vec<(&String, &WizardJob)> = m.iter().collect();
+    jobs.sort_by_key(|(id, j)| (j.started_unix, (*id).clone()));
+    serde_json::Value::Array(jobs.into_iter().map(|(id, j)| j.snapshot(id)).collect())
+}
+
+/// Drop a finished job from the list.
+#[tauri::command]
+fn wizard_forget(state: tauri::State<'_, AppState>, job: String) -> bool {
+    let mut m = state.wizard.lock().unwrap_or_else(|e| e.into_inner());
+    if m.get(&job).is_some_and(|j| j.finished.is_some()) {
+        m.remove(&job);
+        true
+    } else {
+        false
+    }
+}
+
+/// The model folders with the space left on each drive.
+#[tauri::command]
+async fn wizard_roots() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let cfg = cfg()?;
+        serde_json::to_value(fidim_core::wizard::model_roots(&cfg)).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Add a model folder (created if missing) to the configuration, so a
+/// download there is found by the scan.
+#[tauri::command]
+async fn wizard_add_root(state: tauri::State<'_, AppState>, path: String) -> Result<serde_json::Value, String> {
+    let cache = state.cache.clone();
+    blocking(move || {
+        let mut cfg = cfg()?;
+        if fidim_core::wizard::add_model_root(&mut cfg, std::path::Path::new(&path)).map_err(|e| e.to_string())? {
+            cfg.save(&Config::config_path()).map_err(|e| e.to_string())?;
+            invalidate_build_caches(&cache);
+            let _ = ui_log(format!("wizard: added model folder {path}"));
+        }
+        serde_json::to_value(fidim_core::wizard::model_roots(&cfg)).map_err(|e| e.to_string())
     })
     .await
 }
@@ -1063,8 +1880,14 @@ async fn rocm_remove(version: String) -> Result<(), String> {
 
 pub fn run() {
     tauri::Builder::default()
+        // Links in chat replies open in the browser only through our own
+        // Open action; the plugin's click interception stays off.
+        .plugin(tauri_plugin_opener::Builder::new().open_js_links_on_click(false).build())
         .manage(AppState {
-            cache: Arc::new(Mutex::new(UiCache { devices: None, build_probes: HashMap::new(), scan: None })),
+            cache: Arc::new(Mutex::new(UiCache { devices: None, evict: HashMap::new(), build_probes: HashMap::new(), scan: None })),
+            chats: Arc::new(Mutex::new(HashMap::new())),
+            wizard: Arc::new(Mutex::new(HashMap::new())),
+            wizard_made: Arc::new(Mutex::new(WizardMade::default())),
         })
         .invoke_handler(tauri::generate_handler![
             scan,
@@ -1091,6 +1914,7 @@ pub fn run() {
             update_history,
             unsloth_check,
             unsloth_install,
+            unsloth_promote_preview,
             unsloth_promote,
             list_runtimes,
             creator_defaults,
@@ -1098,6 +1922,10 @@ pub fn run() {
             save_config,
             ui_log,
             app_version,
+            app_update_check,
+            app_update_stage,
+            app_update_apply,
+            app_update_set_source,
             router_get,
             router_save,
             router_ini,
@@ -1111,7 +1939,52 @@ pub fn run() {
             rocm_available,
             rocm_install,
             rocm_remove,
+            chat_send,
+            chat_cancel,
+            chat_cancel_all,
+            chat_targets,
+            chat_props,
+            chat_list,
+            chat_load,
+            chat_save,
+            chat_delete,
+            chat_delete_all,
+            chat_presets_get,
+            chat_presets_save,
+            hub_search,
+            wizard_inspect,
+            wizard_plan,
+            wizard_start,
+            wizard_cancel,
+            wizard_jobs,
+            wizard_forget,
+            wizard_roots,
+            wizard_add_root,
+            sglang_installs,
+            sglang_install,
+            sglang_use,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Llama FIDIM UI");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wizard_keeps_the_newest_by_id() {
+        let mut made = WizardMade::default();
+        let (a, b) = (made.id("p"), made.id("p"));
+        assert_ne!(a, b, "ids never repeat");
+        let mut kept: Kept<u32> = Kept::default();
+        for n in 0..(WIZARD_KEEP as u32 + 3) {
+            kept.keep(format!("p{n}"), n);
+        }
+        assert_eq!(kept.get("p0"), None, "the oldest are dropped");
+        assert_eq!(kept.get("p2"), None);
+        assert_eq!(kept.get("p3"), Some(&3));
+        assert_eq!(kept.get(&format!("p{}", WIZARD_KEEP + 2)), Some(&(WIZARD_KEEP as u32 + 2)));
+        assert_eq!(kept.get("nope"), None);
+    }
 }

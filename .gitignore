@@ -3,3 +3,6 @@
 node_modules/
 ui/dist/
 .claude/
+
+# Linux: the CLI copied beside the app for bundling (release.yml does this)
+ui/src-tauri/binaries/

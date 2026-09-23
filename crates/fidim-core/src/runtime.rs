@@ -285,10 +285,53 @@ pub fn prepend_for(rt: &Runtime, exe: &Path) -> Option<PathBuf> {
     Runtime { dirs, ..rt.clone() }.path_prepend()
 }
 
-/// The config-default runtime's PATH prefix for `exe`, or None when no
-/// runtime is configured at all.
+/// The PATH prefix for probing `exe` (`<build>/bin/<exe>`) when no profile
+/// names a runtime: the one its build was compiled against if the manifest
+/// records it, else the config default. None when neither resolves.
 pub fn default_prepend(cfg: &Config, exe: &Path) -> Option<PathBuf> {
-    resolve(cfg, None).ok().and_then(|rt| prepend_for(&rt, exe))
+    let build_dir = exe.parent().and_then(Path::parent);
+    let rt = match build_dir {
+        Some(dir) => resolve_for_build(cfg, None, dir),
+        None => resolve(cfg, None),
+    };
+    rt.ok().and_then(|rt| prepend_for(&rt, exe))
+}
+
+/// The runtime a profile on `build_dir` launches with: the profile's choice,
+/// else the runtime the build was compiled against (a source build records
+/// it: its ggml-hip loads only against those DLLs), else the config default.
+pub fn resolve_for_build(cfg: &Config, name: Option<&str>, build_dir: &Path) -> Result<Runtime> {
+    let pinned = crate::discovery::read_build_meta(build_dir).runtime;
+    match (name, pinned) {
+        (Some(n), _) => resolve(cfg, Some(n)),
+        (None, Some(p)) => resolve(cfg, Some(&p)).map_err(|e| {
+            Error::Config(format!(
+                "{} was compiled against ROCm runtime `{p}`, which is not usable now ({e}); \
+                 reinstall it, or name another runtime in the profile",
+                build_dir.display()
+            ))
+        }),
+        (None, None) => resolve(cfg, None),
+    }
+}
+
+/// `path_prepend` for a profile on `build_dir`: see `resolve_for_build`.
+pub fn path_prepend_for_build(cfg: &Config, name: Option<&str>, build_dir: &Path) -> Result<Option<PathBuf>> {
+    Ok(resolve_for_build(cfg, name, build_dir)?.path_prepend())
+}
+
+/// The name of a runtime that `rocm_dir` (a HIP SDK or TheRock root, or its
+/// `bin`) belongs to, preferring a named install over the `default` alias.
+pub fn name_for_rocm_dir(cfg: &Config, rocm_dir: &Path) -> Option<String> {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    let want = [norm(rocm_dir), norm(&rocm_dir.join("bin"))];
+    let all = discover(cfg);
+    let matches: Vec<&Runtime> = all.iter().filter(|r| r.dirs.iter().any(|d| want.contains(&norm(d)))).collect();
+    matches
+        .iter()
+        .find(|r| r.name != DEFAULT_NAME)
+        .or_else(|| matches.first())
+        .map(|r| r.name.clone())
 }
 
 /// The runtime a profile launches with: its named choice, else the config
@@ -368,6 +411,43 @@ mod tests {
         assert_eq!(d.version.as_deref(), Some("7.1"));
         let r = resolve(&cfg, None).unwrap();
         assert_eq!(r.path_prepend().unwrap(), bin);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_build_runs_on_the_runtime_it_was_compiled_against() {
+        let tmp = std::env::temp_dir().join(format!("fidim-rt-build-{}", std::process::id()));
+        let (sdk, nightly) = (tmp.join("sdk").join("bin"), tmp.join("fidim-test-nightly").join("bin"));
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::create_dir_all(&nightly).unwrap();
+        let cfg = cfg_with(
+            None,
+            vec![
+                ManualRuntime { name: "fidim-test-sdk".into(), dirs: vec![sdk.clone()], version: None },
+                ManualRuntime { name: "fidim-test-nightly".into(), dirs: vec![nightly.clone()], version: None },
+            ],
+            Some("fidim-test-nightly"),
+        );
+        let plain = tmp.join("plain");
+        let pinned = tmp.join("pinned");
+        std::fs::create_dir_all(pinned.join("bin")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(crate::update::manifest_path(&pinned), r#"{"runtime":"fidim-test-sdk"}"#).unwrap();
+        // No record: the config default, as before.
+        assert_eq!(resolve_for_build(&cfg, None, &plain).unwrap().name, "fidim-test-nightly");
+        // A source build's record wins over the default...
+        assert_eq!(resolve_for_build(&cfg, None, &pinned).unwrap().name, "fidim-test-sdk");
+        assert_eq!(default_prepend(&cfg, &pinned.join("bin").join("llama-server.exe")).unwrap(), sdk);
+        // ...and a profile's own choice wins over both.
+        assert_eq!(resolve_for_build(&cfg, Some("fidim-test-nightly"), &pinned).unwrap().name, "fidim-test-nightly");
+        // A recorded runtime that is gone is an error naming it, not a silent switch.
+        std::fs::write(crate::update::manifest_path(&pinned), r#"{"runtime":"removed"}"#).unwrap();
+        let e = resolve_for_build(&cfg, None, &pinned).unwrap_err().to_string();
+        assert!(e.contains("compiled against ROCm runtime `removed`"), "{e}");
+        // The SDK root or its bin both name the runtime.
+        assert_eq!(name_for_rocm_dir(&cfg, &tmp.join("sdk")).as_deref(), Some("fidim-test-sdk"));
+        assert_eq!(name_for_rocm_dir(&cfg, &sdk).as_deref(), Some("fidim-test-sdk"));
+        assert_eq!(name_for_rocm_dir(&cfg, &tmp.join("elsewhere")), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

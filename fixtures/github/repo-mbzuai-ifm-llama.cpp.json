@@ -1,0 +1,19 @@
+{
+ "id": 1349334965,
+ "name": "llama.cpp",
+ "full_name": "ifm-ai/llama.cpp",
+ "owner": {
+  "login": "ifm-ai"
+ },
+ "html_url": "https://github.com/ifm-ai/llama.cpp",
+ "fork": true,
+ "default_branch": "master",
+ "parent": {
+  "full_name": "ggml-org/llama.cpp",
+  "default_branch": "master"
+ },
+ "source": {
+  "full_name": "ggml-org/llama.cpp",
+  "default_branch": "master"
+ }
+}

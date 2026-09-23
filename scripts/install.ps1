@@ -1,18 +1,23 @@
 <#
 .SYNOPSIS
-  Build Llama FIDIM and install it where a shortcut can point: the CLI, the
-  GUI and the DiffusionGemma server (fidim-dg.exe) go to
-  %LOCALAPPDATA%\Programs\LlamaFIDIM, a Start Menu shortcut is
+  Build Llama FIDIM and install it for the current user, in the folder the
+  setup.exe installer uses: the CLI, the GUI and the DiffusionGemma server
+  (fidim-dg.exe) go to %LOCALAPPDATA%\Llama FIDIM, a Start Menu shortcut is
   created, and optionally the folder is added to the user PATH.
 
   Re-run after `git pull` / code changes to update the installed copies.
+  An install in %LOCALAPPDATA%\Programs\LlamaFIDIM, where this script used
+  to install, is retired: its files are removed (running helpers are moved
+  aside and keep running) and, if that folder was on the user PATH, the new
+  one takes its place there.
   Windows does not allow pinning to the taskbar from a script; open the
   Start Menu, right-click "Llama FIDIM", "Pin to taskbar".
 
 .PARAMETER NoBuild
   Skip the cargo / tauri build and just copy what target\release holds.
 .PARAMETER AddToPath
-  Append the install folder to the user PATH so `fidim` works in any shell.
+  Append the install folder to the user PATH so `fidim` works in any shell
+  (the same as running `fidim path add` from the installed copy).
 .EXAMPLE
   powershell -File scripts\install.ps1
   powershell -File scripts\install.ps1 -AddToPath
@@ -23,8 +28,33 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$dest = Join-Path $env:LOCALAPPDATA 'Programs\LlamaFIDIM'
+# The installer's folder (Tauri's default for a per-user install), so the
+# two kinds of install update each other instead of living side by side.
+$dest = Join-Path $env:LOCALAPPDATA 'Llama FIDIM'
+# Where this script installed until the installer existed.
+$oldDest = Join-Path $env:LOCALAPPDATA 'Programs\LlamaFIDIM'
 $release = Join-Path $repo 'target\release'
+
+# Delete $dir\$name. Windows refuses while it runs; then rename it to
+# $name.old-<timestamp> instead, and the process keeps running from there
+# (same pid, same image name, so `fidim stop` still finds it). First
+# deletes the copies earlier installs renamed, unless they still run.
+function Remove-OrMoveAside([string]$dir, [string]$name) {
+  Get-ChildItem $dir -Filter "$name.old-*" -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+  $path = Join-Path $dir $name
+  if (-not (Test-Path $path)) { return }
+  try { Remove-Item $path -Force -ErrorAction Stop }
+  catch {
+    $aside = "$name.old-" + (Get-Date -Format yyyyMMddHHmmss)
+    try {
+      Rename-Item $path $aside -ErrorAction Stop
+      Write-Host "   moved the running $name aside as $aside (it keeps running)"
+    } catch {
+      Write-Host "   could not remove $path or move it aside: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  }
+}
 
 # What a build needs. Say so up front instead of failing halfway.
 if (-not $NoBuild) {
@@ -109,9 +139,9 @@ if (Test-Path $legacy) {
 
 Write-Host "== installing to $dest" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force $dest | Out-Null
-# The installed GUI may be running too.
+# The installed GUI may be running too, from here or from the old folder.
 Get-Process llama-fidim -ErrorAction SilentlyContinue |
-  Where-Object { $_.Path -like "$dest*" } | Stop-Process -Force
+  Where-Object { $_.Path -like "$dest\*" -or $_.Path -like "$oldDest\*" } | Stop-Process -Force
 # A running fidim-dg.exe is a live diffusion server holding a model in VRAM:
 # never stop it. Windows lets a running image be renamed but not replaced, so
 # move it aside; it keeps serving (same pid, same image name, so `fidim stop`
@@ -166,6 +196,32 @@ try {
   }
 }
 
+# Retire the old folder now that the keep-alive helpers run from the new
+# one: a copy still running there (a diffusion server, a terminal's
+# `fidim live`) is moved aside as above, and the folder goes once nothing
+# is left in it.
+$retired = $false
+if (Test-Path $oldDest) {
+  Write-Host "== retiring the old install at $oldDest" -ForegroundColor Cyan
+  foreach ($exe in 'fidim-dg.exe', 'fidim.exe', 'llama-fidim.exe') { Remove-OrMoveAside $oldDest $exe }
+  if (-not (Get-ChildItem $oldDest -Force -ErrorAction SilentlyContinue)) {
+    Remove-Item $oldDest -Force -ErrorAction SilentlyContinue
+  } else {
+    Write-Host "   $oldDest still holds files; the next install removes what is left of Llama FIDIM there"
+  }
+  $retired = $true
+}
+# A user PATH that named the old folder names the new one instead.
+$fidim = Join-Path $dest 'fidim.exe'
+$old = & $fidim --json path --dir $oldDest status | Out-String
+if ($LASTEXITCODE -eq 0 -and $old.Trim() -and ($old | ConvertFrom-Json).status.user) {
+  Write-Host "== the user PATH named $oldDest; moving it to $dest" -ForegroundColor Cyan
+  & $fidim path --dir $oldDest remove
+  if ($LASTEXITCODE -ne 0) { throw "fidim path remove failed ($LASTEXITCODE)" }
+  & $fidim path add
+  if ($LASTEXITCODE -ne 0) { throw "fidim path add failed ($LASTEXITCODE)" }
+}
+
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
 $lnk = Join-Path $startMenu 'Llama FIDIM.lnk'
 $ws = New-Object -ComObject WScript.Shell
@@ -176,18 +232,17 @@ $sc.IconLocation = (Join-Path $dest 'llama-fidim.exe') + ',0'
 $sc.Description = 'Llama FIDIM - llama.cpp servers on AMD, your way'
 $sc.Save()
 Write-Host "== Start Menu shortcut: $lnk" -ForegroundColor Cyan
+if ($retired) { Write-Host "   (a taskbar pin to the old folder must be re-pinned by hand)" }
 
 if ($AddToPath) {
-  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if (($userPath -split ';') -notcontains $dest) {
-    [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $dest), 'User')
-    Write-Host "== added $dest to the user PATH (new shells only)" -ForegroundColor Cyan
-  } else {
-    Write-Host "== $dest already on the user PATH"
-  }
+  # fidim edits the registry value itself: it keeps the value's type and
+  # every other entry, and tells Explorer so new shells see the change.
+  Write-Host "== user PATH" -ForegroundColor Cyan
+  & $fidim path add
+  if ($LASTEXITCODE -ne 0) { throw "fidim path add failed ($LASTEXITCODE)" }
 }
 
-$ver = & (Join-Path $dest 'fidim.exe') --version
+$ver = & $fidim --version
 Write-Host ""
 Write-Host "installed: $ver"
 Write-Host "  GUI : $dest\llama-fidim.exe"

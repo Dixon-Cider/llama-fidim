@@ -293,6 +293,10 @@ impl<'a> Sse<'a> {
     pub fn end(&mut self) -> io::Result<()> {
         self.s.write_all(b"0\r\n\r\n")
     }
+
+    pub fn client_gone(&self) -> bool {
+        client_gone(self.s)
+    }
 }
 
 /// Half-close, then drain briefly: closing a socket with unread input makes
@@ -863,8 +867,12 @@ fn stream_body(
     let chunk = |delta: Value| chat_chunk(&meta, delta, None, None).to_string();
     sse.start()?;
     sse.data(&chunk(json!({ "role": "assistant", "content": null })))?;
-    if sum.id_task.is_none() && q.behind {
-        sse.comment(&format!("queued {}", queue_position(ctx, q.ticket)))?;
+    // `: dg task <id>` names the job, so a client can match its own request
+    // in /slots and /frames. A comment: OpenAI clients skip it.
+    match sum.id_task {
+        Some(id) => sse.comment(&format!("dg task {id}"))?,
+        None if q.behind => sse.comment(&format!("queued {}", queue_position(ctx, q.ticket)))?,
+        None => {}
     }
     let mut last_write = Instant::now();
     let mut pending = first;
@@ -876,6 +884,13 @@ fn stream_body(
             None => match q.events.recv_timeout(TICK) {
                 Ok(ev) => ev,
                 Err(RecvTimeoutError::Timeout) => {
+                    // Still queued: look for a closed connection every tick,
+                    // so a client that left is skipped. Waiting for a
+                    // keep-alive write to fail took up to two of them (the
+                    // first write after a close usually still succeeds).
+                    if sum.id_task.is_none() && sse.client_gone() {
+                        return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "the client left while queued"));
+                    }
                     if last_write.elapsed() >= KEEPALIVE {
                         let c = match sum.id_task {
                             None => format!("queued {}", queue_position(ctx, q.ticket)),
@@ -894,7 +909,11 @@ fn stream_body(
             },
         };
         match ev {
-            EngineEvent::Started { id_task, seed } => sum.started(id_task, seed, t_enq),
+            EngineEvent::Started { id_task, seed } => {
+                sum.started(id_task, seed, t_enq);
+                sse.comment(&format!("dg task {id_task}"))?;
+                last_write = Instant::now();
+            }
             EngineEvent::Restarted { seed } => {
                 shaper.reset();
                 text.clear();

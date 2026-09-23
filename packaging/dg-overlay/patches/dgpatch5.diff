@@ -1,0 +1,877 @@
+dgpatch5: the DiffusionGemma runner patch Llama FIDIM ships as an overlay on
+Unsloth's llama.cpp builds.
+
+- The prompt-KV store is F16, and sliding-window layers keep a ring of
+  n_swa-1 + n_ubatch rows instead of every prompt position.
+- Flash attention pads keys to the kernel's 256-key stride, so the 512-wide
+  full-attention heads run on the GPU; under FA the visual server sizes its
+  context with llama_diffusion_fa_turn_bytes instead of the N^2 score tensor.
+- Each block extends the prompt-KV store instead of prefilling the whole
+  prompt again (DG_PREFILL_REUSE=0 turns this off).
+- The self-conditioning matmul runs as 32 vocabulary slices.
+- A failed denoise step ends the block with ERR gen instead of committing a
+  stale canvas; DG_FRAME_SPECIAL=1 frames keep special tokens.
+- The diffusion CLI sizes its token buffer and batch for chunked prefill, and
+  both trim a repetition loop only when the whole 1- or 2-token period repeats.
+
+Produced against unslothai/llama.cpp release b11030-mix-5ff778e (source commit
+6ba30d05b140ebb0baeded27d7d9b843c5b71ff1). Apply from the top of an extracted
+llama.cpp-source-commit-*.tar.gz with `git apply` or `patch -p1`.
+
+Features: dg-pkv-f16 dg-swa-ring dg-fa-pad dg-fa-turn-sizing dg-step-fail-err
+dg-frame-special dg-prefill-reuse dg-sc-splitk
+
+diff --git a/examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp b/examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp
+index 193b326..d065cfe 100644
+--- a/examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp
++++ b/examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp
+@@ -22,7 +22,11 @@
+ // Startup line: "READY <n_vocab> <MAXTOK>" (MAXTOK is the resolved per-turn context budget; see auto-size).
+ //
+ // Usage: llama-diffusion-gemma-visual-server <model.gguf>
+-//   env: NGL (gpu layers), MAXTOK (0/unset = auto-size the largest context that fits VRAM, else RAM), FA
++//   env: NGL (gpu layers), MAXTOK (0/unset = auto-size the largest context that fits VRAM, else RAM),
++//        FA=1 (flash attention, single GPU only: no N^2 score tensor, so auto-size reaches the 65536 ceiling)
++//        DG_FRAME_SPECIAL=1 (F frames read like a commit: special tokens kept, so the <|channel> markers
++//        show where the thinking ends, and cut at the first end-of-generation token)
++//        DG_PREFILL_REUSE=0 (re-PREFILL the whole prompt every block, as before; default reuses the store)
+ //   diagnostics: DG_FREE_VRAM_MB / DG_FREE_RAM_MB override the probe's memory budgets (testing only)
+ 
+ #include "llama.h"
+@@ -62,6 +66,7 @@ struct vis_cb_data {
+     int64_t              viz_us  = 0;     // host time spent emitting frames (detok + json + flush), excluded from decode
+     FILE *               out     = nullptr;
+     const llama_vocab *  vocab   = nullptr;
++    bool                 special = false; // DG_FRAME_SPECIAL: frames keep special tokens and stop at the first EOG
+ };
+ 
+ // Stream the current argmax canvas (tokens[n_input .. n_tokens)) as one "F" record per denoising step,
+@@ -77,7 +82,13 @@ static bool vis_step_callback(int32_t step, int32_t total_steps, const llama_tok
+     // the visualization cost (this is exactly why the visualization-inclusive tok/s looks ~10x slow).
+     const int64_t t0 = ggml_time_us();
+     std::vector<llama_token> canvas(tokens + d->n_input, tokens + n_tokens);
+-    const std::string text = common_detokenize(d->vocab, canvas, /*special*/ false);
++    if (d->special) {
++        // What the block would commit if it stopped here: past the first EOG the canvas is padding.
++        for (size_t i = 0; i < canvas.size(); i++) {
++            if (llama_vocab_is_eog(d->vocab, canvas[i])) { canvas.resize(i); break; }
++        }
++    }
++    const std::string text = common_detokenize(d->vocab, canvas, /*special*/ d->special);
+     fprintf(d->out, "F %d %d %d %s\n", d->block, step, total_steps, common_json::make(text).dump().c_str());
+     fflush(d->out);
+     d->viz_us += ggml_time_us() - t0;
+@@ -85,7 +96,7 @@ static bool vis_step_callback(int32_t step, int32_t total_steps, const llama_tok
+ }
+ 
+ // Trim a denoised canvas like the CLI: cut at the first end-of-generation token, else at the onset of a
+-// repetition loop (a token recurring at stride 1-2 for >= 6 steps).
++// repetition loop (a 1- or 2-token pattern repeating >= 6 times in a row).
+ static size_t trim_canvas(const llama_vocab * vocab, const llama_token * canvas, size_t n) {
+     size_t cut = n;
+     for (size_t i = 0; i < n; i++) {
+@@ -94,8 +105,13 @@ static size_t trim_canvas(const llama_vocab * vocab, const llama_token * canvas,
+     for (size_t i = 0; i + 1 < cut; i++) {
+         bool loop = false;
+         for (size_t stride = 1; stride <= 2 && !loop; stride++) {
++            // The whole period must repeat. Comparing only every other token read a list such as
++            // "a, b, c, d, e, f, g" (word, comma, word, ...) as a loop and cut the reply at its first comma.
+             size_t reps = 0;
+-            for (size_t j = i; j + stride < n && canvas[j] == canvas[j + stride]; j += stride) { reps++; }
++            for (size_t j = i; j + 2 * stride <= n && std::equal(canvas + j, canvas + j + stride, canvas + j + stride);
++                 j += stride) {
++                reps++;
++            }
+             loop = reps >= 6;
+         }
+         if (loop) { cut = i; break; }
+@@ -158,15 +174,26 @@ int main(int argc, char ** argv) {
+     }
+     const bool one_gpu = (gpu_devs <= 1);
+ 
+-    const bool fa_on  = getenv("FA") && atoi(getenv("FA"));
++    // Flash attention needs the prompt-KV path, which pads keys to the FA kernel's stride. The multi-device
++    // UNIFIED path does not pad, so FA there would put the full-attention layers on the CPU.
++    const bool frame_special = getenv("DG_FRAME_SPECIAL") && atoi(getenv("DG_FRAME_SPECIAL"));
++    const bool prefill_reuse = !(getenv("DG_PREFILL_REUSE") && atoi(getenv("DG_PREFILL_REUSE")) == 0);
++    const bool fa_req = getenv("FA") && atoi(getenv("FA"));
++    const bool fa_on  = fa_req && one_gpu;
++    if (fa_req && !fa_on) {
++        fprintf(stderr, "FA=1 ignored: flash attention needs a single visible GPU (prompt-KV path)\n");
++    }
+     const int  n_head = std::max(1, (int) llama_model_n_head(model));
+     auto make_cparams = [&](int n) {
+         llama_context_params c = llama_context_default_params();
+         c.n_ctx   = (uint32_t) n;
+         c.n_batch = (uint32_t) n;
+-        // chunked causal prefill: keep n_head*chunk*n_kv under 2^31 (CUDA softcap is 32-bit indexed)
+-        const int chunk = (int) std::clamp<int64_t>((int64_t(1) << 30) / (int64_t(n_head) * n), 256, 2048);
++        // chunked causal prefill: keep n_head*chunk*n_kv under 2^31 (CUDA softcap is 32-bit indexed). FA has no
++        // score tensor, so it takes the full 2048 chunk, whole multiples of its 256-key stride.
++        const int chunk = fa_on ? 2048
++                                : (int) std::clamp<int64_t>((int64_t(1) << 30) / (int64_t(n_head) * n), 256, 2048);
+         c.n_ubatch = (uint32_t) std::min(n, chunk);
++        if (fa_on && c.n_ubatch > 256) c.n_ubatch -= c.n_ubatch % 256;
+         c.n_outputs_max = (uint32_t) canvas_length;   // only the canvas rows need logits
+         c.no_perf = true;
+         c.flash_attn_type = fa_on ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+@@ -179,7 +206,18 @@ int main(int argc, char ** argv) {
+     // layers landed. llama_init_from_model returns null on OOM (graph_reserve throws), so probing is safe.
+     const int n_ctx_train = (int) llama_model_n_ctx_train(model);
+     const int floor_ctx   = std::max((int) canvas_length * 4, 2048);
++    // 65536 also bounds FA's padded key count: the pad kernel launches one grid row per key along z, and HIP
++    // allows at most 65536 there (CUDA 65535).
+     const int auto_ceil   = n_ctx_train > 0 ? std::min(n_ctx_train, 65536) : 65536;
++    // Bytes a turn of N tokens needs beyond the creation-time reserve, for the gates below. FA off: the fp32
++    // [n_head, N, N] score tensor. FA on: no scores, and the reserve doesn't grow with N, so the
++    // store and DECODE working copies it can't see (llama_diffusion_fa_turn_bytes).
++    auto turn_bytes = [&](int N) -> double {
++        if (fa_on) {
++            return (double) llama_diffusion_fa_turn_bytes(model, N, make_cparams(N).n_ubatch);
++        }
++        return (double) n_head * (double) N * (double) N * 4.0;
++    };
+     const int cands[] = {65536, 49152, 40960, 32768, 24576, 20480, 16384, 12288, 8192, 6144, 4096, 2048};
+ 
+     // VRAM budget (where NGL asks the model to live) and RAM budget (where it spills if it overflows VRAM).
+@@ -206,10 +244,8 @@ int main(int argc, char ** argv) {
+             if (raw > ceil_ctx) continue;
+             int N = (int) ((raw / canvas_length) * canvas_length);   // whole canvases only
+             if (N < floor_ctx) break;
+-            if (budget) {   // an fp32 [n_head, N, N] scores buffer is unavoidable (FA off): skip if it can't fit
+-                const double min_scores = (double) n_head * (double) N * (double) N * 4.0;
+-                if (min_scores > (double) budget * 0.9) continue;
+-            }
++            // skip sizes whose turn can't fit: the creation-time allocation below doesn't include it
++            if (budget && turn_bytes(N) > (double) budget * 0.9) continue;
+             llama_context * c = llama_init_from_model(model, make_cparams(N));
+             if (!c) continue;
+             if (gpu_headroom && gpu_dev) {
+@@ -226,10 +262,13 @@ int main(int argc, char ** argv) {
+     llama_context * ctx = nullptr;
+     const char * reason = "auto";
+ 
+-    if (MAXTOK_ENV > 0) {   // explicit budget: honour exactly if it fits, else degrade through the probe
+-        const double sc = (double) n_head * (double) MAXTOK_ENV * (double) MAXTOK_ENV * 4.0;
++    if (MAXTOK_ENV > 0 && fa_on && MAXTOK_ENV > auto_ceil) {
++        // the auto-size probe below then tries the largest candidate <= auto_ceil
++        fprintf(stderr, "MAXTOK=%d is above the FA ceiling %d (training context / pad-kernel grid limit)\n",
++                MAXTOK_ENV, auto_ceil);
++    } else if (MAXTOK_ENV > 0) {   // explicit budget: honour exactly if it fits, else degrade through the probe
+         const size_t budget = std::max(v_free, ram_budget);
+-        if (!budget || sc <= (double) budget * 0.9) {
++        if (!budget || turn_bytes(MAXTOK_ENV) <= (double) budget * 0.9) {
+             ctx = llama_init_from_model(model, make_cparams(MAXTOK_ENV));
+             if (ctx) { MAXTOK = MAXTOK_ENV; reason = "requested"; }
+         }
+@@ -325,6 +364,10 @@ int main(int argc, char ** argv) {
+         int total_steps   = 0;
+         int64_t total_viz_us = 0;                     // cumulative host visualization time (frames + commits)
+ 
++        // What the prompt-KV store holds after the previous block: its prompt, as long as nothing reallocated
++        // the store since. Each block then PREFILLs only the canvas just committed.
++        int32_t  cached     = 0;
++        uint64_t cached_gen = 0;
+         for (int b = 0; b < std::max(1, n_blocks); b++) {
+             const int32_t prefix_len = (int32_t) prefix.size();
+             const int32_t max_length = prefix_len + (int32_t) canvas_length;
+@@ -338,12 +381,18 @@ int main(int argc, char ** argv) {
+             eb.max_length              = max_length;
+             eb.seed                    = seed + b;   // distinct per block, deterministic from the request seed
+             eb.visual_mode             = true;
+-            vis_cb_data cb{ b, prefix_len, 0, 0, stdout, vocab };
++            vis_cb_data cb{ b, prefix_len, 0, 0, stdout, vocab, frame_special };
+             eb.step_callback           = vis_step_callback;
+             eb.step_callback_user_data = &cb;
+ 
++            eb.n_cached = (prefill_reuse && eb.kv_cache && b > 0 && cached <= prefix_len &&
++                           llama_diffusion_pkv_generation(model) == cached_gen &&
++                           llama_diffusion_pkv_capacity(model) >= max_length) ? cached : 0;
++
+             int32_t n_generated = 0;
+             diffusion_generate_entropy_bound(ctx, prefix.data(), output_tokens.data(), prefix_len, eb, n_generated);
++            cached     = prefix_len;
++            cached_gen = llama_diffusion_pkv_generation(model);
+             if (n_generated <= prefix_len) { if (b == 0) printf("ERR gen\n"); break; }
+ 
+             blocks_run++;
+diff --git a/examples/diffusion/diffusion-cli.cpp b/examples/diffusion/diffusion-cli.cpp
+index 70487d7..ee71fd8 100644
+--- a/examples/diffusion/diffusion-cli.cpp
++++ b/examples/diffusion/diffusion-cli.cpp
+@@ -247,7 +247,9 @@ int main(int argc, char ** argv) {
+     const bool visual_mode = params.diffusion.visual_mode;
+ 
+     // reused across turns; canvas models fill only n_input + canvas_length of it
+-    std::vector<llama_token> output_tokens(params.n_ubatch);
++    // With the prefix KV cache the prompt is prefilled in n_ubatch chunks, so [prompt | canvas] can exceed
++    // n_ubatch: size for n_ctx.
++    std::vector<llama_token> output_tokens(std::max(params.n_ubatch, params.n_ctx));
+ 
+     struct diffusion_params diff_params;
+ 
+@@ -382,7 +384,7 @@ int main(int argc, char ** argv) {
+     }
+ 
+     // Trim a denoised canvas: cut at the first end-of-generation token, or (checkpoints often emit no stop
+-    // token) at the onset of a repetition loop (a token recurring at stride 1-2 for >= 6 steps).
++    // token) at the onset of a repetition loop (a 1- or 2-token pattern repeating >= 6 times in a row).
+     auto trim_canvas = [&](const llama_token * canvas, size_t n) -> size_t {
+         size_t cut = n;
+         for (size_t i = 0; i < n; i++) {
+@@ -394,8 +396,11 @@ int main(int argc, char ** argv) {
+         for (size_t i = 0; i + 1 < cut; i++) {
+             bool loop = false;
+             for (size_t stride = 1; stride <= 2 && !loop; stride++) {
++                // The whole period must repeat: comparing only every other token read a list such as
++                // "a, b, c, d, e, f, g" (word, comma, word, ...) as a loop and cut it at its first comma.
+                 size_t reps = 0;
+-                for (size_t j = i; j + stride < n && canvas[j] == canvas[j + stride]; j += stride) {
++                for (size_t j = i; j + 2 * stride <= n && std::equal(canvas + j, canvas + j + stride, canvas + j + stride);
++                     j += stride) {
+                     reps++;
+                 }
+                 loop = reps >= 6;
+@@ -435,7 +440,11 @@ int main(int argc, char ** argv) {
+                 std::vector<llama_token>(output_tokens.begin() + n_input, output_tokens.begin() + n_generated), false);
+         }
+ 
+-        const int32_t max_ub   = std::min((int32_t) params.n_ubatch, (int32_t) llama_n_ctx(ctx));
++        // With the prefix KV cache the prompt is prefilled in n_ubatch chunks and only the canvas is decoded,
++        // so [prompt | canvas] need only fit n_ctx, as in the visual server.
++        const int32_t max_ub   = (use_eb && eb_params.kv_cache)
++                                     ? (int32_t) llama_n_ctx(ctx)
++                                     : std::min((int32_t) params.n_ubatch, (int32_t) llama_n_ctx(ctx));
+         const int     n_blocks = std::max(1, params.diffusion.blocks);
+         std::vector<llama_token> response;
+ 
+diff --git a/examples/diffusion/diffusion.cpp b/examples/diffusion/diffusion.cpp
+index 7364947..7090f12 100644
+--- a/examples/diffusion/diffusion.cpp
++++ b/examples/diffusion/diffusion.cpp
+@@ -498,7 +498,13 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
+         // attending causally over the prefix. Keeps n_tokens <= n_ubatch, so the buffer tracks the chunk, not the prompt.
+         const int32_t U = std::max(1, (int32_t) llama_n_ubatch(ctx));
+         bool prefill_ok = true;
+-        for (int32_t s = 0; s < n_input && prefill_ok; s += U) {
++        // Positions the store already holds (the previous block's prompt) are causal K/V that later tokens
++        // cannot change: extend from there instead of recomputing the whole prompt every block.
++        const int32_t s0 = std::clamp(params.n_cached, 0, n_input);
++        if (s0 > 0) {
++            LOG_INF("%s: PREFILL reuses %d cached prompt tokens, computes %d\n", __func__, s0, n_input - s0);
++        }
++        for (int32_t s = s0; s < n_input && prefill_ok; s += U) {
+             const int32_t u = std::min(U, n_input - s);
+             llama_diffusion_set_phase(model, /*PKV_PREFILL=*/1, n_input, /*off=*/s);
+             batch.n_tokens = u;
+@@ -525,6 +531,7 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
+     float   prev_temp_inv = 1.0f;
+     int     held          = 0;
+     bool    finished      = false;
++    bool    step_failed   = false;   // a denoise step's decode failed: the canvas is not a result
+     bool    device_sample_ok = gpu_sample_reduce;   // latched off if a backend (e.g. Metal) can't device-sample
+ 
+     for (int32_t cur_step = S; cur_step >= 1 && !finished; --cur_step) {
+@@ -560,6 +567,7 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
+ 
+         if (llama_decode(ctx, batch) != 0) {
+             LOG_ERR("%s: failed to decode at step %d\n", __func__, step_idx);
++            step_failed = true;
+             break;
+         }
+ 
+@@ -679,5 +687,8 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
+         llama_diffusion_set_device_sc(model, false);             // restore host SC path for later turns
+     }
+     llama_batch_free(batch);
+-    n_generated = params.max_length;
++    // A failed step leaves output_tokens partly denoised, or holding an earlier request's canvas; report
++    // nothing generated so callers see a failure instead of committing it (e.g. the compute buffer can't
++    // grow for a long prompt).
++    n_generated = step_failed ? 0 : params.max_length;
+ }
+diff --git a/examples/diffusion/diffusion.h b/examples/diffusion/diffusion.h
+index a7f305e..a2dc009 100644
+--- a/examples/diffusion/diffusion.h
++++ b/examples/diffusion/diffusion.h
+@@ -75,6 +75,9 @@ struct diffusion_eb_params {
+     int32_t max_length           = 0;      // n_input + canvas_length
+     bool    kv_cache             = false;  // prefix-KV-cache the prompt (PREFILL once, decode canvas-only
+                                            // per step) instead of re-decoding [prompt|canvas] every step
++    int32_t n_cached             = 0;      // kv_cache: leading input tokens whose K/V the store already holds from
++                                           // an earlier call on this context (same tokens, store not reallocated
++                                           // since: llama_diffusion_pkv_generation); PREFILL starts after them
+     bool    gpu_sampling         = false;  // device-resident self-conditioning: keep the prev step's canvas
+                                            // logits on-device for SC instead of a per-step 268 MB host upload
+                                            // (exact; the SC math/values are unchanged)
+diff --git a/include/llama.h b/include/llama.h
+index 1113b58..c6185b2 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -638,12 +638,28 @@ extern "C" {
+                        int32_t   P,
+                        int32_t   off);
+ 
+-    // DiffusionGemma prompt-KV store bytes per prompt token (0 for other models). Pass use_f16 = whether
+-    // flash attention is enabled (the store is F16 under FA, F32 otherwise). Sizes context against the store.
++    // DiffusionGemma prompt-KV store bytes per prompt token if every layer kept every position (0 for other
++    // models). An upper bound: the store is F16 and its sliding layers keep a fixed ring.
+     LLAMA_API size_t llama_diffusion_pkv_bytes_per_token(
+             const struct llama_model * model,
+                               bool      use_f16);
+ 
++    // DiffusionGemma prompt-KV store: how many prompt positions it holds without being reallocated (0 = not
++    // allocated), and a counter that changes whenever it is (re)allocated, which drops its contents. A caller
++    // that prefilled tokens [0, n) can PREFILL a longer prompt with the same first n tokens from position n
++    // on, while the counter is unchanged and the capacity covers the new length (diffusion_eb_params.n_cached).
++    LLAMA_API int64_t  llama_diffusion_pkv_capacity(const struct llama_model * model);
++    LLAMA_API uint64_t llama_diffusion_pkv_generation(const struct llama_model * model);
++
++    // DiffusionGemma: approximate device bytes a turn of up to n_ctx tokens needs beyond the weights and the
++    // compute buffer reserved at context creation, with flash attention on (store, DECODE working copies of
++    // the widest layer's K,V, self-conditioning logits). 0 for other models. Sizes context under FA, where
++    // there is no N^2 score tensor and the creation-time reserve does not grow with n_ctx.
++    LLAMA_API size_t llama_diffusion_fa_turn_bytes(
++            const struct llama_model * model,
++                           int64_t      n_ctx,
++                           int64_t      n_ubatch);
++
+     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
+diff --git a/src/models/diffusion-gemma.cpp b/src/models/diffusion-gemma.cpp
+index d89cd71..10c78b3 100644
+--- a/src/models/diffusion-gemma.cpp
++++ b/src/models/diffusion-gemma.cpp
+@@ -107,52 +107,54 @@ public:
+     int64_t       C;
+ };
+ 
+-// Decode-phase mask (prompt-KV caching): canvas queries over [cached prompt (first P) | fresh canvas
+-// (last C)], rectangular [P+C, C]. Global sees all prompt; sliding the last (n_swa-1) prompt.
++// Decode-phase mask (prompt-KV caching): canvas queries over [cached prompt | fresh canvas (last C)].
++// Full layers see all P prompt keys, [P+C, C]. Sliding layers get the last n_prompt_swa prompt positions
++// [P - n_prompt_swa, P) (all P when every position is stored, the last n_swa-1 from a ring) and see the
++// last (n_swa-1) of them, [n_prompt_swa+C, C].
+ class llm_graph_input_attn_diffusion_decode : public llm_graph_input_attn_no_cache {
+ public:
+     llm_graph_input_attn_diffusion_decode(const llama_hparams & hparams, const llama_cparams & cparams,
+-                                          int64_t n_prompt, int64_t n_canvas) :
+-        llm_graph_input_attn_no_cache(hparams, cparams), n_prompt(n_prompt), n_canvas(n_canvas) {}
++                                          int64_t n_prompt, int64_t n_canvas, int64_t n_prompt_swa) :
++        llm_graph_input_attn_no_cache(hparams, cparams), n_prompt(n_prompt), n_canvas(n_canvas),
++        n_prompt_swa(n_prompt_swa) {}
+     ~llm_graph_input_attn_diffusion_decode() = default;
+ 
+     void set_input(const llama_ubatch * /*ubatch*/) override {
+-        const int64_t P    = n_prompt;
+-        const int64_t C    = n_canvas;
+-        const int64_t n_kv = P + C;
++        const int64_t P = n_prompt;
++        const int64_t C = n_canvas;
+         const int64_t canvas_prompt_lo = P - (int64_t) hparams.n_swa + 1;
+ 
+-        const auto fill = [&](auto * data, bool swa) {
++        // n_pk prompt keys, the first at position P - n_pk, then the C canvas keys. A row is `width` wide:
++        // under flash attention K,V are zero-padded to a multiple of 256 keys and the padding stays -inf.
++        // Every canvas query sees the same keys (bidirectional over the canvas; the window depends on the key
++        // only), so build one row and copy it: this runs before every denoise step, over up to n_ctx keys.
++        const auto fill = [&](auto * data, int64_t width, int64_t n_pk, bool swa) {
+             using T = std::remove_reference_t<decltype(*data)>;
+-            std::fill(data, data + n_kv * C, llama_cast<T>(-INFINITY));
+-            for (int64_t q = 0; q < C; ++q) {            // canvas query (position P+q)
+-                const uint64_t row = q * n_kv;
+-                for (int64_t k = 0; k < n_kv; ++k) {     // key: k<P prompt (pos k), else canvas
+-                    bool allow;
+-                    if (k < P) {
+-                        allow = swa ? (k >= canvas_prompt_lo) : true;
+-                    } else {
+-                        allow = true;                     // bidirectional over the canvas
+-                    }
+-                    if (allow) {
+-                        data[row + k] = llama_cast<T>(0.0f);
+-                    }
+-                }
++            const int64_t n_kv = n_pk + C;
++            GGML_ASSERT(n_kv <= width);
++            const T zero = llama_cast<T>(0.0f);
++            const T ninf = llama_cast<T>(-INFINITY);
++            for (int64_t k = 0; k < width; ++k) {
++                const bool allow = k < n_kv && (k >= n_pk || !swa || P - n_pk + k >= canvas_prompt_lo);
++                data[k] = allow ? zero : ninf;
++            }
++            for (int64_t q = 1; q < C; ++q) {            // canvas query (position P+q)
++                std::memcpy(data + q * width, data, (size_t) width * sizeof(T));
+             }
+         };
+ 
+         GGML_ASSERT(self_kq_mask && ggml_backend_buffer_is_host(self_kq_mask->buffer));
+         if (self_kq_mask->type == GGML_TYPE_F16) {
+-            fill((ggml_fp16_t *) self_kq_mask->data, false);
++            fill((ggml_fp16_t *) self_kq_mask->data, self_kq_mask->ne[0], P, false);
+         } else {
+-            fill((float *) self_kq_mask->data, false);
++            fill((float *) self_kq_mask->data, self_kq_mask->ne[0], P, false);
+         }
+         if (self_kq_mask_swa) {
+             GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
+             if (self_kq_mask_swa->type == GGML_TYPE_F16) {
+-                fill((ggml_fp16_t *) self_kq_mask_swa->data, true);
++                fill((ggml_fp16_t *) self_kq_mask_swa->data, self_kq_mask_swa->ne[0], n_prompt_swa, true);
+             } else {
+-                fill((float *) self_kq_mask_swa->data, true);
++                fill((float *) self_kq_mask_swa->data, self_kq_mask_swa->ne[0], n_prompt_swa, true);
+             }
+         }
+     }
+@@ -161,6 +163,7 @@ public:
+ 
+     int64_t n_prompt;
+     int64_t n_canvas;
++    int64_t n_prompt_swa;
+ };
+ 
+ // Chunked-prefill mask: n_q prompt queries at [off, off+n_q) attend causally over keys [0, off+n_q)
+@@ -168,20 +171,27 @@ public:
+ class llm_graph_input_attn_diffusion_prefill : public llm_graph_input_attn_no_cache {
+ public:
+     llm_graph_input_attn_diffusion_prefill(const llama_hparams & hparams, const llama_cparams & cparams,
+-                                           int64_t off, int64_t n_q) :
+-        llm_graph_input_attn_no_cache(hparams, cparams), off(off), n_q(n_q) {}
++                                           int64_t off, int64_t n_q, int64_t n_prefix_swa) :
++        llm_graph_input_attn_no_cache(hparams, cparams), off(off), n_q(n_q), n_prefix_swa(n_prefix_swa) {}
+     ~llm_graph_input_attn_diffusion_prefill() = default;
+ 
+     void set_input(const llama_ubatch * /*ubatch*/) override {
+-        const int64_t n_kv = off + n_q;
+-        const auto fill = [&](auto * data, bool swa) {
++        // n_prefix earlier positions [off - n_prefix, off) then the chunk: key k is at position off - n_prefix + k.
++        // Full layers get every earlier position (n_prefix = off); sliding layers read from a ring get only
++        // the last n_prefix_swa (<= n_swa-1), which is all a chunk query can reach.
++        // A row is `width` wide: under flash attention K,V are zero-padded to a multiple of 256 keys and the
++        // padding stays -inf.
++        const auto fill = [&](auto * data, int64_t width, int64_t n_prefix, bool swa) {
+             using T = std::remove_reference_t<decltype(*data)>;
+-            std::fill(data, data + n_kv * n_q, llama_cast<T>(-INFINITY));
++            const int64_t n_kv = n_prefix + n_q;
++            const int64_t pos0 = off - n_prefix;
++            GGML_ASSERT(n_kv <= width);
++            std::fill(data, data + width * n_q, llama_cast<T>(-INFINITY));
+             for (int64_t i = 0; i < n_q; ++i) {        // query local i -> global position off+i
+                 const int64_t  q   = off + i;
+-                const uint64_t row = i * n_kv;
+-                for (int64_t k = 0; k <= q; ++k) {     // causal: keys [0, q]
+-                    if (swa && llama_hparams::is_masked_swa(hparams.n_swa, hparams.swa_type, k, q)) {
++                const uint64_t row = i * width;
++                for (int64_t k = 0; k < n_kv && pos0 + k <= q; ++k) {  // causal
++                    if (swa && llama_hparams::is_masked_swa(hparams.n_swa, hparams.swa_type, pos0 + k, q)) {
+                         continue;                       // sliding layers clip keys outside the window
+                     }
+                     data[row + k] = llama_cast<T>(0.0f);
+@@ -191,16 +201,16 @@ public:
+ 
+         GGML_ASSERT(self_kq_mask && ggml_backend_buffer_is_host(self_kq_mask->buffer));
+         if (self_kq_mask->type == GGML_TYPE_F16) {
+-            fill((ggml_fp16_t *) self_kq_mask->data, false);
++            fill((ggml_fp16_t *) self_kq_mask->data, self_kq_mask->ne[0], off, false);
+         } else {
+-            fill((float *) self_kq_mask->data, false);
++            fill((float *) self_kq_mask->data, self_kq_mask->ne[0], off, false);
+         }
+         if (self_kq_mask_swa) {
+             GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
+             if (self_kq_mask_swa->type == GGML_TYPE_F16) {
+-                fill((ggml_fp16_t *) self_kq_mask_swa->data, true);
++                fill((ggml_fp16_t *) self_kq_mask_swa->data, self_kq_mask_swa->ne[0], n_prefix_swa, true);
+             } else {
+-                fill((float *) self_kq_mask_swa->data, true);
++                fill((float *) self_kq_mask_swa->data, self_kq_mask_swa->ne[0], n_prefix_swa, true);
+             }
+         }
+     }
+@@ -209,6 +219,7 @@ public:
+ 
+     int64_t off;
+     int64_t n_q;
++    int64_t n_prefix_swa;
+ };
+ 
+ void llama_model_diffusion_gemma::load_arch_hparams(llama_model_loader & ml) {
+@@ -329,8 +340,14 @@ static void dg_ensure_sc_embT(const llama_model_diffusion_gemma & m);
+ // fwd decl: lazily (re)allocate the device-resident prev-step canvas-logits buffer for device SC (defined below)
+ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C);
+ // fwd decl: lazily (re)allocate the device-resident prompt-KV store (per-layer K,V, grow-only) at the given
+-// element type. Allocated from the graph so the type can follow cparams.flash_attn (F16 under FA).
+-static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type);
++// element type and sliding-layer ring size (0 = every position). Allocated from the graph, where n_ubatch is known.
++static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type, int64_t ring);
++
++// Sliding-window layers keep a ring of rows instead of every prompt position (see pkv_ring), whenever the
++// model has a window. Shared by the graph and llama_diffusion_fa_turn_bytes.
++static bool dg_swa_window_on(const llama_hparams & hp) {
++    return hp.swa_type != LLAMA_SWA_TYPE_NONE && hp.n_swa > 1;
++}
+ 
+ std::unique_ptr<llm_graph_context> llama_model_diffusion_gemma::build_arch_graph(const llm_graph_params & params) const {
+     return std::make_unique<graph>(*this, params);
+@@ -366,10 +383,20 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
+     // keys span [0, prefill_off + n_tokens) (prior chunks live in the store, this chunk is fresh).
+     const int64_t prefill_off = is_prefill ? dmodel.pkv_prefill_off : 0;
+ 
+-    // Allocate the store on the first PREFILL chunk, sized to the whole prompt (pkv_P). Type follows FA so it
+-    // is precision-neutral: under FA, build_attn casts K,V to F16 regardless. DECODE only reads a prior store.
++    // Allocate the store on the first PREFILL chunk, sized to the whole prompt (pkv_P). DECODE only reads a
++    // prior store.
+     if (is_prefill && dmodel.pkv_P > 0) {
+-        dg_ensure_pkv_store(dmodel, dmodel.pkv_P, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
++        // F16 halves the persistent store. Precision-neutral in practice: measured indistinguishable from a
++        // ~1e-6 relative perturbation of an F32 store, and finer than the bf16 KV of the reference.
++        const ggml_type store_type = GGML_TYPE_F16;
++        // Ring rows for sliding layers: the window (n_swa-1) plus one prefill chunk (n_ubatch), which keeps a
++        // chunk's reads [off-(n_swa-1), off) and writes [off, off+n_ubatch) on disjoint rows.
++        const int64_t ring = dg_swa_window_on(hparams) ? (int64_t) hparams.n_swa - 1 + (int64_t) cparams.n_ubatch : 0;
++        // With the ring only the full-attention layers grow per position (20 KiB/token at 26B-A4B), so size the
++        // store for the whole context once. It then survives from one block's PREFILL to the next, which only
++        // has to add the canvas just committed (llama_diffusion_pkv_generation). The FA sizing counts it so.
++        const int64_t cap  = ring > 0 ? std::max<int64_t>(dmodel.pkv_P, (int64_t) cparams.n_ctx) : dmodel.pkv_P;
++        dg_ensure_pkv_store(dmodel, cap, store_type, ring);
+     }
+ 
+     // guard the prompt-KV store is allocated and large enough (misuse fails loudly, not OOB)
+@@ -409,7 +436,26 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
+             // soft_emb = (softmax @ embed_tokens) * embed_scale. sc_embT is the embedding transposed/
+             // dequantized once on-device (dg_ensure_sc_embT) so the per-step cost is one matmul vs a weight.
+             dg_ensure_sc_embT(dmodel);
+-            ggml_tensor * soft = ggml_mul_mat(ctx0, dmodel.sc_embT, probs);             // [n_embd, Cc]
++            // The reduction runs over the whole vocabulary into a small [n_embd, Cc] result, which a GEMM
++            // tiles too coarsely to fill the GPU (rocBLAS without hipBLASLt: 108 ms of a ~220 ms step on
++            // gfx1201). Split K: one batched matmul over 32 vocabulary slices, then add the slices. Same sum,
++            // different order. A vocabulary that does not split evenly into slices of at least 512 keeps the
++            // single matmul.
++            const int64_t sk_want = 32;
++            const int64_t n_split = (n_vocab % sk_want == 0 && n_vocab / sk_want >= 512) ? sk_want : 1;
++            ggml_tensor * soft;
++            if (n_split > 1) {
++                const int64_t slice = n_vocab / n_split;
++                ggml_tensor * a = ggml_view_3d(ctx0, dmodel.sc_embT, slice, dmodel.sc_embT->ne[1], n_split,
++                                               dmodel.sc_embT->nb[1], slice * dmodel.sc_embT->nb[0], 0);
++                ggml_tensor * b = ggml_view_3d(ctx0, probs, slice, Cc, n_split,
++                                               probs->nb[1], slice * probs->nb[0], 0);
++                ggml_tensor * parts = ggml_mul_mat(ctx0, a, b);                          // [n_embd, Cc, n_split]
++                parts = ggml_cont(ctx0, ggml_permute(ctx0, parts, 1, 2, 0, 3));          // [n_split, n_embd, Cc]
++                soft  = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, parts), parts->ne[1], parts->ne[2]);
++            } else {
++                soft = ggml_mul_mat(ctx0, dmodel.sc_embT, probs);                        // [n_embd, Cc]
++            }
+             soft = ggml_scale(ctx0, soft, sqrtf((float) n_embd));
+             // SC gated MLP: pre_norm (plain weight) -> down( gelu_tanh(gate) * up )
+             ggml_tensor * normed = build_norm(soft, model.sc_pre_norm, nullptr, LLM_NORM_RMS, -1);
+@@ -451,27 +497,39 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
+     // canvas K,V. PREFILL: rectangular [prefill_off+n_tokens keys, n_tokens queries], causal over the chunk
+     // + prior chunks. UNIFIED: square [n_tokens, n_tokens] region-aware (prompt causal, canvas bidirectional).
+     const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
++    // Earlier prompt positions a sliding layer attends to: all of them when every position is stored, the
++    // last (n_swa-1) from a ring (pkv_ring) - which is every position such a query can reach.
++    const int64_t swa_reach = (int64_t) hparams.n_swa - 1;
++    const bool    swa_ring  = (is_prefill || is_decode) && dmodel.pkv_ring > 0;
++    // Flash attention's gqa-optimised kernels - the only GPU kernels for the 512-wide heads of the full layers
++    // - need the key count to be a multiple of FATTN_KQ_STRIDE (256); pad K,V with zero rows and the mask
++    // with -inf columns, which contribute exactly nothing.
++    const int64_t kv_pad = cparams.flash_attn ? 256 : 1;
+     llm_graph_input_attn_no_cache * inp_attn = nullptr;
+     if (is_decode) {
+-        const int64_t n_kv = P + C;
+-        auto uptr = std::make_unique<llm_graph_input_attn_diffusion_decode>(hparams, cparams, P, C);
+-        uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, C, 1, 1);
++        const int64_t n_kv     = P + C;
++        const int64_t n_pk_swa = swa_ring ? std::min(P, swa_reach) : P;
++        auto uptr = std::make_unique<llm_graph_input_attn_diffusion_decode>(hparams, cparams, P, C, n_pk_swa);
++        uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, GGML_PAD(n_kv, kv_pad), C, 1, 1);
+         ggml_set_input(uptr->self_kq_mask);
+         uptr->self_kq_mask_cnv = uptr->self_kq_mask;
+         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+-            uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, C, 1, 1);
++            uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, GGML_PAD(n_pk_swa + C, kv_pad), C, 1, 1);
+             ggml_set_input(uptr->self_kq_mask_swa);
+             uptr->self_kq_mask_swa_cnv = uptr->self_kq_mask_swa;
+         }
+         inp_attn = (llm_graph_input_attn_no_cache *) res->add_input(std::move(uptr));
+     } else if (is_prefill) {
+-        const int64_t n_kv = prefill_off + n_tokens;
+-        auto uptr = std::make_unique<llm_graph_input_attn_diffusion_prefill>(hparams, cparams, prefill_off, n_tokens);
+-        uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
++        const int64_t n_kv         = prefill_off + n_tokens;
++        const int64_t n_prefix_swa = swa_ring ? std::min(prefill_off, swa_reach) : prefill_off;
++        auto uptr = std::make_unique<llm_graph_input_attn_diffusion_prefill>(hparams, cparams, prefill_off, n_tokens,
++                                                                             n_prefix_swa);
++        uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, GGML_PAD(n_kv, kv_pad), n_tokens, 1, 1);
+         ggml_set_input(uptr->self_kq_mask);
+         uptr->self_kq_mask_cnv = uptr->self_kq_mask;
+         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+-            uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
++            uptr->self_kq_mask_swa =
++                ggml_new_tensor_4d(ctx0, type_mask, GGML_PAD(n_prefix_swa + n_tokens, kv_pad), n_tokens, 1, 1);
+             ggml_set_input(uptr->self_kq_mask_swa);
+             uptr->self_kq_mask_swa_cnv = uptr->self_kq_mask_swa;
+         }
+@@ -505,50 +563,95 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
+         ggml_tensor * Kcur = kv.k;
+         ggml_tensor * Vcur = kv.v;
+ 
+-        // The store is F16 under FA (halves the persistent K,V store; FA casts K,V to F16 anyway, so it is
+-        // precision-neutral) and F32 otherwise. The fresh K,V stay F32: the store WRITE is an F32->store-type
+-        // cpy (F32->F16 supported), but the prefix READ is cast back to F32 because the CUDA concat op is
+-        // F32-only and FA re-casts to F16 itself. cast_kv() is a no-op when the store is already F32 (non-FA).
++        // The store is F16. The fresh K,V stay F32: the store WRITE is an F32->store-type cpy, but the prefix
++        // READ is cast back to F32 because the CUDA concat op is F32-only (FA re-casts to F16 itself).
++        // cast_kv() would be a no-op for an F32 store.
+         const auto cast_kv = [&](ggml_tensor * t) {
+             return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx0, t, GGML_TYPE_F32);
+         };
+ 
++        // Store addressing. A full layer keeps position p at row p. A sliding layer with a ring keeps it at
++        // row p mod rows, so a run of positions is at most two contiguous row ranges, returned in position
++        // order as (first row, count).
++        const bool layer_ring = swa_ring && hparams.is_swa(il);
++        const auto store_ranges = [&](const ggml_tensor * store, int64_t pos, int64_t len) {
++            std::vector<std::pair<int64_t, int64_t>> ranges;
++            if (!layer_ring) {
++                ranges.emplace_back(pos, len);
++                return ranges;
++            }
++            const int64_t rows  = store->ne[2];
++            GGML_ASSERT(len <= rows && "prompt-KV ring smaller than the positions requested");
++            const int64_t row   = pos % rows;
++            const int64_t first = std::min(len, rows - row);
++            ranges.emplace_back(row, first);
++            if (len > first) {
++                ranges.emplace_back(0, len - first);
++            }
++            return ranges;
++        };
++        const auto store_rows = [&](ggml_tensor * store, int64_t row, int64_t n) {
++            return ggml_view_3d(ctx0, store, n_embd_head, n_head_kv, n, store->nb[1], store->nb[2],
++                                (size_t) row * store->nb[2]);
++        };
++        // positions [pos, pos+len) as one F32 tensor
++        const auto store_read = [&](ggml_tensor * store, int64_t pos, int64_t len) {
++            ggml_tensor * out = nullptr;
++            for (const auto & [row, n] : store_ranges(store, pos, len)) {
++                ggml_tensor * part = cast_kv(store_rows(store, row, n));
++                out = out ? ggml_concat(ctx0, out, part, 2) : part;
++            }
++            return out;
++        };
++        // fresh K or V (dim 2 = positions [pos, pos+ne2)) into the store, F32 -> store type
++        const auto store_write = [&](ggml_tensor * fresh, ggml_tensor * store, int64_t pos) {
++            int64_t done = 0;
++            for (const auto & [row, n] : store_ranges(store, pos, fresh->ne[2])) {
++                ggml_tensor * src = ggml_view_3d(ctx0, fresh, fresh->ne[0], fresh->ne[1], n, fresh->nb[1],
++                                                 fresh->nb[2], (size_t) done * fresh->nb[2]);
++                ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, store_rows(store, row, n)));
++                done += n;
++            }
++        };
++
++        // zero-pad K or V (dim 2 = keys) to the mask's padded width (flash attention; no-op otherwise)
++        const auto pad_keys = [&](ggml_tensor * t) {
++            const int64_t n      = t->ne[2];
++            const int64_t padded = GGML_PAD(n, kv_pad);
++            if (padded == n) {
++                return t;
++            }
++            return ggml_pad(ctx0, ggml_is_contiguous(t) ? t : ggml_cont(ctx0, t), 0, 0, (int) (padded - n), 0);
++        };
++
+         if (is_prefill) {
+-            // PREFILL: persist this chunk's K,V into the store at [prefill_off, prefill_off+n_tokens) for later
+-            // chunks and the block's DECODE steps. Disjoint from the [0,prefill_off) prefix read.
+-            const size_t koff = (size_t) prefill_off * dmodel.pkv_k[il]->nb[2];
+-            const size_t voff = (size_t) prefill_off * dmodel.pkv_v[il]->nb[2];
+-            ggml_tensor * sk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv, n_tokens,
+-                                            dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], koff);
+-            ggml_tensor * sv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, n_tokens,
+-                                            dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], voff);
+-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, sk));   // F32 -> store type (F16/F32)
+-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, sv));
+-            // Attend causally over [0, prefill_off+n_tokens): prepend the prior chunks' cached K,V (written by
+-            // earlier llama_decode calls) to this chunk's fresh K,V. First chunk (off=0) needs no prefix.
++            // PREFILL: persist this chunk's K,V (positions [prefill_off, prefill_off+n_tokens)) for later chunks
++            // and the block's DECODE steps, and attend causally over the earlier positions this layer keeps
++            // plus the chunk. The rows read and the rows written are disjoint (a ring holds the reach plus a
++            // whole chunk), so their order inside the graph does not matter.
++            const int64_t n_prefix = layer_ring ? std::min(prefill_off, swa_reach) : prefill_off;
++            // the rows read and the rows written must not alias: a ring holds the reach plus a whole chunk
++            GGML_ASSERT(!layer_ring || n_prefix + n_tokens <= dmodel.pkv_k[il]->ne[2] ||
++                        prefill_off + n_tokens <= dmodel.pkv_k[il]->ne[2]);
++            store_write(Kcur, dmodel.pkv_k[il], prefill_off);
++            store_write(Vcur, dmodel.pkv_v[il], prefill_off);
+             ggml_tensor * Kfull = Kcur;
+             ggml_tensor * Vfull = Vcur;
+-            if (prefill_off > 0) {
+-                ggml_tensor * pk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv, prefill_off,
+-                                                dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], 0);
+-                ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, prefill_off,
+-                                                dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], 0);
+-                Kfull = ggml_concat(ctx0, cast_kv(pk), Kcur, 2);
+-                Vfull = ggml_concat(ctx0, cast_kv(pv), Vcur, 2);
++            if (n_prefix > 0) {
++                Kfull = ggml_concat(ctx0, store_read(dmodel.pkv_k[il], prefill_off - n_prefix, n_prefix), Kcur, 2);
++                Vfull = ggml_concat(ctx0, store_read(dmodel.pkv_v[il], prefill_off - n_prefix, n_prefix), Vcur, 2);
+             }
+             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
+-                             Qcur, Kfull, Vfull, nullptr, nullptr, nullptr,
++                             Qcur, pad_keys(Kfull), pad_keys(Vfull), nullptr, nullptr, nullptr,
+                              hparams.f_attention_scale, il);
+         } else if (is_decode) {
+-            // DECODE: prepend cached prompt K,V (first P) to the fresh canvas K,V
+-            ggml_tensor * pk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv, P,
+-                                            dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], 0);
+-            ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, P,
+-                                            dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], 0);
+-            ggml_tensor * Kfull = ggml_concat(ctx0, cast_kv(pk), Kcur, 2);
+-            ggml_tensor * Vfull = ggml_concat(ctx0, cast_kv(pv), Vcur, 2);
++            // DECODE: prepend the cached prompt K,V this layer keeps (all P, or the last n_swa-1 of a ring) to
++            // the fresh canvas K,V
++            const int64_t n_prefix = layer_ring ? std::min(P, swa_reach) : P;
++            ggml_tensor * Kfull = ggml_concat(ctx0, store_read(dmodel.pkv_k[il], P - n_prefix, n_prefix), Kcur, 2);
++            ggml_tensor * Vfull = ggml_concat(ctx0, store_read(dmodel.pkv_v[il], P - n_prefix, n_prefix), Vcur, 2);
+             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
+-                             Qcur, Kfull, Vfull, nullptr, nullptr, nullptr,
++                             Qcur, pad_keys(Kfull), pad_keys(Vfull), nullptr, nullptr, nullptr,
+                              hparams.f_attention_scale, il);
+         } else {
+             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
+@@ -779,10 +882,12 @@ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C) {
+ 
+ // Lazily (re)allocate the device-resident prompt-KV store (per-layer K,V, grow-only) for a prompt of length
+ // P at element type `type`, on layer-0's buffer type (single-GPU; cross-device would need a per-buft context
+-// map). Reallocates when the capacity grows or the type changes. Called from the graph (PREFILL), where the
+-// type can follow cparams.flash_attn - F16 halves the store and is precision-neutral under FA.
+-static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type) {
+-    if (m.pkv_buf != nullptr && m.pkv_cap >= P && !m.pkv_k.empty() && m.pkv_k[0]->type == type) {
++// map). Reallocates when the capacity grows, the type changes or the ring size changes. Called from the graph
++// (PREFILL). With ring > 0 each sliding layer gets min(P, ring) rows and the graph addresses it modulo its
++// row count (see pkv_ring), so reusing a store allocated for a longer prompt stays consistent.
++static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type, int64_t ring) {
++    if (m.pkv_buf != nullptr && m.pkv_cap >= P && !m.pkv_k.empty() && m.pkv_k[0]->type == type &&
++        m.pkv_ring == ring) {
+         return;
+     }
+     if (m.pkv_buf) { ggml_backend_buffer_free(m.pkv_buf); m.pkv_buf = nullptr; }
+@@ -803,10 +908,11 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
+     m.pkv_k.resize(n_layer);
+     m.pkv_v.resize(n_layer);
+     for (int il = 0; il < n_layer; ++il) {
+-        const int64_t hd  = m.hparams.n_embd_head_k(il);
+-        const int64_t nkv = m.hparams.n_head_kv(il);
+-        m.pkv_k[il] = ggml_new_tensor_3d(m.pkv_ctx, type, hd, nkv, cap);
+-        m.pkv_v[il] = ggml_new_tensor_3d(m.pkv_ctx, type, hd, nkv, cap);
++        const int64_t hd   = m.hparams.n_embd_head_k(il);
++        const int64_t nkv  = m.hparams.n_head_kv(il);
++        const int64_t rows = ring > 0 && m.hparams.is_swa(il) ? std::min(cap, ring) : cap;
++        m.pkv_k[il] = ggml_new_tensor_3d(m.pkv_ctx, type, hd, nkv, rows);
++        m.pkv_v[il] = ggml_new_tensor_3d(m.pkv_ctx, type, hd, nkv, rows);
+         ggml_format_name(m.pkv_k[il], "pkv_k_l%d", il);
+         ggml_format_name(m.pkv_v[il], "pkv_v_l%d", il);
+     }
+@@ -816,12 +922,14 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
+                                           : ggml_backend_cpu_buffer_type();
+     m.pkv_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.pkv_ctx, buft);
+     GGML_ASSERT(m.pkv_buf != nullptr);
+-    m.pkv_cap = cap;
++    m.pkv_cap  = cap;
++    m.pkv_ring = ring;
++    m.pkv_generation++;
+ }
+ 
+-// Public API: bytes the prompt-KV store consumes per prompt token (sum over layers of K+V element counts x
+-// element size). 0 for non-DiffusionGemma. Lets a caller size context against the store, the dominant runtime
+-// allocation once the activation buffer is chunked. use_f16 must match the store type (FA on -> F16).
++// Public API: bytes the prompt-KV store would consume per prompt token if every layer kept every position
++// (sum over layers of K+V element counts x element size). 0 for non-DiffusionGemma. The store is F16 and its
++// sliding layers keep a fixed ring, so this is an upper bound; llama_diffusion_fa_turn_bytes is the estimate.
+ size_t llama_diffusion_pkv_bytes_per_token(const struct llama_model * model, bool use_f16) {
+     const auto * dm = dynamic_cast<const llama_model_diffusion_gemma *>(model);
+     if (!dm) {
+@@ -835,9 +943,53 @@ size_t llama_diffusion_pkv_bytes_per_token(const struct llama_model * model, boo
+     return bytes;
+ }
+ 
++// Public API: approximate device bytes a turn of up to n_ctx tokens adds on top of the weights and the compute
++// buffer reserved at context creation, with flash attention on. Context creation reserves only the UNIFIED
++// graph at n_ubatch tokens, so an allocation probe cannot see these. With FA there is no N^2 score tensor, so
++// they are what bounds context. Counts:
++//   - the F16 store: full-attention layers keep every position, sliding layers a ring of n_swa-1+n_ubatch rows;
++//   - the DECODE graph's working copies of K,V over n_ctx keys for the widest layer that sees them all (F32
++//     read, concat, pad: ~3 live copies);
++//   - the device-resident self-conditioning canvas logits.
++// Measured on gfx1201 (n_ubatch 2048) at 60.6K tokens: the runner grew 2.88 GiB and this returns 3.38 GiB.
++// 0 for non-DiffusionGemma.
++size_t llama_diffusion_fa_turn_bytes(const struct llama_model * model, int64_t n_ctx, int64_t n_ubatch) {
++    const auto * dm = dynamic_cast<const llama_model_diffusion_gemma *>(model);
++    if (!dm) {
++        return 0;
++    }
++    const auto & hp     = dm->hparams;
++    const bool   window = dg_swa_window_on(hp);
++    size_t store  = 0;
++    size_t widest = 0;   // K+V elements per position of the widest layer that attends over all n_ctx keys
++    for (int il = 0; il < (int) hp.n_layer(); ++il) {
++        const size_t row  = (size_t) hp.n_embd_head_k(il) * hp.n_head_kv(il) * 2;
++        const bool   ring = window && hp.is_swa(il);   // reads at most n_swa-1 prompt keys: bounded, not per-token
++        store += row * sizeof(ggml_fp16_t) * (size_t) (ring ? std::min(n_ctx, (int64_t) hp.n_swa - 1 + n_ubatch) : n_ctx);
++        if (!ring) {
++            widest = std::max(widest, row);
++        }
++    }
++    const size_t work   = widest * sizeof(float) * 3 * (size_t) n_ctx;
++    const size_t sc_dev = (size_t) dm->canvas_length * dm->vocab.n_tokens() * sizeof(float);
++    return store + work + sc_dev;
++}
++
++// Public API: how many prompt positions the store holds without reallocating (0 = not allocated), and a
++// counter bumped whenever it is (re)allocated. 0 / 0 for non-DiffusionGemma.
++int64_t llama_diffusion_pkv_capacity(const struct llama_model * model) {
++    const auto * dm = dynamic_cast<const llama_model_diffusion_gemma *>(model);
++    return dm && dm->pkv_buf ? dm->pkv_cap : 0;
++}
++
++uint64_t llama_diffusion_pkv_generation(const struct llama_model * model) {
++    const auto * dm = dynamic_cast<const llama_model_diffusion_gemma *>(model);
++    return dm ? dm->pkv_generation : 0;
++}
++
+ // Public API: select the prompt-KV-caching phase for the next llama_decode (no-op otherwise). UNIFIED =
+ // no-cache forward; PREFILL writes the prompt K,V store chunk at off (P = whole-prompt length, sizes the
+-// store); DECODE reads it. The store itself is allocated lazily from the PREFILL graph (type follows FA).
++// store); DECODE reads it. The store itself is allocated lazily from the PREFILL graph.
+ void llama_diffusion_set_phase(struct llama_model * model, int phase, int32_t P, int32_t off) {
+     auto * dm = dynamic_cast<llama_model_diffusion_gemma *>(model);
+     if (!dm) {
+diff --git a/src/models/models.h b/src/models/models.h
+index b19fc75..d24e9cb 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -919,13 +919,19 @@ struct llama_model_diffusion_gemma : public llama_model_base {
+     //   PKV_PREFILL : forward a chunk of the prompt; write its per-layer K,V into the store at pkv_prefill_off.
+     //   PKV_DECODE  : forward the canvas only; read the cached prompt K,V.
+     // Store is device-resident (in pkv_buf/pkv_ctx), allocated lazily from the PREFILL graph; element type
+-    // follows flash-attn (F16 under FA - precision-neutral since FA casts K,V to F16 anyway - else F32).
++    // F16 (precision-neutral: measured at the float noise floor, finer than the reference's bf16 KV).
+     enum pkv_phase_t { PKV_UNIFIED = 0, PKV_PREFILL = 1, PKV_DECODE = 2 };
+     mutable pkv_phase_t pkv_phase = PKV_UNIFIED;
+     mutable int64_t     pkv_P     = 0;   // prompt length of the current block
+     mutable int64_t     pkv_prefill_off = 0;   // PREFILL: global start position of the current prompt chunk
+     mutable int64_t     pkv_cap   = 0;   // allocated capacity (max P) of the store
+-    mutable std::vector<ggml_tensor *> pkv_k;   // per layer [n_embd_head_k(il), n_head_kv(il), pkv_cap]
++    mutable uint64_t    pkv_generation = 0;   // bumped on every (re)allocation: its contents are gone
++    // Sliding-window layers need only the last (n_swa-1) prompt positions (for a later prefill chunk or the
++    // canvas) plus the chunk being written, so they keep a ring of min(P, n_swa-1 + n_ubatch) rows, position p
++    // at row p mod rows; full-attention layers keep every position. 0 = sliding layers store every position.
++    mutable int64_t     pkv_ring  = 0;
++    mutable std::vector<ggml_tensor *> pkv_k;   // per layer [n_embd_head_k(il), n_head_kv(il), rows]: rows =
++                                                // pkv_cap, or min(pkv_cap, pkv_ring) on a sliding layer with a ring
+     mutable std::vector<ggml_tensor *> pkv_v;
+     mutable ggml_context        * pkv_ctx = nullptr;
+     mutable ggml_backend_buffer_t pkv_buf = nullptr;

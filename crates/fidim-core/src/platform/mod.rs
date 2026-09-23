@@ -10,6 +10,14 @@ use crate::Result;
 mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::{process_descendants, WindowsPlatform};
+#[cfg(windows)]
+pub use windows_impl::WindowsPlatform as HostPlatform;
+#[cfg(not(windows))]
+mod linux_impl;
+#[cfg(not(windows))]
+pub use linux_impl::{card_busy_percent, card_vram_bytes, kfd_evicted_ms, process_descendants, LinuxPlatform};
+#[cfg(not(windows))]
+pub use linux_impl::LinuxPlatform as HostPlatform;
 
 /// System memory state (R-05).
 ///
@@ -104,7 +112,6 @@ pub trait Platform {
 /// (its runner child does), and a router's model instances are its children.
 pub fn run_pids(root: u32) -> Vec<u32> {
     let mut pids = vec![root];
-    #[cfg(windows)]
     pids.extend(process_descendants(root));
     pids
 }
@@ -136,6 +143,22 @@ pub fn descendants_in(root: u32, pairs: &[(u32, u32)], created: &dyn Fn(u32) -> 
         }
     }
     out
+}
+
+/// Raise `flag` on the first Ctrl+C (or Ctrl+Break) in this console instead
+/// of ending the process, so a long job (a download, a build) stops at its
+/// next check and keeps what it has; a second press ends the process as
+/// usual. False when the handler could not be installed (no console).
+pub fn cancel_on_ctrl_c(flag: &'static std::sync::atomic::AtomicBool) -> bool {
+    #[cfg(windows)]
+    {
+        windows_impl::cancel_on_ctrl_c(flag)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = flag;
+        false
+    }
 }
 
 /// Per-adapter GPU memory summed over `pids`, one entry per LUID. An error

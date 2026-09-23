@@ -54,8 +54,22 @@ function mockDiffusionSample(t) {
   };
 }
 
+// Tauri's IPC parses a command's arguments with serde_json, which rejects
+// a lone surrogate (JSON.stringify writes half an emoji as "\ud83d"). The
+// mocks refuse the same way, so the browser preview shows such a bug too.
+function wellFormed(v) {
+  if (typeof v === "string") return typeof v.isWellFormed !== "function" || v.isWellFormed();
+  if (Array.isArray(v)) return v.every(wellFormed);
+  if (v && typeof v === "object") return Object.entries(v).every(([k, x]) => wellFormed(k) && wellFormed(x));
+  return true;
+}
+const IPC_REJECTS = "lone leading surrogate in hex escape (mock of Tauri's IPC)";
+
 export async function api(cmd, args = {}) {
-  if (!invoke) return mock(cmd, args);
+  if (!invoke) {
+    if (!wellFormed(args)) throw IPC_REJECTS;
+    return mock(cmd, args);
+  }
   try {
     return await invoke(cmd, args);
   } catch (e) {
@@ -71,11 +85,52 @@ export function log(line) {
   invoke("ui_log", { line }).catch(() => {});
 }
 
-/// Subscribe to a Tauri event; returns an unlisten function. No-op outside Tauri.
+// Events the browser preview's mocks send (the model wizard's progress),
+// delivered to onEvent subscribers as Tauri would.
+const mockListeners = new Map(); // name -> Set(cb)
+function mockEmit(name, payload) {
+  for (const cb of mockListeners.get(name) ?? []) {
+    try { cb(structuredClone(payload)); } catch (e) { console.error(e); }
+  }
+}
+
+/// Subscribe to a Tauri event; returns an unlisten function. Outside Tauri
+/// it hears the mocks' events.
 export async function onEvent(name, cb) {
-  if (!inTauri) return () => {};
+  if (!inTauri) {
+    if (!mockListeners.has(name)) mockListeners.set(name, new Set());
+    mockListeners.get(name).add(cb);
+    return () => mockListeners.get(name)?.delete(cb);
+  }
   const { listen } = await import("@tauri-apps/api/event");
   return listen(name, (e) => cb(e.payload));
+}
+
+/// A command that streams: `onEvent` gets each event through a Tauri
+/// Channel (per call and ordered, unlike global events) while the promise
+/// waits for the command's own answer. The two travel separately, so the
+/// last events can land after the promise resolves. Outside Tauri the mock
+/// stream answers.
+export async function stream(cmd, args, onEvent) {
+  if (!invoke) {
+    if (!wellFormed(args)) throw IPC_REJECTS;
+    return mockStream(cmd, args, onEvent);
+  }
+  const { Channel } = await import("@tauri-apps/api/core");
+  const ch = new Channel();
+  ch.onmessage = onEvent;
+  return api(cmd, { ...args, onEvent: ch });
+}
+
+/// Open an http(s) link in the default browser (the opener plugin, scoped
+/// to http and https in capabilities/default.json). Nothing else opens.
+export async function openUrl(url) {
+  if (!/^https?:\/\//i.test(String(url))) throw new Error("only http and https links open in the browser");
+  if (!invoke) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  return api("plugin:opener|open_url", { url });
 }
 
 // ------------------------------------------------------------------ mocks ----
@@ -353,6 +408,23 @@ const MOCK_MODELS = [
       diffusion_canvas_length: 256, attention_causal: false, vocab_size: 262144,
     },
   },
+  // A Hugging Face checkpoint folder (config.json + *.safetensors): no GGUF
+  // header, `hf` from config.json, served by the SGLang engine.
+  {
+    path: "/models/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8", file_size: 31.8e9, modified_unix: 1790000000, header_error: null,
+    engine: "sglang", format: "safetensors", header: null, mmproj_candidates: [], draft_candidates: [],
+    hf: {
+      architecture: "Qwen3MoeForCausalLM", model_type: "qwen3_moe", hidden_size: 2048, num_layers: 48, num_attention_heads: 32,
+      num_kv_heads: 4, head_dim: 128, vocab_size: 151936, max_position_embeddings: 262144, torch_dtype: "bfloat16",
+      attention_layers: 48, num_experts: 128, quantization: "fp8", weights_bytes: 31.8e9, has_vision: false,
+    },
+  },
+];
+
+// SGLang venvs the browser preview "finds" (Settings > SGLang engine).
+const MOCK_SGLANG_INSTALLS = [
+  { venv: "/home/me/venvs/sglang-rocm", python: "/home/me/venvs/sglang-rocm/bin/python", sglang_version: "0.5.4", torch_version: "2.9.0+rocm7.1", device: "rocm 7.1.25424", configured: true },
+  { venv: "/home/me/venvs/sglang-cpu", python: "/home/me/venvs/sglang-cpu/bin/python", sglang_version: "0.5.2", torch_version: "2.8.0+cpu", device: null, configured: false },
 ];
 
 const MOCK_DG_PROFILE = {
@@ -375,6 +447,208 @@ const MOCK_DG_PROFILE = {
 const MOCK_UNSLOTH_TAG = "b11031-mix-3e83366";
 const MOCK_UNSLOTH_GFX = ["gfx103X", "gfx110X", "gfx1150", "gfx1151", "gfx120X", "gfx908", "gfx90a"];
 let mockUnslothInstalled = false;
+// The runner-patch overlay is published for the mock release; installed on demand.
+let mockOverlayInstalled = false;
+
+// ------------------------------------------------------------ chat mocks ----
+// The router's models from the Running mock plus the DiffusionGemma run, as
+// chat_targets returns them. qwen-split is an unloaded router model: the
+// first message "loads" it. bonsai's template has no system role.
+
+const mockRouterTarget = (model, extra) => ({
+  key: `router/${model}`, run: "router", model, engine: "llama-server", label: model, profile_id: null,
+  model_id: model, host: "127.0.0.1", bind_host: "127.0.0.1", port: 1234, base_url: "http://127.0.0.1:1234/v1",
+  loopback: true, status: "loaded", slots_busy: 0, slots_total: 4, n_ctx: 32768, sampling: null,
+  enable_thinking: null, diffusion: null, model_path: null, has_api_key: false, ...extra,
+});
+
+const MOCK_CHAT_TARGETS = [
+  mockRouterTarget("gemma4", { label: MOCK_PROFILE.name, profile_id: "worker-pool", slots_busy: 2, slots_total: 8, sampling: MOCK_PROFILE.sampling, model_path: MOCK_PROFILE.model.path }),
+  mockRouterTarget("dd", { slots_busy: 1, slots_total: 2, n_ctx: 65536, enable_thinking: false, has_api_key: true }),
+  mockRouterTarget("bonsai"),
+  mockRouterTarget("qwen-split", { label: MOCK_SPLIT_PROFILE.name, profile_id: "qwen-split", status: "unloaded", slots_busy: null, slots_total: null, n_ctx: null, model_path: MOCK_SPLIT_PROFILE.model.path }),
+  {
+    key: "dg-26b", run: "dg-26b", model: null, engine: "diffusion-gemma", label: MOCK_DG_PROFILE.name, profile_id: "dg-26b",
+    model_id: "diffusiongemma", host: "127.0.0.1", bind_host: "127.0.0.1", port: 9760, base_url: "http://127.0.0.1:9760/v1",
+    loopback: true, status: "loaded", slots_busy: 0, slots_total: 1, n_ctx: 65536, sampling: null, enable_thinking: null,
+    diffusion: MOCK_DG_PROFILE.diffusion, model_path: MOCK_DG_PROFILE.model.path, has_api_key: false,
+  },
+];
+
+const findMockTarget = (t) => MOCK_CHAT_TARGETS.find((x) => x.run === t?.run && (x.model ?? null) === (t?.model ?? null));
+
+function mockChatProps(t) {
+  if (!t) throw new Error("that run is not running");
+  if (t.status !== "loaded") return { loaded: false, status: t.status };
+  if (t.engine === "diffusion-gemma") {
+    return { engine: "diffusion-gemma", loaded: true, n_ctx: 65536, n_ctx_train: 262144, canvas: 256, diffusion: true, model_alias: "diffusiongemma", params: {}, caps: {}, modalities: {} };
+  }
+  return {
+    engine: "llama-server", loaded: true, n_ctx: t.n_ctx, total_slots: t.slots_total, model_alias: t.model_id, build_info: "b10819-8d2c5a1f0",
+    params: { temperature: 1.0, top_p: 0.95, top_k: 64, min_p: 0.0, repeat_penalty: 1.0, presence_penalty: 0.0, frequency_penalty: 0.0, dry_multiplier: t.model === "gemma4" ? 0.8 : 0.0, max_tokens: -1, n_predict: -1, seed: 4294967295, stop: [], reasoning_format: "deepseek" },
+    modalities: { vision: false, video: false, audio: false },
+    caps: { supports_system_role: t.model !== "bonsai", supports_preserve_reasoning: t.model === "dd", supports_tools: true, supports_tool_calls: true },
+  };
+}
+
+const MOCK_REPLY = `Here is what happens, step by step.
+
+1. **The displays power off.** Windows lets an idle adapter drop into a low-power state.
+2. **Allocations move out first.** Before the adapter powers down, WDDM pages what is not pinned out to system memory.
+3. **The next request pages it back**, which is the slow first token you notice.
+
+| Setting | Effect |
+| --- | --- |
+| PCIe Link State Power Management: Off | the adapter stays powered and the model stays resident |
+| Keep-alive every 5 s | a 1-token request keeps the adapter busy |
+
+Check the power setting with:
+
+\`\`\`powershell
+powercfg /query SCHEME_CURRENT SUB_PCIEXPRESS ASPM
+\`\`\`
+
+More in [Microsoft's WDDM documentation](https://learn.microsoft.com/windows-hardware/drivers/display/). The rest of this line is a sanitizer probe and must show as plain text: <img src=x onerror=alert(1)> and [a script link](javascript:alert(1)).`;
+
+const MOCK_THOUGHT = "The user asks why VRAM gets evicted when the displays sleep. Idle power states, then WDDM residency. Mention the PCIe power setting and the keep-alive workaround, and how to check it.";
+
+const nowS = () => Math.floor(Date.now() / 1000);
+const mockChats = new Map([
+  ["c-demo", {
+    schema: 1, id: "c-demo", title: "Why does VRAM get evicted when the displays sleep?", created_unix: nowS() - 3600, updated_unix: nowS() - 3540,
+    target: { run: "router", model: "gemma4", engine: "llama-server" }, system_prompt: "", params: {}, thinking: null, preserve_reasoning: false,
+    messages: [
+      { id: "m-demo-1", role: "user", content: "Why does VRAM get evicted when the displays sleep?", created_unix: nowS() - 3600 },
+      { id: "m-demo-2", role: "assistant", content: MOCK_REPLY, reasoning: MOCK_THOUGHT, reasoning_ms: 2140, finish: "stop", model: "gemma4", created_unix: nowS() - 3598,
+        timings: { cache_n: 0, prompt_n: 38, prompt_ms: 61.2, prompt_per_second: 620.9, predicted_n: 231, predicted_ms: 4712.4, predicted_per_second: 49.0, draft_n: 96, draft_n_accepted: 61 },
+        usage: { prompt_tokens: 38, completion_tokens: 231, total_tokens: 269 } },
+    ],
+  }],
+]);
+let mockPresets = { "worker-pool": { system_prompt: "You are a concise assistant for a Windows machine with two AMD GPUs.", params: {}, thinking: null } };
+let mockConfigState = null;
+const mockStreams = new Map();   // streamId -> { cancelled }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Saved profiles; the model wizard's mock adds the ones it creates.
+const mockProfiles = [MOCK_PROFILE, MOCK_SPLIT_PROFILE, MOCK_DG_PROFILE];
+
+// The model wizard's mock, loaded only in the browser preview.
+let wizardMock = null;
+const wizardMockCtx = {
+  devices: () => MOCK_DEVICES.map((d) => d.device),
+  devicesRaw: () => MOCK_DEVICES,
+  builds: () => MOCK_BUILDS,
+  profiles: () => mockProfiles,
+  addBuild: (b) => { if (!MOCK_BUILDS.some((x) => x.path === b.path)) MOCK_BUILDS.push(b); },
+  addProfile: (p, plan) => {
+    mockProfiles.push(p);
+    const h = plan.header ?? {};
+    MOCK_MODELS.push({
+      path: p.model.path, file_size: plan.choice.total_size, modified_unix: Math.floor(Date.now() / 1000), header_error: null,
+      engine: "llama-server", mmproj_candidates: p.model.mmproj ? [p.model.mmproj] : [], draft_candidates: p.model.draft ? [p.model.draft.path] : [],
+      header: { architecture: h.architecture, model_name: p.name, size_label: null, file_type: null, block_count: h.block_count, context_length: h.context_length },
+      source: { repo: plan.repo, commit: plan.sha, path: plan.choice.first_file, sha256: plan.choice.files[0]?.sha256 ?? null },
+    });
+  },
+  emit: mockEmit,
+  sleep,
+};
+
+// One llama-server reply: prompt progress, thinking (unless turned off),
+// markdown in small pieces with live timings, then the finish.
+function mockLlamaScript(t, body) {
+  const steps = [];
+  const last = String(body.messages?.at(-1)?.content ?? "");
+  if (t.status !== "loaded") {
+    // The router loads the model on first use: nothing arrives meanwhile.
+    steps.push({ wait: 2200, fn: () => Object.assign(t, { status: "loaded", slots_busy: 0, slots_total: 1, n_ctx: 65536 }) });
+  }
+  if (/#error/i.test(last)) {
+    steps.push({ wait: 500, ev: { kind: "error", status: 400, message: "the request exceeds the available context size (32768 tokens)" } });
+    return steps;
+  }
+  steps.push({ wait: 150, ev: { kind: "open", status: 200 } });
+  const total = 2468 + 17 * (body.messages?.length ?? 1);
+  for (const f of [0.3, 0.62, 0.9, 1]) {
+    steps.push({ wait: 260, ev: { kind: "prefill", processed: Math.round(total * f), total, cache: 0, time_ms: 900 * f } });
+  }
+  const thinking = body.chat_template_kwargs?.enable_thinking ?? t.enable_thinking ?? true;
+  if (thinking) {
+    for (const w of MOCK_THOUGHT.match(/\S+\s*/g)) steps.push({ wait: 28, ev: { kind: "delta", reasoning: w } });
+  }
+  const pieces = MOCK_REPLY.match(/[\s\S]{1,14}/g);
+  pieces.forEach((p, i) => {
+    steps.push({ wait: 32, ev: { kind: "delta", content: p } });
+    if (i % 12 === 11) steps.push({ ev: { kind: "timings", timings: { predicted_n: i + 1, predicted_per_second: 47 + (i % 5), prompt_per_second: 2741.3 } } });
+  });
+  const n = pieces.length;
+  const timings = { cache_n: 0, prompt_n: total, prompt_ms: 900, prompt_per_second: total / 0.9, predicted_n: n, predicted_ms: n * 32, predicted_per_second: 1000 / 32, draft_n: 88, draft_n_accepted: 57 };
+  steps.push({ wait: 40, ev: { kind: "timings", timings } });
+  steps.push({ ev: { kind: "done", finish_reason: "stop", timings, usage: { prompt_tokens: total, completion_tokens: n, total_tokens: total + n }, model: t.model_id } });
+  return steps;
+}
+
+// One DiffusionGemma reply: queued behind the mock's other request, then
+// its task (12, the id mockDiffusionSample's slot carries, so the canvas
+// follows it), denoise progress, and one burst per committed block.
+function mockDgScript(body) {
+  const steps = [{ wait: 250, ev: { kind: "open", status: 200 } }, { ev: { kind: "queued", position: 1 } }];
+  steps.push({ wait: 1200, ev: { kind: "task", id_task: 12 } }, { wait: 150, ev: { kind: "progress", stage: "prefill" } });
+  const blocks = [{ reasoning: "The user wants a haiku about GPUs. Five, seven, five syllables." }, { content: DG_ANSWER }];
+  blocks.forEach((b, i) => {
+    for (let s = 0; s < 48; s += 8) steps.push({ wait: 130, ev: { kind: "progress", stage: "denoise", block: i + 1, n_blocks: 2, step: s + 1, total: 48 } });
+    steps.push({ wait: 120, ev: { kind: "delta", ...b } });
+  });
+  const timings = {
+    predicted_n: 58, predicted_ms: 3120, predicted_per_second: 18.6, prompt_n: 18 + 9 * (body.messages?.length ?? 1), prompt_ms: 42, cache_n: 0,
+    diffusion: true, diffusion_blocks: 2, diffusion_steps: 96, diffusion_canvas: 256, diffusion_wall_ms: 3120, diffusion_decode_ms: 2890,
+    diffusion_effective_tok_s: 164.1, diffusion_parallel_tok_s: 7876.9, diffusion_output_tok_s: 18.6, diffusion_steps_per_second: 30.8,
+    diffusion_seed: body.seed ?? 1234567,
+  };
+  steps.push({ wait: 100, ev: { kind: "done", finish_reason: "stop", timings, usage: { prompt_tokens: timings.prompt_n, completion_tokens: 58, total_tokens: timings.prompt_n + 58 }, model: "diffusiongemma" } });
+  return steps;
+}
+
+/// chat_send in the browser preview: the same events the Rust stream sends,
+/// on timers, with Stop honoured within 50 ms.
+function mockStream(cmd, args, onEvent) {
+  if (cmd !== "chat_send") return Promise.reject(new Error("unmocked stream: " + cmd));
+  const t = findMockTarget(args.target);
+  if (!t) return Promise.reject(new Error(`${args.target?.run} is not running`));
+  if (mockStreams.has(args.streamId)) return Promise.reject(new Error(`chat stream ${args.streamId} is already running`));
+  const st = { cancelled: false };
+  mockStreams.set(args.streamId, st);
+  const steps = t.engine === "diffusion-gemma" ? mockDgScript(args.body) : mockLlamaScript(t, args.body);
+  if (t.slots_busy != null) t.slots_busy += 1;
+  const sum = { finish_reason: null, timings: null, usage: null, cancelled: false, error: null, status: null, id_task: null };
+  return (async () => {
+    try {
+      for (const step of steps) {
+        for (let left = step.wait ?? 0; left > 0 && !st.cancelled; left -= 50) await sleep(Math.min(left, 50));
+        if (st.cancelled) {
+          onEvent({ kind: "cancelled" });
+          sum.cancelled = true;
+          return sum;
+        }
+        step.fn?.();
+        if (!step.ev) continue;
+        const ev = step.ev;
+        if (ev.kind === "task") sum.id_task = ev.id_task;
+        if (ev.kind === "done") Object.assign(sum, { finish_reason: ev.finish_reason, timings: ev.timings, usage: ev.usage });
+        if (ev.kind === "error") Object.assign(sum, { error: ev.message, status: ev.status });
+        onEvent(ev);
+      }
+      return sum;
+    } finally {
+      mockStreams.delete(args.streamId);
+      if (t.slots_busy) t.slots_busy -= 1;
+    }
+  })();
+}
+
+const convSummary = (c) => ({ id: c.id, title: c.title, created_unix: c.created_unix, updated_unix: c.updated_unix, target: c.target, n_messages: c.messages?.length ?? 0 });
 
 const MOCK_LOG_LINES = [
   "0.00.339 I   - ROCm0   : AMD Radeon AI PRO R9700 (32624 MiB, 32472 MiB free)",
@@ -387,15 +661,14 @@ const MOCK_LOG_LINES = [
 
 async function mock(cmd, args) {
   await new Promise((r) => setTimeout(r, 120));
+  wizardMock ??= (await import("./lib/wizardMock.js")).createWizardMock(wizardMockCtx);
+  const wizard = await wizardMock.handle(cmd, args);
+  if (wizard !== undefined) return wizard;
   switch (cmd) {
     case "devices":
       return MOCK_DEVICES;
     case "list_profiles":
-      return [
-        { profile: MOCK_PROFILE, findings: [] },
-        { profile: MOCK_SPLIT_PROFILE, findings: [] },
-        { profile: MOCK_DG_PROFILE, findings: [] },
-      ];
+      return mockProfiles.map((p) => ({ profile: structuredClone(p), findings: [] }));
     case "live_check": {
       const p = args.p;
       if (p?.engine === "diffusion-gemma") {
@@ -482,6 +755,9 @@ async function mock(cmd, args) {
         ],
         resident: [{ card: MOCK_DEVICES[0].device.stable_key, dedicated_bytes: 26.2e9, committed_bytes: 26.2e9 }, { card: MOCK_DEVICES[2].device.stable_key, dedicated_bytes: 13.1e9, committed_bytes: 13.1e9 }],
         gpu_busy_percent: 67,
+        // dd's profile sets --api-key: its Endpoint card says clients need one.
+        has_api_key: false,
+        keyed_models: ["dd"],
       };
       // A standalone DiffusionGemma run (fidim-dg): committed blocks, then the
       // current block's draft sharpening step by step.
@@ -491,14 +767,57 @@ async function mock(cmd, args) {
         samples: [dgSample],
         resident: [{ card: MOCK_DEVICES[2].device.stable_key, dedicated_bytes: 19.7e9, committed_bytes: 19.7e9 }],
         gpu_busy_percent: 88,
+        has_api_key: false,
+        keyed_models: [],
       };
-      const runCrashed = { run: { ...MOCK_RUN, alive: false, health: "dead", crashed: true }, samples: [], resident: [], gpu_busy_percent: 0 };
+      const runCrashed = { run: { ...MOCK_RUN, alive: false, health: "dead", crashed: true }, samples: [], resident: [], gpu_busy_percent: 0, has_api_key: false, keyed_models: [] };
       return { runs: [runRouter, runDiffusion, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
     }
     case "app_version":
       return { version: "0.2.0", long: "0.2.0+3 (4f2a1c9 2026-09-20)", commit: "4f2a1c9", commit_date: "2026-09-20", commits_ahead: 3, modified: false };
     case "get_config":
-      return { path: "C:\\Users\\me\\.fidim\\config.json", config: { build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models"], rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.fidim\\profiles", runs_dir: "C:\\Users\\me\\.fidim\\runs", keep_alive_seconds: 0, runtimes: [] } };
+      mockConfigState ??= { hf_use_cli_token: false, github_token: null, build_roots: ["C:\\llama.cpp"], model_roots: ["D:\\models", "E:\\models"],rocm_bin: "C:\\Program Files\\AMD\\ROCm\\7.1\\bin", default_runtime: null, install_root: null, llama_cpp_source: null, source_build_script: "scripts\\build-from-tag.bat", hf_token: null, integrated_name_patterns: ["Radeon(TM) Graphics"], profile_dir: "C:\\Users\\me\\.fidim\\profiles", runs_dir: "C:\\Users\\me\\.fidim\\runs", keep_alive_seconds: 0, save_chats: true, runtimes: [], sglang: { venv: MOCK_SGLANG_INSTALLS[0].venv, pythonpath: [], env: { SGLANG_USE_AITER: "0", GPU_ARCHS: "gfx1201" } } };
+      return { path: "C:\\Users\\me\\.fidim\\config.json", config: structuredClone(mockConfigState) };
+    case "save_config":
+      mockConfigState = structuredClone(args.config);
+      return null;
+    case "creator_defaults":
+      return { repo: "google/gemma-4-26b-a4b-it", url: "https://huggingface.co/google/gemma-4-26b-a4b-it/raw/main/generation_config.json", temperature: 1.0, top_p: 0.95, top_k: 64, min_p: null, repetition_penalty: null, fetched_at_unix: nowS(), from_cache: true, raw: {} };
+    case "chat_targets":
+      return structuredClone(MOCK_CHAT_TARGETS);
+    case "chat_props":
+      return mockChatProps(findMockTarget(args.target));
+    case "chat_list":
+      return [...mockChats.values()].map(convSummary).sort((a, b) => b.updated_unix - a.updated_unix);
+    case "chat_load": {
+      const c = mockChats.get(args.id);
+      if (!c) throw new Error(`no conversation ${args.id}`);
+      return structuredClone(c);
+    }
+    case "chat_save":
+      if (mockConfigState && mockConfigState.save_chats === false) return false;
+      mockChats.set(args.conv.id, structuredClone(args.conv));
+      return true;
+    case "chat_delete":
+      return mockChats.delete(args.id);
+    case "chat_delete_all": {
+      const n = mockChats.size;
+      mockChats.clear();
+      return n;
+    }
+    case "chat_presets_get":
+      return structuredClone(mockPresets);
+    case "chat_presets_save":
+      mockPresets = structuredClone(args.presets);
+      return null;
+    case "chat_cancel": {
+      const s = mockStreams.get(args.streamId);
+      if (s) s.cancelled = true;
+      return !!s;
+    }
+    case "chat_cancel_all":
+      mockStreams.forEach((s) => (s.cancelled = true));
+      return mockStreams.size;
     case "list_runtimes":
       return [{ name: "default", source: "config", version: "7.1", available: true, is_default: true, dirs: ["C:\\Program Files\\AMD\\ROCm\\7.1\\bin"] }, { name: "rocm-7.14.0a20260612", source: "amd-nightly", version: "7.14.0a20260612", available: true, is_default: false, is_latest: true, dirs: ["D:\\llama.cpp\\rocm\\7.14.0a20260612\\bin"] }];
     case "router_get":
@@ -513,40 +832,73 @@ async function mock(cmd, args) {
       return { latest: { tag: "b10819", published_at: "2026-09-05" }, update_available: false, behind: 0, already_installed: true, newest_installed: { version: "b10819", path: "C:\\llama.cpp\\b10819-rocm" }, install_dir: "C:\\llama.cpp\\b10819-rocm", assets: [{ name: "llama-b10819-bin-win-cpu-x64.zip", size: 21e6 }], asset_error: null };
     case "update_history":
       return [];
+    case "app_update_check":
+      return {
+        current: { version: "0.2.0", long: "0.2.0+3 (fe51863 2026-09-19)", commit: "fe51863", commits_ahead: 3, modified: false, install_dir: "C:\\Users\\paul\\AppData\\Local\\Llama FIDIM", exe: "C:\\Users\\paul\\AppData\\Local\\Llama FIDIM\\llama-fidim.exe", in_install_folder: true },
+        latest: { tag: "v0.2.0", version: "0.2.0", published_at: "2026-09-18T20:31:47Z", html_url: "https://github.com/Dixon-Cider/llama-fidim/releases/tag/v0.2.0", notes: "### Added\n- Get a model.\n### Fixed\n- fidim scan named quantizations after the wrong table.", zip: { name: "llama-fidim-v0.2.0-win-x64.zip", url: "", size: 9586045 }, sha256: { name: "llama-fidim-v0.2.0-win-x64.zip.sha256", url: "", size: 97 } },
+        update_available: false, note: "this build is past the v0.2.0 release; nothing newer is published",
+        source_dir: "C:\\src\\llamactl", source_ok: true, staged: [], history: [],
+      };
+    case "app_update_stage":
+      return { dir: "C:\\Users\\paul\\.fidim\\app-updates\\checkout-fe51863\\stage", source: args.source ? "checkout" : "release", tag: args.source ? null : "v0.2.0", checkout: args.source ? "C:\\src\\llamactl" : null, version: "fidim 0.2.0+4 (abc1234 2026-09-19)", staged_unix: Math.floor(Date.now() / 1000) };
+    case "app_update_apply":
+      return { updater_pid: 4242, install_dir: "C:\\Users\\paul\\AppData\\Local\\Llama FIDIM", log: "C:\\Users\\paul\\.fidim\\app-updates\\apply.log" };
+    case "app_update_set_source":
+      return { source_dir: args.dir, source_ok: !!args.dir };
     case "unsloth_check": {
       const tag = args.tag ?? MOCK_UNSLOTH_TAG;
       const gfx = args.gfx || "gfx120X";
       const name = `app-${tag}-windows-x64-rocm-${gfx}.zip`;
       const known = MOCK_UNSLOTH_GFX.includes(gfx);
       const dir = `C:\\llama.cpp\\${tag}-unsloth`;
-      const installed = MOCK_BUILDS.filter((b) => b.channel === "unsloth").map((b) => ({ tag: b.tag, version: b.version, path: b.path }));
+      const installed = MOCK_BUILDS.filter((b) => b.channel === "unsloth").map((b) => ({ tag: b.tag, version: b.version, path: b.path, patch: b.patch?.name }));
       if (mockUnslothInstalled) installed.unshift({ tag: `${tag}-unsloth`, version: "b11031", path: dir });
+      if (mockOverlayInstalled) installed.unshift({ tag: `${tag}-unsloth-dgpatch5`, version: "b11031", path: `${dir}-dgpatch5`, patch: "dgpatch5" });
+      const overlayPublished = tag === MOCK_UNSLOTH_TAG;
       return {
         latest: { tag, published_at: "2026-09-18T21:04:11Z", html_url: `https://github.com/unslothai/llama.cpp/releases/tag/${tag}`, assets: [], name: `llama.cpp prebuilt ${tag}`, body: "" },
         upstream_tag: "b11031", gfx, gfx_available: MOCK_UNSLOTH_GFX,
         asset: known ? { name, url: "", size: 494370803, digest: "sha256:09135ea01882040460a1eda0f301ca28effd270fdf661c3697d29119e2234011" } : null,
         asset_error: known ? null : `release ${tag} has no ${name}; its Windows ROCm zips are: ${MOCK_UNSLOTH_GFX.map((g) => `app-${tag}-windows-x64-rocm-${g}.zip`).join(", ")}`,
         install_dir: dir, already_installed: mockUnslothInstalled, installed,
+        overlay_repo: "Dixon-Cider/fidim-dg-overlay", overlay_patch: "dgpatch5", overlay_available: overlayPublished,
+        overlay_asset: overlayPublished ? { name: `fidim-dg-overlay-${tag}-windows-x64.zip`, url: "", size: 9437184, digest: "sha256:0ce183b190a9b2e678e9bd6e31c40c42b878834233f75529e6d785fa3106eeb8" } : null,
+        overlay_error: null, overlay_install_dir: `${dir}-dgpatch5`, overlay_installed: mockOverlayInstalled,
       };
     }
     case "unsloth_install": {
       await new Promise((r) => setTimeout(r, 1500));
       const tag = args.tag ?? MOCK_UNSLOTH_TAG;
-      const skipped = mockUnslothInstalled;
-      mockUnslothInstalled = true;
+      const overlay = !!args.overlay;
+      const skipped = overlay ? mockOverlayInstalled : mockUnslothInstalled;
+      if (overlay) mockOverlayInstalled = true; else mockUnslothInstalled = true;
       return {
-        tag, dir: `C:\\llama.cpp\\${tag}-unsloth`, source: "unsloth-prebuilt", skipped_existing: skipped,
+        tag, dir: `C:\\llama.cpp\\${tag}-unsloth${overlay ? "-dgpatch5" : ""}`,
+        source: overlay ? "unsloth-overlay" : "unsloth-prebuilt", skipped_existing: skipped,
         verify: {
           version: "b11031", commit: "a41c7e2d0", hip_ok: true, detail: "", runner_present: true,
           devices: MOCK_DEVICES.map((d) => ({ index: d.device.hip_index, backend: "ROCm", name: d.device.name, total_mib: d.device.total_mib })),
         },
       };
     }
-    case "unsloth_promote":
+    case "unsloth_promote_preview": {
+      // The diffusion profile sits on the locally patched build: onto the
+      // dgpatch5 overlay it moves (every feature is there), onto a plain
+      // build it stays.
+      const patched = MOCK_BUILDS.find((b) => b.patch);
+      const fork = [["worker-pool", "Unsloth fork build: pick it in the editor if wanted"], ["qwen-split", "Unsloth fork build: pick it in the editor if wanted"]];
+      if (/-dgpatch5$/.test(args.toPath)) {
+        return { moves: [{ profile_id: "dg-26b", from: { path: patched.path, version: patched.version }, from_patch: patched.patch.name }], skipped: fork };
+      }
+      return { moves: [], skipped: [["dg-26b", `on a patched runner build (${patched.patch.name}) whose features the target lacks (${patched.patch.features.join(", ")}); pick the new build in the editor if wanted`], ...fork] };
+    }
+    case "unsloth_promote": {
+      const ids = args.ids ?? ["dg-26b"];
       return {
-        batch: { at_unix: Math.floor(Date.now() / 1000), entries: [{ profile_id: "dg-26b", from: { path: MOCK_BUILDS[1].path, version: "b11027" }, to: { path: args.toPath, version: args.toVersion } }] },
+        batch: { at_unix: Math.floor(Date.now() / 1000), entries: ids.map((id) => ({ profile_id: id, from: { path: MOCK_BUILDS[1].path, version: "b11027" }, to: { path: args.toPath, version: args.toVersion } })) },
         skipped: [["worker-pool", "Unsloth fork build: pick it in the editor if wanted"], ["qwen-split", "Unsloth fork build: pick it in the editor if wanted"]],
       };
+    }
     case "rocm_families":
       return ["gfx103X-all", "gfx110X-all", "gfx1151", "gfx120X-all"];
     case "rocm_available":
@@ -568,6 +920,24 @@ async function mock(cmd, args) {
       return { path: "C:\\Users\\me\\.fidim\\profiles\\worker-pool.bat", text: "@echo off\r\nset \"HIP_VISIBLE_DEVICES=2\"\r\n\"llama-server.exe\" -m ..." };
     case "scan":
       return { builds: MOCK_BUILDS, models: MOCK_MODELS, drafts: [MOCK_PROFILE.model.draft.path], mmproj: [] };
+    case "sglang_installs": {
+      const configured = mockConfigState?.sglang?.venv ?? null;
+      return MOCK_SGLANG_INSTALLS.map((i) => ({ ...i, configured: i.venv === configured }));
+    }
+    case "sglang_use": {
+      const hit = MOCK_SGLANG_INSTALLS.find((i) => i.venv === args.venv);
+      if (!hit) throw new Error("that venv does not import sglang");
+      mockConfigState ??= (await mock("get_config")).config;
+      mockConfigState.sglang = { ...(mockConfigState.sglang ?? { pythonpath: [], env: {} }), venv: hit.venv };
+      return { ...hit, configured: true };
+    }
+    case "sglang_install": {
+      await new Promise((r) => setTimeout(r, 2500));
+      if (!String(args.dir ?? "").trim()) throw new Error("a directory is needed");
+      const row = { venv: args.dir, python: args.dir + "/bin/python", sglang_version: "0.5.4", torch_version: args.flavor === "rocm" ? "2.9.0+rocm7.1" : args.flavor === "cuda" ? "2.9.0+cu128" : "2.9.0+cpu", device: args.flavor === "rocm" ? "rocm 7.1.25424" : args.flavor === "cuda" ? "cuda 12.8" : null, configured: false };
+      if (!MOCK_SGLANG_INSTALLS.some((i) => i.venv === row.venv)) MOCK_SGLANG_INSTALLS.push(row);
+      return row;
+    }
     default:
       throw new Error("unmocked command: " + cmd);
   }

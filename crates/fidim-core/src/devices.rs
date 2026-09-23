@@ -241,6 +241,54 @@ pub fn correlate(
 }
 
 /// Outcome of resolving a persisted profile key against current devices.
+/// Devices from the OS adapters alone, for a host with no llama.cpp build
+/// to probe (Linux serving SGLang). HIP orders discrete cards by PCI bus,
+/// so `hip_index` is the rank by bus number; the integrated GPU comes last.
+/// VRAM totals come from the platform where it can read them.
+pub fn from_adapters(adapters: &[OsAdapter], integrated_patterns: &[String]) -> Vec<Device> {
+    let mut sorted: Vec<&OsAdapter> = adapters.iter().collect();
+    sorted.sort_by_key(|a| a.bus_number.unwrap_or(u32::MAX));
+    // pci.ids names drop the "(TM)" the Windows driver reports ("Radeon
+    // Graphics" vs "Radeon(TM) Graphics"): compare with it removed.
+    let norm = |s: &str| s.replace("(TM)", "").replace("(R)", "");
+    let is_igpu = |a: &OsAdapter| integrated_patterns.iter().any(|p| norm(&a.name).contains(&norm(p)));
+    let mut discrete: Vec<&OsAdapter> = sorted.iter().copied().filter(|a| !is_igpu(a)).collect();
+    discrete.extend(sorted.iter().copied().filter(|a| is_igpu(a)));
+    discrete
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let (total_mib, free_mib) = adapter_vram_mib(a).unwrap_or((0, 0));
+            Device {
+                stable_key: stable_key(&a.pnp_device_id, a.bus_number),
+                name: a.name.clone(),
+                hip_index: i as u32,
+                backend: if a.pnp_device_id.contains("VEN_1002") { "ROCm".into() } else { "GPU".into() },
+                total_mib,
+                free_mib,
+                integrated: is_igpu(a),
+                bus_number: a.bus_number,
+                driver_version: Some(a.driver_version.clone()),
+                display: a.display.clone(),
+                luid_low: a.luid_low,
+                correlation_assumed: false,
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn adapter_vram_mib(a: &OsAdapter) -> Option<(u64, u64)> {
+    let bus = a.bus_number?;
+    let (total, used) = crate::platform::card_vram_bytes(bus)?;
+    Some((total / (1024 * 1024), total.saturating_sub(used) / (1024 * 1024)))
+}
+
+#[cfg(windows)]
+fn adapter_vram_mib(_a: &OsAdapter) -> Option<(u64, u64)> {
+    None
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Resolution {
     pub device: Device,

@@ -1,0 +1,257 @@
+name: build-overlay
+
+# Build the dgpatch5 overlay for one Unsloth llama.cpp release and publish it
+# as release `dgpatch5-<unsloth tag>` of this repository, which is where
+# Llama FIDIM looks for it. Manual only: pick the Unsloth tag (or `latest`).
+#
+# build   : fetch the release's exact source, apply the patch, build without
+#           HIP, gate the result against the release's gfx120X zip.
+# sign    : only when the repository variable AS_ACCOUNT is set (Azure
+#           Artifact Signing through GitHub OIDC, in the `release-signing`
+#           environment). Without it the overlay ships unsigned.
+# release : package (zip, fidim-overlay.json, the patch, SHA256SUMS), attest
+#           build provenance, create the release.
+on:
+  workflow_dispatch:
+    inputs:
+      unsloth_tag:
+        description: "Unsloth release tag (b<n>-mix-<sha>), or latest"
+        required: true
+        default: latest
+      toolchain:
+        description: "Compiler: clang (upstream's Windows recipe, as Unsloth) or msvc"
+        required: true
+        default: clang
+        type: choice
+        options: [clang, msvc]
+
+concurrency:
+  group: overlay-${{ inputs.unsloth_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    defaults:
+      run:
+        shell: pwsh
+    # Everything is built in $RUNNER_TEMP\o, outside the checkout: the build
+    # stamps its version from the first git repository above the source.
+    # The build runs code this repository does not control (Unsloth's
+    # source and CMake scripts, the BoringSSL clone, Unsloth's binaries in
+    # the smoke test), so the token goes only to the steps that call GitHub,
+    # and the checkout keeps no credentials.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Git settings and Ninja
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+          # Visual Studio's own Ninja is used when its CMake component puts
+          # it on PATH; this one is the fallback, as in upstream's recipe.
+          choco install ninja --no-progress -y
+
+      - name: Script self-tests (no network, no build)
+        run: ./tests/scripts.tests.ps1
+
+      - name: Resolve the Unsloth tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.unsloth_tag }}
+        run: |
+          . ./scripts/common.ps1
+          $rel = Get-GitHubRelease $BaseRepo $env:INPUT_TAG
+          $tag = $rel.tag_name
+          Assert-UnslothTag $tag
+          $ours = Get-OverlayReleaseTag $tag
+          gh release view $ours --repo $env:GITHUB_REPOSITORY --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw "release $ours already exists; delete it to rebuild" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "building $ours"
+          exit 0
+
+      - name: Fetch the base (source and the gfx120X zip)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/fetch-base.ps1 -Tag ${{ steps.tag.outputs.tag }} -WorkDir "$env:RUNNER_TEMP\o" -Gfx gfx120X
+
+      - name: Apply the patch
+        id: apply
+        run: ./scripts/apply-patch.ps1 -WorkDir "$env:RUNNER_TEMP\o"
+
+      - name: Open an issue when the patch no longer applies
+        if: failure() && steps.apply.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.tag.outputs.tag }}"
+          $run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          gh issue create --repo $env:GITHUB_REPOSITORY --title "rebase dgpatch5 onto $tag" `
+            --body "patches/dgpatch5.diff no longer applies to the source of Unsloth release $tag. See $run."
+
+      - name: Build
+        run: ./scripts/build.ps1 -WorkDir "$env:RUNNER_TEMP\o" -Toolchain ${{ inputs.toolchain }}
+
+      # Whether the HIP runtime DLLs load on a runner without an AMD GPU or
+      # driver is not known, so this one only reports. It runs first: every
+      # gate run starts by removing gate.pass, and the one that decides
+      # (below) must be the last.
+      - name: Smoke test (llama-server --version on base + overlay)
+        continue-on-error: true
+        run: ./scripts/gate.ps1 -WorkDir "$env:RUNNER_TEMP\o" -Smoke
+
+      - name: Gate (symbol closure and file set)
+        run: ./scripts/gate.ps1 -WorkDir "$env:RUNNER_TEMP\o"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overlay-unsigned
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/o/overlay/
+            ${{ runner.temp }}/o/licenses/
+            ${{ runner.temp }}/o/base.json
+            ${{ runner.temp }}/o/build-info.json
+            ${{ runner.temp }}/o/ggml-imports.json
+            ${{ runner.temp }}/o/gate.pass
+
+  sign:
+    needs: build
+    if: vars.AS_ACCOUNT != ''
+    runs-on: windows-2022
+    timeout-minutes: 30
+    # Required reviewer on this environment; the Entra federated credential
+    # names it, so no other job, branch or fork can sign.
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: overlay-unsigned
+          path: ${{ runner.temp }}/o
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Only the files built here. Unsloth's and AMD's DLLs are not in the
+      # overlay and are never re-signed.
+      - uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AS_ENDPOINT }}
+          signing-account-name: ${{ vars.AS_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AS_PROFILE }}
+          files-folder: ${{ runner.temp }}\o\overlay
+          files-folder-filter: exe,dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Verify signatures
+        run: |
+          $bad = @()
+          foreach ($f in Get-ChildItem "$env:RUNNER_TEMP\o\overlay" -File) {
+            $s = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            if ($s.Status -ne 'Valid') { $bad += "$($f.Name): $($s.Status)" }
+          }
+          if ($bad) { throw "not validly signed:`n$($bad -join "`n")" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overlay-signed
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/o/overlay/
+            ${{ runner.temp }}/o/licenses/
+            ${{ runner.temp }}/o/base.json
+            ${{ runner.temp }}/o/build-info.json
+            ${{ runner.temp }}/o/ggml-imports.json
+            ${{ runner.temp }}/o/gate.pass
+
+  release:
+    needs: [build, sign]
+    # After the build, whether signing ran or was skipped (never after a
+    # failed signing, which would publish unsigned what was meant to be signed).
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.sign.result == 'success' && 'overlay-signed' || 'overlay-unsigned' }}
+          path: ${{ runner.temp }}/o
+
+      - name: Package
+        run: ./scripts/package.ps1 -WorkDir "$env:RUNNER_TEMP\o" -OutDir "$env:RUNNER_TEMP\out" -Repo $env:GITHUB_REPOSITORY
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/out/*.zip
+            ${{ runner.temp }}/out/fidim-overlay.json
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . ./scripts/common.ps1
+          $tag = "${{ needs.build.outputs.tag }}"
+          $ours = Get-OverlayReleaseTag $tag
+          $d = Get-Content -Raw "$env:RUNNER_TEMP\out\fidim-overlay.json" | ConvertFrom-Json
+          $signed = if ($d.signer) { "Signed by $($d.signer)." } else { 'Unsigned: Smart App Control blocks unsigned DLLs, so this overlay only loads where it is off.' }
+          $notes = @(
+            "The $PatchName runner patch built for Unsloth's llama.cpp release [$tag](https://github.com/$BaseRepo/releases/tag/$tag)",
+            "(source commit $($d.base.source_commit)). Install it with Llama FIDIM:",
+            '',
+            '```',
+            "fidim update --channel unsloth --tag $tag --install --overlay",
+            '```',
+            '',
+            "Built with $($d.build.cxx_compiler) ($($d.build.toolchain)) on $($d.build.runner). $signed",
+            "fidim-overlay.json lists every file's sha256 and the base zips it fits; SHA256SUMS covers the assets."
+          )
+          Set-Content -Path "$env:RUNNER_TEMP\notes.md" -Value ($notes -join "`n") -Encoding utf8
+          gh release create $ours (Get-ChildItem "$env:RUNNER_TEMP\out" -File | ForEach-Object { $_.FullName }) `
+            --repo $env:GITHUB_REPOSITORY --title "$PatchName for $tag" --notes-file "$env:RUNNER_TEMP\notes.md" `
+            --target $env:GITHUB_SHA --latest=false

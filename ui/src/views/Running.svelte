@@ -7,8 +7,31 @@
   import CountUp from "../components/CountUp.svelte";
   import Skeleton from "../components/Skeleton.svelte";
   import DiffusionCanvas from "../components/DiffusionCanvas.svelte";
+  import EndpointCard from "../components/chat/EndpointCard.svelte";
+  import { endpointFor } from "../lib/endpoint.js";
+  import { copyText } from "../lib/clipboard.js";
+  import { openTarget } from "../lib/chat.svelte.js";
+
+  let { go = () => {} } = $props();
 
   let data = $state({ runs: [], cards: [] });
+
+  // Chat with a server, or hand its endpoint to another program. Copy
+  // endpoint copies the base URL at once and shows the model id and
+  // snippets beside it.
+  function chatWith(run, model = null) {
+    openTarget(run, model);
+    go("chat");
+  }
+  let endpointOpen = $state(null);   // { key, copied }
+  async function copyEndpoint(key, state, model = null) {
+    if (endpointOpen?.key === key) {
+      endpointOpen = null;
+      return;
+    }
+    const ok = await copyText(endpointFor(state, model).baseUrl);
+    endpointOpen = { key, copied: ok ? "url" : "failed" };
+  }
   let loaded = $state(false);   // first poll landed: skeletons give way to content
   let error = $state("");
   // Dismiss with a 3-second undo: the row leaves at once, the state file
@@ -104,15 +127,16 @@
     return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
   }
   function health(r) {
-    if (r.crashed) return { kind: "block", label: "crashed" };
-    if (r.health === "healthy") return { kind: "pass", label: "healthy" };
-    if (r.health === "responding-not-generating") return { kind: "warn", label: "responding, not generating" };
-    return { kind: "block", label: "not responding" };
+    if (r.crashed) return { kind: "block", label: "crashed", hint: "The process exited; its log is kept below" };
+    if (r.health === "healthy") return { kind: "pass", label: "healthy", hint: "Answers /v1/models and generated a token when probed" };
+    if (r.health === "responding-not-generating") return { kind: "warn", label: "stalled", hint: "Answers /v1/models but a 1-token completion fails" };
+    return { kind: "block", label: "unreachable", hint: "No answer on /v1/models within 3 s" };
   }
   function phaseOf(samples) {
     return samples.some((s) => s.phase === "decode") ? "decode" : samples.some((s) => s.phase === "prefill") ? "prefill" : "idle";
   }
   const phaseChip = (p) => (p === "decode" ? "accent live" : p === "prefill" ? "warn live" : "plain");
+  const phaseHint = (p) => (p === "decode" ? "Generating tokens on at least one slot" : p === "prefill" ? "Reading a prompt on at least one slot" : "No request in progress");
   const heldOn = (cardKey) => data.runs.reduce((a, row) => a + row.resident.filter((m) => m.card === cardKey).reduce((b, m) => b + Math.max(m.dedicated_bytes, m.committed_bytes), 0), 0);
   const short = (k) => String(k ?? "").split(":").pop();
   const fmt1 = (v) => (v == null ? "—" : Number(v).toFixed(1));
@@ -178,7 +202,7 @@
 
 <h1>
   Running
-  <span class="sub">Each server Llama FIDIM started, sampled once a second.</span>
+  <span class="sub">Every server started here.</span>
 </h1>
 
 <div class="strip">
@@ -195,20 +219,28 @@
       </div>
       <div class="two">
         <div class="stat">
-          <span class="v"><CountUp value={Math.round(c.busy_percent)} /><small>% busy</small></span>
-          <span class="l">GPU engine, all processes</span>
+          <span class="v" title="GPU engine busy across every process, not only servers"><CountUp value={Math.round(c.busy_percent)} /><small>%</small></span>
+          <span class="l">busy</span>
         </div>
         <div class="stat">
-          <span class="v"><CountUp value={held / GIB} format={(v) => v.toFixed(1)} /><small>/ {(total / GIB).toFixed(0)} GiB</small></span>
-          <span class="l">VRAM held by servers</span>
+          <span class="v" title="VRAM held by servers started here, of the card's total"><CountUp value={held / GIB} format={(v) => v.toFixed(1)} /><small>/ {(total / GIB).toFixed(0)} GiB</small></span>
+          <span class="l">held</span>
         </div>
+        {#if c.free_mib != null}
+          {@const freeGib = c.free_mib * 1024 * 1024 / GIB}
+          {@const tight = c.display && freeGib < 1.5}
+          <div class="stat">
+            <span class="v" class:warn-text={tight} title={c.display ? "Free VRAM; this card drives a display, so under 1.5 GiB the desktop evicts the server" : "Free VRAM on the card right now"}>{freeGib.toFixed(1)}<small>GiB</small></span>
+            <span class="l">headroom</span>
+          </div>
+        {/if}
       </div>
-      <div class="meter" title="GPU busy"><div class="fill" style="width: {Math.round(c.busy_percent)}%;"></div></div>
+      <div class="meter" title="GPU engine busy"><div class="fill" style="width: {Math.round(c.busy_percent)}%;"></div></div>
     </div>
   {/each}
   <div class="strip-tools">
     <button class="btn" onclick={() => (paused = !paused)}>{paused ? "Resume" : "Pause"}</button>
-    <span class="chip {paused ? 'plain' : 'pass live'}">{paused ? "paused" : "live · 1 Hz"}</span>
+    <span class="chip {paused ? 'plain' : 'pass live'}" title={paused ? "Polling stopped; Resume to sample again" : "Sampled once a second"}>{paused ? "paused" : "live"}</span>
     {#if error}<span class="chip block shake">{error}</span>{/if}
     {#if pending}
       <span class="chip warn" transition:fade={{ duration: LAYOUT }}>dismissed {pending.id} · <button class="link" onclick={undo}>undo</button></span>
@@ -229,20 +261,31 @@
     <header class="server-head">
       <div class="who">
         <span class="title">{r.state.profile_id}</span>
-        <span class="chip {h.kind}">{h.label}</span>
-        {#if r.alive}<span class="chip {phaseChip(phase)}">{phase}</span>{/if}
+        <span class="chip {h.kind}" title={h.hint}>{h.label}</span>
+        {#if r.alive}<span class="chip {phaseChip(phase)}" title={phaseHint(phase)}>{phase}</span>{/if}
+        {#if (row.evicting_ms_per_s ?? 0) > 20}<span class="chip block live" title="The driver is evicting this process from VRAM ({Math.round(row.evicting_ms_per_s)} ms per second): lower the VRAM share or move a display">evicting</span>{/if}
       </div>
       <div class="facts">
         {#if r.alive}
-          <span title="GPU engine utilization of this process"><b class="num">{Math.round(row.gpu_busy_percent)}%</b> gpu</span>
-          <span title="resident VRAM of this server and its child processes (dedicated, or committed while paging in)"><b class="num">{(vram / GIB).toFixed(1)} GiB</b>{#if row.resident.length}&nbsp;on {[...new Set(row.resident.map((m) => short(m.card ?? "?")))].join(" + ")}{/if}</span>
+          <span title="GPU engine busy for this process alone"><b class="num">{Math.round(row.gpu_busy_percent)}%</b> gpu</span>
+          {#if (row.evicted_ms ?? 0) > 0}<span title="Time this process has spent evicted from VRAM since it started"><b class="num">{(row.evicted_ms / 1000).toFixed(0)}s</b> evicted</span>{/if}
+          <span title="VRAM held by this server and its children (dedicated, or committed while paging in)"><b class="num">{(vram / GIB).toFixed(1)} GiB</b>{#if row.resident.length}&nbsp;on {[...new Set(row.resident.map((m) => short(m.card ?? "?")))].join(" + ")}{/if}</span>
         {/if}
-        <span><b class="num">{uptime(r.state.started_unix)}</b> up</span>
-        <span class="mono">pid {r.state.pid} · :{r.state.port} · {r.state.alias}</span>
+        <span title="Time since the process started"><b class="num">{uptime(r.state.started_unix)}</b> up</span>
+        <span class="mono" title="Listens on port {r.state.port} as “{r.state.alias}”; Copy endpoint shows the URL">pid {r.state.pid}</span>
       </div>
+      {#if r.alive && r.state.profile_id !== "router"}
+        <button class="btn" onclick={() => chatWith(r.state.profile_id)} title="Open a chat with this server">Chat</button>
+        <button class="btn" class:primary={endpointOpen?.key === r.state.profile_id} onclick={() => copyEndpoint(r.state.profile_id, r.state)} title="Copy the base URL; the model id and snippets show below">Copy endpoint</button>
+      {/if}
       {#if r.alive}<button class="btn danger" onclick={() => stop(r.state.profile_id)}>Stop</button>
-      {:else}<button class="btn" onclick={() => dismiss(r.state.profile_id)} title="forget this run; the log file stays">Dismiss</button>{/if}
+      {:else}<button class="btn" onclick={() => dismiss(r.state.profile_id)} title="Forget this run; the log file stays">Dismiss</button>{/if}
     </header>
+    {#if endpointOpen?.key === r.state.profile_id}
+      <div class="endpoint-pop" transition:slide={leave}>
+        <EndpointCard endpoint={endpointFor(r.state, null, !!row.has_api_key)} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
+      </div>
+    {/if}
 
     {#each row.samples as s, si (key(r, s))}
       {@const k = key(r, s)}
@@ -255,46 +298,86 @@
       <div class="model" class:active={s.phase !== "idle"} in:fly={arrive(stagger(si, 40))} out:slide={leave} animate:flip={flipParams}>
         <div class="ident">
           <div class="model-name">{s.model ?? r.state.alias}</div>
-          <span class="chip {phaseChip(s.phase)}">{s.phase}</span>
-          {#if s.slots.some((x) => x.loop_hint)}<span class="chip block live" title="a slot is repeating the same fragment back-to-back; click it to see the text">looping</span>{/if}
-          <div class="slot-count"><b class="num">{busySlots}</b><span class="faint"> of {s.slots.length} slots busy</span></div>
+          <span class="chip {phaseChip(s.phase)}" title={phaseHint(s.phase)}>{s.phase}</span>
+          {#if s.slots.some((x) => x.loop_hint)}<span class="chip block live" title="A slot is repeating the same fragment; click it to see the text">looping</span>{/if}
+          <div class="slot-count" title="Slots serving a request, of the {s.slots.length} this model has (-np)"><b class="num">{busySlots}</b><span class="faint"> / {s.slots.length} busy</span></div>
           {#if s.error}<div class="err">{s.error}</div>{/if}
+          {#if s.model && r.alive}
+            <div class="row-actions">
+              <button class="btn small" onclick={() => chatWith(r.state.profile_id, s.model)} title="Open a chat with this model through the router">Chat</button>
+              <button class="btn small" class:primary={endpointOpen?.key === k} onclick={() => copyEndpoint(k, r.state, s.model)} title="Copy the router's base URL; the model id and snippets show below">Copy endpoint</button>
+            </div>
+          {/if}
         </div>
+        {#if endpointOpen?.key === k}
+          <div class="endpoint-pop in-model" transition:slide={leave}>
+            <EndpointCard endpoint={endpointFor(r.state, s.model, !!row.keyed_models?.includes(s.model))} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
+          </div>
+        {/if}
 
         <div class="stats">
           {#if dg}
             <!-- Diffusion: text delivered (compare with autoregressive decode) vs.
                  canvas tokens predicted per step (Unsloth Studio's "Speed"). -->
-            <div class="stat" class:dim={!m.predicted_tokens_seconds} title="Answer tokens delivered per second over the last reply, prefill included. Compare this with an autoregressive model's decode speed.">
-              <span class="v">{fmt1(m.predicted_tokens_seconds)}<small>tok/s</small></span>
-              <span class="l">output, last reply</span>
+            <div class="stat" class:dim={!m.predicted_tokens_seconds}>
+              <span class="v" title="Answer tokens per second over the last reply, prefill included; compare with a decode rate">{fmt1(m.predicted_tokens_seconds)}<small>tok/s</small></span>
+              <span class="l">last reply</span>
             </div>
-            <div class="stat" class:dim={!rt?.canvas} title="Canvas tokens predicted per second right now: every denoise step re-predicts the whole 256-token block. This is how Unsloth Studio counts its Speed.">
-              <span class="v">{fmt0(rt?.canvas)}<small>tok/s</small></span>
-              <span class="l">canvas, now</span>
+            <div class="stat" class:dim={!rt?.canvas}>
+              <span class="v" title="Canvas tokens predicted per second right now; each denoise step redoes the whole 256-token block">{fmt0(rt?.canvas)}<small>tok/s</small></span>
+              <span class="l">canvas</span>
             </div>
-            <div class="stat" class:dim={!m.diffusion_canvas_tokens_seconds} title="Unsloth Studio's headline Speed for the last reply: 256 × denoise steps ÷ time.">
-              <span class="v">{fmt0(m.diffusion_canvas_tokens_seconds)}<small>tok/s</small></span>
-              <span class="l">canvas, last reply</span>
+            <div class="stat" class:dim={!m.diffusion_canvas_tokens_seconds}>
+              <span class="v" title="Unsloth Studio's Speed for the last reply: 256 × denoise steps ÷ time">{fmt0(m.diffusion_canvas_tokens_seconds)}<small>tok/s</small></span>
+              <span class="l">last canvas</span>
             </div>
           {:else}
-          <div class="stat" class:dim={!rt?.decode}>
-            <span class="v">{fmt1(rt?.decode)}<small>tok/s</small></span>
-            <span class="l">decode, now</span>
+          <div class="stat" class:dim={!(rt?.decode || (busySlots && m.gen_throughput))}>
+            <span class="v" title="Tokens generated per second right now, over the last poll">{fmt1(rt?.decode || (busySlots && m.gen_throughput) || 0)}<small>tok/s</small></span>
+            <span class="l">decode</span>
           </div>
           <div class="stat" class:dim={!rt?.prompt}>
-            <span class="v">{fmt0(rt?.prompt)}<small>tok/s</small></span>
-            <span class="l">prefill, now</span>
+            <span class="v" title="Prompt tokens read per second right now, over the last poll">{fmt0(rt?.prompt)}<small>tok/s</small></span>
+            <span class="l">prefill</span>
           </div>
           {/if}
           <div class="stat" class:dim={!(m.requests_processing || m.requests_deferred)}>
-            <span class="v">{m.requests_processing ?? 0}<small>+ {m.requests_deferred ?? 0} queued</small></span>
-            <span class="l">requests in flight</span>
+            <span class="v" title="Requests being served now, plus those waiting in the queue">{m.requests_processing ?? 0}<small>+ {m.requests_deferred ?? 0} queued</small></span>
+            <span class="l">in flight</span>
           </div>
           {#if hasDraft}
             <div class="stat">
-              <span class="v">{rt?.accept != null ? Math.round(rt.accept * 100) : Math.round(100 * m.spec_decode_num_accepted_tokens_total / m.spec_decode_num_draft_tokens_total)}<small>%</small></span>
-              <span class="l">draft accepted{rt?.accept != null ? "" : ", lifetime"}</span>
+              <span class="v" title={rt?.accept != null ? "Share of draft tokens the main model accepted since the last poll" : "Share of draft tokens the main model accepted over this server's lifetime"}>{rt?.accept != null ? Math.round(rt.accept * 100) : Math.round(100 * m.spec_decode_num_accepted_tokens_total / m.spec_decode_num_draft_tokens_total)}<small>%</small></span>
+              <span class="l">accepted</span>
+            </div>
+          {:else if m.spec_accept_rate != null}
+            <div class="stat" class:dim={!m.spec_accept_rate}>
+              <span class="v" title="Share of draft tokens accepted in the last batch, and mean accepted length per verify step">{Math.round(m.spec_accept_rate * 100)}<small>% · {(m.spec_accept_length ?? 0).toFixed(1)} tok</small></span>
+              <span class="l">accepted</span>
+            </div>
+          {/if}
+          {#if m.cache_hit_rate != null}
+            <div class="stat" class:dim={!m.cache_hit_rate}>
+              <span class="v" title="Prompt tokens served from the prefix cache, last batch; low mid-chat means the prefix was evicted">{Math.round(m.cache_hit_rate * 100)}<small>%</small></span>
+              <span class="l">cache hits</span>
+            </div>
+          {/if}
+          {#if m.token_usage != null}
+            <div class="stat" class:dim={!m.token_usage}>
+              <span class="v" title="KV cache tokens held of the pool ({(m.kv_used_tokens ?? 0).toLocaleString()} of {(m.max_total_num_tokens ?? 0).toLocaleString()}){m.mamba_usage != null ? `; state slots are GatedDeltaNet's (mamba)` : ""}">{Math.round(m.token_usage * 100)}<small>%{m.mamba_usage != null ? ` · state ${Math.round(m.mamba_usage * 100)}%` : ""}</small></span>
+              <span class="l">cache used</span>
+            </div>
+          {/if}
+          {#if m.num_retracted_reqs != null && m.num_retracted_reqs > 0}
+            <div class="stat">
+              <span class="v warn-text" title="Requests pulled back to the queue because the KV cache filled; the context budget is too tight">{m.num_retracted_reqs}</span>
+              <span class="l">retracted</span>
+            </div>
+          {/if}
+          {#if m.time_to_first_token_seconds_count > 0}
+            <div class="stat">
+              <span class="v" title="Mean time to first token over {m.time_to_first_token_seconds_count} requests; inter-token latency {m.inter_token_latency_seconds_count > 0 ? (1000 * m.inter_token_latency_seconds_sum / m.inter_token_latency_seconds_count).toFixed(0) : "?"} ms mean">{(m.time_to_first_token_seconds_sum / m.time_to_first_token_seconds_count).toFixed(1)}<small>s</small></span>
+              <span class="l">first token</span>
             </div>
           {/if}
         </div>
@@ -308,13 +391,13 @@
               <circle cx={pts[pts.length - 1][0]} cy={pts[pts.length - 1][1]} r="2.5" class="end" />
             {/if}
           </svg>
-          <span class="l">{dg ? "canvas" : "decode"} tok/s · last 60 s{pts.length > 1 ? ` · peak ${dg ? fmt0(Math.max(...spark[k])) : fmt1(Math.max(...spark[k]))}` : ""}</span>
+          <span class="l" title="{dg ? "Canvas" : "Decode"} tokens per second, one sample a second for the last minute">{dg ? "canvas" : "decode"} tok/s · 60 s{pts.length > 1 ? ` · peak ${dg ? fmt0(Math.max(...spark[k])) : fmt1(Math.max(...spark[k]))}` : ""}</span>
         </div>
 
         <div class="slots">
           {#each s.slots as x}
             {@const prog = slotProgress(x)}
-            <button type="button" class="slot {x.phase}" class:loop={!!x.loop_hint} class:open={!!open[slotKey(k, x.id)]} title="{slotTitle(x)} · click for prompt and generated text" onclick={() => toggleSlot(k, x.id)}>
+            <button type="button" class="slot {x.phase}" class:loop={!!x.loop_hint} class:open={!!open[slotKey(k, x.id)]} title="{slotTitle(x)}; click for its text" onclick={() => toggleSlot(k, x.id)}>
               <div class="fill" style="width: {Math.round(100 * prog)}%;"></div>
               <span class="n">{x.id}</span>
               <span class="p">
@@ -328,7 +411,7 @@
                 {:else if x.phase === "decode"}{isDiffusion(x) ? "denoising" : "decoding"}
                 {:else}&nbsp;{/if}
               </span>
-              <div class="ctx" style="width: {Math.round(100 * x.ctx_fraction)}%;" title="context used"></div>
+              <div class="ctx" style="width: {Math.round(100 * x.ctx_fraction)}%;" title="Context used in this slot"></div>
             </button>
           {/each}
         </div>
@@ -338,24 +421,24 @@
             <div class="dhead">
               <span class="mono" style="font-weight: 700;">slot {x.id}</span>
               <span class="chip {phaseChip(x.phase)}">{x.phase}</span>
-              {#if x.loop_hint}<span class="chip block live">looping × {x.loop_hint.repeats} <span style="text-transform: none; letter-spacing: 0; font-weight: 500;">“{trimFrag(x.loop_hint.fragment)}”</span></span>{/if}
-              {#if x.generated != null}<span class="faint small">{x.generated_chars.toLocaleString()} chars generated · prompt {x.prompt_chars.toLocaleString()} chars{#if x.prompt_chars > 4000 || x.generated_chars > 4000} · showing the last 4,000 of each{/if}</span>{/if}
-              {#if draftChars(x) > 0}<span class="chip plain" title="DiffusionGemma writes a whole block at once: each denoise step rewrites the block's draft (dimmed) until it settles and is committed.">draft {draftChars(x).toLocaleString()} chars</span>{/if}
+              {#if x.loop_hint}<span class="chip block live" title="The same fragment came back {x.loop_hint.repeats} times: “{trimFrag(x.loop_hint.fragment)}”">looping ×{x.loop_hint.repeats}</span>{/if}
+              {#if x.generated != null}<span class="faint small" title="Characters generated, then in the prompt{x.prompt_chars > 4000 || x.generated_chars > 4000 ? "; the panes show the last 4,000 of each" : ""}">{x.generated_chars.toLocaleString()} out · {x.prompt_chars.toLocaleString()} in</span>{/if}
+              {#if draftChars(x) > 0}<span class="chip plain" title="Each denoise step rewrites the block's draft (dimmed) until it settles and is committed">draft {draftChars(x).toLocaleString()}</span>{/if}
               <button class="btn small" style="margin-left: auto;" onclick={() => toggleSlot(k, x.id)}>Close</button>
             </div>
             {#if x.diffusion}
               <DiffusionCanvas host={r.state.host} port={r.state.port} slot={x} />
             {/if}
             {#if x.prompt == null && x.generated == null}
-              <div class="faint small">This server does not expose slot text. Turn on <b>trace tokens</b> in the profile's Advanced section and reload it. For the router, turn it on for any member and relaunch the router.</div>
+              <div class="faint small" title="For the router, turn it on for any member profile and relaunch the router">No slot text — turn on <b>trace tokens</b> in the profile's Advanced section and reload it.</div>
             {:else}
               <div class="panes">
                 <div class="pane">
-                  <div class="pl">last prompt received</div>
+                  <div class="pl" title="The last prompt this slot received">prompt</div>
                   <pre use:stick>{x.prompt ?? ""}</pre>
                 </div>
                 <div class="pane">
-                  <div class="pl">generated {x.is_processing ? "so far" : "in the last request"}{isDiffusion(x) && x.is_processing ? " · committed, then the current block's draft" : ""}</div>
+                  <div class="pl" title={x.is_processing ? (isDiffusion(x) ? "Generated so far: committed text, then the current block's draft dimmed" : "Generated so far in this request") : "Generated in the last request"}>generated</div>
                   {#if isDiffusion(x)}
                     {@const parts = splitDraft(x)}
                     <pre use:stick>{parts[0]}<span class="draft">{parts[1]}</span></pre>
@@ -369,23 +452,25 @@
         {/each}
       </div>
     {:else}
-      {#if r.alive}<div class="empty small">No loaded models to sample</div>{/if}
+      {#if r.alive && row.fronting?.length}
+        <div class="empty small" title="The router forwards to these models; each has its own card below">fronting {row.fronting.join(" · ")}</div>
+      {:else if r.alive}<div class="empty small">No models loaded</div>{/if}
     {/each}
 
     <footer class="server-foot">
       <span>devices {r.state.device_keys.map(short).join(", ")}{r.state.visibility_env ? ` · HIP_VISIBLE_DEVICES=${r.state.visibility_env}` : ""}</span>
-      {#if r.crashed}<span class="gone">Process gone. Log kept for diagnosis: <span class="mono">{r.state.log_path}</span></span>{/if}
+      {#if r.crashed}<span class="gone" title="The process exited; its log is kept for diagnosis">log <span class="mono">{r.state.log_path}</span></span>{/if}
     </footer>
   </section>
 {:else}
-  {#if loaded}<div class="card" in:fade={{ duration: LAYOUT }}><div class="empty">Nothing is running. Launch a profile, or start the router.</div></div>{/if}
+  {#if loaded}<div class="card" in:fade={{ duration: LAYOUT }}><div class="empty">Nothing running — Profiles → Launch, or Router → Start</div></div>{/if}
 {/each}
 
 {#if data.runs.some((x) => x.samples.length)}
   <div class="legend">
-    <span><i class="sw prefill"></i> prefill, fill = prompt tokens read</span>
-    <span><i class="sw decode"></i> decoding, fill = tokens generated so far</span>
-    <span><i class="sw ctx"></i> thin bar = context used in that slot</span>
+    <span title="Fill grows as the prompt is read"><i class="sw prefill"></i> prefill</span>
+    <span title="Fill grows with tokens generated so far"><i class="sw decode"></i> decode</span>
+    <span title="The thin bar is how much of the slot's context is used"><i class="sw ctx"></i> context used</span>
   </div>
 {/if}
 
@@ -405,6 +490,9 @@
   .facts { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; color: var(--ink-muted); font-size: 12.5px; margin-left: auto; }
   .facts b { color: var(--ink); font-weight: 600; }
   .facts .mono { font-size: 11.5px; color: var(--ink-faint); }
+  .endpoint-pop { padding: 14px 18px; border-bottom: 1px solid var(--rule); background: var(--ground-inset); }
+  .endpoint-pop.in-model { grid-column: 1 / -1; border: 1px solid var(--rule-strong); border-radius: 6px; padding: 12px 14px; }
+  .row-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
 
   .model {
     display: grid; grid-template-columns: 200px 1fr 280px; grid-template-areas: "ident stats spark" "slots slots slots";
@@ -453,6 +541,7 @@
   }
   .drawer.loop .pane:last-child pre { border-color: rgba(232, 125, 110, 0.5); color: var(--ink); }
   .pane pre .draft { opacity: 0.55; font-style: italic; }
+  .warn-text { color: var(--warn, #e8a33d); }
   @media (max-width: 1100px) { .panes { grid-template-columns: 1fr; } }
   .slot { transition: border-color var(--t-layout), background-color var(--t-layout), box-shadow var(--t-fast); }
   .slot .fill { position: absolute; inset: 0 auto 0 0; transition: width .3s ease, background-color var(--t-layout); }

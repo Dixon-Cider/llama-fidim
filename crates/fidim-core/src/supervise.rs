@@ -151,7 +151,7 @@ pub fn spawn(
     if let Some(rocm) = &plan.path_prepend {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut joined = rocm.as_os_str().to_owned();
-        joined.push(";");
+        joined.push(if cfg!(windows) { ";" } else { ":" });
         joined.push(path);
         cmd.env("PATH", joined);
     }
@@ -197,7 +197,22 @@ pub fn spawn(
 /// Minimal HTTP/1.1 GET — avoids an async client dependency for what is a
 /// localhost status poll. Returns (status code, body).
 pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<(u16, String)> {
-    let addr = format!("{host}:{port}");
+    http_get_auth(host, port, path, timeout, None)
+}
+
+/// `http_get` with a bearer token: a llama-server started with `--api-key`
+/// answers 401 on everything but `/health` without one.
+pub fn http_get_auth(host: &str, port: u16, path: &str, timeout: Duration, bearer: Option<&str>) -> Result<(u16, String)> {
+    let auth = match bearer {
+        // A control character would end the header line.
+        Some(k) if k.chars().any(char::is_control) => {
+            return Err(Error::Config("the API key contains a control character".into()));
+        }
+        Some(k) => format!("Authorization: Bearer {k}\r\n"),
+        None => String::new(),
+    };
+    // A server bound to 0.0.0.0 is reached over loopback; IPv6 in brackets.
+    let addr = crate::chat::host_port(host, port);
     let stream = TcpStream::connect_timeout(
         &addr
             .parse()
@@ -208,7 +223,7 @@ pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     let mut stream = stream;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n");
     stream
         .write_all(req.as_bytes())
         .map_err(|e| Error::Platform(format!("send {addr}: {e}")))?;
@@ -226,7 +241,7 @@ pub fn http_post_json(
     json: &str,
     timeout: Duration,
 ) -> Result<(u16, String)> {
-    let addr = format!("{host}:{port}");
+    let addr = crate::chat::host_port(host, port);
     let stream = TcpStream::connect_timeout(
         &addr
             .parse()
@@ -352,7 +367,10 @@ pub fn wait_ready_in(
                 state.log_path.display()
             )));
         }
-        if let Ok((200, _)) = http_get(&state.host, state.port, "/v1/models", Duration::from_secs(2))
+        // SGLang answers /v1/models before its warm-up and CUDA-graph capture
+        // finish; /health turns 200 only at "fired up and ready to roll".
+        let ready_path = if state.engine.is_sglang() { "/health" } else { "/v1/models" };
+        if let Ok((200, _)) = http_get(&state.host, state.port, ready_path, Duration::from_secs(2))
         {
             if let Some(dir) = runs_dir {
                 let mut ready_state = state.clone();
@@ -419,6 +437,37 @@ pub fn process_alive(pid: u32) -> bool {
     process_image(pid).is_some()
 }
 
+/// Linux: the executable name from `/proc/<pid>/comm` (what `tasklist`
+/// reports on Windows, minus the `.exe`). For an interpreter, argv[1]'s file
+/// name (`model_router.py`) is the image that means something.
+#[cfg(not(windows))]
+pub fn process_image(pid: u32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let comm = comm.trim();
+    if comm.is_empty() {
+        return None;
+    }
+    if comm.starts_with("python") {
+        if let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            let args: Vec<&[u8]> = cmd.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+            // `python -m pkg.module` -> "pkg.module"; `python script.py` -> "script.py"
+            let arg = match args.get(1) {
+                Some(a) if *a == b"-m" => args.get(2),
+                a => a,
+            };
+            if let Some(script) = arg {
+                let script = String::from_utf8_lossy(script);
+                if let Some(name) = std::path::Path::new(script.as_ref()).file_name() {
+                    return Some(name.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    Some(comm.to_string())
+}
+
+#[cfg(windows)]
+
 /// Image name of a live process (`llama-server.exe`), or None when no
 /// process has that pid. tasklist CSV: `"image","pid","session",...`.
 pub fn process_image(pid: u32) -> Option<String> {
@@ -453,6 +502,9 @@ pub fn run_alive(s: &RunState) -> bool {
             process_image(s.pid).is_some_and(|img| img.eq_ignore_ascii_case(DG_HELPER_EXE))
                 && crate::launch::listens_on(s.port, s.pid)
         }
+        // The router (or a bare server) is a python process; what matters is
+        // that the recorded pid still owns the port.
+        Engine::SgLang => process_alive(s.pid) && crate::launch::listens_on(s.port, s.pid),
         Engine::Unknown => false,
     }
 }
@@ -460,7 +512,10 @@ pub fn run_alive(s: &RunState) -> bool {
 /// The keep-alive helper's image: `fidim.exe`, or `llamactl.exe` from before
 /// the rename. Exact, because `llama-fidim.exe` (the GUI) contains "fidim".
 pub(crate) fn is_keepalive_image(img: &str) -> bool {
-    img.eq_ignore_ascii_case("fidim.exe") || img.eq_ignore_ascii_case("llamactl.exe")
+    img.eq_ignore_ascii_case("fidim.exe")
+        || img.eq_ignore_ascii_case("llamactl.exe")
+        || img.eq_ignore_ascii_case("fidim")
+        || img.eq_ignore_ascii_case("llamactl")
 }
 
 /// Stop a server. llama-server has no shutdown endpoint; on Windows a
@@ -470,6 +525,44 @@ pub(crate) fn is_keepalive_image(img: &str) -> bool {
 ///
 /// A run whose process is gone (or whose pid now belongs to something
 /// else) is only forgotten: the state file goes, nothing is killed.
+#[cfg(not(windows))]
+pub fn stop(state: &RunState, runs_dir: &Path) -> Result<()> {
+    // Children first (a python launcher's scheduler/detokenizer hold the GPU),
+    // then the root; SIGKILL, as the Windows path does with /F.
+    fn kill_tree(pid: u32) {
+        for c in crate::platform::process_descendants(pid) {
+            unsafe { libc_kill(c) };
+        }
+        unsafe { libc_kill(pid) };
+    }
+    unsafe fn libc_kill(pid: u32) {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        kill(pid as i32, 9);
+    }
+    if let Some(kp) = state.keepalive_pid {
+        if process_image(kp).is_some_and(|img| is_keepalive_image(&img)) {
+            kill_tree(kp);
+        }
+    }
+    if run_alive(state) {
+        kill_tree(state.pid);
+        for _ in 0..50 {
+            if !process_alive(state.pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    if state.engine.is_diffusion() {
+        remove_diffusion_requests(state, runs_dir);
+    }
+    forget(state, runs_dir);
+    Ok(())
+}
+
+#[cfg(windows)]
 pub fn stop(state: &RunState, runs_dir: &Path) -> Result<()> {
     if let Some(kp) = state.keepalive_pid {
         if process_image(kp).is_some_and(|img| is_keepalive_image(&img)) {
@@ -587,7 +680,8 @@ mod tests {
     fn process_alive_matches_reality() {
         assert!(process_alive(std::process::id()));
         // Our own image is the test binary, not llama-server.
-        assert!(process_image(std::process::id()).unwrap().to_ascii_lowercase().ends_with(".exe"));
+        let img = process_image(std::process::id()).unwrap().to_ascii_lowercase();
+        assert!(if cfg!(windows) { img.ends_with(".exe") } else { img.starts_with("fidim_core") }, "{img}");
         assert!(!process_alive_as(std::process::id(), "llama-server"));
         assert!(!process_alive_as(4_000_000, "llama-server"));
         // PID 4 is System; PID 0 idle — use an absurd value instead.

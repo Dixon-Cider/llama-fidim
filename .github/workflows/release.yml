@@ -1,9 +1,18 @@
 name: release
 
 # Tag a commit `vX.Y.Z` (scripts/release.ps1 does) and this builds the CLI
-# and the desktop app on a clean Windows runner, zips them with the license,
-# README and changelog, and attaches the zip to a GitHub release for that
-# tag, with the version's CHANGELOG.md section as the notes.
+# and the desktop app on a clean Windows runner and ships them two ways: a
+# zip with the license, README and changelog, and a per-user NSIS installer
+# (setup.exe) that is installed, upgraded from an older version and
+# uninstalled here as a test. Both go to a GitHub release for that tag,
+# with the version's CHANGELOG.md section as the notes.
+#
+# Code signing is optional. It switches on once the repository variable
+# AS_ACCOUNT is set (docs/signing.md lists every step): a tag build then runs
+# as `build-signed`, in the `release` environment, and signs through Azure
+# Artifact Signing. Every other run is `build`, unsigned. The two jobs run
+# the same steps (the build-steps anchor); SIGN tells those steps which job
+# they are in.
 on:
   push:
     tags: ["v*"]
@@ -20,8 +29,11 @@ env:
 
 jobs:
   build:
+    if: ${{ vars.AS_ACCOUNT == '' || !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: windows-latest
-    steps:
+    env:
+      SIGN: "false"
+    steps: &build-steps
       - uses: actions/checkout@v4
         with:
           # History and tags, so a build that is not a release says how many
@@ -69,6 +81,94 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm tauri build --no-bundle
 
+      # Signing only: signtool and Artifact Signing's signtool plug-in (the
+      # versions azure/artifact-signing-action v2 pins, checked against
+      # nuget.org's SHA-512), and a Tauri config that makes Tauri sign every
+      # file it bundles with them.
+      - name: Prepare signing
+        if: env.SIGN == 'true'
+        shell: pwsh
+        env:
+          AS_ENDPOINT: ${{ vars.AS_ENDPOINT }}
+          AS_ACCOUNT: ${{ vars.AS_ACCOUNT }}
+          AS_PROFILE: ${{ vars.AS_PROFILE }}
+        run: |
+          foreach ($k in 'AS_ENDPOINT', 'AS_ACCOUNT', 'AS_PROFILE') {
+            if (-not [Environment]::GetEnvironmentVariable($k)) { throw "repository variable $k is not set (docs/signing.md)" }
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'sign'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $packages = @(
+            @{ id = 'microsoft.windows.sdk.buildtools'; version = '10.0.26100.4188'; sha512 = 'OkiRhdDr0ngD6+wm0Ezdu1mgV8ZuknXdHwjzeHVZjYSXi9bCkYkq9Ns/X/ab9BoHb+Tq/5/RmXbdNWtC0qHipQ==' },
+            @{ id = 'microsoft.artifactsigning.client'; version = '1.0.128'; sha512 = 'mPBqaR9Pwvoi8Z3PhVZzPphgf775GjEsRTubB5jMkIja4KyzbjibVSoRtNIyAyR4W4VBwrUQkackwFvF31y/lQ==' }
+          )
+          $ProgressPreference = 'SilentlyContinue'
+          foreach ($p in $packages) {
+            $zip = Join-Path $dir "$($p.id).zip"
+            Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/$($p.id)/$($p.version)/$($p.id).$($p.version).nupkg" -OutFile $zip
+            $sha = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($zip)))
+            if ($sha -ne $p.sha512) { throw "$($p.id) $($p.version): SHA-512 mismatch" }
+            Expand-Archive $zip (Join-Path $dir $p.id)
+          }
+          $signtool = Join-Path $dir 'microsoft.windows.sdk.buildtools\bin\10.0.26100.0\x64\signtool.exe'
+          $dlib = Join-Path $dir 'microsoft.artifactsigning.client\bin\x64\Azure.CodeSigning.Dlib.dll'
+          foreach ($f in $signtool, $dlib) { if (-not (Test-Path $f)) { throw "missing $f" } }
+          # The plug-in signs as whoever azure/login signed in: exclude every
+          # other credential DefaultAzureCredential would try first.
+          $metadata = Join-Path $dir 'metadata.json'
+          @{
+            Endpoint = $env:AS_ENDPOINT
+            CodeSigningAccountName = $env:AS_ACCOUNT
+            CertificateProfileName = $env:AS_PROFILE
+            CorrelationId = "${{ github.repository }}@${{ github.sha }}"
+            ExcludeCredentials = @('EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+              'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+              'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential')
+          } | ConvertTo-Json | Set-Content $metadata -Encoding utf8
+          # RFC 3161 timestamps: the certificate itself is valid for days.
+          $signArgs = @('sign', '/v', '/fd', 'SHA256', '/tr', 'http://timestamp.acs.microsoft.com', '/td', 'SHA256', '/dlib', $dlib, '/dmdf', $metadata)
+          $conf = Join-Path $env:RUNNER_TEMP 'tauri.sign.conf.json'
+          @{ bundle = @{ windows = @{ signCommand = @{ cmd = $signtool; args = $signArgs + '%1' } } } } |
+            ConvertTo-Json -Depth 6 | Set-Content $conf -Encoding utf8
+          "SIGNTOOL=$signtool" | Add-Content $env:GITHUB_ENV
+          "SIGN_ARGS=$($signArgs -join '|')" | Add-Content $env:GITHUB_ENV
+          "TAURI_SIGN_CONF=$conf" | Add-Content $env:GITHUB_ENV
+          # Tauri checks with signtool which files are signed already.
+          "TAURI_WINDOWS_SIGNTOOL_PATH=$signtool" | Add-Content $env:GITHUB_ENV
+
+      # OpenID Connect: GitHub vouches for this job to Azure, no secret is
+      # stored. Right before the bundle step, since the rest needs no Azure.
+      - name: Sign in to Azure
+        if: env.SIGN == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # tauri.release.conf.json holds everything that is only for the
+      # installer. When signing, Tauri signs fidim.exe and fidim-dg.exe in
+      # place in target\release, the GUI inside the installer, the NSIS
+      # plug-ins, uninstall.exe and setup.exe itself.
+      - name: Bundle the installer
+        working-directory: ui
+        shell: pwsh
+        run: |
+          $configs = @('--config', 'src-tauri/tauri.release.conf.json')
+          if ($env:SIGN -eq 'true') { $configs += @('--config', $env:TAURI_SIGN_CONF) }
+          pnpm tauri bundle --bundles nsis @configs
+          if ($LASTEXITCODE -ne 0) { throw "tauri bundle failed ($LASTEXITCODE)" }
+
+      # Tauri puts the unsigned GUI back in target\release after bundling;
+      # the zip gets a signed one.
+      - name: Sign the GUI for the zip
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $signArgs = $env:SIGN_ARGS -split '\|'
+          & $env:SIGNTOOL @signArgs target\release\llama-fidim.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+
       - name: Package
         shell: pwsh
         run: |
@@ -78,10 +178,40 @@ jobs:
           New-Item -ItemType Directory -Force $name | Out-Null
           Copy-Item target\release\fidim.exe, target\release\fidim-dg.exe, target\release\llama-fidim.exe, LICENSE, README.md, CHANGELOG.md $name\
           Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $setup = @(Get-ChildItem target\release\bundle\nsis\*-setup.exe)
+          if ($setup.Count -ne 1) { throw "expected one setup.exe, found $($setup.Count)" }
+          Copy-Item $setup[0].FullName "$name-setup.exe"
           # LF and no BOM, so `sha256sum -c` matches the file name on any OS.
-          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
-          [IO.File]::WriteAllText("$PWD\$name.zip.sha256", "$hash  $name.zip`n", (New-Object System.Text.UTF8Encoding($false)))
+          foreach ($f in "$name.zip", "$name-setup.exe") {
+            $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            [IO.File]::WriteAllText("$PWD\$f.sha256", "$hash  $f`n", (New-Object System.Text.UTF8Encoding($false)))
+          }
+          $v = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
           "ASSET=$name.zip" | Add-Content $env:GITHUB_ENV
+          "SETUP=$name-setup.exe" | Add-Content $env:GITHUB_ENV
+          "STAGE=$name" | Add-Content $env:GITHUB_ENV
+          "VERSION=$v" | Add-Content $env:GITHUB_ENV
+
+      - name: Verify signatures
+        if: env.SIGN == 'true'
+        shell: pwsh
+        env:
+          AS_SIGNER: ${{ vars.AS_SIGNER }}
+        run: |
+          # Valid, by the expected signer when AS_SIGNER names one, and
+          # timestamped: without a timestamp the signature dies with the
+          # certificate, days from now.
+          $bad = 0
+          foreach ($f in @(Get-ChildItem $env:STAGE -Filter *.exe) + @(Get-Item $env:SETUP)) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            $ok = $s.Status -eq 'Valid'
+            if ($ok -and $env:AS_SIGNER) { $ok = $s.SignerCertificate.Subject -match ('(^|, )CN="?' + [regex]::Escape($env:AS_SIGNER) + '"?(,|$)') }
+            $verify = & $env:SIGNTOOL verify /pa /v $f.FullName | Out-String
+            if ($ok -and $verify -notmatch 'The signature is timestamped') { $ok = $false; Write-Host "$($f.Name) has no timestamp" }
+            "{0,-6} {1,-40} {2}" -f $(if ($ok) { 'ok' } else { 'FAIL' }), $f.Name, $s.SignerCertificate.Subject
+            if (-not $ok) { $bad++ }
+          }
+          if ($bad) { throw "$bad file(s) are not validly signed" }
 
       - name: Smoke test the built CLI
         shell: pwsh
@@ -93,12 +223,30 @@ jobs:
           & target\release\fidim-dg.exe --help
           if ($LASTEXITCODE -ne 0) { throw "fidim-dg.exe --help exited $LASTEXITCODE" }
 
+      # Install, upgrade over running helpers and uninstall, as the runner's
+      # user. The upgrades start from the same installer rebuilt as an older
+      # version (from Tauri's installer.nsi): once silently, installing over
+      # it, and once the way the interactive installer does it, running the
+      # installed version's uninstaller first. With signing, every installed
+      # file must be signed.
+      - name: Test the installer
+        shell: pwsh
+        env:
+          AS_SIGNER: ${{ vars.AS_SIGNER }}
+        run: |
+          $extra = @{}
+          if ($env:SIGN -eq 'true') { $extra.Signed = $true; if ($env:AS_SIGNER) { $extra.Signer = $env:AS_SIGNER } }
+          & scripts\test-installer.ps1 -ThrowawayMachine -Setup $env:SETUP -Version $env:VERSION -Binaries $env:STAGE -NsisDir target\release\nsis\x64 @extra
+          if ($LASTEXITCODE -ne 0) { throw "installer test failed" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ASSET }}
           path: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
+            ${{ env.SETUP }}
+            ${{ env.SETUP }}.sha256
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -107,5 +255,91 @@ jobs:
           files: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
+            ${{ env.SETUP }}
+            ${{ env.SETUP }}.sha256
           body_path: release-notes.md
           generate_release_notes: true
+
+  build-signed:
+    if: ${{ vars.AS_ACCOUNT != '' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: windows-latest
+    # Holds the Azure sign-in secrets and waits for the required reviewer;
+    # Azure trusts only this environment (docs/signing.md).
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      SIGN: "true"
+    steps: *build-steps
+
+  # Linux packages: a .deb and an AppImage per architecture, with the CLI
+  # (which carries the SGLang router, `fidim router serve`) bundled beside
+  # the app. x86-64 for the AMD box; arm64 for a DGX Spark. Unsigned.
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tauri build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev pkg-config libayatana-appindicator3-dev libfuse2t64
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Tests
+        env:
+          DISPLAY: ""
+          SSH_ASKPASS: ""
+        run: cargo test --workspace
+      - name: Build the CLI
+        run: |
+          cargo build --release -p fidim-cli
+          mkdir -p ui/src-tauri/binaries
+          cp target/release/fidim ui/src-tauri/binaries/fidim-${{ matrix.triple }}
+      - name: Bundle the desktop app (deb + AppImage, CLI beside it)
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm tauri build -b deb,appimage -c '{"bundle":{"active":true,"targets":["deb","appimage"],"externalBin":["binaries/fidim"],"linux":{"deb":{"depends":["libwebkit2gtk-4.1-0","libgtk-3-0"],"files":{"/usr/share/applications/rocks.fca.fidim.desktop":"linux/rocks.fca.fidim.desktop","/usr/share/icons/hicolor/scalable/apps/rocks.fca.fidim.svg":"icons/icon.svg","/usr/share/icons/hicolor/256x256/apps/rocks.fca.fidim.png":"icons/256x256.png"}}}}}'
+      - name: Package
+        run: |
+          v=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          out=dist; mkdir -p $out
+          cp target/release/bundle/deb/*.deb "$out/llama-fidim_${v}_${{ matrix.arch }}.deb"
+          cp target/release/bundle/appimage/*.AppImage "$out/llama-fidim_${v}_${{ matrix.arch }}.AppImage"
+          tar -C target/release -czf "$out/fidim-cli_${v}_linux-${{ matrix.arch }}.tar.gz" fidim
+          (cd $out && sha256sum * > SHA256SUMS-linux-${{ matrix.arch }}.txt)
+          ls -la $out
+      - name: Smoke test the built CLI
+        run: |
+          target/release/fidim --help | head -3
+          target/release/fidim devices || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

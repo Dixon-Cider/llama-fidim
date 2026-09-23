@@ -306,7 +306,7 @@ pub fn launch(cfg: &Config, rc: &RouterConfig, profiles: &[Profile], devices: &[
         launch::wait_port_free(&rc.host, rc.port, Duration::from_secs(20))?;
     }
 
-    let path_prepend = crate::runtime::path_prepend(cfg, rc.rocm_runtime.as_deref())?;
+    let path_prepend = crate::runtime::path_prepend_for_build(cfg, rc.rocm_runtime.as_deref(), build_dir)?;
     let plan = router_plan(rc, exe, &ini, &rendered.env, path_prepend);
     let profile = synthetic_profile(rc, build_dir)?;
     let state = supervise::spawn(&plan, &profile, &cfg.runs_dir, rendered.device_keys.clone(), vec![], false, 0)?;
@@ -417,6 +417,20 @@ mod tests {
         assert_eq!(r.device_keys, vec!["pci:x:bus03"]);
         assert_eq!(r.sections, vec!["dd"]);
         assert!(r.text.contains("load-on-startup = false"));
+    }
+
+    #[test]
+    fn device_index_follows_the_builds_enumeration() {
+        // The same card is ROCm2 to a build that also lists the iGPU and
+        // ROCm1 to a gfx1201-only local build. The preset must carry the
+        // index of whichever build renders it, never a cached one.
+        let rc = RouterConfig { members: vec![RouterMember { profile_id: "dd".into(), load_on_startup: true }], ..Default::default() };
+        let with_igpu = render_ini(&rc, &[profile()], &[dev(0, "pci:x:bus08"), dev(1, "pci:igpu:bus19"), dev(2, "pci:x:bus03")]).unwrap();
+        let local_only = render_ini(&rc, &[profile()], &[dev(0, "pci:x:bus08"), dev(1, "pci:x:bus03")]).unwrap();
+        assert!(with_igpu.text.contains("device = ROCm2"), "{}", with_igpu.text);
+        assert!(!with_igpu.text.contains("device = ROCm1"), "{}", with_igpu.text);
+        assert!(local_only.text.contains("device = ROCm1"), "{}", local_only.text);
+        assert!(!local_only.text.contains("device = ROCm2"), "{}", local_only.text);
     }
 
     #[test]

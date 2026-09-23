@@ -208,7 +208,7 @@ pub fn ensure_benchable(p: &Profile) -> Result<()> {
                 .into(),
         ));
     }
-    if !p.engine.is_llama_server() {
+    if !p.engine.is_llama_server() && !p.engine.is_sglang() {
         return Err(Error::Config(format!("profile `{}` has an unknown engine; nothing to benchmark", p.id)));
     }
     Ok(())

@@ -2203,10 +2203,11 @@ mod tests {
     #[test]
     fn runner_env_removals_cover_overrides_and_test_hooks() {
         let keys: Vec<&str> = runner_env_removals().collect();
-        for k in ["GGML_CUDA_DEVICES", "DG_FREE_VRAM_MB", "DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_EXIT_AFTER_DUMP"] {
+        for k in ["GGML_CUDA_DEVICES", "DG_FREE_VRAM_MB", "DG_PKV_TYPE", "DG_SWA_WINDOW", "DG_POISON", "DG_EXIT_AFTER_DUMP",
+                  "DG_PROFILE", "DG_SC_SPLITK", "DG_SC_SPLITK_CHECK"] {
             assert!(keys.contains(&k), "{k} must not reach the runner: {keys:?}");
         }
-        for k in ["DG_POOL_TRIM", "GPU_RESOURCE_CACHE_SIZE", "FA", "MAXTOK"] {
+        for k in ["DG_POOL_TRIM", "DG_PREFILL_REUSE", "DG_FRAME_SPECIAL", "GPU_RESOURCE_CACHE_SIZE", "FA", "MAXTOK"] {
             assert!(!keys.contains(&k), "{k} is a real runner setting: {keys:?}");
         }
     }

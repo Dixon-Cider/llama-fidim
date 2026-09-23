@@ -44,6 +44,9 @@ pub struct Config {
     pub profile_dir: PathBuf,
     /// Where run state + captured logs live.
     pub runs_dir: PathBuf,
+    /// SGLang on this host (Linux): venv, tools dir, env. None = no SGLang engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sglang: Option<crate::sglang::SgLangHost>,
     /// Where `fidim update` installs new builds (`<root>/<tag>-<flavor>`).
     /// Defaults to the first build root so the scan finds them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,14 +55,31 @@ pub struct Config {
     /// build root, which on this machine IS the checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llama_cpp_source: Option<PathBuf>,
+    /// A checkout of Llama FIDIM itself, for updating the app from source
+    /// (the Updates tab and `fidim self-update install --source`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidim_source: Option<PathBuf>,
     /// Script invoked as `<script> <checkout> <tag> <output dir>` to build a
     /// tag from source with the local HIP toolchain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_build_script: Option<PathBuf>,
-    /// Hugging Face token for gated repos when fetching creator defaults
-    /// (`HF_TOKEN` in the environment takes precedence).
+    /// Hugging Face token for gated repos (creator defaults, the model
+    /// wizard). `HF_TOKEN` and `HF_TOKEN_PATH` in the environment take
+    /// precedence; see `hub::token`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_token: Option<String>,
+    /// Also use the token `huggingface-cli login` saved
+    /// (`%USERPROFILE%\.cache\huggingface\token`, or `%HF_HOME%\token`) when
+    /// no other token is set. Off by default: that file belongs to another
+    /// tool, and reading it is the user's call.
+    #[serde(default)]
+    pub hf_use_cli_token: bool,
+    /// GitHub token for the build resolver's API calls (`GITHUB_TOKEN` in
+    /// the environment takes precedence). Optional: without one GitHub
+    /// allows 60 API requests an hour per IP address and 10 searches a
+    /// minute; with one, 5000 and 30. Read-only public access is enough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_token: Option<String>,
     /// Default keep-alive interval for launched servers (seconds; 0 = off).
     /// A 1-token request this often stops WDDM from evicting the model when
     /// the displays power off. OFF by default: the root cause is the PCIe
@@ -67,6 +87,10 @@ pub struct Config {
     /// on (5 s measured sufficient) only if that setting cannot be Off.
     #[serde(default = "default_keep_alive")]
     pub keep_alive_seconds: u32,
+    /// Keep chat conversations in `<config-dir>/chats` (on by default). Off,
+    /// a conversation lives only while the app is open.
+    #[serde(default = "default_true")]
+    pub save_chats: bool,
     /// Preserved unknown fields from newer schema versions.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -110,6 +134,10 @@ fn lm_studio_models_dir() -> Option<PathBuf> {
 
 fn default_keep_alive() -> u32 {
     0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -213,11 +241,16 @@ impl Config {
             allow_integrated: false,
             profile_dir: dir.join("profiles"),
             runs_dir: dir.join("runs"),
+            sglang: None,
             install_root: None,
             llama_cpp_source: None,
+            fidim_source: None,
             source_build_script: None,
             hf_token: None,
+            hf_use_cli_token: false,
+            github_token: None,
             keep_alive_seconds: default_keep_alive(),
+            save_chats: true,
             extra: serde_json::Map::new(),
         }
     }
@@ -271,5 +304,9 @@ mod tests {
         assert!(out.contains("some_future_field"));
         // Default applied for the missing patterns field.
         assert!(cfg.integrated_name_patterns.iter().any(|p| p == "Radeon(TM) Graphics"));
+        // Chats are saved unless the config says otherwise.
+        assert!(cfg.save_chats);
+        let off: Config = serde_json::from_str(&raw.replace("\"rocm_bin\": null,", "\"rocm_bin\": null, \"save_chats\": false,")).unwrap();
+        assert!(!off.save_chats);
     }
 }
