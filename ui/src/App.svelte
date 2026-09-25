@@ -59,12 +59,14 @@
   // stop them all once at boot.
   api("chat_cancel_all").catch(() => {});
 
-  // Live server count for the nav badge.
+  // Live server count for the nav badge (every 15 s, skipped while the
+  // window is hidden: each call probes every run over HTTP).
   async function count() {
+    if (document.hidden) return;
     try { alive = (await api("status", { deep: false })).filter((r) => r.alive).length; } catch { /* keep last */ }
   }
   count();
-  const counter = setInterval(count, 5000);
+  const counter = setInterval(count, 15000);
   onDestroy(() => clearInterval(counter));
 
   // Boot diagnostics: one line in ~/.fidim/ui.log saying what the GUI can

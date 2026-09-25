@@ -596,6 +596,15 @@ pub fn compose(cfg: &Config, p: &Profile, device: &Device, runs_dir: &Path) -> R
         env.push(("PYTORCH_TUNABLEOP_TUNING".into(), "0".into()));
         env.push(("PYTORCH_TUNABLEOP_FILENAME".into(), tunable.to_string_lossy().into_owned()));
     }
+    // Idle CPU: torch exports `rocprofiler_configure` (Kineto), so
+    // rocprofiler-register loads rocprofiler-sdk at hsa_init; its 4096-signal
+    // pool exhausts KFD's per-process event limit, one queue signal is left
+    // without an interrupt event, and ROCr's AsyncEventsLoop polls instead of
+    // sleeping -- one core at 100% per GPU process (launcher and scheduler)
+    // while the server is idle (ROCm 7.14 / 10.0). Skipping the registration
+    // costs only GPU kernel events in torch.profiler / `/start_profile`; the
+    // host or profile env can set it back to 1 for a profiling run.
+    env.push(("ROCPROFILER_REGISTER_ENABLED".into(), "0".into()));
     for (k, v) in &host.env {
         env.push((k.clone(), v.clone()));
     }
