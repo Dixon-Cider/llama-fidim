@@ -388,7 +388,7 @@ pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64,
                 // +1 padding slot; spec verify keeps a snapshot per draft token
                 // for every running request (bf16-ish, ~0.9 of the fp32 state).
                 let scratch = if spec.is_some() {
-                    per_slot * 9 / 10 * ((s.max_running_requests as u64).min(k) + 1) * draft_tokens
+                    per_slot * 9 / 10 * ((s.max_running_requests as u64).min(k / state_slots_per_request(s)) + 1) * draft_tokens
                 } else {
                     0
                 };
@@ -420,6 +420,22 @@ pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64,
         kv_bytes_per_token: per_token,
         tokens_in_budget: kv_budget / per_token,
         ctx,
+    }
+}
+
+/// State slots SGLang holds per running request on a hybrid model
+/// (`_calculate_mamba_ratio`): 3 plus a 2-slot ping-pong buffer under the
+/// overlap scheduler; 1 without the radix cache. It caps
+/// `--max-running-requests` at slots / ratio (qwenMoE with 24 slots came up
+/// at 4 requests, 2026-09-26).
+pub fn state_slots_per_request(s: &SgLangCfg) -> u64 {
+    let has = |f: &str| s.extra_args.iter().any(|a| a == f);
+    if has("--disable-radix-cache") {
+        1
+    } else if has("--disable-overlap-schedule") {
+        4
+    } else {
+        5
     }
 }
 
@@ -1000,6 +1016,22 @@ pub fn preflight(
                 ))
             },
         ));
+        if let (Some(k), false) = (b.state_slots, b.state_auto) {
+            let ratio = state_slots_per_request(&s);
+            let cap = k / ratio;
+            if cap < s.max_running_requests as u64 {
+                out.push(check(
+                    "state-slots",
+                    11,
+                    "State slots cover the concurrent requests",
+                    Outcome::Warn(format!(
+                        "{k} state slots at {ratio} per request: SGLang caps concurrent requests at {cap}, not {}; set state slots to {}",
+                        s.max_running_requests,
+                        ratio * s.max_running_requests as u64
+                    )),
+                ));
+            }
+        }
         if shape.nextn_layers == Some(0) && s.spec.as_ref().is_some_and(SgSpec::is_nextn) {
             out.push(check("spec-head", 5, "Speculative decoding has a draft", Outcome::Block(format!("{}: NEXTN drafts with the model's own predict layers and this checkpoint has none; use NGRAM or a draft model", shape.label))));
         }

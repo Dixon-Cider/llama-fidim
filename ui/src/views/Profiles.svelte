@@ -1412,9 +1412,9 @@
             {#if sgHybrid}
               <Range bind:value={draft.sglang.mamba_slots} label="state slots" min={1} max={256} step={1} nullable offLabel="auto"
                 placeholder={sgPool?.state_auto ? sgPool.state_slots : Math.max(1, Number(draft.sglang.max_running_requests) || 1) * 5}
-                hint={sgPool?.state_auto ? `auto: ~${sgPool.state_slots} slots, ${(sgPool.state_bytes / GIB).toFixed(1)} GiB taken from KV` : "each running or cached request holds one"}
+                hint={sgPool?.state_auto ? `auto: ~${sgPool.state_slots} slots, ${(sgPool.state_bytes / GIB).toFixed(1)} GiB taken from KV` : `5 per concurrent request: ${Math.max(1, Number(draft.sglang.max_running_requests) || 1) * 5} for ${draft.sglang.max_running_requests}`}
                 onchange={scheduleCheck} span={3}
-                title="Recurrent-state slots; auto gives them ~47% of the memory after weights (--max-mamba-cache-size)" />
+                title="Recurrent-state slots; fewer than 5 per request caps concurrency (--max-mamba-cache-size)" />
             {/if}
             <Range bind:value={draft.sglang.memguard_gb} label="host RAM guard" min={0} max={128} step={1}
               hint="GB of anonymous RAM per process · 0 = off" onchange={scheduleCheck} span={3}
