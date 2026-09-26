@@ -450,12 +450,24 @@ impl ModelStats {
                     .unwrap_or(0)
                     .max(0) as u64;
                 self.speculative = truthy(d.get("speculative_algorithm"));
-                pick("max_running_requests").unwrap_or(1).max(0) as usize
+                // The scheduler's own cap wins over the flag: on a hybrid model
+                // SGLang lowers it to state slots / 5 (qwenMoE: flag 8, runs 4).
+                let effective = d
+                    .get("internal_states")
+                    .and_then(|v| v.as_array())
+                    .filter(|a| !a.is_empty())
+                    .map(|a| a.iter().filter_map(|st| st.get("effective_max_running_requests_per_dp").and_then(py_int)).sum::<i64>())
+                    .filter(|n| *n > 0);
+                effective.or_else(|| pick("max_running_requests")).unwrap_or(1).max(0) as usize
             }
             None => self.n_slots.max(1),
         };
         while self.slots.len() < want {
             self.slots.push(Slot::new(self.slots.len()));
+        }
+        // Drop idle slots past the count (a busy one stays until it finishes).
+        while self.slots.len() > want.max(1) && self.slots.last().is_some_and(|s| !s.busy) {
+            self.slots.pop();
         }
         self.n_slots = want;
         self.info_at = Some(now());
@@ -1988,4 +2000,15 @@ vllm:other 1.0
 
         server.abort();
     }
+
+    #[test]
+    fn slot_count_follows_the_schedulers_cap() {
+        let mut st = ModelStats::new("qwenMoE", "http://127.0.0.1:1");
+        st.apply_info(Some(&json!({"max_running_requests": 8})));
+        assert_eq!(st.slots.len(), 8);
+        st.apply_info(Some(&json!({"max_running_requests": 8,
+            "internal_states": [{"effective_max_running_requests_per_dp": 4}]})));
+        assert_eq!(st.slots.len(), 4);
+    }
+
 }
