@@ -8,6 +8,11 @@
 //! placement is expressed with `device = ROCm0[,ROCm2]` (llama.cpp's own
 //! device names) rather than `HIP_VISIBLE_DEVICES`, and process-level knobs
 //! (`GPU_MAX_HW_QUEUES` and friends) are set once on the router.
+//!
+//! A router whose members are all SGLang profiles is FIDIM's own router
+//! instead (`sglang::router_plan`, `fidim router serve`): members keep their
+//! ports and run as separate servers, and it forwards by model name. The
+//! same `router.json` describes both; `kind` says which.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -167,6 +172,22 @@ pub fn render_section(p: &Profile, resolved: &[ResolvedDevice], load_on_startup:
     }
     lines.push(format!("load-on-startup = {}", if load_on_startup { "true" } else { "false" }));
     lines.join("\n")
+}
+
+/// Which router a config describes: `sglang` (FIDIM's router in front of
+/// SGLang members, `sglang::is_sglang_router`) or `llama` (llama-server's
+/// router mode). An empty router is SGLang only where SGLang is set up and
+/// no llama.cpp build is installed.
+pub fn kind(rc: &RouterConfig, profiles: &[Profile], sglang_configured: bool, llama_builds: bool) -> &'static str {
+    if rc.members.is_empty() {
+        return empty_kind(sglang_configured, llama_builds);
+    }
+    if crate::sglang::is_sglang_router(rc, profiles) { "sglang" } else { "llama" }
+}
+
+/// The kind a router with no members yet defaults to.
+pub fn empty_kind(sglang_configured: bool, llama_builds: bool) -> &'static str {
+    if sglang_configured && !llama_builds { "sglang" } else { "llama" }
 }
 
 /// Only llama-server profiles can be router members: every instance is a
@@ -450,6 +471,19 @@ mod tests {
         }
         assert!(check_member(&dg).is_err());
         assert!(check_member(&profile()).is_ok());
+    }
+
+    #[test]
+    fn kind_follows_the_members_then_the_install() {
+        let mut sg = profile();
+        sg.engine = crate::profile::Engine::SgLang;
+        let one = RouterConfig { members: vec![RouterMember { profile_id: "dd".into(), load_on_startup: false }], ..Default::default() };
+        assert_eq!(kind(&one, &[sg.clone()], false, true), "sglang");
+        assert_eq!(kind(&one, &[profile()], true, false), "llama");
+        let empty = RouterConfig::default();
+        assert_eq!(kind(&empty, &[sg], true, false), "sglang");
+        assert_eq!(kind(&empty, &[], true, true), "llama");
+        assert_eq!(kind(&empty, &[], false, false), "llama");
     }
 
     #[test]

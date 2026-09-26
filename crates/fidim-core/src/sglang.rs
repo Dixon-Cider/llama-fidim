@@ -116,6 +116,23 @@ pub struct SgSpec {
     /// draft lm_head to a hot vocabulary (hot_tokens.py).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_map: Option<PathBuf>,
+    /// `--speculative-draft-model-path`: the separate draft checkpoint EAGLE,
+    /// EAGLE3 and STANDALONE need (NEXTN and NGRAM take none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_model: Option<PathBuf>,
+}
+
+impl SgSpec {
+    /// Algorithms that load a second checkpoint from `draft_model`.
+    pub fn needs_draft_model(&self) -> bool {
+        matches!(self.algorithm.to_ascii_uppercase().as_str(), "EAGLE" | "EAGLE3" | "STANDALONE")
+    }
+    pub fn is_ngram(&self) -> bool {
+        self.algorithm.eq_ignore_ascii_case("NGRAM")
+    }
+    pub fn is_nextn(&self) -> bool {
+        self.algorithm.eq_ignore_ascii_case("NEXTN")
+    }
 }
 
 fn d_nextn() -> String {
@@ -214,6 +231,11 @@ impl Default for SgLangCfg {
     }
 }
 
+/// `--attention-backend` values with NVIDIA-only kernels.
+pub const NVIDIA_ONLY_ATTENTION: &[&str] = &["flashinfer", "fa3", "fa4", "trtllm_mha", "trtllm_mla", "flashmla", "cutedsl_mla", "hpc_ops"];
+/// AMD backends whose kernels target Instinct (gfx9) only.
+pub const AMD_GFX9_ATTENTION: &[&str] = &["aiter", "wave"];
+
 /// Minimum free VRAM a display-driving card must keep: below it the desktop's
 /// allocations evict the compute process (KFD evicted_ms climbs, decode drops
 /// to 3 tok/s — measured 2026-09-20/21 on the R9700 with two displays).
@@ -232,6 +254,13 @@ pub struct ModelShape {
     /// fp32 recurrent state per request slot for hybrid GDN/SSM models
     /// (linear layers x ssm.inner_size x ssm.state_size x 4 B); None = unknown.
     pub state_bytes_per_slot: Option<u64>,
+    /// Only some layers carry KV (GatedDeltaNet/SSM hybrid): SGLang gives the
+    /// recurrent state its own pool (`--max-mamba-cache-size`).
+    #[serde(default)]
+    pub hybrid: bool,
+    /// Built-in next-token predict layers (what NEXTN drafts with); None = unknown.
+    #[serde(default)]
+    pub nextn_layers: Option<u64>,
 }
 
 /// Fallback per-slot state when the model does not describe it: the 27B GDN value.
@@ -253,7 +282,8 @@ impl ModelShape {
             (Some(i), Some(inner), Some(state)) if i > 1 => Some((layers - attention_layers) * inner * state * 4),
             _ => None,
         };
-        Some(Self { weights_bytes, attention_layers, kv_heads, head_dim, label: h.architecture.clone().unwrap_or_default(), state_bytes_per_slot })
+        let hybrid = matches!(h.full_attention_interval, Some(i) if i > 1);
+        Some(Self { weights_bytes, attention_layers, kv_heads, head_dim, label: h.architecture.clone().unwrap_or_default(), state_bytes_per_slot, hybrid, nextn_layers: h.nextn_predict_layers })
     }
     pub fn from_hf(i: &crate::discovery::HfModelInfo) -> Option<Self> {
         Some(Self {
@@ -263,6 +293,8 @@ impl ModelShape {
             head_dim: i.head_dim?,
             label: i.architecture.clone().or_else(|| i.model_type.clone()).unwrap_or_default(),
             state_bytes_per_slot: None,
+            hybrid: matches!((i.attention_layers, i.num_layers), (Some(a), Some(n)) if a < n),
+            nextn_layers: None,
         })
     }
     /// Read the model a profile points at (a .gguf file or a checkpoint dir).
@@ -295,14 +327,22 @@ impl ModelShape {
 }
 
 /// Activations, CUDA graphs and allocator cache SGLang grows on top of the
-/// static pool under long-context load (measured ~3 GB on a 27B).
-pub const RUNTIME_OVERHEAD_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+/// static pool under long-context load: the 27B at 0.85 held 31.1 GiB of
+/// its card with a 104K-token prompt in flight (2026-09-26), 4 GiB over.
+pub const RUNTIME_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// How the static pool divides up for a profile on a device.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PoolBudget {
     pub pool_bytes: u64,
     pub weights_bytes: u64,
+    /// Draft head or draft model weights (speculative decoding).
+    pub draft_bytes: u64,
+    /// Recurrent-state pool of a hybrid model, spec scratch included.
+    pub state_bytes: u64,
+    /// State slots: the configured count, or SGLang's own sizing when auto.
+    pub state_slots: Option<u64>,
+    pub state_auto: bool,
     pub kv_budget_bytes: u64,
     pub kv_bytes_per_token: u64,
     /// Tokens the pool can hold in KV (SGLang's max_total_num_tokens, roughly).
@@ -310,17 +350,88 @@ pub struct PoolBudget {
     pub ctx: u64,
 }
 
-pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64) -> PoolBudget {
+/// What loaded weights take on the card over their file size (dequant
+/// scratch, torch context): 18.86 GB for a 17.2 GiB GGUF, 21.83 for 19.8.
+const WEIGHTS_VRAM_NUM: u64 = 11;
+const WEIGHTS_VRAM_DEN: u64 = 10;
+/// An MTP draft head as SGLang loads it for NEXTN (1.07 GB measured on the 27B).
+const NEXTN_DRAFT_BYTES: u64 = 1 << 30;
+/// SGLang's `mamba_full_memory_ratio`: with no `--max-mamba-cache-size` it
+/// gives the state pool 0.9 / 1.9 of what is left after the weights.
+const MAMBA_AUTO_SHARE: f64 = 0.9 / 1.9;
+
+/// SGLang's own arithmetic (kv_cache_configurator.py): it loads the weights,
+/// keeps `1 - mem_fraction` of the card back, gives a hybrid model's state
+/// pool its share, and fills the rest with KV. `others_bytes` is VRAM other
+/// processes hold on the card now. Checked against both servers on this box:
+/// 27B GGUF (fp4 KV, NEXTN, 10 slots) 204K predicted vs 208,379 allocated;
+/// 35B-A3B (fp8 KV, 40 slots) 438K vs 428,128.
+pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64, others_bytes: u64) -> PoolBudget {
     let pool = estimated_bytes(s, device);
-    let per_token = shape.kv_bytes_per_token(&s.kv_cache_dtype).max(1);
-    // Calibrated on the 27B GGUF at 0.85: SGLang reported 117,990 tokens for a
-    // 27.1 GiB pool with 17.2 GiB of weights, i.e. it keeps ~5 GiB for CUDA
-    // graphs, activations, the vision tower and its own reserve, plus ~150 MiB
-    // per GatedDeltaNet state slot. This is an approximation, marked "~".
-    let per_slot = shape.state_bytes_per_slot.unwrap_or(DEFAULT_STATE_BYTES_PER_SLOT);
-    let reserve = (4_500u64 << 20) + s.mamba_slots.unwrap_or(0) as u64 * per_slot;
-    let kv_budget = pool.saturating_sub(shape.weights_bytes).saturating_sub(reserve);
-    PoolBudget { pool_bytes: pool, weights_bytes: shape.weights_bytes, kv_budget_bytes: kv_budget, kv_bytes_per_token: per_token, tokens_in_budget: kv_budget / per_token, ctx }
+    let weights = shape.weights_bytes / WEIGHTS_VRAM_DEN * WEIGHTS_VRAM_NUM;
+    let spec = s.spec.as_ref();
+    let draft = match spec {
+        Some(sp) if sp.is_nextn() => NEXTN_DRAFT_BYTES,
+        Some(sp) if sp.needs_draft_model() => sp.draft_model.as_deref().map(path_bytes).unwrap_or(0) / WEIGHTS_VRAM_DEN * WEIGHTS_VRAM_NUM,
+        _ => 0,
+    };
+    // SGLang starts from what is free (the card minus other processes) and
+    // keeps (1 - mem_fraction) of the whole card back.
+    let base = (256u64 << 20).max(others_bytes);
+    let rest = pool.saturating_sub(base).saturating_sub(weights).saturating_sub(draft);
+    let draft_tokens = spec.map(|sp| sp.draft_tokens.max(1) as u64).unwrap_or(0);
+    let (state_bytes, state_slots, state_auto) = if shape.hybrid {
+        let per_slot = shape.state_bytes_per_slot.unwrap_or(DEFAULT_STATE_BYTES_PER_SLOT);
+        match s.mamba_slots {
+            Some(k) => {
+                let k = k as u64;
+                // +1 padding slot; spec verify keeps a snapshot per draft token
+                // for every running request (bf16-ish, ~0.9 of the fp32 state).
+                let scratch = if spec.is_some() {
+                    per_slot * 9 / 10 * ((s.max_running_requests as u64).min(k) + 1) * draft_tokens
+                } else {
+                    0
+                };
+                ((k + 1) * per_slot + scratch, Some(k), false)
+            }
+            None => {
+                let budget = (rest as f64 * MAMBA_AUTO_SHARE) as u64;
+                let per = per_slot * (1 + draft_tokens);
+                (budget, Some(budget / per.max(1)), true)
+            }
+        }
+    } else {
+        (0, None, false)
+    };
+    let kv_budget = rest.saturating_sub(state_bytes);
+    let mut per_token = shape.kv_bytes_per_token(&s.kv_cache_dtype).max(1);
+    // NEXTN's draft layer keeps its own KV for every token of the pool.
+    if spec.is_some_and(SgSpec::is_nextn) && shape.attention_layers > 0 {
+        per_token = per_token * (shape.attention_layers + shape.nextn_layers.unwrap_or(1)) / shape.attention_layers;
+    }
+    PoolBudget {
+        pool_bytes: pool,
+        weights_bytes: weights,
+        draft_bytes: draft,
+        state_bytes,
+        state_slots,
+        state_auto,
+        kv_budget_bytes: kv_budget,
+        kv_bytes_per_token: per_token,
+        tokens_in_budget: kv_budget / per_token,
+        ctx,
+    }
+}
+
+/// Bytes of a file, or of every file under a checkpoint folder.
+fn path_bytes(p: &Path) -> u64 {
+    if p.is_dir() {
+        std::fs::read_dir(p)
+            .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+            .unwrap_or(0)
+    } else {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
 }
 
 // ------------------------------------------------ installs (venvs) ----
@@ -541,18 +652,17 @@ pub fn compose(cfg: &Config, p: &Profile, device: &Device, runs_dir: &Path) -> R
         args.extend(["--max-mamba-cache-size".into(), m.to_string()]);
     }
     if let Some(sp) = &s.spec {
-        args.extend([
-            "--speculative-algorithm".into(),
-            sp.algorithm.clone(),
-            "--speculative-num-steps".into(),
-            sp.steps.to_string(),
-            "--speculative-eagle-topk".into(),
-            sp.topk.to_string(),
-            "--speculative-num-draft-tokens".into(),
-            sp.draft_tokens.to_string(),
-        ]);
+        args.extend(["--speculative-algorithm".into(), sp.algorithm.clone(), "--speculative-num-steps".into(), sp.steps.to_string()]);
+        // NGRAM sets its own top-k (the n-gram search breadth) and ignores ours.
+        if !sp.is_ngram() {
+            args.extend(["--speculative-eagle-topk".into(), sp.topk.to_string()]);
+        }
+        args.extend(["--speculative-num-draft-tokens".into(), sp.draft_tokens.to_string()]);
         if let Some(m) = &sp.token_map {
             args.extend(["--speculative-token-map".into(), m.to_string_lossy().into_owned()]);
+        }
+        if let Some(m) = sp.draft_model.as_ref().filter(|_| sp.needs_draft_model()) {
+            args.extend(["--speculative-draft-model-path".into(), m.to_string_lossy().into_owned()]);
         }
     }
     if let Some(r) = &s.reasoning_parser {
@@ -679,6 +789,33 @@ pub fn estimated_bytes(s: &SgLangCfg, device: &Device) -> u64 {
     (device.total_mib as f64 * 1024.0 * 1024.0 * s.mem_fraction) as u64
 }
 
+/// VRAM free on `d` for launching `p`: free now plus what a running
+/// instance of the same profile holds (the launch replaces it).
+pub fn free_for_launch(cfg: &Config, p: &Profile, d: &Device, platform: &dyn Platform) -> u64 {
+    let mut free = d.free_mib * 1024 * 1024;
+    for r in supervise::reattach(&cfg.runs_dir) {
+        if r.alive && r.state.profile_id == p.id {
+            let mut pids = vec![r.state.pid];
+            pids.extend(crate::platform::process_descendants(r.state.pid));
+            for pid in pids {
+                for m in platform.gpu_process_memory(pid).unwrap_or_default() {
+                    if Some(m.luid_low) == d.luid_low {
+                        free += m.dedicated_bytes;
+                    }
+                }
+            }
+        }
+    }
+    free.min(d.total_mib * 1024 * 1024)
+}
+
+/// The pool split for `p` on `d` (None when the model cannot be read).
+pub fn budget_for(cfg: &Config, p: &Profile, d: &Device, platform: &dyn Platform) -> Option<PoolBudget> {
+    let shape = ModelShape::of_model(&p.model.path)?;
+    let others = (d.total_mib * 1024 * 1024).saturating_sub(free_for_launch(cfg, p, d, platform));
+    Some(pool_budget(&cfg_of(p), &shape, d, p.runtime.ctx_total, others))
+}
+
 pub fn preflight(
     cfg: &Config,
     p: &Profile,
@@ -722,18 +859,31 @@ pub fn preflight(
             }
         }
     }
+    let mut spec_problem = None;
     if let Some(sp) = &s.spec {
         if let Some(m) = &sp.token_map {
             if !m.is_file() {
                 missing.push(m.to_string_lossy().into_owned());
             }
         }
+        if sp.needs_draft_model() {
+            match &sp.draft_model {
+                None => spec_problem = Some(format!("{} needs a draft model; set one, or use NEXTN or NGRAM", sp.algorithm)),
+                Some(m) if !m.exists() => missing.push(m.to_string_lossy().into_owned()),
+                _ => {}
+            }
+        }
     }
     out.push(check(
         "files-exist",
         2,
-        "Model, sidecar and token-map files exist",
-        if missing.is_empty() { Outcome::Pass } else { Outcome::Block(format!("missing: {}", missing.join(", "))) },
+        "Model, sidecar and draft files exist",
+        match (missing.is_empty(), spec_problem) {
+            (_, Some(m)) if missing.is_empty() => Outcome::Block(m),
+            (true, _) => Outcome::Pass,
+            (false, Some(m)) => Outcome::Block(format!("missing: {}; {m}", missing.join(", "))),
+            (false, None) => Outcome::Block(format!("missing: {}", missing.join(", "))),
+        },
     ));
 
     // 3: device resolves
@@ -750,23 +900,33 @@ pub fn preflight(
         ),
     });
 
+    // 4: the attention kernel exists for this card's vendor
+    if let Some(d) = device {
+        let b = s.attention_backend.as_str();
+        let amd = d.stable_key.contains("VEN_1002");
+        let nvidia = d.stable_key.contains("VEN_10DE");
+        out.push(check(
+            "attention-backend",
+            4,
+            "Attention kernel runs on this card",
+            if amd && NVIDIA_ONLY_ATTENTION.contains(&b) {
+                Outcome::Block(format!("{b} is an NVIDIA kernel; on {} use triton", d.name))
+            } else if amd && AMD_GFX9_ATTENTION.contains(&b) && !d.name.contains("Instinct") {
+                Outcome::Warn(format!("{b} is built for Instinct (gfx9) cards; on {} use triton", d.name))
+            } else if nvidia && AMD_GFX9_ATTENTION.contains(&b) {
+                Outcome::Block(format!("{b} is an AMD kernel; on {} use triton or flashinfer", d.name))
+            } else {
+                Outcome::Pass
+            },
+        ));
+    }
+
     // 6: VRAM fits (free now + what our own previous instance holds)
+    let mut others_bytes = 0u64;
     if let Some(d) = device {
         let need = estimated_bytes(&s, d);
-        let mut free = d.free_mib * 1024 * 1024;
-        for r in supervise::reattach(&cfg.runs_dir) {
-            if r.alive && r.state.profile_id == p.id {
-                let mut pids = vec![r.state.pid];
-                pids.extend(crate::platform::process_descendants(r.state.pid));
-                for pid in pids {
-                    for m in platform.gpu_process_memory(pid).unwrap_or_default() {
-                        if Some(m.luid_low) == d.luid_low {
-                            free += m.dedicated_bytes;
-                        }
-                    }
-                }
-            }
-        }
+        let free = free_for_launch(cfg, p, d, platform);
+        others_bytes = (d.total_mib * 1024 * 1024).saturating_sub(free);
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         out.push(check(
             "vram-fits",
@@ -781,52 +941,68 @@ pub fn preflight(
                 Outcome::Pass
             },
         ));
-        // display headroom
+        // display headroom: the static pool is taken at launch; activations,
+        // CUDA graphs and the allocator cache grow on top of it under load.
         let total = d.total_mib * 1024 * 1024;
         let headroom = total.saturating_sub(need);
+        let loaded = headroom.saturating_sub(RUNTIME_OVERHEAD_BYTES);
+        let safe_fraction = 1.0 - (DISPLAY_HEADROOM_BYTES + RUNTIME_OVERHEAD_BYTES) as f64 / total as f64;
         out.push(check(
             "display-headroom",
             10,
             "A display-driving card keeps VRAM headroom",
-            match (&d.display, headroom) {
-                (Some(_), h) if h < DISPLAY_HEADROOM_BYTES => Outcome::Block(format!(
-                    "{} drives a display and mem_fraction {:.2} leaves only {:.2} GiB; the desktop's allocations \
-                     then evict the compute process (3 tok/s, KFD evicted_ms climbing). Keep >= {:.1} GiB: \
-                     mem_fraction <= {:.2}",
-                    d.name, s.mem_fraction, gib(h), gib(DISPLAY_HEADROOM_BYTES),
-                    1.0 - DISPLAY_HEADROOM_BYTES as f64 / total as f64
+            match &d.display {
+                Some(_) if headroom < DISPLAY_HEADROOM_BYTES => Outcome::Block(format!(
+                    "{} drives a display and VRAM share {:.2} leaves only {:.2} GiB; the desktop's allocations \
+                     then evict the server (3 tok/s, KFD evicted_ms climbing). Keep >= {:.1} GiB: share <= {:.2}",
+                    d.name, s.mem_fraction, gib(headroom), gib(DISPLAY_HEADROOM_BYTES), safe_fraction
                 )),
-                (Some(_), h) => Outcome::Note(format!("{} drives a display; {:.2} GiB headroom", d.name, gib(h))),
-                (None, _) => Outcome::Pass,
+                Some(_) if loaded < DISPLAY_HEADROOM_BYTES => Outcome::Warn(format!(
+                    "{} drives a display: {:.2} GiB free at launch, ~{:.1} GiB once long prompts grow the server \
+                     (~{:.0} GiB of activations and graphs); eviction likely under load. Share <= {:.2} keeps {:.1} GiB",
+                    d.name, gib(headroom), gib(loaded), gib(RUNTIME_OVERHEAD_BYTES), safe_fraction, gib(DISPLAY_HEADROOM_BYTES)
+                )),
+                Some(_) => Outcome::Note(format!("{} drives a display; {:.2} GiB free at launch, ~{:.1} GiB under load", d.name, gib(headroom), gib(loaded))),
+                None => Outcome::Pass,
             },
         ));
     }
 
     // 7: does the model + KV for the context fit inside the pool?
     if let (Some(d), Some(shape)) = (device, ModelShape::of_model(&p.model.path)) {
-        let b = pool_budget(&s, &shape, d, p.runtime.ctx_total);
+        let b = pool_budget(&s, &shape, d, p.runtime.ctx_total, others_bytes);
         let gib = |x: u64| x as f64 / (1u64 << 30) as f64;
+        let state = match (b.state_slots, b.state_auto) {
+            (Some(n), true) => format!(", state pool {:.1} GiB (auto, ~{n} slots)", gib(b.state_bytes)),
+            (Some(n), false) => format!(", state pool {:.1} GiB ({n} slots)", gib(b.state_bytes)),
+            _ => String::new(),
+        };
+        let draft = if b.draft_bytes > 0 { format!(", draft {:.1} GiB", gib(b.draft_bytes)) } else { String::new() };
+        let split = format!("weights {:.1} GiB{draft}{state}", gib(b.weights_bytes));
         out.push(check(
             "kv-budget",
             7,
             "Weights and KV cache fit in the static pool",
             if b.kv_budget_bytes == 0 || b.tokens_in_budget < 1024 {
                 Outcome::Block(format!(
-                    "{}: weights {:.1} GiB do not fit the {:.1} GiB pool ({:.0}% of the card) with room for KV; raise mem_fraction, use a smaller quant or a bigger card",
-                    shape.label, gib(b.weights_bytes), gib(b.pool_bytes), s.mem_fraction * 100.0
+                    "{}: {split} leave no room for KV in the {:.1} GiB pool ({:.0}% of the card); raise VRAM share, cut state slots, use a smaller quant or a bigger card",
+                    shape.label, gib(b.pool_bytes), s.mem_fraction * 100.0
                 ))
             } else if b.tokens_in_budget < b.ctx {
                 Outcome::Warn(format!(
-                    "{}: after {:.1} GiB of weights the pool holds ~{} KV tokens ({} B/token, {}), less than the {} context; SGLang will cap max_total_tokens and retract long requests",
-                    shape.label, gib(b.weights_bytes), b.tokens_in_budget, b.kv_bytes_per_token, s.kv_cache_dtype, b.ctx
+                    "{}: {split}; ~{} KV tokens fit ({} B/token, {}), fewer than the {} context: one request cannot reach it",
+                    shape.label, b.tokens_in_budget, b.kv_bytes_per_token, s.kv_cache_dtype, b.ctx
                 ))
             } else {
                 Outcome::Note(format!(
-                    "{}: weights {:.1} GiB + KV {:.1} GiB for {} tokens ({} B/token, {}) in a {:.1} GiB pool; ~{} tokens fit",
-                    shape.label, gib(b.weights_bytes), gib(b.kv_bytes_per_token * b.ctx), b.ctx, b.kv_bytes_per_token, s.kv_cache_dtype, gib(b.pool_bytes), b.tokens_in_budget
+                    "{}: {split}; ~{} KV tokens fit ({} B/token, {}) in the {:.1} GiB pool",
+                    shape.label, b.tokens_in_budget, b.kv_bytes_per_token, s.kv_cache_dtype, gib(b.pool_bytes)
                 ))
             },
         ));
+        if shape.nextn_layers == Some(0) && s.spec.as_ref().is_some_and(SgSpec::is_nextn) {
+            out.push(check("spec-head", 5, "Speculative decoding has a draft", Outcome::Block(format!("{}: NEXTN drafts with the model's own predict layers and this checkpoint has none; use NGRAM or a draft model", shape.label))));
+        }
     }
 
     // 8: port
@@ -1074,12 +1250,26 @@ mod tests {
 
     #[test]
     fn pool_budget_matches_the_measured_pool() {
-        // dd on the R9700 at 0.85 with 10 mamba slots: SGLang gave 117,990 tokens.
-        let s: SgLangCfg = serde_json::from_value(serde_json::json!({ "mem_fraction": 0.85, "mamba_slots": 10 })).unwrap();
-        let shape = ModelShape { weights_bytes: (17.2 * (1u64 << 30) as f64) as u64, attention_layers: 16, kv_heads: 4, head_dim: 256, label: "qwen35".into(), state_bytes_per_slot: None };
-        let b = pool_budget(&s, &shape, &dev(32624), 262144);
-        assert!((100_000..170_000).contains(&b.tokens_in_budget), "{}", b.tokens_in_budget);
+        // dd: 27B GGUF (17.2 GiB), fp4 KV, NEXTN 3/1/4, 10 state slots, 2
+        // requests, 0.85 of an R9700: SGLang allocated 208,379 tokens.
+        let s: SgLangCfg = serde_json::from_value(serde_json::json!({
+            "mem_fraction": 0.85, "mamba_slots": 10, "max_running_requests": 2,
+            "kv_cache_dtype": "fp4_mx_block16", "spec": { "algorithm": "NEXTN" } })).unwrap();
+        let shape = ModelShape { weights_bytes: (17.2 * (1u64 << 30) as f64) as u64, attention_layers: 16, kv_heads: 4, head_dim: 256, label: "qwen35".into(), state_bytes_per_slot: Some(151 << 20), hybrid: true, nextn_layers: Some(1) };
+        let b = pool_budget(&s, &shape, &dev(32624), 262144, 0);
+        assert!((190_000..225_000).contains(&b.tokens_in_budget), "{}", b.tokens_in_budget);
         assert!(b.tokens_in_budget < b.ctx);
+        // qwenMoE: 35B-A3B (19.8 GiB), fp8 KV, 40 slots, 8 requests, 0.90: 428,128.
+        let s: SgLangCfg = serde_json::from_value(serde_json::json!({
+            "mem_fraction": 0.90, "mamba_slots": 40, "max_running_requests": 8, "kv_cache_dtype": "fp8_e4m3" })).unwrap();
+        let shape = ModelShape { weights_bytes: (19.8 * (1u64 << 30) as f64) as u64, attention_layers: 10, kv_heads: 2, head_dim: 256, label: "qwen35moe".into(), state_bytes_per_slot: Some(30 * 4096 * 128 * 4), hybrid: true, nextn_layers: Some(0) };
+        let b = pool_budget(&s, &shape, &dev(32624), 262144, 0);
+        assert!((405_000..450_000).contains(&b.tokens_in_budget), "{}", b.tokens_in_budget);
+        assert!(b.tokens_in_budget > b.ctx);
+        // auto state slots: SGLang gives the state pool 0.9/1.9 of the rest.
+        let s: SgLangCfg = serde_json::from_value(serde_json::json!({ "mem_fraction": 0.90, "kv_cache_dtype": "fp8_e4m3" })).unwrap();
+        let b2 = pool_budget(&s, &shape, &dev(32624), 262144, 0);
+        assert!(b2.state_auto && b2.state_bytes > b.state_bytes && b2.tokens_in_budget < b.tokens_in_budget);
     }
 
     #[test]

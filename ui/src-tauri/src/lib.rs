@@ -357,7 +357,13 @@ fn live_check_blocking(
         let results = fidim_core::sglang::preflight(&cfg, &p, device, &HostPlatform, &fidim_core::sglang::running_aliases(&cfg));
         let plan = device.and_then(|d| fidim_core::sglang::compose(&cfg, &p, d, &cfg.runs_dir).ok());
         let s = fidim_core::sglang::cfg_of(&p);
-        let estimate = device.map(|d| serde_json::json!({ "total_bytes": fidim_core::sglang::estimated_bytes(&s, d), "per_device": [], "assumptions": ["SGLang static pool = mem_fraction x card VRAM; +~3 GB activations under long-context load"] }));
+        let estimate = device.map(|d| serde_json::json!({
+            "total_bytes": fidim_core::sglang::estimated_bytes(&s, d),
+            "per_device": [],
+            "free_for_launch_bytes": fidim_core::sglang::free_for_launch(&cfg, &p, d, &HostPlatform),
+            "runtime_overhead_bytes": fidim_core::sglang::RUNTIME_OVERHEAD_BYTES,
+            "budget": fidim_core::sglang::budget_for(&cfg, &p, d, &HostPlatform),
+        }));
         return Ok(serde_json::json!({
             "findings": findings,
             "results": results,
@@ -444,9 +450,24 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         return Err("profile has validation errors — fix them in the editor first".into());
     }
     if profile.engine.is_sglang() {
+        // Same shape as a llama-server launch: blocked findings come back as
+        // rows for the editor (and its Override button), not as an error.
+        if !override_blocks {
+            let devices = fidim_core::sglang::devices_now(&cfg, &platform).map_err(|e| e.to_string())?;
+            let device = fidim_core::sglang::resolve_device(&profile, &devices);
+            let results = fidim_core::sglang::preflight(&cfg, &profile, device, &platform, &fidim_core::sglang::running_aliases(&cfg));
+            if preflight::any_block(&results) {
+                return Ok(serde_json::json!({ "blocked": true, "results": results }));
+            }
+        }
         let r = fidim_core::sglang::launch(&cfg, &profile, &platform, override_blocks, Duration::from_secs(900))
             .map_err(|e| e.to_string())?;
-        return Ok(serde_json::json!({ "blocked": false, "results": r.results, "state": r.state, "replaced": r.replaced }));
+        let mem = fidim_core::platform::sum_gpu_memory(&platform, &fidim_core::platform::run_pids(r.state.pid)).unwrap_or_default();
+        let resident: u64 = mem.iter().map(|m| m.dedicated_bytes).sum();
+        return Ok(serde_json::json!({
+            "blocked": false, "engine": "sglang", "results": r.results, "state": r.state, "replaced": r.replaced,
+            "resident_bytes": resident, "cold_start": r.state.cold_start,
+        }));
     }
     let prepared = launch::prepare(&cfg, &profile, &platform, running_aliases(&cfg))
         .map_err(|e| e.to_string())?;
@@ -586,15 +607,19 @@ fn slots(port: u16, host: String) -> Result<serde_json::Value, String> {
     }
 }
 
+/// Stopping waits up to 5 s for the process to exit: off the main thread.
 #[tauri::command]
-fn stop_run(target: String) -> Result<(), String> {
-    let cfg = cfg()?;
-    let runs = supervise::reattach(&cfg.runs_dir);
-    let run = runs
-        .into_iter()
-        .find(|r| r.state.profile_id == target || r.state.port.to_string() == target)
-        .ok_or(format!("no run matches {target}"))?;
-    supervise::stop(&run.state, &cfg.runs_dir).map_err(|e| e.to_string())
+async fn stop_run(target: String) -> Result<(), String> {
+    blocking(move || {
+        let cfg = cfg()?;
+        let runs = supervise::reattach(&cfg.runs_dir);
+        let run = runs
+            .into_iter()
+            .find(|r| r.state.profile_id == target || r.state.port.to_string() == target)
+            .ok_or(format!("no run matches {target}"))?;
+        supervise::stop(&run.state, &cfg.runs_dir).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -662,7 +687,7 @@ fn do_bench(id: &str, concurrency: Option<u32>, tokens: u32) -> Result<serde_jso
     let opts = bench::BenchOptions {
         warmups: 2,
         max_tokens: tokens,
-        concurrency: concurrency.unwrap_or(profile.runtime.slots).max(1),
+        concurrency: concurrency.unwrap_or(profile.concurrent_requests()).max(1),
         ..Default::default()
     };
     let sweep = bench::run_sweep(&run.state.host, run.state.port, &run.state.alias, &opts)
@@ -767,14 +792,15 @@ fn export_blocking(id: &str, format: &str) -> Result<serde_json::Value, String> 
     let platform = HostPlatform;
     let profile =
         Profile::load(&cfg.profile_dir.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
-    let prepared = launch::prepare(&cfg, &profile, &platform, running_aliases(&cfg))
-        .map_err(|e| e.to_string())?;
-    let (text, ext) = match format {
-        "ps1" => (export::to_ps1(&profile, &prepared.plan), "ps1"),
-        _ => (export::to_bat(&profile, &prepared.plan), "bat"),
-    };
+    let format = (!format.is_empty()).then_some(format);
+    let (text, ext) = export::render(&cfg, &profile, &platform, running_aliases(&cfg), format).map_err(|e| e.to_string())?;
     let out = cfg.profile_dir.join(format!("{id}.{ext}"));
     std::fs::write(&out, &text).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    if ext == "sh" {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+    }
     Ok(serde_json::json!({ "path": out, "text": text }))
 }
 
@@ -1069,10 +1095,25 @@ fn update_history() -> Result<serde_json::Value, String> {
 
 // ----------------------------------------------------------------- router ----
 
+/// The saved router config plus `kind` (`sglang` or `llama`, from its
+/// members) and `default_kind` (what an empty router becomes: SGLang where
+/// it is set up and no llama.cpp build is installed).
 #[tauri::command]
-fn router_get() -> Result<serde_json::Value, String> {
-    let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
-    serde_json::to_value(rc).map_err(|e| e.to_string())
+async fn router_get() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let cfg = cfg()?;
+        let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
+        let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
+        let llama_builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref())
+            .iter()
+            .any(|b| b.version.is_some());
+        let sglang = cfg.sglang.is_some();
+        let mut v = serde_json::to_value(&rc).map_err(|e| e.to_string())?;
+        v["kind"] = fidim_core::router::kind(&rc, &profiles, sglang, llama_builds).into();
+        v["default_kind"] = fidim_core::router::empty_kind(sglang, llama_builds).into();
+        Ok(v)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1080,13 +1121,21 @@ fn router_save(rc: fidim_core::router::RouterConfig) -> Result<(), String> {
     fidim_core::router::save_config(&rc).map_err(|e| e.to_string())
 }
 
-/// Render the preset file for a (possibly unsaved) router config.
+/// Render the preset file for a (possibly unsaved) router config; for an
+/// SGLang router, the router's command line (it has no preset file).
 #[tauri::command]
 async fn router_ini(state: tauri::State<'_, AppState>, rc: fidim_core::router::RouterConfig) -> Result<serde_json::Value, String> {
     let cache = state.cache.clone();
     blocking(move || {
         let cfg = cfg()?;
         let profiles = Profile::load_all(&cfg.profile_dir).map_err(|e| e.to_string())?;
+        if fidim_core::sglang::is_sglang_router(&rc, &profiles) {
+            let members: Vec<&Profile> =
+                rc.members.iter().filter_map(|m| profiles.iter().find(|p| p.id == m.profile_id)).collect();
+            let plan = fidim_core::sglang::router_plan(&cfg, &rc, &members).map_err(|e| e.to_string())?;
+            let sections: Vec<String> = members.iter().map(|p| fidim_core::router::model_id(p)).collect();
+            return Ok(serde_json::json!({ "kind": "sglang", "text": plan.command_line(), "sections": sections }));
+        }
         let devices = cached_devices(&cache, &cfg, false)?;
         let r = fidim_core::router::render_ini(&rc, &profiles, &devices).map_err(|e| e.to_string())?;
         serde_json::to_value(r).map_err(|e| e.to_string())
@@ -1103,7 +1152,16 @@ async fn router_launch() -> Result<serde_json::Value, String> {
         if fidim_core::sglang::is_sglang_router(&rc, &profiles) {
             let (state, started, replaced) = fidim_core::sglang::launch_router(&cfg, &rc, &profiles, &HostPlatform, Duration::from_secs(900))
                 .map_err(|e| e.to_string())?;
-            return Ok(serde_json::json!({ "state": state, "ini_path": "", "replaced": replaced, "env_conflicts": [], "sections": started }));
+            let sections: Vec<String> = rc
+                .members
+                .iter()
+                .filter_map(|m| profiles.iter().find(|p| p.id == m.profile_id))
+                .map(fidim_core::router::model_id)
+                .collect();
+            return Ok(serde_json::json!({
+                "state": state, "ini_path": "", "replaced": replaced, "env_conflicts": [],
+                "sections": sections, "started": started,
+            }));
         }
         let builds = discovery::scan_builds(&cfg.build_roots_effective(), cfg.rocm_bin.as_deref());
         let build_dir = match &rc.build {
@@ -1139,19 +1197,52 @@ async fn router_models() -> Result<serde_json::Value, String> {
     .await
 }
 
+/// The SGLang member profile behind router model `id`, when the saved
+/// router is an SGLang router (its members are separate servers).
+fn sglang_member(cfg: &Config, rc: &fidim_core::router::RouterConfig, id: &str) -> Result<Option<Profile>, String> {
+    let profiles = Profile::load_all(&cfg.profile_dir).map_err(|e| e.to_string())?;
+    if !fidim_core::sglang::is_sglang_router(rc, &profiles) {
+        return Ok(None);
+    }
+    profiles
+        .into_iter()
+        .find(|p| rc.members.iter().any(|m| m.profile_id == p.id) && fidim_core::router::model_id(p) == id)
+        .map(Some)
+        .ok_or_else(|| format!("{id} is not a member of the router"))
+}
+
+/// Load a router model. Behind the SGLang router: start the member's own
+/// server (its profile, pre-flight included).
 #[tauri::command]
 async fn router_load(id: String) -> Result<(), String> {
     blocking(move || {
+        let cfg = cfg()?;
         let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
+        if let Some(p) = sglang_member(&cfg, &rc, &id)? {
+            if profile::validate(&p).iter().any(|f| f.severity == profile::Severity::Error) {
+                return Err(format!("{} has validation errors — fix them in the editor first", p.id));
+            }
+            fidim_core::sglang::launch(&cfg, &p, &HostPlatform, false, Duration::from_secs(900)).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         fidim_core::router::load_model(&rc.host, rc.port, &id).map_err(|e| e.to_string())
     })
     .await
 }
 
+/// Unload a router model. Behind the SGLang router: stop the member's server.
 #[tauri::command]
 async fn router_unload(id: String) -> Result<(), String> {
     blocking(move || {
+        let cfg = cfg()?;
         let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
+        if let Some(p) = sglang_member(&cfg, &rc, &id)? {
+            let run = supervise::reattach(&cfg.runs_dir)
+                .into_iter()
+                .find(|r| r.alive && r.state.profile_id == p.id)
+                .ok_or_else(|| format!("{} is not running", p.id))?;
+            return supervise::stop(&run.state, &cfg.runs_dir).map_err(|e| e.to_string());
+        }
         fidim_core::router::unload_model(&rc.host, rc.port, &id).map_err(|e| e.to_string())
     })
     .await
@@ -1170,11 +1261,21 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
         let devices = cached_devices(&cache, &cfg, false).unwrap_or_default();
         let card_of = |luid: u64| devices.iter().find(|d| d.luid_low == Some(luid)).map(|d| d.stable_key.clone());
         let util = platform.gpu_utilization().unwrap_or_default();
-        // Per-card busy: sum over every process on that adapter.
+        // Per-card busy. Windows: sum over every process on that adapter.
+        // Linux: the card's own sysfs figure, which already covers every
+        // process; gpu_utilization charges it to the biggest VRAM holder, so
+        // summing would count the compositor's fdinfo time twice.
         let mut cards: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        #[cfg(windows)]
         for u in &util {
             if let Some(k) = card_of(u.luid_low) {
                 *cards.entry(k).or_insert(0.0) += u.percent;
+            }
+        }
+        #[cfg(not(windows))]
+        for (bus, pct) in fidim_core::platform::card_busy_percent() {
+            if let Some(k) = card_of(bus as u64) {
+                cards.insert(k, pct as f64);
             }
         }
         // A server started with an API key answers /slots and /metrics
@@ -1182,6 +1283,12 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
         let profiles = Profile::load_all(&cfg.profile_dir).unwrap_or_default();
         let member = |id: &str| profiles.iter().find(|p| fidim_core::router::model_id(p) == id);
         let all_runs = supervise::reattach(&cfg.runs_dir);
+        // The SGLang router's members, by served name: a member run behind it
+        // is sampled (and chatted with) through the router. None: no router,
+        // or its list failed (then any SGLang run is tried through it).
+        let sg_router = all_runs.iter().find(|x| x.alive && x.state.profile_id == fidim_core::router::ROUTER_ID && x.state.engine.is_sglang());
+        let router_members: Option<Vec<String>> =
+            sg_router.and_then(|r| fidim_core::router::models(&r.state.host, r.state.port).ok()).map(|ms| ms.into_iter().map(|m| m.id).collect());
         let runs: Vec<serde_json::Value> = all_runs
             .clone()
             .into_iter()
@@ -1192,8 +1299,21 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                 // router card just names them instead of repeating their slots.
                 let mut fronting: Vec<String> = Vec::new();
                 let profile = profiles.iter().find(|p| p.id == r.state.profile_id);
+                let is_router = r.state.profile_id == fidim_core::router::ROUTER_ID;
+                let routed_by = sg_router.filter(|_| r.alive && !is_router && r.state.engine.is_sglang()).filter(|_| {
+                    router_members.as_ref().map_or(true, |ms| ms.contains(&r.state.alias))
+                });
+                // The router's /health names members that stopped answering;
+                // its /v1/models (what `health` probes) answers 200 regardless.
+                let router_health = (r.alive && is_router && r.state.engine.is_sglang()).then(|| {
+                    match fidim_core::supervise::http_get(&r.state.host, r.state.port, "/health", std::time::Duration::from_secs(3)) {
+                        Ok((200, _)) => serde_json::json!({ "ok": true, "detail": "" }),
+                        Ok((code, body)) => serde_json::json!({ "ok": false, "detail": if body.trim().is_empty() { format!("HTTP {code}") } else { body.trim().to_string() } }),
+                        Err(e) => serde_json::json!({ "ok": false, "detail": e.to_string() }),
+                    }
+                });
                 if r.alive {
-                    if r.state.profile_id == fidim_core::router::ROUTER_ID {
+                    if is_router {
                         if let Ok(ms) = fidim_core::router::models(&r.state.host, r.state.port) {
                             for m in &ms {
                                 if member(&m.id).is_some_and(chat::requires_api_key) {
@@ -1211,8 +1331,8 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                         }
                     } else if r.state.engine.is_sglang() {
                         // An SGLang member has no /slots of its own: the router
-                        // (model_router.py) answers for it by served name.
-                        if let Some(router) = all_runs.iter().find(|x| x.alive && x.state.profile_id == fidim_core::router::ROUTER_ID) {
+                        // answers for it by served name.
+                        if let Some(router) = routed_by {
                             samples.push(fidim_core::live::sample_with_key(&router.state.host, router.state.port, Some(&r.state.alias), None));
                         }
                     } else {
@@ -1257,7 +1377,9 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                 let busy: f64 = util.iter().filter(|u| pids.contains(&u.pid)).map(|u| u.percent).sum();
                 // KFD eviction: cumulative ms and the rate over the last poll.
                 #[cfg(not(windows))]
-                let evicted_ms: u64 = pids.iter().map(|p| fidim_core::platform::kfd_evicted_ms(*p)).sum();
+                // A run's processes (scheduler, detokenizer, launcher) are
+                // evicted together: the largest counter is the run's time.
+                let evicted_ms: u64 = pids.iter().map(|p| fidim_core::platform::kfd_evicted_ms(*p)).max().unwrap_or(0);
                 #[cfg(windows)]
                 let evicted_ms: u64 = 0;
                 let evict_rate = {
@@ -1288,6 +1410,10 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                     "gpu_busy_percent": if busy <= 0.0 { 0.0 } else { busy.min(100.0) },
                     "has_api_key": has_api_key,
                     "keyed_models": keyed_models,
+                    "router_health": router_health,
+                    // The router run fronting this SGLang member (chat and
+                    // endpoint go through it: it tracks the slots).
+                    "routed_by": routed_by.map(|x| serde_json::json!({ "profile_id": x.state.profile_id, "host": x.state.host, "port": x.state.port, "alias": x.state.alias })),
                 })
             })
             .collect();
@@ -1387,6 +1513,10 @@ struct ResolvedTarget {
     model: String,
     api_key: Option<String>,
     router: bool,
+    /// Where to ask for server facts when that is not host:port: an SGLang
+    /// member's own server (the router forwards `/get_server_info` to its
+    /// default member whatever the model).
+    backend: Option<(String, u16)>,
 }
 
 fn resolve_target(cfg: &Config, t: &ChatTarget) -> Result<ResolvedTarget, String> {
@@ -1400,13 +1530,19 @@ fn resolve_target(cfg: &Config, t: &ChatTarget) -> Result<ResolvedTarget, String
     if s.profile_id == fidim_core::router::ROUTER_ID {
         let model = t.model.clone().filter(|m| !m.trim().is_empty()).ok_or("pick a model on the router")?;
         let member = profiles.iter().find(|p| fidim_core::router::model_id(p) == model);
+        // The member's engine: the SGLang router fronts SGLang servers.
+        let engine = member.map_or(s.engine, |p| p.engine);
+        let backend = member
+            .filter(|p| p.engine.is_sglang())
+            .map(|p| (chat::connect_host(&p.server.host).to_string(), p.server.port));
         Ok(ResolvedTarget {
             host,
             port: s.port,
-            engine: Engine::LlamaServer,
+            engine,
             api_key: member.and_then(chat::api_key),
             model,
             router: true,
+            backend,
         })
     } else {
         let profile = profiles.iter().find(|p| p.id == s.profile_id);
@@ -1417,6 +1553,7 @@ fn resolve_target(cfg: &Config, t: &ChatTarget) -> Result<ResolvedTarget, String
             model: s.alias.clone(),
             api_key: profile.and_then(chat::api_key),
             router: false,
+            backend: None,
         })
     }
 }
@@ -1525,6 +1662,7 @@ async fn chat_targets() -> Result<serde_json::Value, String> {
 /// A target's server-side facts: context, default sampler, capabilities.
 /// A router model that is not loaded is not asked; one evicted between the
 /// check and the question gets an error, not a load (`autoload=false`).
+/// SGLang (standalone or behind the router) is asked on its own port.
 #[tauri::command]
 async fn chat_props(target: ChatTarget) -> Result<serde_json::Value, String> {
     blocking(move || {
@@ -1541,8 +1679,19 @@ async fn chat_props(target: ChatTarget) -> Result<serde_json::Value, String> {
                 return Ok(serde_json::json!({ "loaded": false, "status": status }));
             }
         }
-        let mut v = chat::props(&t.host, t.port, t.engine, t.router.then_some(t.model.as_str()), t.api_key.as_deref())
-            .map_err(|e| e.to_string())?;
+        let mut v = if t.engine.is_sglang() {
+            // Asked of the member's own server; a router model with no
+            // profile behind it has no server to ask (the router would
+            // answer for its default member).
+            match (&t.backend, t.router) {
+                (Some((h, p)), _) => chat::props(h, *p, t.engine, None, t.api_key.as_deref()),
+                (None, false) => chat::props(&t.host, t.port, t.engine, None, t.api_key.as_deref()),
+                (None, true) => Ok(serde_json::json!({ "engine": "sglang", "params": {}, "caps": {}, "modalities": {} })),
+            }
+        } else {
+            chat::props(&t.host, t.port, t.engine, t.router.then_some(t.model.as_str()), t.api_key.as_deref())
+        }
+        .map_err(|e| e.to_string())?;
         v["loaded"] = true.into();
         Ok(v)
     })

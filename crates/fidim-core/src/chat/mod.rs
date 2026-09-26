@@ -186,7 +186,9 @@ pub fn api_key(p: &Profile) -> Option<String> {
 /// The body sent upstream: the GUI's messages and sampler overrides, plus
 /// the fields streaming depends on. llama-server also gets prompt progress
 /// (otherwise nothing arrives until the first token) and per-token timings;
-/// fidim-dg would ignore them, so they are not sent there.
+/// fidim-dg would ignore them, so they are not sent there. SGLang gets its
+/// own sampler names: `repetition_penalty`, no DRY, and -1 (not 0) for top-k
+/// off, since it rejects `top_k: 0`.
 pub fn request_body(body: &Value, model: &str, engine: Engine) -> Result<Value> {
     let Some(obj) = body.as_object() else {
         return Err(Error::Config("the chat request must be a JSON object".into()));
@@ -203,6 +205,22 @@ pub fn request_body(body: &Value, model: &str, engine: Engine) -> Result<Value> 
     if engine.is_llama_server() {
         out.insert("return_progress".into(), true.into());
         out.insert("timings_per_token".into(), true.into());
+    }
+    if engine.is_sglang() {
+        if let Some(v) = out.remove("repeat_penalty") {
+            out.entry("repetition_penalty").or_insert(v);
+        }
+        let llama_only: Vec<String> = out
+            .keys()
+            .filter(|k| k.starts_with("dry_") || matches!(k.as_str(), "return_progress" | "timings_per_token"))
+            .cloned()
+            .collect();
+        for k in llama_only {
+            out.remove(&k);
+        }
+        if out.get("top_k").and_then(Value::as_i64) == Some(0) {
+            out.insert("top_k".into(), (-1).into());
+        }
     }
     Ok(Value::Object(out))
 }
@@ -908,12 +926,86 @@ pub fn parse_dg_models(v: &Value) -> Value {
     })
 }
 
+/// SGLang's OpenAI chat defaults for a sampler the request leaves out and
+/// the model's generation config does not set (`protocol.py`).
+const SGLANG_DEFAULTS: &[(&str, f64)] = &[
+    ("temperature", 1.0),
+    ("top_p", 1.0),
+    ("top_k", -1.0),
+    ("min_p", 0.0),
+    ("repetition_penalty", 1.0),
+    ("presence_penalty", 0.0),
+    ("frequency_penalty", 0.0),
+];
+
+/// SGLang has no `/props`: `/get_server_info` carries the context and the
+/// request limit, `/get_model_info` the served name and vision/audio, and
+/// the default sampler is the model's `generation_config.json` (when
+/// `sampling_defaults` is `model`, SGLang's default) over SGLang's own.
+/// top-k off (-1) is reported as 0, the panel's "off". (The server's
+/// `preferred_sampling_params` never reach a chat request: the OpenAI layer
+/// fills every sampler first.)
+pub fn parse_sglang(server: &Value, model: &Value, generation: Option<&Value>) -> Value {
+    let mut p = Map::new();
+    let from_model = server.get("sampling_defaults").and_then(Value::as_str).unwrap_or("model") == "model";
+    for (k, d) in SGLANG_DEFAULTS {
+        let v = generation
+            .filter(|_| from_model)
+            .and_then(|g| g.get(*k))
+            .and_then(Value::as_f64)
+            .unwrap_or(*d);
+        let v = if *k == "top_k" { json!(if v < 1.0 { 0 } else { v as i64 }) } else { json!(v) };
+        p.insert((*k).into(), v);
+    }
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
+    json!({
+        "engine": "sglang",
+        "n_ctx": n(server, "max_req_input_len").or_else(|| n(server, "context_length")),
+        "total_slots": n(server, "max_running_requests"),
+        "params": p,
+        "modalities": {
+            "vision": model.get("has_image_understanding").and_then(Value::as_bool).unwrap_or(false),
+            "audio": model.get("has_audio_understanding").and_then(Value::as_bool).unwrap_or(false),
+        },
+        "caps": {},
+        "reasoning_parser": model.get("reasoning_parser").or_else(|| server.get("reasoning_parser")).cloned().unwrap_or(Value::Null),
+        "tool_call_parser": model.get("tool_call_parser").or_else(|| server.get("tool_call_parser")).cloned().unwrap_or(Value::Null),
+        "model_alias": model.get("served_model_name").or_else(|| server.get("served_model_name")).cloned().unwrap_or(Value::Null),
+        "build_info": server.get("version").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// The `generation_config.json` SGLang reads for a local model: in the
+/// model's folder (a GGUF file's parent). None for a hub id or no file.
+fn local_generation_config(model_path: &str) -> Option<Value> {
+    let p = std::path::Path::new(model_path);
+    let dir = if p.is_dir() { p } else { p.parent()? };
+    let text = std::fs::read_to_string(dir.join("generation_config.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn get_json(host: &str, port: u16, path: &str, t: Duration, api_key: Option<&str>) -> Result<Value> {
+    let (code, body) = crate::supervise::http_get_auth(host, port, path, t, api_key)?;
+    if code != 200 {
+        return Err(Error::Platform(format!("{path} answered {code}: {}", error_message(code, &body))));
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
 /// Fetch the props of a target. `model` names a router model, asked with
 /// `autoload=false` so the question never loads it; `api_key` is the
 /// profile's (`api_key`): a keyed llama-server answers 401 without it.
+/// SGLang is asked directly (`host:port` is the member's own server, not
+/// the router, which forwards these paths to its default member).
 pub fn props(host: &str, port: u16, engine: Engine, model: Option<&str>, api_key: Option<&str>) -> Result<Value> {
     let host = connect_host(host);
     let t = Duration::from_secs(5);
+    if engine.is_sglang() {
+        let server = get_json(host, port, "/get_server_info", t, api_key)?;
+        let info = get_json(host, port, "/get_model_info", t, api_key)?;
+        let gen = info.get("model_path").and_then(Value::as_str).and_then(local_generation_config);
+        return Ok(parse_sglang(&server, &info, gen.as_ref()));
+    }
     let path = if engine.is_diffusion() { "/v1/models".to_string() } else { crate::live::query("/props", model) };
     let (code, body) = crate::supervise::http_get_auth(host, port, &path, t, api_key)?;
     if code != 200 {
@@ -971,7 +1063,12 @@ pub fn target_for(
         model.map(str::to_string).unwrap_or_else(|| state.profile_id.clone())
     });
     let slots = sample.filter(|s| s.error.is_none()).map(|s| &s.slots);
-    let engine = if model.is_some() { Engine::LlamaServer } else { state.engine };
+    // A router model runs on its member profile's engine (llama-server's
+    // router or FIDIM's SGLang router); unknown members take the router's.
+    let engine = match (model, profile) {
+        (Some(_), Some(p)) => p.engine,
+        _ => state.engine,
+    };
     Target {
         key: match model {
             Some(m) => format!("{}/{m}", state.profile_id),

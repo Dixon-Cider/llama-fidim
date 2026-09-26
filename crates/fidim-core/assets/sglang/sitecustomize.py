@@ -1,6 +1,6 @@
 """In-process RSS guard, active in every Python process that sees this on PYTHONPATH
 (including SGLang's spawned scheduler/detokenizer). When a process crosses
-SGL_MEMGUARD_GB (default 6), it writes every thread's stack to
+SGL_MEMGUARD_GB (default 6; 0 = no guard), it writes every thread's stack to
 SGL_MEMGUARD_LOG and exits, before the kernel OOM killer takes the desktop down.
 Also raises oom_score_adj so that if something else blows up, we die first."""
 import os, sys, threading, time, traceback
@@ -39,4 +39,5 @@ try:
         f.write("1000")
 except Exception:
     pass
-threading.Thread(target=_guard, daemon=True, name="memguard").start()
+if _LIMIT > 0:
+    threading.Thread(target=_guard, daemon=True, name="memguard").start()

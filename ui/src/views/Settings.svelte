@@ -18,6 +18,11 @@
   let diagBusy = $state(false);
 
   let manualRuntimesText = $state("");
+  // On Linux the engine is SGLang: its section comes first and the
+  // llama.cpp-only settings (builds, ROCm runtimes, keep-alive) fold away.
+  const linux = /linux/i.test(navigator.platform ?? "");
+  // A source (editable) install of sglang reports 0.0.0.
+  const sgVer = (v) => (!v ? "—" : /^0\.0\.0/.test(v) ? "source install" : v);
 
   // One sentence per hover; the config.json key or flag last, in parentheses.
   const HINTS = {
@@ -34,15 +39,15 @@
     runtimes: "Runtimes added by hand, a JSON list of {name, dirs, version} (runtimes)",
     integrated_name_patterns: "Device names containing any of these count as integrated graphics (integrated_name_patterns)",
     allow_integrated: "Let profiles bind integrated graphics, for an APU-only box or Strix Halo. Off, pre-flight blocks it: beside a discrete card an iGPU is slow and never errors",
-    keep_alive: "1-token request every N seconds, keeping the GPU awake when PCIe link power saving cannot be Off; profiles can override",
+    keep_alive: "1-token request every N seconds to keep a llama-server's GPU awake; profiles can override (keep_alive_seconds)",
     hf_token: "Read token for gated repos (Gemma, Llama) in Models and the creator defaults; HF_TOKEN in the environment wins",
     hf_use_cli_token: "When no token is set here, use the one huggingface-cli login saved; off because that file belongs to another tool",
     github_token: "Read-only token for the model wizard's build lookups; without one GitHub allows 60 an hour (GITHUB_TOKEN)",
     save_chats: "Keep each conversation as a JSON file in the tool's chats folder; off, they last until the app closes (save_chats)",
     sglang_venv: "Its bin/python launches every SGLang server and the router; pick one below with Use, or type its path (sglang.venv)",
-    sglang_tools_dir: "Where model_router.py and the memory guard live; empty = the copies bundled with the tool (sglang.tools_dir)",
+    sglang_tools_dir: "Holds memguard/, an optional tunableop.csv and a fallback router script; empty = bundled (sglang.tools_dir)",
     sglang_env: "Environment every SGLang server and the router get, edited in config.json (sglang.env)",
-    sglang_install: "Creates the venv and pip-installs SGLang with torch for that flavor; minutes and gigabytes, pip output in Logs",
+    sglang_install: "Creates the venv and pip-installs SGLang and torch; minutes and gigabytes, output in ~/.fidim/ui.log",
   };
 
   // SGLang engine: the venvs found that import sglang, and an installer.
@@ -217,22 +222,13 @@
     </span>
   </div>
 
+  {#snippet folders()}
   <section class="card">
-    <div class="sec">Folders <span class="faint">where models and builds are found</span></div>
-    <div class="grid2">
-      <label class="field" title={HINTS.model_roots}>
+    <div class="sec">Folders <span class="faint">where models and profiles are kept</span></div>
+    <div class="formgrid">
+      <label class="field" style="grid-column: span 3;" title={HINTS.model_roots}>
         <span class="k">model folders <span class="faint">({cfg.model_roots.length})</span></span>
-        <PathList bind:value={cfg.model_roots} placeholder="D:\models" onchange={touch} />
-      </label>
-      <label class="field" title={HINTS.build_roots}>
-        <span class="k">llama.cpp build folders <span class="faint">({cfg.build_roots.length})</span></span>
-        <PathList bind:value={cfg.build_roots} placeholder="D:\llama.cpp" />
-      </label>
-    </div>
-    <div class="formgrid" style="margin-top: 16px;">
-      <label class="field" style="grid-column: span 3;" title={HINTS.install_root}>
-        <span class="k">install root</span>
-        <input bind:value={cfg.install_root} oninput={touch} placeholder="(first build folder, or the tool's own folder)" />
+        <PathList bind:value={cfg.model_roots} placeholder={linux ? "/home/me/models" : "D:\\models"} onchange={touch} />
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.profile_dir}>
         <span class="k">profile folder</span>
@@ -244,9 +240,34 @@
       </label>
     </div>
   </section>
+  {/snippet}
 
-  <section class="card">
-    <div class="sec">ROCm <span class="faint">which runtime a server loads</span></div>
+  <!-- llama.cpp only: build folders, source builds, ROCm runtimes, keep-alive. -->
+  {#snippet llamaBody()}
+    <div class="grid2">
+      <label class="field" title={HINTS.build_roots}>
+        <span class="k">build folders <span class="faint">({cfg.build_roots.length})</span></span>
+        <PathList bind:value={cfg.build_roots} placeholder={linux ? "/home/me/llama.cpp" : "D:\\llama.cpp"} onchange={touch} />
+      </label>
+      <div class="formgrid" style="grid-template-columns: 1fr;">
+        <label class="field" title={HINTS.install_root}>
+          <span class="k">install root</span>
+          <input bind:value={cfg.install_root} oninput={touch} placeholder="(first build folder, or the tool's own folder)" />
+        </label>
+      </div>
+    </div>
+    <div class="formgrid" style="margin-top: 16px;">
+      <label class="field" style="grid-column: span 3;" title={HINTS.llama_cpp_source}>
+        <span class="k">llama.cpp checkout</span>
+        <input bind:value={cfg.llama_cpp_source} oninput={touch} placeholder="(first build folder)" />
+      </label>
+      <label class="field" style="grid-column: span 3;" title={HINTS.source_build_script}>
+        <span class="k">build script</span>
+        <input bind:value={cfg.source_build_script} oninput={touch} placeholder="(scripts\build-from-tag.bat)" />
+      </label>
+      <Range bind:value={cfg.keep_alive_seconds} label="keep-alive, seconds (0 = off)" title={HINTS.keep_alive} min={0} max={60} step={1} span={3} onchange={touch} />
+    </div>
+    <div class="k small" style="margin: 16px 0 6px;" title="Which ROCm runtime a llama-server loads">ROCm runtime</div>
     <div class="formgrid">
       <label class="field" style="grid-column: span 3;" title={HINTS.default_runtime}>
         <span class="k">default runtime</span>
@@ -259,7 +280,7 @@
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.rocm_bin}>
         <span class="k">fallback runtime folder</span>
-        <input bind:value={cfg.rocm_bin} oninput={touch} placeholder="C:\Program Files\AMD\ROCm\7.1\bin" />
+        <input bind:value={cfg.rocm_bin} oninput={touch} placeholder={linux ? "/opt/rocm/bin" : "C:\\Program Files\\AMD\\ROCm\\7.1\\bin"} />
       </label>
       <label class="field" style="grid-column: span 2;" title={HINTS.rocm_family}>
         <span class="k">GPU family</span>
@@ -274,8 +295,25 @@
     <div class="faint small" style="margin-top: 10px;" title="Runtimes found now, newest first; install more in Updates">
       found: {runtimes.map((r) => r.name + (r.is_latest ? " (latest)" : "") + (r.available ? "" : " (missing)")).join(" · ") || "none"}
     </div>
-  </section>
+  {/snippet}
 
+  {#snippet llama()}
+  {#if linux}
+    <details class="card llama">
+      <summary class="sec" title="Build folders, source builds, ROCm runtimes and keep-alive; SGLang uses its venv and sglang.env">
+        llama.cpp <span class="faint">not used by SGLang</span>
+      </summary>
+      <div style="margin-top: 14px;">{@render llamaBody()}</div>
+    </details>
+  {:else}
+    <section class="card">
+      <div class="sec">llama.cpp <span class="faint">builds, source builds, ROCm runtimes</span></div>
+      {@render llamaBody()}
+    </section>
+  {/if}
+  {/snippet}
+
+  {#snippet gpus()}
   <section class="card">
     <div class="sec">GPUs <span class="faint">{devices.length ? `${devices.length} adapters, ${igpus.length} integrated` : "none seen yet"}</span></div>
     <div class="grid2">
@@ -283,32 +321,21 @@
         <span class="k">integrated name patterns</span>
         <PathList bind:value={cfg.integrated_name_patterns} placeholder="Radeon(TM) Graphics" addLabel="Add pattern" mono={false} />
       </label>
-      <div style="display: flex; flex-direction: column; gap: 14px;">
-        <label class="field" title={HINTS.allow_integrated}>
-          <span class="k">integrated graphics</span>
-          <span><input type="checkbox" checked={!!cfg.allow_integrated} onchange={(e) => { cfg.allow_integrated = e.target.checked; touch(); }} /> allow profiles to bind it</span>
-        </label>
-        <div class="formgrid" style="grid-template-columns: 1fr;">
-          <Range bind:value={cfg.keep_alive_seconds} label="keep-alive, seconds (0 = off)" title={HINTS.keep_alive} min={0} max={60} step={1} span={1} onchange={touch} />
-        </div>
-      </div>
+      <label class="field" title={HINTS.allow_integrated}>
+        <span class="k">integrated graphics</span>
+        <span><input type="checkbox" checked={!!cfg.allow_integrated} onchange={(e) => { cfg.allow_integrated = e.target.checked; touch(); }} /> allow profiles to bind it</span>
+      </label>
     </div>
     {#if igpus.length}
       <div class="faint small" style="margin-top: 10px;" title="Devices the patterns above classify as integrated">integrated now: {igpus.map((d) => d.name).join(", ")}</div>
     {/if}
   </section>
+  {/snippet}
 
+  {#snippet sources()}
   <section class="card">
-    <div class="sec">Sources <span class="faint">source builds, Hugging Face, GitHub</span></div>
+    <div class="sec">Tokens <span class="faint">Hugging Face, GitHub</span></div>
     <div class="formgrid">
-      <label class="field" style="grid-column: span 3;" title={HINTS.llama_cpp_source}>
-        <span class="k">llama.cpp checkout</span>
-        <input bind:value={cfg.llama_cpp_source} oninput={touch} placeholder="(first build folder)" />
-      </label>
-      <label class="field" style="grid-column: span 3;" title={HINTS.source_build_script}>
-        <span class="k">build script</span>
-        <input bind:value={cfg.source_build_script} oninput={touch} placeholder="(scripts\build-from-tag.bat)" />
-      </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.hf_token}>
         <span class="k">Hugging Face token</span>
         <input type="password" bind:value={cfg.hf_token} oninput={touch} placeholder="hf_…" autocomplete="off" />
@@ -323,11 +350,13 @@
       </label>
     </div>
   </section>
+  {/snippet}
 
+  {#snippet sglang()}
   <section class="card">
     <div class="sec">
       SGLang
-      <span class="faint">the Python engine behind SGLang profiles (Linux)</span>
+      <span class="faint">the Python engine behind SGLang profiles</span>
       <span style="margin-left: auto;"><button class="btn" onclick={sgRescan} disabled={sgScanning || sgInstalling}>{sgScanning ? "Scanning…" : "Rescan"}</button></span>
     </div>
     <div class="formgrid">
@@ -336,7 +365,7 @@
         <input value={cfg.sglang?.venv ?? ""} oninput={(e) => { sgEdit(); cfg.sglang.venv = e.target.value; }} placeholder="/home/me/venvs/sglang (none configured)" spellcheck="false" />
       </label>
       <label class="field" style="grid-column: span 3;" title={HINTS.sglang_tools_dir}>
-        <span class="k">Router and guard scripts</span>
+        <span class="k">tools folder</span>
         <input value={cfg.sglang?.tools_dir ?? ""} oninput={(e) => { sgEdit(); cfg.sglang.tools_dir = e.target.value; }} placeholder="(bundled copies)" spellcheck="false" />
       </label>
       <div class="field" style="grid-column: 1 / -1;" title={HINTS.sglang_env}>
@@ -359,7 +388,7 @@
         {#each sgInstalls as i (i.venv)}
           <tr class:on={i.configured}>
             <td><span class="mono">{i.venv}</span>{#if i.configured} <span class="chip pass">configured</span>{/if}</td>
-            <td class="mono">{i.sglang_version ?? "—"}</td>
+            <td class="mono" title={i.sglang_version && sgVer(i.sglang_version) !== i.sglang_version ? `sglang reports ${i.sglang_version}: an editable install from a checkout` : null}>{sgVer(i.sglang_version)}</td>
             <td class="mono">{i.torch_version ?? "—"}</td>
             <td class="mono">{i.device ?? "cpu"}</td>
             <td class="r">
@@ -390,11 +419,19 @@
     {#if sgResult}
       <div class="notice" style="margin-top: 10px;" in:scale={{ duration: LAYOUT, start: 0.95 }}>
         <span class="chip pass">installed</span>
-        <span><span class="mono">{sgResult.venv}</span> · sglang {sgResult.sglang_version ?? "?"} · torch {sgResult.torch_version ?? "?"} · {sgResult.device ?? "cpu"}
+        <span><span class="mono">{sgResult.venv}</span> · sglang {sgVer(sgResult.sglang_version)} · torch {sgResult.torch_version ?? "?"} · {sgResult.device ?? "cpu"}
           {#if !sgResult.configured}<button class="link" onclick={() => sgUse(sgResult.venv)} disabled={!!sgUsing}>Use it</button>{/if}</span>
       </div>
     {/if}
   </section>
+
+  {/snippet}
+
+  {#if linux}
+    {@render sglang()}{@render folders()}{@render gpus()}{@render sources()}
+  {:else}
+    {@render folders()}{@render llama()}{@render gpus()}{@render sources()}{@render sglang()}
+  {/if}
 
   <section class="card">
     <div class="sec">Chat <span class="faint">conversations in the Chat tab</span></div>
@@ -410,6 +447,8 @@
     </div>
   </section>
 
+  {#if linux}{@render llama()}{/if}
+
   <section class="card">
     <div class="sec">
       Diagnostics
@@ -420,9 +459,9 @@
       {#each diag.errors as e}<div class="notice" style="margin-bottom: 6px;"><span class="chip block">failed</span> <span class="mono">{e}</span></div>{/each}
       <div class="stats">
         <div class="stat" class:dim={!diag.models.length}><span class="v">{diag.models.length}</span><span class="l">models{diag.models.filter((m) => m.header_error).length ? `, ${diag.models.filter((m) => m.header_error).length} with header errors` : ""}</span></div>
-        <div class="stat" class:dim={!diag.builds.length}><span class="v">{diag.builds.length}</span><span class="l">builds{diag.builds.length ? ": " + diag.builds.map((b) => b.version ?? "broken").join(", ") : ""}</span></div>
+        {#if !linux || diag.builds.length}<div class="stat" class:dim={!diag.builds.length}><span class="v">{diag.builds.length}</span><span class="l">builds{diag.builds.length ? ": " + diag.builds.map((b) => b.version ?? "broken").join(", ") : ""}</span></div>{/if}
         <div class="stat" class:dim={!diag.devices.length}><span class="v">{diag.devices.length}</span><span class="l">devices{diag.devices.length ? ": " + diag.devices.map((d) => `${d.backend}${d.hip_index}`).join(", ") : ""}</span></div>
-        <div class="stat" class:dim={!diag.runtimes.length}><span class="v">{diag.runtimes.filter((r) => r.available).length}</span><span class="l">runtimes usable</span></div>
+        {#if !linux || diag.runtimes.length}<div class="stat" class:dim={!diag.runtimes.length}><span class="v">{diag.runtimes.filter((r) => r.available).length}</span><span class="l">runtimes usable</span></div>{/if}
       </div>
       <div class="faint small" style="margin-top: 10px;" title="The same numbers went to ui.log in the tool's folder">{diag.ms} ms</div>
     {:else}
@@ -447,4 +486,5 @@
   .sgtab tr.on td { background: var(--accent-soft); }
   .sginstall { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .sginstall input { flex: 1; min-width: 260px; }
+  details.llama > summary { cursor: pointer; list-style: revert; }
 </style>

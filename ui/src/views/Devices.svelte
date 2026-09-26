@@ -8,7 +8,13 @@
   let runtimes = $state([]);
   let loading = $state(false);
   let error = $state("");
-  api("list_runtimes").then((r) => (runtimes = r)).catch(() => {});
+  // ROCm runtimes are Windows DLL folders; on Linux SGLang brings its own.
+  const linux = /linux/i.test(navigator.platform ?? "");
+  if (!linux) api("list_runtimes").then((r) => (runtimes = r)).catch(() => {});
+  // Where the list comes from: the newest llama.cpp build's
+  // --list-devices, or the OS adapters when there is no build (null = unknown yet).
+  let builds = $state(null);
+  api("scan").then((s) => (builds = s?.builds?.length ?? 0)).catch(() => {});
 
   async function load(refresh) {
     loading = true;
@@ -32,7 +38,11 @@
 
 <h1>
   Devices
-  <span class="sub">Fresh from <span class="mono">llama-server --list-devices</span>. Profiles bind to the stable key; the index is resolved at every launch.</span>
+  <span class="sub" title="Profiles bind to the stable key; the index is resolved at every launch">
+    {#if builds}Fresh from <span class="mono">llama-server --list-devices</span>.
+    {:else if builds === 0}From the operating system's GPU list; no llama.cpp build to ask.
+    {:else}GPUs a profile can bind.{/if}
+  </span>
 </h1>
 
 <div class="toolbar">
@@ -61,7 +71,7 @@
       </div>
       <dl class="kv">
         <dt>display</dt>
-        <dd>{#if d.display}<span class="chip warn">{d.display.width}×{d.display.height} @ {d.display.refresh_hz} Hz</span>{:else}<span class="faint">none attached</span>{/if}</dd>
+        <dd>{#if d.display}<span class="chip warn">{d.display.width}×{d.display.height}{d.display.refresh_hz ? ` @ ${d.display.refresh_hz} Hz` : ""}</span>{:else}<span class="faint">none attached</span>{/if}</dd>
         <dt>occupied by</dt>
         <dd>{#if row.occupied_by.length}{#each row.occupied_by as p}<span class="chip accent">{p}</span> {/each}{:else}<span class="faint">no Llama FIDIM server</span>{/if}</dd>
         <dt>driver</dt>
@@ -79,6 +89,7 @@
   A display on a compute card costs VRAM and can pre-empt compute.
 </p>
 
+{#if !linux}
 <h2>ROCm runtimes <span class="sub">DLL folders a profile can launch with: HIP SDK installs, versions installed from the Updates tab, LM Studio's, and any you add in Settings. Newest first.</span></h2>
 <div class="card flush" style="overflow-x: auto;">
   <table class="grid">
@@ -98,6 +109,7 @@
     </tbody>
   </table>
 </div>
+{/if}
 
 <style>
   .cap { display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 6px; }

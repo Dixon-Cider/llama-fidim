@@ -293,6 +293,9 @@ pub struct Slot {
     pub t_end: f64,
     pub n_prompt: u64,
     pub n_prompt_exact: bool,
+    /// The raw chars/4 estimate `n_prompt` started from (before the
+    /// member's learned scale), to learn the scale once usage is exact.
+    pub n_prompt_est: u64,
     pub processed: u64,
     pub prompt: String,
     pub generated: String,
@@ -313,6 +316,7 @@ impl Slot {
             t_end: 0.0,
             n_prompt: 0,
             n_prompt_exact: false,
+            n_prompt_est: 0,
             processed: 0,
             prompt: String::new(),
             generated: String::new(),
@@ -333,17 +337,20 @@ impl Slot {
         }
     }
 
-    pub fn view(&self, n_ctx: u64) -> Value {
+    /// `speculative`: the member runs a draft (SGLang `speculative_algorithm`).
+    pub fn view(&self, n_ctx: u64, speculative: bool) -> Value {
         let decoded = self.decoded_now();
         json!({
             "id": self.id,
             "id_task": self.id_task,
             "n_ctx": n_ctx,
             "is_processing": self.busy,
-            "speculative": true,
+            "speculative": speculative,
             "n_prompt_tokens": self.n_prompt,
             "n_prompt_tokens_processed": if self.busy && decoded == 0 { self.processed } else { self.n_prompt },
             "n_prompt_tokens_cache": 0,
+            // false while n_prompt_tokens is still the estimate (usage not in yet)
+            "n_prompt_tokens_exact": self.n_prompt_exact || self.n_prompt == 0,
             "next_token": [{
                 "has_next_token": self.busy,
                 "n_decoded": decoded,
@@ -395,6 +402,11 @@ pub struct ModelStats {
     pub prompt_tokens_total: u64,
     pub prompt_seconds: f64,
     pub requests_total: u64,
+    /// The member runs speculative decoding (from `/get_server_info`).
+    pub speculative: bool,
+    /// Real prompt tokens per chars/4-estimated token, learned from the
+    /// usage of finished requests (None until one reported it).
+    pub prompt_scale: Option<f64>,
     task_counter: i64,
     info_at: Option<f64>,
 }
@@ -412,6 +424,8 @@ impl ModelStats {
             prompt_tokens_total: 0,
             prompt_seconds: 0.0,
             requests_total: 0,
+            speculative: false,
+            prompt_scale: None,
             task_counter: 0,
             info_at: None,
         }
@@ -435,6 +449,7 @@ impl ModelStats {
                     .or_else(|| pick("max_total_num_tokens"))
                     .unwrap_or(0)
                     .max(0) as u64;
+                self.speculative = truthy(d.get("speculative_algorithm"));
                 pick("max_running_requests").unwrap_or(1).max(0) as usize
             }
             None => self.n_slots.max(1),
@@ -481,6 +496,19 @@ impl ModelStats {
             self.prompt_seconds += (t_first - s.t0).max(0.0);
         }
         self.prompt_tokens_total += s.n_prompt;
+        if s.n_prompt_exact && s.n_prompt_est > 0 && s.n_prompt > 0 {
+            let r = (s.n_prompt as f64 / s.n_prompt_est as f64).clamp(0.25, 4.0);
+            self.prompt_scale = Some(match self.prompt_scale {
+                Some(p) => 0.7 * p + 0.3 * r,
+                None => r,
+            });
+        }
+    }
+
+    /// A new request's prompt size before the backend reports it: the
+    /// chars/4 estimate, scaled by what this member's usage has shown.
+    pub fn estimate_prompt(&self, est: u64) -> u64 {
+        ((est as f64 * self.prompt_scale.unwrap_or(1.0)).round() as u64).max(1)
     }
 
     /// Slots still prefilling (busy, nothing generated yet).
@@ -524,7 +552,9 @@ impl ModelStats {
             "# HELP llamacpp:tokens_predicted_total Number of generation tokens processed.\n\
              # TYPE llamacpp:tokens_predicted_total counter\n\
              llamacpp:tokens_predicted_total {}\n\
-             # TYPE llamacpp:predicted_tokens_seconds counter\n\
+             # TYPE llamacpp:tokens_predicted_seconds_total counter\n\
+             llamacpp:tokens_predicted_seconds_total {:.3}\n\
+             # TYPE llamacpp:predicted_tokens_seconds gauge\n\
              llamacpp:predicted_tokens_seconds {:.3}\n\
              # TYPE llamacpp:prompt_tokens_total counter\n\
              llamacpp:prompt_tokens_total {}\n\
@@ -536,6 +566,12 @@ impl ModelStats {
              llamacpp:n_decode_total {}\n",
             self.tokens_predicted_total + live_tokens,
             self.predicted_seconds + live_secs,
+            // llama-server's gauge is tok/s (the seconds are the _total above)
+            if self.predicted_seconds + live_secs > 0.0 {
+                (self.tokens_predicted_total + live_tokens) as f64 / (self.predicted_seconds + live_secs)
+            } else {
+                0.0
+            },
             self.prompt_tokens_total + live_prompt,
             self.prompt_seconds,
             processing,
@@ -544,7 +580,7 @@ impl ModelStats {
     }
 
     pub fn views(&self) -> Vec<Value> {
-        self.slots.iter().map(|s| s.view(self.n_ctx)).collect()
+        self.slots.iter().map(|s| s.view(self.n_ctx, self.speculative)).collect()
     }
 
     pub fn state_json(&self) -> Value {
@@ -1303,9 +1339,11 @@ impl Router {
                 let idx = {
                     let mut s = Self::lock_stats(&st);
                     let idx = s.take();
+                    let scaled = s.estimate_prompt(n_prompt);
                     let sl = &mut s.slots[idx];
                     sl.prompt = prompt;
-                    sl.n_prompt = n_prompt;
+                    sl.n_prompt_est = n_prompt;
+                    sl.n_prompt = scaled;
                     sl.max_tokens = max_tokens;
                     idx
                 };
@@ -1537,11 +1575,11 @@ mod tests {
         s.max_tokens = 100;
         s.processed = 4;
         s.prompt = "p".repeat(7000);
-        let v = s.view(4096);
+        let v = s.view(4096, true);
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["id", "id_task", "n_ctx", "is_processing", "speculative", "n_prompt_tokens", "n_prompt_tokens_processed", "n_prompt_tokens_cache", "next_token", "prompt", "generated"]
+            ["id", "id_task", "n_ctx", "is_processing", "speculative", "n_prompt_tokens", "n_prompt_tokens_processed", "n_prompt_tokens_cache", "n_prompt_tokens_exact", "next_token", "prompt", "generated"]
         );
         assert_eq!(v["n_ctx"], 4096);
         assert_eq!(v["is_processing"], true);
@@ -1554,7 +1592,7 @@ mod tests {
         assert_eq!(v["prompt"].as_str().unwrap().len(), TEXT_TAIL);
         // decode: prompt counts as fully processed, chars/4 estimate wins over chunk count
         s.add_text(&"g".repeat(40));
-        let v = s.view(4096);
+        let v = s.view(4096, true);
         assert_eq!(v["n_prompt_tokens_processed"], 10);
         assert_eq!(v["next_token"][0]["n_decoded"], 10);
         assert_eq!(v["next_token"][0]["n_remain"], 90);
@@ -1562,7 +1600,8 @@ mod tests {
         s.busy = false;
         s.n_decoded_exact = true;
         s.n_decoded = 3;
-        let v = s.view(0);
+        let v = s.view(0, false);
+        assert_eq!(v["speculative"], false);
         assert_eq!(v["next_token"][0]["n_decoded"], 3);
         assert_eq!(v["next_token"][0]["has_next_token"], false);
         assert_eq!(v["next_token"][0]["n_remain"], 97);
@@ -1693,6 +1732,17 @@ vllm:other 1.0
         assert!(st.slots[idx].t_first.is_some());
         st.release(idx);
         assert_eq!((st.tokens_predicted_total, st.prompt_tokens_total), (9, 13));
+        // exact usage teaches the prompt estimate this member's ratio
+        assert_eq!(st.estimate_prompt(100), 100);
+        let idx = st.take();
+        st.slots[idx].n_prompt_est = 10;
+        apply_final_reply(&mut st.slots[idx], br#"{"choices":[{"text":"x"}],"usage":{"prompt_tokens":12,"completion_tokens":1}}"#);
+        st.release(idx);
+        assert_eq!(st.estimate_prompt(100), 120);
+        // the draft flag comes from the server info
+        assert!(!st.speculative);
+        st.apply_info(Some(&json!({"max_running_requests": 2, "speculative_algorithm": "EAGLE"})));
+        assert!(st.speculative);
     }
 
     #[test]
@@ -1876,7 +1926,8 @@ vllm:other 1.0
         assert_eq!(pm["prompt_tokens_total"], 11.0, "{m}");
         assert_eq!(pm["requests_processing"], 0.0, "{m}");
         assert_eq!(pm["n_decode_total"], 1.0, "{m}");
-        assert!(pm["predicted_tokens_seconds"] > 0.3, "{m}");
+        assert!(pm["tokens_predicted_seconds_total"] > 0.3, "{m}");
+        assert!(pm["predicted_tokens_seconds"] > 0.0 && pm["predicted_tokens_seconds"] < 7.0 / 0.3, "{m}");
         assert!(m.contains("sglang:generation_tokens_total 30.0\n"), "{m}");
         assert!(!m.contains("_bucket"), "{m}");
         let (_, slots) = get(&client, &format!("{base}/slots")).await;

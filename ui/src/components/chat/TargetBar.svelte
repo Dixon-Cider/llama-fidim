@@ -2,7 +2,7 @@
   // Which server this conversation talks to, how busy it is, and how any
   // other program would reach it.
   import { fade } from "svelte/transition";
-  import { chat, targetKey, setTarget } from "../../lib/chat.svelte.js";
+  import { chat, targetKey, setTarget, isStoppedSglang } from "../../lib/chat.svelte.js";
   import { endpointFor } from "../../lib/endpoint.js";
   import { LAYOUT } from "../../motion.js";
   import EndpointCard from "./EndpointCard.svelte";
@@ -20,13 +20,19 @@
     if (t) setTarget(t);
   }
   const optLabel = (t) => (t.model ? t.model_id + (t.label !== t.model_id ? " · " + t.label : "") : t.label + " · :" + t.port)
-    + (t.status === "loaded" ? "" : " (" + t.status + ")");
+    + (t.status === "loaded" ? "" : " (" + (isStoppedSglang(t) ? "stopped" : t.status) + ")");
   const statusChip = $derived(
     !target ? { kind: "block", text: "not running" }
       : target.status === "loaded" ? { kind: "pass", text: "loaded" }
+      : isStoppedSglang(target) ? { kind: "block", text: "stopped", title: "This model's SGLang server is not running; start it from Router or Profiles" }
       : target.status === "loading" ? { kind: "warn live", text: "loading" }
       : { kind: "plain", text: "loads on first message" }
   );
+  const ENGINES = {
+    "diffusion-gemma": { chip: "note", text: "DiffusionGemma" },
+    sglang: { chip: "plain", text: "sglang" },
+  };
+  const engineChip = $derived(ENGINES[target?.engine] ?? { chip: "plain", text: "llama-server" });
   const busy = $derived(
     target?.slots_total ? target.slots_busy + " of " + target.slots_total + " slots busy" : ""
   );
@@ -53,9 +59,9 @@
     </select>
   </label>
   {#if target}
-    <span class="chip {target.engine === 'diffusion-gemma' ? 'note' : 'plain'}">{target.engine === "diffusion-gemma" ? "DiffusionGemma" : "llama-server"}</span>
+    <span class="chip {engineChip.chip}" title={target.model ? "Served through the router on port " + target.port : null}>{engineChip.text}</span>
   {/if}
-  <span class="chip {statusChip.kind}">{statusChip.text}</span>
+  <span class="chip {statusChip.kind}" title={statusChip.title ?? null}>{statusChip.text}</span>
   {#if busy}<span class="faint small num" title="from the server's /slots">{busy}</span>{/if}
   <span class="grow"></span>
   {#if endpoint}

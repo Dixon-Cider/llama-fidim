@@ -155,6 +155,63 @@ fn request_body_forces_streaming_fields() {
     assert!(request_body(&json!([1]), "m", Engine::LlamaServer).is_err());
 }
 
+#[test]
+fn request_body_for_sglang_uses_its_sampler_names() {
+    let b = json!({
+        "messages": [{ "role": "user", "content": "hi" }],
+        "temperature": 0.6, "repeat_penalty": 1.1, "dry_multiplier": 0.8, "dry_base": 1.75,
+        "top_k": 0, "frequency_penalty": 0.2, "return_progress": true,
+    });
+    let v = request_body(&b, "dd", Engine::SgLang).unwrap();
+    assert_eq!(v["model"], "dd");
+    assert_eq!(v["stream"], true);
+    assert_eq!(v["stream_options"]["include_usage"], true);
+    assert_eq!(v["repetition_penalty"], 1.1);
+    assert_eq!(v["top_k"], -1, "SGLang rejects top_k 0; -1 is its off");
+    assert_eq!((v["temperature"].clone(), v["frequency_penalty"].clone()), (json!(0.6), json!(0.2)));
+    for gone in ["repeat_penalty", "dry_multiplier", "dry_base", "return_progress", "timings_per_token"] {
+        assert!(v.get(gone).is_none(), "{gone} is llama-server only: {v}");
+    }
+    // An explicit repetition_penalty wins over a leftover repeat_penalty.
+    let b = json!({ "messages": [{ "role": "user", "content": "hi" }], "repeat_penalty": 1.3, "repetition_penalty": 1.05, "top_k": 20 });
+    let v = request_body(&b, "dd", Engine::SgLang).unwrap();
+    assert_eq!((v["repetition_penalty"].clone(), v["top_k"].clone()), (json!(1.05), json!(20)));
+    // llama-server keeps its own names.
+    let l = request_body(&b, "m", Engine::LlamaServer).unwrap();
+    assert_eq!(l["repeat_penalty"], 1.3);
+}
+
+#[test]
+fn sglang_props_from_server_and_model_info() {
+    let server = json!({
+        "context_length": 262144, "max_req_input_len": 208373, "max_running_requests": 2,
+        "sampling_defaults": "model", "version": "0.5.9", "served_model_name": "dd",
+        "reasoning_parser": "qwen3-thinking",
+    });
+    let model = json!({
+        "model_path": "/m/Qwen/x.gguf", "served_model_name": "dd", "has_image_understanding": true,
+        "has_audio_understanding": false, "tool_call_parser": "qwen3_coder", "reasoning_parser": "qwen3-thinking",
+    });
+    let generation = json!({ "do_sample": true, "temperature": 1.0, "top_k": 20, "top_p": 0.95 });
+    let p = parse_sglang(&server, &model, Some(&generation));
+    assert_eq!(p["engine"], "sglang");
+    assert_eq!((p["n_ctx"].clone(), p["total_slots"].clone()), (json!(208373), json!(2)));
+    assert_eq!(p["params"]["temperature"], 1.0);
+    assert_eq!(p["params"]["top_p"], 0.95);
+    assert_eq!(p["params"]["top_k"], 20);
+    assert_eq!(p["params"]["repetition_penalty"], 1.0);
+    assert_eq!(p["params"]["frequency_penalty"], 0.0);
+    assert!(p["params"].get("repeat_penalty").is_none() && p["params"].get("dry_multiplier").is_none());
+    assert_eq!(p["modalities"]["vision"], true);
+    assert_eq!(p["model_alias"], "dd");
+    assert_eq!(p["build_info"], "0.5.9");
+    // `--sampling-defaults openai`: the model's config is not applied; top-k off reads as 0.
+    let openai = json!({ "context_length": 4096, "sampling_defaults": "openai" });
+    let p = parse_sglang(&openai, &json!({}), Some(&generation));
+    assert_eq!((p["params"]["top_p"].clone(), p["params"]["top_k"].clone()), (json!(1.0), json!(0)));
+    assert_eq!(p["n_ctx"], 4096);
+}
+
 fn profile(v: Value) -> Profile {
     let mut base = json!({
         "schema": 1, "id": "worker-pool", "name": "Worker pool",
@@ -436,6 +493,19 @@ fn targets_describe_runs_and_router_models() {
     // An unknown member: labelled by its model id.
     let t = target_for(&router, None, Some("other"), "loaded", None);
     assert_eq!((t.label.as_str(), t.profile_id.as_ref()), ("other", None));
+    assert_eq!(t.engine, Engine::LlamaServer);
+
+    // Behind the SGLang router a model runs on its member's engine, and an
+    // unknown one takes the router's; no llama-server sampling is claimed.
+    let sg = profile(json!({ "engine": "sglang", "id": "dd", "server": { "port": 30000, "alias": "dd" } }));
+    let sg_router = RunState { engine: Engine::SgLang, ..router.clone() };
+    let t = target_for(&sg_router, Some(&sg), Some("dd"), "loaded", None);
+    assert_eq!(t.engine, Engine::SgLang);
+    assert_eq!(serde_json::to_value(&t).unwrap()["engine"], "sglang");
+    assert!(t.sampling.is_none());
+    assert_eq!(target_for(&sg_router, None, Some("x"), "loaded", None).engine, Engine::SgLang);
+    // A llama-server member of a llama-server router stays llama-server.
+    assert_eq!(target_for(&router, Some(&p), Some("gemma-4-worker"), "loaded", None).engine, Engine::LlamaServer);
 }
 
 // ----------------------------------------------------------------- streams ----

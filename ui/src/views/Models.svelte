@@ -10,7 +10,7 @@
   import { arrive, leave, stagger, toastFly, LAYOUT } from "../motion.js";
   import { handoff } from "../lib/handoff.js";
   import {
-    wz, init, submit, open, looksLikeRepo, toBuild, setBuild, setDest, addRoot, start, cancel, resume, runCheck, startOver, ensurePlan,
+    wz, init, submit, open, looksLikeRepo, toBuild, setBuild, setDest, addRoot, start, cancel, resume, runCheck, startOver, ensurePlan, makePlan,
   } from "../lib/models.svelte.js";
   import {
     gib, mbps, eta, params, shortSha, day, levelChip, fitChip, fitWord, actionTitle, sourceOf, supportText, supportChip,
@@ -20,18 +20,40 @@
 
   init();
 
+  // Linux serves models with SGLang and has no llama.cpp builds (the build
+  // step would fetch Windows zips or run a .bat): the wizard gets the files
+  // only, and Done hands them to Profiles for an SGLang profile.
+  const linux = /linux/i.test(navigator.platform ?? "");
   const STEPS = [
     { n: 1, label: "Find" },
     { n: 2, label: "Choose file" },
-    { n: 3, label: "Build" },
+    ...(linux ? [] : [{ n: 3, label: "Build" }]),
     { n: 4, label: "Get" },
     { n: 5, label: "Done" },
   ];
+  // Choose file -> Continue: on Linux straight to Get with no build.
+  async function toNext() {
+    if (!linux) return toBuild();
+    if (!wz.destRoot) {
+      wz.planError = "Add a model folder to save into first (Save to, above).";
+      return;
+    }
+    wz.build = { kind: "skip" };
+    if (await makePlan()) wz.step = 4;
+  }
+  // Done with files but no profile (always on Linux): an SGLang profile
+  // on the downloaded model, made in Profiles.
+  function sglangProfileFor(path) {
+    handoff.modelPath = path;
+    log(`models: new sglang profile for ${path}`);
+    go("profiles");
+  }
   const running = $derived(!!wz.job && !wz.job.finished);
   const reached = $derived(
     wz.job?.finished?.ok ? 5 : wz.job ? 4 : wz.plan ? 4 : wz.view?.kind?.kind === "gguf" ? 2 : wz.view ? 2 : 1
   );
   function canGo(n) {
+    if (linux && n === 3) return false;
     if (running) return n === 4;
     if (n === 5) return !!wz.job?.finished?.ok;
     if (n >= 2 && !wz.view) return n === 4 && !!wz.job;
@@ -200,13 +222,13 @@
 
 <h1>
   Get a model
-  <span class="sub" title="Nothing here loads a model; the Done step has a Launch button for that">Find it on Hugging Face, pick the file that fits, download it, get a profile.</span>
+  <span class="sub" title="Nothing here loads a model; the Done step has a Launch button for that">{linux ? "Find a GGUF on Hugging Face, pick the file that fits, download it, then make an SGLang profile." : "Find it on Hugging Face, pick the file that fits, download it, get a profile."}</span>
 </h1>
 
 <nav class="stepper" aria-label="steps">
-  {#each STEPS as s (s.n)}
+  {#each STEPS as s, i (s.n)}
     <button class="st" class:on={wz.step === s.n} class:past={s.n < wz.step} disabled={!canGo(s.n) && wz.step !== s.n} onclick={() => goStep(s.n)}>
-      <span class="num">{s.n}</span><span>{s.label}</span>
+      <span class="num">{i + 1}</span><span>{s.label}</span>
     </button>
     {#if s.n < 5}<span class="sep"></span>{/if}
   {/each}
@@ -223,7 +245,7 @@
         placeholder="Search Hugging Face, or paste owner/name or a huggingface.co link"
         title="Matches words of the repo name; a repo id or a huggingface.co link opens it directly"
         onkeydown={(e) => e.key === "Enter" && submit()} />
-      <label class="opt" title="Only repos with .gguf files, which llama.cpp loads; off also lists safetensors and other formats">
+      <label class="opt" title={linux ? "Only repos with .gguf files, the format this wizard downloads; off also lists others" : "Only repos with .gguf files, which llama.cpp loads; off also lists safetensors and other formats"}>
         <input type="checkbox" checked={!wz.allFormats} onchange={(e) => (wz.allFormats = !e.target.checked)} /> GGUF only
       </label>
       <button class="btn primary" onclick={submit} disabled={wz.searching || !!wz.opening || !wz.query.trim()}>
@@ -238,7 +260,7 @@
     <section class="card flush">
       {#if wz.hits.length}
         <table class="grid hits">
-          <thead><tr><th>Repo</th><th>Architecture</th><th class="r">Params</th><th class="r">Downloads</th><th class="r">Likes</th><th>Updated</th><th>Build</th></tr></thead>
+          <thead><tr><th>Repo</th><th>Architecture</th><th class="r">Params</th><th class="r">Downloads</th><th class="r">Likes</th><th>Updated</th>{#if !linux}<th>Build</th>{/if}</tr></thead>
           <tbody>
             {#each wz.hits as h, i (h.id)}
               <tr class="hit" in:fade={{ duration: LAYOUT, delay: stagger(i, 15) }} onclick={() => open(h.id)} title="Open {h.id}">
@@ -252,11 +274,11 @@
                 <td class="r num">{Number(h.downloads).toLocaleString()}</td>
                 <td class="r num">{h.likes}</td>
                 <td class="mono faint">{day(h.last_modified)}</td>
-                <td>
+                {#if !linux}<td>
                   {#if h.arch_known === true}<span class="chip pass" title="An installed build names this architecture">installed</span>
                   {:else if h.arch_known === false}<span class="chip warn" title="No installed build names this architecture; the wizard finds one to install or build">needs build</span>
                   {:else}<span class="faint">—</span>{/if}
-                </td>
+                </td>{/if}
               </tr>
             {/each}
           </tbody>
@@ -359,7 +381,7 @@
             <th></th><th>File</th><th class="r">Size</th>
             <th class="r" title="Estimate on one card: weights, KV cache, compute buffers and overhead">Needs</th>
             <th title="Against the whole card; tight is over 90%, no room for a display or another model">One card</th>
-            <th title="Layer split over the two largest cards">Two-card split</th>
+            {#if !linux}<th title="Layer split over the two largest cards">Two-card split</th>{/if}
             <th class="r" title="Longest context that fits one card with 10% to spare">Max context</th>
           </tr>
         </thead>
@@ -377,7 +399,7 @@
               <td class="r num">{gib(c.total_size)}</td>
               <td class="r num">{f?.one_card?.need_bytes ? gib(f.one_card.need_bytes) : "—"}</td>
               <td>{#if f}<span class="chip {fitChip(f.one_card.fit)}" title={f.one_card.detail}>{fitWord(f.one_card.fit)}</span>{#if f.one_card.fit !== "not_applicable" && !f.one_card.fits_free_now && f.one_card.fit !== "no_fit"}<span class="faint small" title="Less VRAM is free right now; another server holds some"> busy now</span>{/if}{:else}<span class="faint">—</span>{/if}</td>
-              <td>{#if f}<span class="chip {fitChip(f.two_card_split.fit)}" title={f.two_card_split.detail}>{fitWord(f.two_card_split.fit)}</span>{:else}<span class="faint">—</span>{/if}</td>
+              {#if !linux}<td>{#if f}<span class="chip {fitChip(f.two_card_split.fit)}" title={f.two_card_split.detail}>{fitWord(f.two_card_split.fit)}</span>{:else}<span class="faint">—</span>{/if}</td>{/if}
               <td class="r num">{f?.max_ctx_one_card ? Number(f.max_ctx_one_card).toLocaleString() : "—"}</td>
             </tr>
           {/each}
@@ -388,14 +410,14 @@
     <section class="card">
       <div class="sec">Extras <span class="faint">downloaded beside the model and paired in the profile</span></div>
       <div class="formgrid">
-        <label class="field" style="grid-column: span 2;" title="Lets the server read images; its VRAM counts on the main card (--mmproj)">
+        <label class="field" style="grid-column: span 2;" title={linux ? "Image projector file, downloaded beside the model" : "Lets the server read images; its VRAM counts on the main card (--mmproj)"}>
           <span class="k">vision projector</span>
           <select bind:value={wz.mmproj} disabled={!v.catalog.mmproj.length}>
             <option value="">{v.catalog.mmproj.length ? "none" : "none in this repo"}</option>
             {#each v.catalog.mmproj as m}<option value={m.path}>{m.path} · {gib(m.size)}</option>{/each}
           </select>
         </label>
-        <label class="field" style="grid-column: span 2;" title="Draft model, MTP head or DFlash draft; the profile turns speculative decoding on with it (-md)">
+        <label class="field" style="grid-column: span 2;" title={linux ? "Draft model or MTP head file, downloaded beside the model" : "Draft model, MTP head or DFlash draft; the profile turns speculative decoding on with it (-md)"}>
           <span class="k">draft / MTP head</span>
           <select bind:value={wz.draft} disabled={!v.catalog.drafts.length}>
             <option value="">{v.catalog.drafts.length ? "none" : "none in this repo"}</option>
@@ -405,7 +427,7 @@
             {/each}
           </select>
         </label>
-        <label class="field" style="grid-column: span 2;" title="Context of the new profile; empty is the largest that fits one card, up to 32,768">
+        <label class="field" style="grid-column: span 2;" title={linux ? "Context the fit estimate uses; the SGLang profile sets its own" : "Context of the new profile; empty is the largest that fits one card, up to 32,768"}>
           <span class="k">context</span>
           <input type="number" min="512" step="1024" bind:value={wz.ctx} placeholder={`auto (${Number(Math.min(32768, fitOf(wz.choice)?.max_ctx_one_card ?? 32768)).toLocaleString()})`} />
         </label>
@@ -420,7 +442,9 @@
 
     <section class="card">
       <div class="notice">
-        {#if usable}
+        {#if linux}
+          <span class="chip plain">files</span><span title="SGLang reads a .gguf with the base model's config.json and tokenizer.json beside it">Downloads the file only; Done makes an SGLang profile from it.</span>
+        {:else if usable}
           <span class="chip pass">build</span><span><b>{usable.name}</b> can load it.</span>
         {:else if v.needs}
           <span class="chip warn">build</span><span>No installed build knows <span class="mono">{v.needs.arch}</span>{v.needs.tokenizer_pre ? ` (pre-tokenizer ${v.needs.tokenizer_pre})` : ""}. The next step gets one.</span>
@@ -433,7 +457,7 @@
         <button class="btn" onclick={() => (wz.step = 1)}>Back</button>
         <div class="grow"></div>
         {#if !wz.destRoot}<span class="faint small">Add a model folder above first.</span>{/if}
-        <button class="btn primary" onclick={toBuild} disabled={!wz.choice || wz.planning || !wz.destRoot}>{#if wz.planning}<span class="spinner"></span> Planning…{:else}Continue{/if}</button>
+        <button class="btn primary" onclick={toNext} disabled={!wz.choice || wz.planning || !wz.destRoot}>{#if wz.planning}<span class="spinner"></span> Planning…{:else}Continue{/if}</button>
       </div>
     </section>
   {/if}
@@ -636,7 +660,7 @@
 
     <div class="toolbar" style="margin: 14px 0 0;">
       {#if !wz.job}
-        <button class="btn" onclick={() => (wz.step = 3)} disabled={!wz.view}>Back</button>
+        <button class="btn" onclick={() => (wz.step = linux ? 2 : 3)} disabled={!wz.view}>Back</button>
         <div class="grow"></div>
         {#if jobPlan.blocked}<span class="faint small">Fix the errors above first.</span>
         {:else if blockedByConsent}<span class="faint small">The build needs your consent on the Build step.</span>{/if}
@@ -684,7 +708,11 @@
       </dl>
     {:else}
       {#each result.files as f}<div class="path">{f}</div>{/each}
-      <div class="faint small" style="margin-top: 8px;">No profile: no build loads this model yet — make one in Profiles once one does.</div>
+      {#if linux}
+        <div class="faint small" style="margin-top: 8px;" title="Profiles checks for the base model's config.json and tokenizer.json beside the .gguf">No profile yet: make an SGLang profile on the file below.</div>
+      {:else}
+        <div class="faint small" style="margin-top: 8px;">No profile: no build loads this model yet — make one in Profiles once one does.</div>
+      {/if}
     {/if}
     {#each result.warnings as w}<div class="notice small" style="margin-top: 6px;"><span class="chip warn">note</span><span>{w}</span></div>{/each}
     {#if result.build}
@@ -700,6 +728,8 @@
           title="Loads the model now, after the same pre-flight as Profiles">
           {#if launching}<span class="spinner"></span> Loading…{:else}Launch{/if}
         </button>
+      {:else if linux && result.files?.length}
+        <button class="btn primary" onclick={() => sglangProfileFor(result.files[0])} title="Opens Profiles with a new SGLang profile on the downloaded model">Make an SGLang profile</button>
       {:else}
         <button class="btn" onclick={() => go("profiles")}>Open Profiles</button>
       {/if}

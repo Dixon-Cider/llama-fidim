@@ -45,7 +45,31 @@
   let loadErrors = $state([]); // [name, message] for anything that failed to load
   let loading = $state(true);
   let keepAliveDefault = $state(5);
-  api("get_config").then((c) => (keepAliveDefault = c.config?.keep_alive_seconds ?? 5)).catch(() => {});
+  // The SGLang section of config.json (venv): with it, a box needs no llama.cpp build.
+  let sglangHost = $state(null);
+  api("get_config").then((c) => {
+    keepAliveDefault = c.config?.keep_alive_seconds ?? 5;
+    sglangHost = c.config?.sglang ?? null;
+  }).catch(() => {});
+  // The web view's platform: script export is .sh on Linux, .bat/.ps1 on Windows.
+  const linux = /linux/i.test(navigator.platform ?? "");
+  // Engines this box can run: SGLang with a venv (or on Linux, where it is
+  // the engine), llama.cpp with a build (or on Windows, where Updates gets one).
+  const canSgLang = $derived(!!sglangHost || linux);
+  const canLlama = $derived(builds.length > 0 || !linux);
+  const ENGINE_NAMES = { "llama-server": "llama.cpp", sglang: "SGLang", "diffusion-gemma": "DiffusionGemma" };
+  const engineOf = (p) => p?.engine ?? "llama-server";
+  // The list, one group per engine, llama.cpp first.
+  const groups = $derived.by(() => {
+    const order = ["llama-server", "sglang", "diffusion-gemma"];
+    const by = new Map();
+    for (const row of profiles) {
+      const e = order.includes(engineOf(row.profile)) ? engineOf(row.profile) : "unknown";
+      if (!by.has(e)) by.set(e, []);
+      by.get(e).push(row);
+    }
+    return [...order, "unknown"].filter((e) => by.has(e)).map((e) => ({ engine: e, rows: by.get(e) }));
+  });
 
   async function load() {
     loading = true;
@@ -128,15 +152,38 @@
     reasoning_parser: "", tool_call_parser: "", memguard_gb: 12, enable_metrics: true,
     sleep_on_idle: true, compile_threads: 2, aliases: [], extra_args: [],
   };
-  const SG_SPEC_DEFAULTS = { algorithm: "NEXTN", steps: 3, topk: 1, draft_tokens: 4, token_map: "" };
+  const SG_SPEC_DEFAULTS = { algorithm: "NEXTN", steps: 3, topk: 1, draft_tokens: 4, token_map: "", draft_model: "" };
   const SG_KV_DTYPES = ["fp8_e4m3", "fp4_mx_block16", "fp8_e5m2", "bf16", "auto"];
-  const SG_ATTN_BACKENDS = ["triton", "flashinfer", "fa3", "trtllm_mha", "torch_native"];
+  // Attention kernels by vendor (pre-flight blocks the other vendor's);
+  // aiter and wave are Instinct (gfx9) kernels, so a Radeon gets triton.
+  const SG_ATTN_BACKENDS_AMD = ["triton", "torch_native", "aiter", "wave"];
+  const SG_ATTN_BACKENDS_NVIDIA = ["triton", "flashinfer", "fa3", "fa4", "trtllm_mha", "torch_native"];
   const SG_DTYPES = ["bfloat16", "float16", "auto"];
-  const SG_SPEC_ALGOS = ["NEXTN", "EAGLE", "EAGLE3", "NGRAM"];
+  const SG_SPEC_ALGOS = ["NEXTN", "EAGLE", "EAGLE3", "STANDALONE", "NGRAM"];
+  const SG_SPEC_LABELS = {
+    NEXTN: "the model's own draft head (NEXTN)",
+    EAGLE: "EAGLE draft model",
+    EAGLE3: "EAGLE-3 draft model",
+    STANDALONE: "a small model of the same family (STANDALONE)",
+    NGRAM: "prompt lookup, no model (NGRAM)",
+  };
+  const sgNeedsDraftModel = (a) => ["EAGLE", "EAGLE3", "STANDALONE"].includes(String(a ?? "").toUpperCase());
   const SG_REASONING_PARSERS = ["qwen3-thinking", "qwen3", "deepseek-r1", "deepseek-v3", "glm45", "kimi", "gpt-oss", "step3"];
   const SG_TOOL_PARSERS = ["qwen3_coder", "qwen25", "hermes", "llama3", "mistral", "deepseekv3", "glm45", "kimi_k2", "pythonic", "gpt-oss"];
   // The one card an SGLang profile runs on, from the device list.
   const sgDevice = $derived(isSgLang ? devices.find((d) => d.stable_key === draft?.devices?.[0]?.key) ?? null : null);
+  const sgNvidia = $derived(!!sgDevice?.stable_key?.includes("VEN_10DE"));
+  const sgAttnBackends = $derived(sgNvidia ? SG_ATTN_BACKENDS_NVIDIA : SG_ATTN_BACKENDS_AMD);
+  // Largest VRAM share that still leaves 1.5 GiB once the server has grown
+  // under load (sglang::RUNTIME_OVERHEAD_BYTES, 4 GiB) on a display card.
+  const sgSafeShare = $derived(sgDevice?.total_mib ? 1 - (1.5 * 1024 + 4 * 1024) / sgDevice.total_mib : 0.83);
+  // What pre-flight worked out for the pool (sglang::PoolBudget).
+  const sgPool = $derived(isSgLang ? check?.estimate?.budget ?? null : null);
+  // A hybrid (GatedDeltaNet/SSM) model keeps a recurrent state per request:
+  // only then does SGLang have state slots to size.
+  const sgHybrid = $derived(
+    sgPool ? sgPool.state_slots != null
+      : (header?.full_attention_interval ?? 0) > 1 || (hf?.attention_layers != null && hf?.num_layers != null && hf.attention_layers < hf.num_layers));
   // Text of the env map while it is being edited (parsing every keystroke
   // back into the map would drop the line being typed).
   let sgEnvText = $state("");
@@ -210,6 +257,12 @@
     draft.keep_alive_seconds = null;
     draft.runtime.extra_flags = [];
     if (!draft.runtime.ctx_total) draft.runtime.ctx_total = 32768;
+    // llama-server's sampler, thinking switch and slot trace have no SGLang
+    // equivalent in the profile (requests carry their own sampling), and a
+    // saved SGLang profile drops them; clear them so nothing hidden lingers.
+    for (const k of Object.keys(draft.sampling ?? {})) draft.sampling[k] = null;
+    if (draft.chat) draft.chat.enable_thinking = null;
+    if (draft.env) delete draft.env.LLAMA_SERVER_SLOTS_DEBUG;
     sgEnvText = envToText(draft.env);
   }
 
@@ -518,6 +571,17 @@
     scheduleCheck();
   }
 
+  // A blank SGLang profile: port above the SGLang servers already saved.
+  function newSgLang() {
+    newProfile();
+    enterSgLang();
+    draft.id = draft.server.alias = "new-sglang";
+    draft.name = "New SGLang profile";
+    const used = profiles.filter((r) => engineOf(r.profile) === "sglang").map((r) => r.profile.server.port);
+    draft.server.port = used.length ? Math.max(...used) + 1 : 30000;
+    scheduleCheck();
+  }
+
   // A new SGLang profile on a checkpoint the Models view handed over: id and
   // name from the folder (or file stem), alias = id.
   function newSgLangProfile(path) {
@@ -621,6 +685,10 @@
       delete copy.speculative;
       delete copy.keep_alive_seconds;
       delete copy.diffusion;
+      // Requests bring their own sampling; the file keeps none (profile.rs prunes it too).
+      copy.sampling = {};
+      delete copy.chat.enable_thinking;
+      delete copy.env.LLAMA_SERVER_SLOTS_DEBUG;
       const s = (copy.sglang = sgFill(copy.sglang));
       s.mem_fraction = Number(s.mem_fraction);
       if (!Number.isFinite(s.mem_fraction)) s.mem_fraction = SG_DEFAULTS.mem_fraction;
@@ -635,6 +703,8 @@
         for (const k of ["steps", "topk", "draft_tokens"]) sp[k] = Math.max(1, intOr(sp[k], SG_SPEC_DEFAULTS[k]));
         sp.token_map = String(sp.token_map ?? "").trim();
         if (!sp.token_map) delete sp.token_map;
+        sp.draft_model = String(sp.draft_model ?? "").trim();
+        if (!sp.draft_model || !sgNeedsDraftModel(sp.algorithm)) delete sp.draft_model;
       } else {
         delete s.spec;
       }
@@ -727,20 +797,39 @@
 
   // SGLang's estimate is one number for the one card (per_device is empty):
   // the static pool = mem_fraction x the card's VRAM, against what is free now.
+  // The bar is the card: other processes, then the pool split the way SGLang
+  // splits it (weights, draft, state, KV), then the growth under load.
   const sgBudget = $derived.by(() => {
     if (!isSgLang || !check?.estimate) return null;
     const dev = check.resolved?.[0]?.device;
-    const totalBytes = (dev?.total_mib ?? 0) * 1024 * 1024;
-    const freeBytes = (dev?.free_mib ?? 0) * 1024 * 1024;
-    const est = check.estimate.total_bytes ?? 0;
-    const frac = totalBytes > 0 ? est / totalBytes : 0;
+    const total = (dev?.total_mib ?? 0) * 1024 * 1024;
+    if (!total) return null;
+    const e = check.estimate;
+    const free = e.free_for_launch_bytes ?? (dev?.free_mib ?? 0) * 1024 * 1024;
+    const pool = e.total_bytes ?? 0;
+    const b = e.budget;
+    const others = Math.max(0, total - free);
+    const growth = e.runtime_overhead_bytes ?? 0;
+    const part = (label, bytes, cls, title) => ({ label, bytes, cls, title, pct: (100 * bytes) / total });
+    const parts = [part("others", others, "others", "Held by other processes on this card now (the desktop, other servers)")];
+    if (b) {
+      parts.push(part("weights", b.weights_bytes, "weights", "Model weights as loaded (file size + ~10%)"));
+      if (b.draft_bytes) parts.push(part("draft", b.draft_bytes, "draft", "Draft head or draft model for speculative decoding"));
+      if (b.state_bytes) parts.push(part("state", b.state_bytes, "state", `Recurrent state, ${b.state_slots ?? "?"} slots${b.state_auto ? " (SGLang's auto share)" : ""} (--max-mamba-cache-size)`));
+      parts.push(part("KV", b.kv_budget_bytes, "kv", `KV cache: ~${fmtInt(b.tokens_in_budget)} tokens at ${b.kv_bytes_per_token} B each`));
+    } else {
+      parts.push(part("pool", Math.max(0, pool - others), "weights", "Static pool (model not readable, so no split)"));
+    }
+    parts.push(part("growth", growth, "growth", "Activations, graphs and allocator cache added under long prompts"));
+    const afterLaunch = free - pool;
+    const underLoad = afterLaunch - growth;
     return {
-      name: dev?.name ?? draft?.devices?.[0]?.key ?? "?",
-      key: dev?.stable_key ?? draft?.devices?.[0]?.key ?? "",
-      estGib: est / GIB, totalGib: totalBytes / GIB, freeGib: freeBytes / GIB,
-      frac, freeFrac: totalBytes > 0 ? freeBytes / totalBytes : 0,
-      kind: est > freeBytes ? "block" : frac > 0.9 ? "warn" : "pass",
-      assumptions: check.estimate.assumptions ?? [],
+      name: dev?.name ?? "?", key: dev?.stable_key ?? "",
+      totalGib: total / GIB, poolGib: pool / GIB, parts,
+      afterLaunchGib: afterLaunch / GIB, underLoadGib: underLoad / GIB,
+      display: !!dev?.display,
+      tokens: b?.tokens_in_budget ?? null, ctx: b?.ctx ?? null,
+      kind: afterLaunch < 0 ? "block" : dev?.display && underLoad < 1.5 * GIB ? "warn" : "pass",
     };
   });
 
@@ -821,6 +910,10 @@
       if (r.blocked) {
         toastMsg("Blocked by pre-flight. See the list below, or Override to accept the named risks.", true);
         check = { ...check, results: r.results };
+      } else if (r.engine === "sglang") {
+        const rep = r.replaced ? ` · replaced ${r.replaced} on this port` : "";
+        const vram = r.resident_bytes ? ` — ${(r.resident_bytes / GIB).toFixed(1)} GiB on the card` : "";
+        toastMsg(`SGLang up: pid ${r.state.pid} on port ${r.state.port}${r.cold_start ? " (cold cache)" : ""}${vram}${rep}`);
       } else {
         const place = (r.placement ?? [])
           .map((p) => `${(Math.max(p.dedicated_bytes ?? 0, p.committed_bytes ?? 0) / GIB).toFixed(1)} GiB on ${p.key.split(":").pop()}`)
@@ -855,7 +948,7 @@
 </script>
 <h1>
   Profiles
-  <span class="sub" title="Pre-flight here is the same check a launch runs">One saved launch: model, build, GPUs and flags.</span>
+  <span class="sub" title="Pre-flight here is the same check a launch runs">One saved launch: engine, model, GPU and settings.</span>
 </h1>
 {#if loadErrors.length}
   <div class="card">
@@ -864,10 +957,10 @@
     {/each}
     <div class="faint small" style="margin-top: 6px;">Check the roots on the Settings tab, then Rescan.</div>
   </div>
-{:else if !loading && (!models.length || !builds.length || !devices.length)}
+{:else if !loading && (!models.length || (!builds.length && !sglangHost) || !devices.length)}
   <div class="card notice">
-    <span class="chip warn" title="Nothing to pick from: no models, builds or GPUs were found under the roots">empty</span>
-    <span>{models.length} models · {builds.length} builds · {devices.length} GPUs — set the roots in <b>Settings</b>, then Rescan.</span>
+    <span class="chip warn" title="Nothing to pick from: no models, engine or GPUs were found">empty</span>
+    <span>{models.length} models · {sglangHost ? "SGLang venv set" : `${builds.length} llama.cpp builds`} · {devices.length} GPUs — set the roots{linux ? " and the SGLang venv" : ""} in <b>Settings</b>, then Rescan.</span>
   </div>
 {/if}
 
@@ -875,27 +968,37 @@
   <!-- list -->
   <aside class="list">
     <div class="toolbar" style="margin-bottom: 10px;">
-      <button class="btn" onclick={newProfile}>New</button>
-      <button class="btn" onclick={duplicate} disabled={!draft}>Duplicate</button>
+      <span class="newrow">
+        {#if canLlama}<button class="btn" onclick={newProfile} title="A llama-server profile on a llama.cpp build">New llama.cpp</button>{/if}
+        {#if canSgLang}<button class="btn" onclick={newSgLang} title="An SGLang server from the venv in Settings, one card">New SGLang</button>{/if}
+        <button class="btn" onclick={duplicate} disabled={!draft} title="Copy this profile, same engine, next port">Duplicate</button>
+      </span>
       <div class="grow"></div>
       <button class="btn small" onclick={rescan} disabled={busy === "scan"} title="Scan the build and model roots again">{busy === "scan" ? "…" : "Rescan"}</button>
     </div>
     <div class="rows">
-      {#each profiles as row, i (row.profile.id)}
-        {@const p = row.profile}
-        <button class="row" class:active={selectedId === p.id} onclick={() => select(p.id)} in:fly={arrive(stagger(i, 30))} out:slide={leave} animate:flip={flipParams}>
-          <div class="r1"><span class="id">{p.id}</span><span class="mono faint">:{p.server.port}</span></div>
-          <div class="r2">{base(p.model.path) || "no model"}</div>
-          <div class="r3">
-            <span class="mono">{p.engine === "sglang" ? "venv" : p.build.version ?? "?"}</span>
-            <span>{p.devices.length} GPU{p.devices.length === 1 ? "" : "s"}{p.split_mode ? `, ${p.split_mode} split` : ""}</span>
-            {#if p.engine === "diffusion-gemma"}<span class="chip note" title="Runs on the DiffusionGemma runner, not llama-server">diffusion</span>
-            {:else if p.engine === "sglang"}<span class="chip note" title="Runs on SGLang from the venv in Settings, behind model_router.py">sglang</span>
-            {:else if p.engine && p.engine !== "llama-server"}<span class="chip block" title="This file names an engine this version does not know; fix the engine field by hand">unknown</span>{/if}
-            {#if p.baseline}<span class="tok num">{p.baseline.serial_tok_s} tok/s</span>{/if}
-            {#if row.findings.length}<span class="chip warn" title="Problems in the profile file; open it to see them">{row.findings.length}</span>{/if}
-          </div>
-        </button>
+      {#each groups as g (g.engine)}
+        <div class="group" title={g.engine === "sglang" ? "Python servers from the SGLang venv, fronted by the router" : g.engine === "llama-server" ? "llama-server on a llama.cpp build" : ""}>{ENGINE_NAMES[g.engine] ?? "unknown engine"} <span class="faint">{g.rows.length}</span></div>
+        {#each g.rows as row, i (row.profile.id)}
+          {@const p = row.profile}
+          <button class="row" class:active={selectedId === p.id} onclick={() => select(p.id)} in:fly={arrive(stagger(i, 30))} out:slide={leave} animate:flip={flipParams}>
+            <div class="r1"><span class="id">{p.id}</span><span class="mono faint">:{p.server.port}</span></div>
+            <div class="r2">{base(p.model.path) || "no model"}</div>
+            <div class="r3">
+              {#if p.engine === "sglang"}
+                <span class="mono" title="Requests decoded at once (--max-running-requests)">{p.sglang?.max_running_requests ?? 2} concurrent</span>
+                <span class="mono" title="KV cache precision (--kv-cache-dtype)">{p.sglang?.kv_cache_dtype ?? "fp8_e4m3"}</span>
+                {#if p.sglang?.spec}<span class="mono" title="Speculative decoding (--speculative-algorithm)">{p.sglang.spec.algorithm}</span>{/if}
+              {:else}
+                <span class="mono">{p.build.version ?? "?"}</span>
+                <span>{p.devices.length} GPU{p.devices.length === 1 ? "" : "s"}{p.split_mode ? `, ${p.split_mode} split` : ""}</span>
+              {/if}
+              {#if p.engine && !["llama-server", "sglang", "diffusion-gemma"].includes(p.engine)}<span class="chip block" title="This file names an engine this version does not know; fix the engine field by hand">unknown</span>{/if}
+              {#if p.baseline}<span class="tok num">{p.baseline.serial_tok_s} tok/s</span>{/if}
+              {#if row.findings.length}<span class="chip warn" title="Problems in the profile file; open it to see them">{row.findings.length}</span>{/if}
+            </div>
+          </button>
+        {/each}
       {:else}
         <div class="empty">No profiles yet — New, or <button class="link" onclick={() => go("models")}>Models</button> → Get a model</div>
       {/each}
@@ -929,15 +1032,37 @@
           {#if anyBlock}
             <button class="btn danger" onclick={() => launch(true)} disabled={!!busy}>Override blocks &amp; load</button>
           {/if}
-          <button class="btn" onclick={() => exportScript("bat")} disabled={!!busy} title="Write a standalone .bat that launches this profile">Export .bat</button>
-          <button class="btn" onclick={() => exportScript("ps1")} disabled={!!busy} title="Write a standalone .ps1 that launches this profile">Export .ps1</button>
+          {#if linux}
+            <button class="btn" onclick={() => exportScript("sh")} disabled={!!busy || !selectedId} title="Write a bash script next to the profile that starts this server without FIDIM">Export .sh</button>
+          {:else}
+            <button class="btn" onclick={() => exportScript("bat")} disabled={!!busy || !selectedId} title="Write a standalone .bat that launches this profile">Export .bat</button>
+            <button class="btn" onclick={() => exportScript("ps1")} disabled={!!busy || !selectedId} title="Write a standalone .ps1 that launches this profile">Export .ps1</button>
+          {/if}
           <button class="btn danger" onclick={remove} disabled={!!busy || !selectedId}>Delete</button>
         </div>
       </div>
 
       <!-- identity -->
       <section class="card">
-        <div class="sec">Identity</div>
+        <div class="sec">
+          Identity
+          {#if isDiffusion && modelEngine === "diffusion-gemma"}
+            <span class="chip note" style="margin-left: auto;" title="The model's header makes this a DiffusionGemma profile">DiffusionGemma</span>
+          {:else}
+            <span class="engines" role="radiogroup" aria-label="engine" style="margin-left: auto;">
+              <button role="radio" aria-checked={engineOf(draft) === "llama-server"} class:on={engineOf(draft) === "llama-server"} disabled={isHf(selectedModel) || (!canLlama && !isSgLang)}
+                onclick={() => onEnginePick("llama-server")}
+                title={isHf(selectedModel) ? "A safetensors checkpoint loads only on SGLang" : "llama-server from a llama.cpp build: GGUF, layer splits across cards"}>
+                llama.cpp<small>{selectedBuild?.version ?? "llama-server build"}</small>
+              </button>
+              <button role="radio" aria-checked={isSgLang} class:on={isSgLang} disabled={!canSgLang && !isSgLang}
+                onclick={() => onEnginePick("sglang")}
+                title="SGLang from the venv in Settings: GGUF or safetensors, one card, behind the router">
+                SGLang<small>{sglangHost?.venv ? base(sglangHost.venv) : "Python venv"}</small>
+              </button>
+            </span>
+          {/if}
+        </div>
         <div class="formgrid">
           <label class="field" title="File name of the profile and what the CLI launches; letters, digits, dashes (fidim launch <id>)"><span class="k">id</span><input bind:value={draft.id} oninput={scheduleCheck} /></label>
           <label class="field" style="grid-column: span 2;" title="Display name, free text"><span class="k">name</span><input bind:value={draft.name} /></label>
@@ -953,18 +1078,8 @@
       <section class="card">
         <div class="sec">Model <span class="faint">{isSgLang ? "a .gguf file or a Hugging Face safetensors folder" : `${ggufModels.length} GGUF files in the roots`}</span></div>
         <div class="formgrid">
-          {#if modelEngine !== "diffusion-gemma"}
-            <label class="field" style="grid-column: span 2;" title="Which server runs this profile: a llama.cpp build, or SGLang from the venv in Settings">
-              <span class="k">engine</span>
-              <select value={draft.engine ?? "llama-server"} onchange={(e) => onEnginePick(e.target.value)}>
-                <option value="llama-server">llama-server (llama.cpp build)</option>
-                <option value="sglang">SGLang (Python venv)</option>
-                {#if isDiffusion}<option value="diffusion-gemma">DiffusionGemma</option>{/if}
-              </select>
-            </label>
-          {/if}
           {#if isSgLang}
-            <label class="field" style="grid-column: span 4;" title="A .gguf file or a Hugging Face checkpoint folder, inside the roots or not (--model-path)">
+            <label class="field" style="grid-column: 1 / -1;" title="A .gguf file or a Hugging Face checkpoint folder, inside the roots or not (--model-path)">
               <span class="k">model path</span>
               <input bind:value={draft.model.path} oninput={() => { creator = null; scheduleCheck(); }} placeholder="/models/Qwen3-27B-GGUF/model.gguf, or /models/Qwen3-27B (safetensors)" />
             </label>
@@ -987,7 +1102,7 @@
               </label>
             {/if}
           {:else}
-          <label class="field" style="grid-column: {modelEngine !== 'diffusion-gemma' ? 'span 4' : '1 / -1'};" title="GGUF file the server loads (-m)">
+          <label class="field" style="grid-column: 1 / -1;" title="GGUF file the server loads (-m)">
             <span class="k">weights</span>
             <select value={ggufModels.find((m) => samePath(m.path, draft.model.path))?.path ?? ""} onchange={(e) => onModelPick(e.target.value)}>
               <option value="" disabled>choose a model…</option>
@@ -1098,7 +1213,11 @@
           {#if isDiffusion && !runnerBuilds.length}
             <div class="notice" style="grid-column: 1 / -1;">
               <span class="chip block">no runner</span>
-              <span>Save, then <button class="link" onclick={() => go("updates")} title="Opens Updates; unsaved edits here are dropped">install an Unsloth build from Updates</button></span>
+              {#if linux}
+                <span>no DiffusionGemma runner build under the build roots (Updates installs them on Windows only)</span>
+              {:else}
+                <span>Save, then <button class="link" onclick={() => go("updates")} title="Opens Updates; unsaved edits here are dropped">install an Unsloth build from Updates</button></span>
+              {/if}
             </div>
           {/if}
           {/if}
@@ -1176,16 +1295,21 @@
           <div class="budget">
             <div>
               <div class="cap">
-                <span>static pool on {sgBudget.name.replace(/^AMD /, "")} <span class="faint">({sgBudget.key.split(":").pop()})</span></span>
-                <span><span class="num">{sgBudget.estGib.toFixed(2)}</span> of <span class="num">{sgBudget.totalGib.toFixed(2)}</span> GiB · {Math.round(sgBudget.frac * 100)}% · <span class="num">{sgBudget.freeGib.toFixed(2)}</span> GiB free now</span>
+                <span>{sgBudget.name.replace(/^AMD /, "")} <span class="faint">({sgBudget.key.split(":").pop()})</span>{#if sgBudget.tokens != null} · <span class="num" title="KV tokens the pool holds, shared by all requests; SGLang logs the exact figure as max_total_num_tokens">~{fmtInt(sgBudget.tokens)}</span> KV tokens{/if}</span>
+                <span title="Free on the card once the pool is taken, and once long prompts have grown the server">
+                  <span class="num chip {sgBudget.kind}">{sgBudget.afterLaunchGib.toFixed(1)}</span> GiB free at launch ·
+                  <span class="num">{sgBudget.underLoadGib.toFixed(1)}</span> under load
+                </span>
               </div>
-              <div class="bar" title="The bar is the card, the mark what is free now; the pool must fit in the free part">
-                <div class="fill {sgBudget.kind}" style="width: {Math.min(100, sgBudget.frac * 100)}%;"></div>
-                <div class="mark" style="left: {Math.min(100, sgBudget.freeFrac * 100)}%;"></div>
+              <div class="bar stack">
+                {#each sgBudget.parts as p}
+                  <div class="seg {p.cls}" style="width: {Math.max(0, Math.min(100, p.pct))}%;" title="{p.label}: {(p.bytes / GIB).toFixed(1)} GiB. {p.title}"></div>
+                {/each}
               </div>
-              {#each sgBudget.assumptions as a}
-                <div class="faint small" style="margin-top: 4px;">{a}</div>
-              {/each}
+              <div class="legend faint small">
+                {#each sgBudget.parts.filter((p) => p.bytes > 0) as p}<span><i class="seg {p.cls}"></i>{p.label} {(p.bytes / GIB).toFixed(1)}</span>{/each}
+                <span>of {sgBudget.totalGib.toFixed(1)} GiB</span>
+              </div>
             </div>
           </div>
         {/if}
@@ -1276,22 +1400,25 @@
       {#if isSgLang && draft.sglang}
         <!-- sglang -->
         <section class="card">
-          <div class="sec">SGLang <span class="faint">server flags; sampling comes from each request</span></div>
+          <div class="sec">SGLang <span class="faint" title="SGLang uses each request's sampling, else the model's generation_config.json; the profile sets none">server settings; sampling is per request</span></div>
           <div class="formgrid">
             <Range bind:value={draft.sglang.mem_fraction} label="VRAM share" min={0.3} max={0.98} step={0.01}
-              hint={sgDevice?.display ? "display on this card: keep ≥ 1.5 GB free (0.85 on 32 GB)" : "weights + KV pool"}
+              hint={sgDevice?.display ? `display on this card: ≤ ${sgSafeShare.toFixed(2)} keeps 1.5 GB under load` : "weights, state and KV pool"}
               format={(v) => Number(v).toFixed(2)} onchange={scheduleCheck} span={3}
               title="Share of the card SGLang reserves for weights and cache; leave 1.5 GB when the card drives a display (--mem-fraction-static)" />
             <Range bind:value={draft.sglang.chunked_prefill} label="prompt chunk" min={512} max={32768} step={512}
               hint="tokens per forward pass" format={fmtInt} onchange={scheduleCheck} span={3}
               title="Prompt tokens per prefill pass; larger is faster but takes more VRAM (--chunked-prefill-size)" />
-            <Range bind:value={draft.sglang.mamba_slots} label="state slots" min={1} max={256} step={1} nullable offLabel="auto"
-              placeholder={Math.max(1, Number(draft.sglang.max_running_requests) || 1) * 5}
-              hint="hybrid (GatedDeltaNet) models; auto = 5 × concurrent requests" onchange={scheduleCheck} span={3}
-              title="Recurrent-state slots on a hybrid model, one per running or queued request (--max-mamba-cache-size)" />
+            {#if sgHybrid}
+              <Range bind:value={draft.sglang.mamba_slots} label="state slots" min={1} max={256} step={1} nullable offLabel="auto"
+                placeholder={sgPool?.state_auto ? sgPool.state_slots : Math.max(1, Number(draft.sglang.max_running_requests) || 1) * 5}
+                hint={sgPool?.state_auto ? `auto: ~${sgPool.state_slots} slots, ${(sgPool.state_bytes / GIB).toFixed(1)} GiB taken from KV` : "each running or cached request holds one"}
+                onchange={scheduleCheck} span={3}
+                title="Recurrent-state slots; auto gives them ~47% of the memory after weights (--max-mamba-cache-size)" />
+            {/if}
             <Range bind:value={draft.sglang.memguard_gb} label="host RAM guard" min={0} max={128} step={1}
-              hint="GB per process" onchange={scheduleCheck} span={3}
-              title="Aborts the server when its host RSS passes this GB, ahead of the OOM killer (memguard). A GGUF needs file size plus margin." />
+              hint="GB of anonymous RAM per process · 0 = off" onchange={scheduleCheck} span={3}
+              title="Stops a server process whose private RAM passes this, ahead of the OOM killer (memguard)" />
             <label class="field" style="grid-column: span 2;" title="KV pool storage type; fp8_e4m3 halves it against bf16, fp4_mx_block16 halves it again and needs the gfx1201 kernel patch (--kv-cache-dtype)">
               <span class="k">cache precision</span>
               <select bind:value={draft.sglang.kv_cache_dtype} onchange={scheduleCheck}>
@@ -1299,11 +1426,11 @@
                 {#if !SG_KV_DTYPES.includes(draft.sglang.kv_cache_dtype)}<option value={draft.sglang.kv_cache_dtype}>{draft.sglang.kv_cache_dtype}</option>{/if}
               </select>
             </label>
-            <label class="field" style="grid-column: span 2;" title="triton is the one that runs on gfx1201; the others are for other cards (--attention-backend)">
+            <label class="field" style="grid-column: span 2;" title={sgNvidia ? "Attention kernel; triton runs everywhere, flashinfer/fa3 are NVIDIA's (--attention-backend)" : "Attention kernel; triton runs on Radeon, aiter/wave only on Instinct (--attention-backend)"}>
               <span class="k">attention kernel</span>
               <select bind:value={draft.sglang.attention_backend} onchange={scheduleCheck}>
-                {#each SG_ATTN_BACKENDS as t}<option value={t}>{t}</option>{/each}
-                {#if !SG_ATTN_BACKENDS.includes(draft.sglang.attention_backend)}<option value={draft.sglang.attention_backend}>{draft.sglang.attention_backend}</option>{/if}
+                {#each sgAttnBackends as t}<option value={t}>{t}</option>{/each}
+                {#if !sgAttnBackends.includes(draft.sglang.attention_backend)}<option value={draft.sglang.attention_backend}>{draft.sglang.attention_backend}</option>{/if}
               </select>
             </label>
             <label class="field" style="grid-column: span 2;" title="Type for unquantised weights and activations; bfloat16 is safe, float16 can overflow (--dtype)">
@@ -1371,28 +1498,39 @@
             {#if mtpBuiltIn}<span class="chip pass" title="The checkpoint has its own draft head (next-token predict layers)">MTP</span>{/if}
           </div>
           <div class="formgrid">
-            <label class="field" style="grid-column: span 3;" title="On sends --speculative-algorithm with the settings below">
+            <label class="field" style="grid-column: span 3;" title="A cheap draft proposes tokens the model verifies in one pass (--speculative-algorithm)">
               <span class="k">enabled</span>
               <span><input type="checkbox" checked={!!draft.sglang.spec} onchange={(e) => onSgSpecToggle(e.target.checked)} /> {draft.sglang.spec ? "on" : "off"}</span>
             </label>
             {#if draft.sglang.spec}
-              <label class="field" style="grid-column: span 3;" title="NEXTN uses the model's own draft head, EAGLE a draft model from extra arguments, NGRAM prompt lookup">
+              {@const algo = String(draft.sglang.spec.algorithm ?? "").toUpperCase()}
+              <label class="field" style="grid-column: span 3;" title="Where the draft tokens come from (--speculative-algorithm)">
                 <span class="k">algorithm</span>
                 <select bind:value={draft.sglang.spec.algorithm} onchange={scheduleCheck}>
-                  {#each SG_SPEC_ALGOS as a}<option value={a}>{a === "NEXTN" ? "the model's own draft head (NEXTN)" : a === "NGRAM" ? "prompt lookup, no model (NGRAM)" : a}</option>{/each}
+                  {#each SG_SPEC_ALGOS as a}<option value={a}>{SG_SPEC_LABELS[a] ?? a}</option>{/each}
                   {#if !SG_SPEC_ALGOS.includes(draft.sglang.spec.algorithm)}<option value={draft.sglang.spec.algorithm}>{draft.sglang.spec.algorithm}</option>{/if}
                 </select>
               </label>
-              <Range bind:value={draft.sglang.spec.steps} label="draft steps" min={1} max={8} step={1} hint="SGLang default 3" onchange={scheduleCheck} span={2}
-                title="Draft head runs per verify pass (--speculative-num-steps)" />
-              <Range bind:value={draft.sglang.spec.topk} label="draft top-k" min={1} max={8} step={1} hint="SGLang default 1" onchange={scheduleCheck} span={2}
-                title="Branches kept per step; 1 is what an MTP head is trained for (--speculative-eagle-topk)" />
-              <Range bind:value={draft.sglang.spec.draft_tokens} label="draft tokens" min={1} max={16} step={1} hint="SGLang default 4" onchange={scheduleCheck} span={2}
+              {#if sgNeedsDraftModel(algo)}
+                <label class="field" style="grid-column: 1 / -1;" title="The draft checkpoint, a folder or file SGLang loads beside the model (--speculative-draft-model-path)">
+                  <span class="k">draft model</span>
+                  <input bind:value={draft.sglang.spec.draft_model} oninput={scheduleCheck} placeholder={algo === "STANDALONE" ? "/models/Qwen3-0.6B" : "/models/EAGLE3-Qwen3-8B"} />
+                </label>
+              {/if}
+              <Range bind:value={draft.sglang.spec.steps} label="draft steps" min={1} max={8} step={1} hint={algo === "NGRAM" ? "n-gram lookups per pass" : "3 suits an MTP head"} onchange={scheduleCheck} span={2}
+                title="Draft passes per verify pass (--speculative-num-steps)" />
+              {#if algo !== "NGRAM"}
+                <Range bind:value={draft.sglang.spec.topk} label="draft top-k" min={1} max={8} step={1} hint="1 = a single chain" onchange={scheduleCheck} span={2}
+                  title="Branches kept per step; 1 is what an MTP head is trained for (--speculative-eagle-topk)" />
+              {/if}
+              <Range bind:value={draft.sglang.spec.draft_tokens} label="draft tokens" min={1} max={16} step={1} hint={algo === "NGRAM" ? "SGLang picks 12 when unset" : "steps + 1 for a chain"} onchange={scheduleCheck} span={2}
                 title="Tokens verified per pass; more is faster if accepted, wasted if not (--speculative-num-draft-tokens)" />
-              <label class="field" style="grid-column: 1 / -1;" title="Torch-saved id tensor limiting the draft head to hot tokens; empty is full (--speculative-token-map)">
-                <span class="k">hot-token map</span>
-                <input bind:value={draft.sglang.spec.token_map} oninput={scheduleCheck} placeholder="/models/hot_tokens.pt" />
-              </label>
+              {#if algo === "NEXTN" || algo === "EAGLE" || algo === "EAGLE3"}
+                <label class="field" style="grid-column: 1 / -1;" title="Torch-saved id tensor limiting the draft head to hot tokens; empty is full (--speculative-token-map)">
+                  <span class="k">hot-token map</span>
+                  <input bind:value={draft.sglang.spec.token_map} oninput={scheduleCheck} placeholder="/models/hot_tokens.pt" />
+                </label>
+              {/if}
             {/if}
           </div>
           {#if draft.sglang.spec?.algorithm === "NEXTN" && header && !mtpBuiltIn}
@@ -1629,6 +1767,35 @@
   .row .r2 { font-size: 12px; color: var(--ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .r3 { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: var(--ink-faint); flex-wrap: wrap; }
   .row .tok { color: var(--ink-muted); }
+  .group { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); margin: 8px 2px 0; display: flex; gap: 8px; align-items: baseline; }
+  .group:first-child { margin-top: 0; }
+  .group .faint { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .newrow { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  /* engine switch at the top of the editor */
+  .engines { display: inline-flex; border: 1px solid var(--rule-strong); border-radius: 8px; overflow: hidden; }
+  .engines button {
+    all: unset; cursor: pointer; padding: 6px 14px; display: flex; flex-direction: column; gap: 1px;
+    font-size: 13px; font-weight: 600; color: var(--ink-muted);
+  }
+  .engines button + button { border-left: 1px solid var(--rule-strong); }
+  .engines button small { font-weight: 400; font-size: 11px; color: var(--ink-faint); }
+  .engines button.on { background: var(--accent-soft); color: var(--accent); }
+  .engines button:disabled { cursor: not-allowed; opacity: 0.45; }
+  .engines button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  /* SGLang VRAM split */
+  .budget .bar.stack { display: flex; overflow: hidden; }
+  .seg { display: block; height: 100%; flex: none; }
+  .seg.others { background: var(--ink-faint); opacity: 0.45; }
+  .seg.weights { background: var(--accent); }
+  .seg.draft { background: var(--note); }
+  .seg.state { background: var(--warn); }
+  .seg.kv { background: var(--pass); }
+  .seg.growth { background: repeating-linear-gradient(45deg, var(--rule-strong) 0 4px, transparent 4px 8px); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i.seg { width: 9px; height: 9px; border-radius: 2px; }
 
   .editor { flex: 1; min-width: 0; }
   .editbar {

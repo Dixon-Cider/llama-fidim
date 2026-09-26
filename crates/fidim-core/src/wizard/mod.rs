@@ -1522,6 +1522,18 @@ fn pick_build(
     choice: &BuildChoice,
     notes: &mut Vec<Note>,
 ) -> Result<BuildPick> {
+    // An SGLang host without a llama.cpp build (the Linux port): there is
+    // no build to fetch or compile here, so Auto and Skip plan the files
+    // only and never look up releases or sources.
+    if cfg.sglang.is_some() && builds.is_empty() && matches!(choice, BuildChoice::Auto | BuildChoice::Skip) {
+        notes.push(Note::new(
+            Level::Info,
+            "sglang-host",
+            "no llama.cpp build on this machine: files only; an SGLang profile for them (Profiles) also needs \
+             the base model's config.json and tokenizer.json beside them",
+        ));
+        return Ok(BuildPick { step: None, build: None, plan: None, sources: Vec::new() });
+    }
     let Some(needs) = needs else {
         notes.push(Note::new(Level::Warning, "build-unchecked", "the model's architecture is unknown: no build was checked"));
         let b = enumeration_build(builds);

@@ -207,9 +207,9 @@ enum Cmd {
     /// Export a profile as a standalone script.
     Export {
         profile_id: String,
-        /// bat or ps1.
-        #[arg(long, default_value = "bat")]
-        format: String,
+        /// sh, bat or ps1 (default: sh on Linux, bat on Windows).
+        #[arg(long)]
+        format: Option<String>,
         /// Output path (default: <profile>.<ext> in the current directory).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -385,7 +385,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Stop { target } => cmd_stop(&cfg, &target),
         Cmd::Status { deep } => cmd_status(&cfg, deep, cli.json),
         Cmd::Export { profile_id, format, out } => {
-            cmd_export(&cfg, &platform, &profile_id, &format, out)
+            cmd_export(&cfg, &platform, &profile_id, format.as_deref(), out)
         }
         Cmd::Logs { target, tail } => cmd_logs(&cfg, &target, tail),
         Cmd::Bench { profile_id, concurrency, tokens, warmups, no_save } => {
@@ -1739,17 +1739,19 @@ fn cmd_export(
     cfg: &Config,
     platform: &dyn Platform,
     profile_id: &str,
-    format: &str,
+    format: Option<&str>,
     out: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let (profile, prepared) = prepare(cfg, platform, profile_id)?;
-    let (text, ext) = match format {
-        "bat" => (export::to_bat(&profile, &prepared.plan), "bat"),
-        "ps1" => (export::to_ps1(&profile, &prepared.plan), "ps1"),
-        other => bail!("unknown format {other:?} (bat|ps1)"),
-    };
+    let profile = load_profile(cfg, profile_id)?;
+    let aliases: Vec<String> = supervise::reattach(&cfg.runs_dir).into_iter().filter(|r| r.alive).map(|r| r.state.alias).collect();
+    let (text, ext) = export::render(cfg, &profile, platform, aliases, format)?;
     let out = out.unwrap_or_else(|| PathBuf::from(format!("{profile_id}.{ext}")));
     std::fs::write(&out, text).with_context(|| format!("writing {}", out.display()))?;
+    #[cfg(unix)]
+    if ext == "sh" {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+    }
     println!("exported {} -> {}", profile_id, out.display());
     Ok(())
 }
@@ -1782,7 +1784,7 @@ fn cmd_bench(
     if run.crashed {
         bail!("run for {profile_id} has crashed — relaunch before benchmarking");
     }
-    let n = concurrency.unwrap_or(profile.runtime.slots).max(1);
+    let n = concurrency.unwrap_or(profile.concurrent_requests()).max(1);
     let opts = fidim_core::bench::BenchOptions {
         warmups,
         max_tokens: tokens,

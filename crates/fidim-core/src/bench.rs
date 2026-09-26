@@ -6,7 +6,10 @@
 //! Measurements use llama-server's native `/completion` endpoint because its
 //! `timings` block reports server-side decode rate (excludes prompt
 //! processing and client overhead); the aggregate rate is wall-clock across
-//! all streams, which is what a caller actually experiences.
+//! all streams, which is what a caller actually experiences. Engines without
+//! it (SGLang answers 404) are measured over a streamed `/v1/completions`:
+//! decode rate is the tokens after the first over the time between the first
+//! and the last streamed chunk, so prefill and queueing stay out of it.
 
 use std::time::{Duration, Instant};
 
@@ -43,9 +46,12 @@ pub struct StreamMeasure {
     pub wall_seconds: f64,
     /// Client wall-clock rate (includes prompt + queueing).
     pub wall_tok_s: f64,
-    /// Server-reported decode rate (`timings.predicted_per_second`), when
-    /// the endpoint provides it.
+    /// Decode rate: server-reported (`timings.predicted_per_second`) on
+    /// llama-server, else from the streamed chunks' arrival times.
     pub decode_tok_s: Option<f64>,
+    /// Time to the first streamed token (streamed `/v1/completions` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,31 +125,133 @@ fn measure_one(
             wall_seconds: wall,
             wall_tok_s: tokens as f64 / wall.max(1e-9),
             decode_tok_s: decode,
+            ttft_seconds: None,
         });
     }
-    // Fallback: OpenAI-compatible endpoint, wall-clock only.
+    measure_streamed(host, port, alias, prompt, n_predict, timeout)
+}
+
+/// One streamed OpenAI-compatible `/v1/completions` request (SGLang, or a
+/// llama-server without `/completion`), timed chunk by chunk.
+fn measure_streamed(
+    host: &str,
+    port: u16,
+    alias: &str,
+    prompt: &str,
+    n_predict: u32,
+    timeout: Duration,
+) -> Result<StreamMeasure> {
+    use std::io::BufRead;
     let body = serde_json::json!({
-        "model": alias, "prompt": prompt, "max_tokens": n_predict, "stream": false,
+        "model": alias, "prompt": prompt, "max_tokens": n_predict,
+        "stream": true, "stream_options": { "include_usage": true },
     })
     .to_string();
+    let url = format!("http://{}/v1/completions", crate::chat::host_port(host, port));
+    let agent = ureq::AgentBuilder::new().timeout_connect(timeout).timeout_read(timeout).build();
     let t0 = Instant::now();
-    let (status, resp) = http_post_json(host, port, "/v1/completions", &body, timeout)?;
-    if status != 200 {
-        return Err(Error::Platform(format!("completion request failed: HTTP {status}")));
+    let resp = match agent.post(&url).set("Content-Type", "application/json").send_string(&body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(Error::Platform(format!("completion request failed: HTTP {code}")))
+        }
+        Err(e) => return Err(Error::Platform(format!("POST {url}: {e}"))),
+    };
+    let mut timing = StreamTiming::default();
+    let mut plain = String::new();
+    for line in std::io::BufReader::new(resp.into_reader()).lines() {
+        let line = line.map_err(|e| Error::Platform(format!("reading {url}: {e}")))?;
+        let t = t0.elapsed().as_secs_f64();
+        match parse_sse_line(&line) {
+            Some(c) if c.done => break,
+            Some(c) => timing.observe(&c, t),
+            // Not an event stream: a server that ignored "stream".
+            None => plain.push_str(&line),
+        }
     }
     let wall = t0.elapsed().as_secs_f64();
-    let v: serde_json::Value = serde_json::from_str(body_json(&resp))
-        .map_err(|e| Error::Platform(format!("bad /v1/completions response: {e}")))?;
-    let tokens = v
-        .pointer("/usage/completion_tokens")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(n_predict as u64);
+    let tokens = if timing.chunks == 0 && timing.usage.is_none() {
+        let v: serde_json::Value = serde_json::from_str(body_json(&plain))
+            .map_err(|e| Error::Platform(format!("bad /v1/completions response: {e}")))?;
+        v.pointer("/usage/completion_tokens").and_then(|x| x.as_u64()).unwrap_or(n_predict as u64)
+    } else {
+        timing.tokens()
+    };
     Ok(StreamMeasure {
         tokens,
         wall_seconds: wall,
         wall_tok_s: tokens as f64 / wall.max(1e-9),
-        decode_tok_s: None,
+        decode_tok_s: timing.decode_tok_s(tokens),
+        ttft_seconds: timing.first,
     })
+}
+
+/// What one `data:` line of an OpenAI completion stream carries.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct SseChunk {
+    /// `data: [DONE]`.
+    done: bool,
+    /// A choice arrived (a token, or the finish chunk).
+    choice: bool,
+    /// The choice carried non-empty text.
+    text: bool,
+    /// `usage.completion_tokens`, on the final usage chunk.
+    completion_tokens: Option<u64>,
+}
+
+/// Parse one line of an SSE body; None for anything but a `data:` line
+/// whose payload is `[DONE]` or JSON.
+fn parse_sse_line(line: &str) -> Option<SseChunk> {
+    let data = line.trim().strip_prefix("data:")?.trim();
+    if data == "[DONE]" {
+        return Some(SseChunk { done: true, ..Default::default() });
+    }
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let first = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first());
+    Some(SseChunk {
+        done: false,
+        choice: first.is_some(),
+        text: first.and_then(|c| c.get("text")).and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty()),
+        completion_tokens: v.pointer("/usage/completion_tokens").and_then(|x| x.as_u64()),
+    })
+}
+
+/// Arrival times of a completion stream's chunks, seconds from the request.
+#[derive(Debug, Default)]
+struct StreamTiming {
+    /// First chunk with text: time to first token.
+    first: Option<f64>,
+    /// Last chunk with a choice.
+    last: Option<f64>,
+    /// Chunks with text (the token count when no usage chunk arrives).
+    chunks: u64,
+    usage: Option<u64>,
+}
+
+impl StreamTiming {
+    fn observe(&mut self, c: &SseChunk, t: f64) {
+        if c.text {
+            self.first.get_or_insert(t);
+            self.chunks += 1;
+        }
+        if c.choice && self.first.is_some() {
+            self.last = Some(t);
+        }
+        if let Some(n) = c.completion_tokens {
+            self.usage = Some(n);
+        }
+    }
+
+    fn tokens(&self) -> u64 {
+        self.usage.unwrap_or(self.chunks)
+    }
+
+    /// Tokens after the first over the time from the first chunk to the
+    /// last: decode only, prefill and queueing excluded.
+    fn decode_tok_s(&self, tokens: u64) -> Option<f64> {
+        let (first, last) = (self.first?, self.last?);
+        (tokens > 1 && last > first).then(|| (tokens - 1) as f64 / (last - first))
+    }
 }
 
 /// Chunked transfer bodies arrive with chunk-size lines; strip to the JSON
@@ -294,7 +402,66 @@ mod tests {
             wall_seconds: wall,
             wall_tok_s: tokens as f64 / wall,
             decode_tok_s: decode,
+            ttft_seconds: None,
         }
+    }
+
+    #[test]
+    fn sse_lines_parse() {
+        let tok = parse_sse_line(r#"data: {"id":"1","choices":[{"index":0,"text":" the","finish_reason":null}],"usage":null}"#).unwrap();
+        assert_eq!(tok, SseChunk { done: false, choice: true, text: true, completion_tokens: None });
+        let fin = parse_sse_line(r#"data: {"choices":[{"index":0,"text":"","finish_reason":"length"}]}"#).unwrap();
+        assert!(fin.choice && !fin.text);
+        let usage = parse_sse_line(r#"data: {"choices":[],"usage":{"prompt_tokens":30,"completion_tokens":256}}"#).unwrap();
+        assert_eq!(usage, SseChunk { done: false, choice: false, text: false, completion_tokens: Some(256) });
+        assert!(parse_sse_line("data: [DONE]").unwrap().done);
+        assert_eq!(parse_sse_line(""), None);
+        assert_eq!(parse_sse_line(": keep-alive"), None);
+        assert_eq!(parse_sse_line(r#"{"choices":[]}"#), None);
+    }
+
+    #[test]
+    fn sglang_like_server_is_measured_over_the_stream() {
+        use crate::test_http::{Resp, Server};
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"text\":\"a\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"b\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"c\",\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let srv = Server::start("127.0.0.1", move |r| match r.path() {
+            "/v1/completions" => Resp::new(200, sse).header("Content-Type", "text/event-stream"),
+            _ => Resp::new(404, "{}"),
+        })
+        .unwrap();
+        let port: u16 = srv.base.rsplit(':').next().unwrap().parse().unwrap();
+        let m = measure_one("127.0.0.1", port, "t", "hi", 3, Duration::from_secs(5)).unwrap();
+        assert_eq!(m.tokens, 3);
+        assert!(m.ttft_seconds.is_some());
+        let paths: Vec<String> = srv.requests().iter().map(|r| r.path().to_string()).collect();
+        assert_eq!(paths, ["/completion", "/v1/completions"]);
+    }
+
+    #[test]
+    fn stream_timing_excludes_prefill() {
+        // Prefill 2 s, then 5 tokens 0.1 s apart, a finish chunk, usage.
+        let mut t = StreamTiming::default();
+        let tok = SseChunk { choice: true, text: true, ..Default::default() };
+        for i in 0..5 {
+            t.observe(&tok, 2.0 + 0.1 * i as f64);
+        }
+        t.observe(&SseChunk { choice: true, ..Default::default() }, 2.4);
+        t.observe(&SseChunk { completion_tokens: Some(5), ..Default::default() }, 2.45);
+        assert_eq!(t.first, Some(2.0));
+        assert_eq!(t.tokens(), 5);
+        let r = t.decode_tok_s(t.tokens()).unwrap();
+        assert!((r - 10.0).abs() < 1e-9, "{r}"); // 4 tokens over 0.4 s
+        // One token (or none) has no decode interval.
+        let mut one = StreamTiming::default();
+        one.observe(&tok, 1.0);
+        assert_eq!(one.decode_tok_s(one.tokens()), None);
+        assert_eq!(StreamTiming::default().decode_tok_s(0), None);
     }
 
     #[test]

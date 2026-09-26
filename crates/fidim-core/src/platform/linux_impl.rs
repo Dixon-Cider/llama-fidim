@@ -289,18 +289,19 @@ fn kfd_vram(pid: u32, buses: &HashMap<String, u32>) -> Vec<(u32, u64)> {
 }
 
 /// Milliseconds this process has spent evicted from the GPU (KFD
-/// `stats_<gpu>/evicted_ms`, summed over the cards it touches). Climbing
-/// while serving means the desktop is forcing it out of VRAM.
+/// `stats_<gpu>/evicted_ms`). KFD evicts a process's queues on every node
+/// at once and records the same time under each, so take the largest, not
+/// the sum. Climbing while serving means the desktop is forcing it out of VRAM.
 pub fn kfd_evicted_ms(pid: u32) -> u64 {
-    let mut total = 0;
+    let mut most = 0;
     if let Ok(rd) = fs::read_dir(format!("/sys/class/kfd/kfd/proc/{pid}")) {
         for e in rd.flatten() {
             if e.file_name().to_string_lossy().starts_with("stats_") {
-                total += read_u64(&e.path().join("evicted_ms")).unwrap_or(0);
+                most = most.max(read_u64(&e.path().join("evicted_ms")).unwrap_or(0));
             }
         }
     }
-    total
+    most
 }
 
 /// Every pid with a KFD process entry.
@@ -396,7 +397,9 @@ impl Platform for LinuxPlatform {
         // sees, so fdinfo engine time stays 0 for a serving process. Use the
         // card's own busy figure and charge it to the KFD process holding the
         // most VRAM on that card (one server per card here); DRM clients
-        // (compositor, browsers) still come from fdinfo deltas.
+        // (compositor, browsers) still come from fdinfo deltas. The card
+        // figure already includes them: a per-card total is
+        // `card_busy_percent`, not the sum of these entries.
         let mut out = fdinfo_utilization(std::time::Duration::from_millis(200));
         let buses = kfd_gpu_buses();
         let busy = card_busy_percent();

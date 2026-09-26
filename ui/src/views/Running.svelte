@@ -143,15 +143,39 @@
   async function stop(target) {
     try { await api("stop_run", { target }); lastBusy = Date.now(); await poll(); } catch (e) { error = String(e); }
   }
+  // A member the router fronts takes a second click: the router keeps
+  // routing to it, and those requests fail until the router restarts.
+  let stopAsk = $state(null);   // { id, timer }
+  function askStop(row) {
+    const id = row.run.state.profile_id;
+    if (row.routed_by && stopAsk?.id !== id) {
+      if (stopAsk) clearTimeout(stopAsk.timer);
+      stopAsk = { id, timer: setTimeout(() => (stopAsk = null), 4000) };
+      return;
+    }
+    if (stopAsk) clearTimeout(stopAsk.timer);
+    stopAsk = null;
+    stop(id);
+  }
+  const ROUTER = "router";
+  const isLinux = /linux/i.test(navigator.platform);
+  const isSg = (r) => r.state.engine === "sglang";
+  // FIDIM's Rust router for SGLang: no GPU, no model of its own.
+  const isSgRouter = (r) => r.state.profile_id === ROUTER && isSg(r);
+  // Driver allocations (~8 MiB per card) are not where a model lives.
+  const MIN_RESIDENT = 64 * 1024 * 1024;
   function uptime(started) {
     const s = Math.max(0, now - started);
     const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
     if (d) return `${d}d ${h}h`;
     return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
   }
-  function health(r) {
+  function health(r, row) {
     if (r.crashed) return { kind: "block", label: "crashed", hint: "The process exited; its log is kept below" };
-    if (r.health === "healthy") return { kind: "pass", label: "healthy", hint: "Answers /v1/models and generated a token when probed" };
+    const rh = r.health === "healthy" ? row?.router_health : null;
+    if (rh && !rh.ok) return { kind: "warn", label: "degraded", hint: `The router's /health reports: ${rh.detail}` };
+    if (rh) return { kind: "pass", label: "healthy", hint: "Every member answers the router's readiness probe (/health)" };
+    if (r.health === "healthy") return { kind: "pass", label: "healthy", hint: "Answers /v1/models within 3 s; not a generation test" };
     if (r.health === "responding-not-generating") return { kind: "warn", label: "stalled", hint: "Answers /v1/models but a 1-token completion fails" };
     return { kind: "block", label: "unreachable", hint: "No answer on /v1/models within 3 s" };
   }
@@ -159,6 +183,8 @@
     return samples.some((s) => s.phase === "decode") ? "decode" : samples.some((s) => s.phase === "prefill") ? "prefill" : "idle";
   }
   const phaseChip = (p) => (p === "decode" ? "accent live" : p === "prefill" ? "warn live" : "plain");
+  // The SGLang router has no samples of its own: its phase is its members'.
+  const rowPhase = (row) => phaseOf([...row.samples, ...(row.fronting?.length ? data.runs.filter((x) => x !== row && row.fronting.includes(x.run.state.alias)).flatMap((x) => x.samples) : [])]);
   const phaseHint = (p) => (p === "decode" ? "Generating tokens on at least one slot" : p === "prefill" ? "Reading a prompt on at least one slot" : "No request in progress");
   const heldOn = (cardKey) => data.runs.reduce((a, row) => a + row.resident.filter((m) => m.card === cardKey).reduce((b, m) => b + Math.max(m.dedicated_bytes, m.committed_bytes), 0), 0);
   const short = (k) => String(k ?? "").split(":").pop();
@@ -191,13 +217,15 @@
     return [chars.slice(0, chars.length - n).join(""), chars.slice(chars.length - n).join("")];
   }
   function slotTitle(x) {
-    if (!x.is_processing) return `slot ${x.id}: idle · ${Math.round(100 * x.ctx_fraction)}% of ${x.n_ctx.toLocaleString()} ctx used`;
+    // The router estimates a prompt's size until the reply reports usage.
+    const est = x.n_prompt_tokens_exact === false ? "~" : "";
+    if (!x.is_processing) return `slot ${x.id}: idle · ${est}${Math.round(100 * x.ctx_fraction)}% of ${x.n_ctx.toLocaleString()} ctx used`;
     const p = x.phase === "prefill"
-      ? `prefill ${x.n_prompt_tokens_processed.toLocaleString()} / ${x.n_prompt_tokens.toLocaleString()} prompt tokens`
+      ? `prefill ${est}${x.n_prompt_tokens_processed.toLocaleString()} / ${est}${x.n_prompt_tokens.toLocaleString()} prompt tokens`
       : isDiffusion(x)
         ? `denoise: ${x.n_decoded.toLocaleString()} of ${(x.n_decoded + Math.max(0, x.n_remain)).toLocaleString()} canvas tokens`
         : `decode ${x.n_decoded.toLocaleString()} generated, ${Math.max(0, x.n_remain).toLocaleString()} remaining`;
-    return `slot ${x.id}: ${p} · ${Math.round(100 * x.ctx_fraction)}% of ${x.n_ctx.toLocaleString()} ctx used`;
+    return `slot ${x.id}: ${p} · ${est}${Math.round(100 * x.ctx_fraction)}% of ${x.n_ctx.toLocaleString()} ctx used${est ? " (prompt size estimated)" : ""}`;
   }
   function slotProgress(x) {
     if (x.phase === "prefill") return x.prefill_fraction;
@@ -277,36 +305,45 @@
 
 {#each data.runs.filter((x) => x.run.state.profile_id !== pending?.id) as row, ri (row.run.state.profile_id + ":" + row.run.state.port)}
   {@const r = row.run}
-  {@const h = health(r)}
+  {@const h = health(r, row)}
   {@const vram = row.resident.reduce((a, m) => a + Math.max(m.dedicated_bytes, m.committed_bytes), 0)}
-  {@const phase = phaseOf(row.samples)}
+  {@const phase = rowPhase(row)}
+  {@const via = row.routed_by}
+  {@const chatRun = via?.profile_id ?? r.state.profile_id}
+  {@const epState = via ?? r.state}
+  {@const epModel = via ? r.state.alias : isSgRouter(r) ? (row.fronting?.[0] ?? null) : null}
+  {@const asking = stopAsk?.id === r.state.profile_id}
   <section class="server" class:crashed={r.crashed} in:fly={arrive(stagger(ri, 60))} out:slide={leave} animate:flip={flipParams}>
     <header class="server-head">
       <div class="who">
         <span class="title">{r.state.profile_id}</span>
         <span class="chip {h.kind}" title={h.hint}>{h.label}</span>
         {#if r.alive}<span class="chip {phaseChip(phase)}" title={phaseHint(phase)}>{phase}</span>{/if}
-        {#if (row.evicting_ms_per_s ?? 0) > 20}<span class="chip block live" title="The driver is evicting this process from VRAM ({Math.round(row.evicting_ms_per_s)} ms per second): lower the VRAM share or move a display">evicting</span>{/if}
+        {#if (row.evicting_ms_per_s ?? 0) > 20}<span class="chip block live" title="The driver is evicting this server from VRAM ({Math.round(row.evicting_ms_per_s)} ms per second): lower the VRAM share or move a display">evicting</span>{/if}
+        {#if asking}<span class="chip warn" transition:fade={{ duration: LAYOUT }} title="Requests for {r.state.alias} through the router fail until the router restarts">router still routes here</span>{/if}
       </div>
       <div class="facts">
-        {#if r.alive}
-          <span title="GPU engine busy for this process alone"><b class="num">{Math.round(row.gpu_busy_percent)}%</b> gpu</span>
-          {#if (row.evicted_ms ?? 0) > 0}<span title="Time this process has spent evicted from VRAM since it started"><b class="num">{(row.evicted_ms / 1000).toFixed(0)}s</b> evicted</span>{/if}
-          <span title="VRAM held by this server and its children (dedicated, or committed while paging in)"><b class="num">{(vram / GIB).toFixed(1)} GiB</b>{#if row.resident.length}&nbsp;on {[...new Set(row.resident.map((m) => short(m.card ?? "?")))].join(" + ")}{/if}</span>
+        {#if r.alive && !isSgRouter(r)}
+          <span title={isLinux ? "Its card's busy, charged to the biggest VRAM holder (ROCm has no per-process time)" : "GPU engine busy for this server's processes"}><b class="num">{Math.round(row.gpu_busy_percent)}%</b> gpu</span>
+          {#if (row.evicted_ms ?? 0) > 0}<span title="Time this server has spent evicted from VRAM since it started"><b class="num">{(row.evicted_ms / 1000).toFixed(0)}s</b> evicted</span>{/if}
+          {@const cardsHeld = [...new Set(row.resident.filter((m) => Math.max(m.dedicated_bytes, m.committed_bytes) >= MIN_RESIDENT).map((m) => short(m.card ?? "?")))]}
+          <span title="VRAM held by this server and its children (dedicated, or committed while paging in)"><b class="num">{(vram / GIB).toFixed(1)} GiB</b>{#if cardsHeld.length}&nbsp;on {cardsHeld.join(" + ")}{/if}</span>
         {/if}
         <span title="Time since the process started"><b class="num">{uptime(r.state.started_unix)}</b> up</span>
-        <span class="mono" title="Listens on port {r.state.port} as “{r.state.alias}”; Copy endpoint shows the URL">pid {r.state.pid}</span>
+        <span class="mono" title="Listens on port {r.state.port} as “{r.state.alias}”">pid {r.state.pid}</span>
       </div>
-      {#if r.alive && r.state.profile_id !== "router"}
-        <button class="btn" onclick={() => chatWith(r.state.profile_id)} title="Open a chat with this server">Chat</button>
-        <button class="btn" class:primary={endpointOpen?.key === r.state.profile_id} onclick={() => copyEndpoint(r.state.profile_id, r.state)} title="Copy the base URL; the model id and snippets show below">Copy endpoint</button>
+      {#if r.alive && r.state.profile_id !== ROUTER}
+        <button class="btn" onclick={() => chatWith(chatRun, via ? r.state.alias : null)} title={via ? "Open a chat with this model through the router" : "Open a chat with this server"}>Chat</button>
       {/if}
-      {#if r.alive}<button class="btn danger" onclick={() => stop(r.state.profile_id)}>Stop</button>
+      {#if r.alive && (r.state.profile_id !== ROUTER || isSgRouter(r))}
+        <button class="btn" class:primary={endpointOpen?.key === r.state.profile_id} onclick={() => copyEndpoint(r.state.profile_id, epState, epModel)} title={via || isSgRouter(r) ? "Copy the router's base URL; the model id and snippets show below" : "Copy the base URL; the model id and snippets show below"}>Copy endpoint</button>
+      {/if}
+      {#if r.alive}<button class="btn danger" onclick={() => askStop(row)} title={via ? `The router keeps routing ${r.state.alias} here; stopping fails those requests` : "Stop this server"}>{asking ? "Stop anyway" : "Stop"}</button>
       {:else}<button class="btn" onclick={() => dismiss(r.state.profile_id)} title="Forget this run; the log file stays">Dismiss</button>{/if}
     </header>
     {#if endpointOpen?.key === r.state.profile_id}
       <div class="endpoint-pop" transition:slide={leave}>
-        <EndpointCard endpoint={endpointFor(r.state, null, !!row.has_api_key)} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
+        <EndpointCard endpoint={endpointFor(epState, epModel, via ? !!row.has_api_key : isSgRouter(r) ? !!row.keyed_models?.includes(epModel) : !!row.has_api_key)} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
       </div>
     {/if}
 
@@ -317,24 +354,27 @@
       {@const pts = sparkPts(spark[k])}
       {@const busySlots = s.slots.filter((x) => x.is_processing).length}
       {@const hasDraft = (m.spec_decode_num_draft_tokens_total ?? 0) > 0}
+      {@const sgSpec = (m.spec_num_draft_tokens ?? 0) > 0 || (m.spec_verify_calls_total ?? 0) > 0}
+      {@const queued = m.requests_deferred ?? m.num_queue_reqs ?? 0}
+      {@const inFlight = Math.max(m.requests_processing ?? 0, m.num_running_reqs ?? 0)}
       {@const dg = s.slots.some((x) => x.diffusion)}
       <div class="model" class:active={s.phase !== "idle"} in:fly={arrive(stagger(si, 40))} out:slide={leave} animate:flip={flipParams}>
         <div class="ident">
           <div class="model-name">{s.model ?? r.state.alias}</div>
           <span class="chip {phaseChip(s.phase)}" title={phaseHint(s.phase)}>{s.phase}</span>
           {#if s.slots.some((x) => x.loop_hint)}<span class="chip block live" title="A slot is repeating the same fragment; click it to see the text">looping</span>{/if}
-          <div class="slot-count" title="Slots serving a request, of the {s.slots.length} this model has (-np)"><b class="num">{busySlots}</b><span class="faint"> / {s.slots.length} busy</span></div>
+          <div class="slot-count" title="Slots serving a request, of the {s.slots.length} this model has ({isSg(r) ? "--max-running-requests" : "-np"})"><b class="num">{busySlots}</b><span class="faint"> / {s.slots.length} busy</span></div>
           {#if s.error}<div class="err">{s.error}</div>{/if}
           {#if s.model && r.alive}
             <div class="row-actions">
-              <button class="btn small" onclick={() => chatWith(r.state.profile_id, s.model)} title="Open a chat with this model through the router">Chat</button>
-              <button class="btn small" class:primary={endpointOpen?.key === k} onclick={() => copyEndpoint(k, r.state, s.model)} title="Copy the router's base URL; the model id and snippets show below">Copy endpoint</button>
+              <button class="btn small" onclick={() => chatWith(chatRun, s.model)} title="Open a chat with this model through the router">Chat</button>
+              <button class="btn small" class:primary={endpointOpen?.key === k} onclick={() => copyEndpoint(k, epState, s.model)} title="Copy the router's base URL; the model id and snippets show below">Copy endpoint</button>
             </div>
           {/if}
         </div>
         {#if endpointOpen?.key === k}
           <div class="endpoint-pop in-model" transition:slide={leave}>
-            <EndpointCard endpoint={endpointFor(r.state, s.model, !!row.keyed_models?.includes(s.model))} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
+            <EndpointCard endpoint={endpointFor(epState, s.model, via ? !!row.has_api_key : !!row.keyed_models?.includes(s.model))} copiedFirst={endpointOpen.copied} onclose={() => (endpointOpen = null)} />
           </div>
         {/if}
 
@@ -364,8 +404,8 @@
             <span class="l">prefill</span>
           </div>
           {/if}
-          <div class="stat" class:dim={!(m.requests_processing || m.requests_deferred)}>
-            <span class="v" title="Requests being served now, plus those waiting in the queue">{m.requests_processing ?? 0}<small>+ {m.requests_deferred ?? 0} queued</small></span>
+          <div class="stat" class:dim={!(inFlight || queued)}>
+            <span class="v" title="Requests being served now, plus those waiting in the queue">{inFlight}<small>+ {queued} queued</small></span>
             <span class="l">in flight</span>
           </div>
           {#if hasDraft}
@@ -373,9 +413,9 @@
               <span class="v" title={rt?.accept != null ? "Share of draft tokens the main model accepted since the last poll" : "Share of draft tokens the main model accepted over this server's lifetime"}>{rt?.accept != null ? Math.round(rt.accept * 100) : Math.round(100 * m.spec_decode_num_accepted_tokens_total / m.spec_decode_num_draft_tokens_total)}<small>%</small></span>
               <span class="l">accepted</span>
             </div>
-          {:else if m.spec_accept_rate != null}
+          {:else if m.spec_accept_rate != null && sgSpec}
             <div class="stat" class:dim={!m.spec_accept_rate}>
-              <span class="v" title="Share of draft tokens accepted in the last batch, and mean accepted length per verify step">{Math.round(m.spec_accept_rate * 100)}<small>% · {(m.spec_accept_length ?? 0).toFixed(1)} tok</small></span>
+              <span class="v" title="Draft tokens accepted over the last ~40 decode steps, and mean tokens per verify step">{Math.round(m.spec_accept_rate * 100)}<small>% · {(m.spec_accept_length ?? 0).toFixed(1)} tok</small></span>
               <span class="l">accepted</span>
             </div>
           {/if}
@@ -388,7 +428,7 @@
           {#if m.token_usage != null}
             <div class="stat" class:dim={!m.token_usage}>
               <span class="v" title="KV cache tokens held of the pool ({(m.kv_used_tokens ?? 0).toLocaleString()} of {(m.max_total_num_tokens ?? 0).toLocaleString()}){m.mamba_usage != null ? `; state slots are GatedDeltaNet's (mamba)` : ""}">{Math.round(m.token_usage * 100)}<small>%{m.mamba_usage != null ? ` · state ${Math.round(m.mamba_usage * 100)}%` : ""}</small></span>
-              <span class="l">cache used</span>
+              <span class="l">{isSg(r) ? "KV in use" : "cache used"}</span>
             </div>
           {/if}
           {#if m.num_retracted_reqs != null && m.num_retracted_reqs > 0}
@@ -445,19 +485,23 @@
               <span class="mono" style="font-weight: 700;">slot {x.id}</span>
               <span class="chip {phaseChip(x.phase)}">{x.phase}</span>
               {#if x.loop_hint}<span class="chip block live" title="The same fragment came back {x.loop_hint.repeats} times: “{trimFrag(x.loop_hint.fragment)}”">looping ×{x.loop_hint.repeats}</span>{/if}
-              {#if x.generated != null}<span class="faint small" title="Characters generated, then in the prompt{x.prompt_chars > 4000 || x.generated_chars > 4000 ? "; the panes show the last 4,000 of each" : ""}">{x.generated_chars.toLocaleString()} out · {x.prompt_chars.toLocaleString()} in</span>{/if}
+              {#if x.generated != null && isSg(r)}<span class="faint small" title="The router keeps only the tail of each text; these are the chars shown">last {[...x.generated].length.toLocaleString()} chars out · {[...(x.prompt ?? "")].length.toLocaleString()} in</span>
+              {:else if x.generated != null}<span class="faint small" title="Characters generated, then in the prompt{x.prompt_chars > 4000 || x.generated_chars > 4000 ? "; the panes show the last 4,000 of each" : ""}">{x.generated_chars.toLocaleString()} out · {x.prompt_chars.toLocaleString()} in</span>{/if}
               {#if draftChars(x) > 0}<span class="chip plain" title="Each denoise step rewrites the block's draft (dimmed) until it settles and is committed">draft {draftChars(x).toLocaleString()}</span>{/if}
               <button class="btn small" style="margin-left: auto;" onclick={() => toggleSlot(k, x.id)}>Close</button>
             </div>
             {#if x.diffusion}
               <DiffusionCanvas host={r.state.host} port={r.state.port} slot={x} />
             {/if}
-            {#if x.prompt == null && x.generated == null}
+            {#if isSg(r) && !x.prompt && !x.generated}
+              <div class="faint small">idle</div>
+            {:else if x.prompt == null && x.generated == null}
               <div class="faint small" title="For the router, turn it on for any member profile and relaunch the router">No slot text — turn on <b>trace tokens</b> in the profile's Advanced section and reload it.</div>
             {:else}
               <div class="panes">
                 <div class="pane">
-                  <div class="pl" title="The last prompt this slot received">prompt</div>
+                  {#if isSg(r)}<div class="pl" title="The router keeps the request's last user turn, not the whole prompt">last user message</div>
+                  {:else}<div class="pl" title="The last prompt this slot received">prompt</div>{/if}
                   <pre use:stick>{x.prompt ?? ""}</pre>
                 </div>
                 <div class="pane">
@@ -477,6 +521,7 @@
     {:else}
       {#if r.alive && row.fronting?.length}
         <div class="empty small" title="The router forwards to these models; each has its own card below">fronting {row.fronting.join(" · ")}</div>
+      {:else if r.alive && isSg(r) && !isSgRouter(r)}<div class="empty small" title="SGLang has no per-slot view; FIDIM's router tracks each request">Slots need the router — Router → Start</div>
       {:else if r.alive}<div class="empty small">No models loaded</div>{/if}
     {/each}
 

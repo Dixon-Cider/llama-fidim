@@ -9,20 +9,32 @@
   let { conv, target = null } = $props();
 
   const dg = $derived(target?.engine === "diffusion-gemma" || conv?.target?.engine === "diffusion-gemma");
+  const sg = $derived((target?.engine ?? conv?.target?.engine) === "sglang");
   const props = $derived(target ? chat.props[target.key] ?? null : null);
   const server = $derived(props?.params ?? {});
   const caps = $derived(props?.caps ?? {});
   const creator = $derived(target?.model_path ? chat.creator[target.model_path] ?? null : null);
 
-  const FIELDS = [
+  const COMMON = [
     { k: "temperature", min: 0, max: 2, step: 0.05, title: "Randomness: 0 is greedy, 1 the model's own distribution.", creator: "temperature" },
     { k: "top_p", min: 0, max: 1, step: 0.01, title: "Keep the smallest set of tokens whose probability adds up to this.", creator: "top_p" },
     { k: "top_k", min: 0, max: 200, step: 1, title: "Keep only the k most likely tokens (0 = off).", creator: "top_k" },
     { k: "min_p", min: 0, max: 1, step: 0.01, title: "Drop tokens less likely than this fraction of the top token.", creator: "min_p" },
+  ];
+  const LLAMA_FIELDS = [
+    ...COMMON,
     { k: "repeat_penalty", min: 0.8, max: 2, step: 0.01, title: "Penalise recently used tokens (1 = off).", creator: "repetition_penalty" },
     { k: "presence_penalty", min: -2, max: 2, step: 0.05, title: "Penalise any token already present (0 = off)." },
     { k: "dry_multiplier", min: 0, max: 2, step: 0.05, title: "DRY repetition penalty strength (0 = off)." },
   ];
+  // SGLang has no DRY and names the repeat penalty repetition_penalty.
+  const SGLANG_FIELDS = [
+    ...COMMON,
+    { k: "repetition_penalty", min: 0.8, max: 2, step: 0.01, title: "Penalise tokens already in the prompt or reply (1 = off).", creator: "repetition_penalty" },
+    { k: "presence_penalty", min: -2, max: 2, step: 0.05, title: "Penalise any token already present (0 = off)." },
+    { k: "frequency_penalty", min: -2, max: 2, step: 0.05, title: "Penalise tokens by how often they already appeared (0 = off)." },
+  ];
+  const FIELDS = $derived(sg ? SGLANG_FIELDS : LLAMA_FIELDS);
   const fmt = (v) => (typeof v === "number" ? (Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/0$/, "")) : String(v));
   const serverLabel = (k) => (server[k] != null ? "server: " + fmt(server[k]) : "inherit");
   const creatorHint = (f) => (f.creator && creator && creator[f.creator] != null ? "creator " + fmt(creator[f.creator]) : "");
@@ -63,7 +75,7 @@
         <textarea rows="5" value={conv.system_prompt} oninput={(e) => setSystem(e.target.value)} placeholder="(none)" spellcheck="true"></textarea>
       </label>
       {#if caps.supports_system_role === false}
-        <div class="warnline">This model's chat template has no system role: llama-server folds the system prompt into the first message.</div>
+        <div class="warnline">This model's chat template has no system role: the server folds the system prompt into the first message.</div>
       {/if}
     </section>
 

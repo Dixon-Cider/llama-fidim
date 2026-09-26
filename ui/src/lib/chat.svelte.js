@@ -11,6 +11,8 @@ import { api, stream, log } from "../api.js";
 /// Sampler fields sent to llama-server when overridden, and the few a
 /// DiffusionGemma run reads (it ignores sampling; its thinking is always on).
 export const LLAMA_PARAMS = ["temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty", "dry_multiplier", "max_tokens", "seed", "stop"];
+/// SGLang's names: repetition_penalty, no DRY, and a frequency penalty.
+export const SGLANG_PARAMS = ["temperature", "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty", "frequency_penalty", "max_tokens", "seed", "stop"];
 export const DG_PARAMS = ["max_tokens", "seed", "stop"];
 
 export const chat = $state({
@@ -46,6 +48,9 @@ export const presetKey = (t) => t?.profile_id ?? t?.key ?? "";
 export const current = () => (chat.currentId ? chat.convs[chat.currentId] ?? null : null);
 export const targetOf = (conv) => (conv ? chat.targets.find((t) => t.key === targetKey(conv.target)) ?? null : null);
 export const isDiffusion = (conv) => (targetOf(conv)?.engine ?? conv?.target?.engine) === "diffusion-gemma";
+/// An SGLang target that is not running: behind the router nothing loads it
+/// on demand, its server has to be started.
+export const isStoppedSglang = (t) => t?.engine === "sglang" && t.status !== "loaded";
 
 /// The first 60 characters, cut between graphemes. Never by UTF-16 code
 /// unit: a cut through an emoji leaves half a surrogate pair, which the IPC
@@ -369,6 +374,7 @@ export function resetParams() {
 /// the sampler fields this conversation overrides.
 export function buildBody(conv, target) {
   const dg = target.engine === "diffusion-gemma";
+  const sg = target.engine === "sglang";
   const preserve = conv.preserve_reasoning && !!chat.props[target.key]?.caps?.supports_preserve_reasoning;
   const messages = [];
   if (conv.system_prompt?.trim()) messages.push({ role: "system", content: conv.system_prompt });
@@ -388,8 +394,10 @@ export function buildBody(conv, target) {
     messages.push(x);
   }
   const body = { messages };
-  const p = conv.params ?? {};
-  for (const k of dg ? DG_PARAMS : LLAMA_PARAMS) {
+  const p = { ...(conv.params ?? {}) };
+  // A conversation moved over from llama-server keeps its repeat penalty.
+  if (sg && p.repetition_penalty == null && p.repeat_penalty != null) p.repetition_penalty = p.repeat_penalty;
+  for (const k of dg ? DG_PARAMS : sg ? SGLANG_PARAMS : LLAMA_PARAMS) {
     const v = p[k];
     if (v === null || v === undefined || v === "") continue;
     if (k === "stop") {
@@ -425,6 +433,15 @@ async function reply(conv) {
     finalize(convId, m, null, { error: `${conv.target?.model ?? conv.target?.run ?? "that server"} is not running. Pick another target above.` });
     return;
   }
+  if (isStoppedSglang(target)) {
+    // The list is polled every 5 s: look again before refusing.
+    await refreshTargets();
+    const now = targetOf(conv);
+    if (!now || isStoppedSglang(now)) {
+      finalize(convId, m, null, { error: `${target.model_id}'s SGLang server is stopped. Start it from Router or Profiles.` });
+      return;
+    }
+  }
   const streamId = uid("s");
   chat.streams[convId] = {
     streamId,
@@ -432,7 +449,7 @@ async function reply(conv) {
     engine: target.engine,
     host: target.host,
     port: target.port,
-    phase: target.status === "loaded" ? "connecting" : "loading",
+    phase: target.status === "loaded" || target.engine === "sglang" ? "connecting" : "loading",
     queue: null,
     progress: null,
     idTask: null,

@@ -21,13 +21,17 @@ export function isLoopback(host) {
 }
 
 /// The shells the snippets are written for, in the order the card offers
-/// them. On Windows `curl` in PowerShell 5.1 is Invoke-WebRequest, and cmd
-/// has neither `\` continuations nor single quotes, so each gets its own.
-export const SHELLS = [
-  ["powershell", "PowerShell"],
-  ["cmd", "cmd"],
-  ["bash", "Git Bash / WSL"],
-];
+/// them; the first is the default. On Windows `curl` in PowerShell 5.1 is
+/// Invoke-WebRequest, and cmd has neither `\` continuations nor single
+/// quotes, so each gets its own. On Linux there is only bash.
+export const IS_LINUX = typeof navigator !== "undefined" && /linux/i.test(navigator.platform ?? "");
+export const SHELLS = IS_LINUX
+  ? [["bash", "bash"]]
+  : [
+      ["powershell", "PowerShell"],
+      ["cmd", "cmd"],
+      ["bash", "Git Bash / WSL"],
+    ];
 
 // Quoting. PowerShell and bash: single quotes, nothing inside expands.
 // cmd: double quotes, and curl.exe reads `\"` as a quote (the C runtime's

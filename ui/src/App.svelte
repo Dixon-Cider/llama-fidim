@@ -15,8 +15,13 @@
   import { fly } from "svelte/transition";
   import { arrive } from "./motion.js";
 
+  // Where a llama.cpp build cannot exist (Linux) or the config has an
+  // sglang section, the engine to set up is SGLang, never a build. No
+  // command reports the platform, so the web view's own is used.
+  const linux = /linux/i.test(navigator.platform ?? "");
   // Grouped by what the person is doing: operating servers, inspecting the
-  // box, maintaining the tool.
+  // box, maintaining the tool. Updates is Windows-only (win-x64 app zips,
+  // bin-win llama.cpp builds, AMD's Windows ROCm), so Linux does not list it.
   const groups = [
     { label: "operate", views: [
       { id: "running", label: "Running", component: Running },
@@ -31,7 +36,7 @@
       { id: "logs", label: "Logs", component: Logs },
     ]},
     { label: "maintain", views: [
-      { id: "updates", label: "Updates", component: Updates },
+      ...(linux ? [] : [{ id: "updates", label: "Updates", component: Updates }]),
       { id: "settings", label: "Settings", component: Settings },
     ]},
   ];
@@ -39,10 +44,6 @@
   let active = $state("running");
   let alive = $state(0);
   let setup = $state(null); // { models, builds, sglang, profiles, sglangHost } from boot; drives the first-run banner
-  // Where a llama.cpp build cannot exist (Linux) or the config has an
-  // sglang section, the engine to set up is SGLang, never a build. No
-  // command reports the platform, so the web view's own is used.
-  const linux = /linux/i.test(navigator.platform ?? "");
   // The active pill slides between nav items instead of appearing.
   let btns = $state({});
   let pill = $state(null);
@@ -106,7 +107,10 @@
       }
     } catch (e) { log(`boot live_check failed: ${String(e)}`); }
   })();
-  const ActiveComponent = $derived(views.find((v) => v.id === active).component);
+  const ActiveComponent = $derived((views.find((v) => v.id === active) ?? views[0]).component);
+  // A view's link to one this platform does not list (Updates on Linux)
+  // goes nowhere rather than to a page whose actions cannot work here.
+  const go = (id) => { if (views.some((v) => v.id === id)) active = id; };
   // The one next action for the first-run banner, or null once set up.
   const firstRun = $derived(
     !setup ? null
@@ -198,7 +202,7 @@
         <span class="chip accent" title={firstRun === "sglang" ? "No SGLang environment is configured yet" : firstRun === "build" ? "No llama.cpp build found yet" : firstRun === "models" ? "No models found yet" : "No profiles yet"}>first run</span>
         <span>
           {#if firstRun === "sglang"}Set up SGLang in <button class="link" onclick={() => (active = "settings")}>Settings</button>
-          {:else if firstRun === "build"}Install a llama.cpp build in <button class="link" onclick={() => (active = "updates")}>Updates</button>
+          {:else if firstRun === "build"}Install a llama.cpp build in <button class="link" onclick={() => go("updates")}>Updates</button>
           {:else if firstRun === "models"}Add a model folder in <button class="link" onclick={() => (active = "settings")}>Settings</button> or get one in <button class="link" onclick={() => (active = "models")}>Models</button>
           {:else}Make a profile from a model in <button class="link" onclick={() => (active = "models")}>Models</button>{/if}
         </span>
@@ -206,7 +210,7 @@
     {/if}
     {#key active}
       <div in:fly={arrive()}>
-        <ActiveComponent go={(id) => (active = id)} />
+        <ActiveComponent go={go} />
       </div>
     {/key}
   </main>

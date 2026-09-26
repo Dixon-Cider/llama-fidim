@@ -3,12 +3,12 @@
   // (what most clients ask for), then the model id and snippets to paste.
   // The shell the snippets are written for outlives one card (Running
   // remounts it each time it opens).
-  let lastShell = "powershell";
+  import { SHELLS } from "../../lib/endpoint.js";
+  let lastShell = SHELLS[0][0];
 </script>
 
 <script>
   import { copyText } from "../../lib/clipboard.js";
-  import { SHELLS } from "../../lib/endpoint.js";
 
   // `copiedFirst`: the opener already copied this item (Running's Copy
   // endpoint copies the base URL, then shows the rest here).
@@ -58,12 +58,14 @@
     <div class="note">{"This profile requires an API key (--api-key or --api-key-file): clients send one of its keys as the bearer token."}</div>
   {/if}
 
-  <div class="shells" role="group" aria-label="shell">
-    <span class="k">{"snippets for"}</span>
-    {#each SHELLS as [id, label]}
-      <button class="btn small" class:primary={shell === id} aria-pressed={shell === id} onclick={() => pickShell(id)}>{label}</button>
-    {/each}
-  </div>
+  {#if SHELLS.length > 1}
+    <div class="shells" role="group" aria-label="shell">
+      <span class="k">{"snippets for"}</span>
+      {#each SHELLS as [id, label]}
+        <button class="btn small" class:primary={shell === id} aria-pressed={shell === id} onclick={() => pickShell(id)}>{label}</button>
+      {/each}
+    </div>
+  {/if}
   {#each [["curl", "curl (streaming)", endpoint.curl[shell]], ["python", "Python (openai)", endpoint.python], ["env", "environment", endpoint.env[shell]]] as [id, label, text]}
     <div class="snip">
       <div class="snip-head">

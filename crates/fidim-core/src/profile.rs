@@ -21,6 +21,9 @@ pub struct Profile {
     pub engine: Engine,
     pub id: String,
     pub name: String,
+    /// The llama.cpp build (llama-server and diffusion). An SGLang profile
+    /// runs from the venv in the config and saves none.
+    #[serde(default)]
     pub build: BuildRef,
     pub model: ModelRef,
     pub devices: Vec<DeviceRef>,
@@ -71,6 +74,31 @@ pub struct Profile {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Strip what an SGLang launch never reads from a serialized profile:
+/// `runtime` keeps only `ctx_total` (the `--context-length`), `model` only
+/// its path, devices only their keys, and FIDIM's llama-server trace switch
+/// leaves the env. Unknown extra keys stay (a newer FIDIM's fields).
+fn prune_llama_only(v: &mut serde_json::Value) {
+    let Some(o) = v.as_object_mut() else { return };
+    for k in ["build", "split_mode", "main_device", "rocm_runtime", "keep_alive_seconds", "sampling", "speculative", "diffusion", "chat"] {
+        o.remove(k);
+    }
+    if let Some(r) = o.get_mut("runtime").and_then(|r| r.as_object_mut()) {
+        r.retain(|k, _| k == "ctx_total");
+    }
+    if let Some(m) = o.get_mut("model").and_then(|m| m.as_object_mut()) {
+        m.retain(|k, _| k == "path");
+    }
+    if let Some(ds) = o.get_mut("devices").and_then(|d| d.as_array_mut()) {
+        for d in ds.iter_mut().filter_map(|d| d.as_object_mut()) {
+            d.retain(|k, _| k == "key");
+        }
+    }
+    if let Some(e) = o.get_mut("env").and_then(|e| e.as_object_mut()) {
+        e.remove("LLAMA_SERVER_SLOTS_DEBUG");
+    }
+}
+
 /// The server process a profile launches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -110,7 +138,7 @@ impl Engine {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuildRef {
     pub path: PathBuf,
     #[serde(default)]
@@ -402,6 +430,16 @@ pub struct Chat {
 // ------------------------------------------------------------ load/save ----
 
 impl Profile {
+    /// Requests the server decodes at once: llama-server's slots, SGLang's
+    /// `--max-running-requests`.
+    pub fn concurrent_requests(&self) -> u32 {
+        if self.engine.is_sglang() {
+            crate::sglang::cfg_of(self).max_running_requests
+        } else {
+            self.runtime.slots
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Profile> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
         let p: Profile = serde_json::from_str(&text)
@@ -429,7 +467,11 @@ impl Profile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
-        let text = serde_json::to_string_pretty(self)?;
+        let mut v = serde_json::to_value(self)?;
+        if self.engine.is_sglang() {
+            prune_llama_only(&mut v);
+        }
+        let text = serde_json::to_string_pretty(&v)?;
         std::fs::write(path, text).map_err(|e| Error::io(path, e))
     }
 
@@ -1111,6 +1153,40 @@ fn validate_diffusion(p: &Profile, out: &mut Vec<Finding>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sglang_profile_saves_without_llama_settings() {
+        let p: super::Profile = serde_json::from_value(serde_json::json!({
+            "schema": 1, "engine": "sglang", "id": "dd", "name": "dd",
+            "build": { "path": "", "version": null },
+            "model": { "path": "/m/x.gguf", "mmproj": null, "draft": null },
+            "devices": [{ "key": "pci:VEN_1002&DEV_7551:bus03", "split_fraction": null, "resolved_index_last_launch": null }],
+            "server": { "port": 30000, "alias": "dd", "host": "127.0.0.1" },
+            "runtime": { "ctx_total": 262144, "slots": 2, "kv_type_k": "q8_0", "flash_attn": "on", "cache_reuse": 256 },
+            "sampling": { "temperature": 1.0 }, "speculative": { "mode": "off" }, "chat": {},
+            "sglang": { "mem_fraction": 0.85, "aliases": ["ddg"] },
+            "env": { "LLAMA_SERVER_SLOTS_DEBUG": "1", "SGLANG_KV4_ANY_PLATFORM": "1" }
+        }))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("fidim-sg-prune-{}", std::process::id()));
+        let path = dir.join("dd.json");
+        p.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        for gone in ["build", "sampling", "speculative", "chat", "main_device", "split_mode"] {
+            assert!(!keys.contains(&gone), "{gone} still saved: {text}");
+        }
+        assert_eq!(v["runtime"], serde_json::json!({ "ctx_total": 262144 }));
+        assert_eq!(v["model"], serde_json::json!({ "path": "/m/x.gguf" }));
+        assert_eq!(v["devices"], serde_json::json!([{ "key": "pci:VEN_1002&DEV_7551:bus03" }]));
+        assert_eq!(v["env"], serde_json::json!({ "SGLANG_KV4_ANY_PLATFORM": "1" }));
+        // and it loads back with the same SGLang settings
+        let back = super::Profile::load(&path).unwrap();
+        assert_eq!(back.sglang, p.sglang);
+        assert_eq!(back.runtime.ctx_total, 262144);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     fn base_profile() -> Profile {

@@ -28,6 +28,10 @@ pub struct SlotView {
     pub n_prompt_tokens: u64,
     pub n_prompt_tokens_processed: u64,
     pub n_prompt_tokens_cache: u64,
+    /// Some(false) while `n_prompt_tokens` is an estimate (FIDIM's SGLang
+    /// router counts chars until the backend reports usage). None: exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_prompt_tokens_exact: Option<bool>,
     pub n_decoded: u64,
     pub n_remain: i64,
     /// Prompt tokens processed / total, 0..1 (1.0 once prefill is done).
@@ -154,6 +158,7 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
                 n_prompt_tokens: n_prompt,
                 n_prompt_tokens_processed: processed,
                 n_prompt_tokens_cache: g("n_prompt_tokens_cache"),
+                n_prompt_tokens_exact: s.get("n_prompt_tokens_exact").and_then(|x| x.as_bool()),
                 n_decoded,
                 n_remain,
                 prefill_fraction: if phase == "decode" { 1.0 } else { prefill_fraction },
@@ -288,6 +293,9 @@ mod tests {
         assert_eq!(s[1].prefill_fraction, 1.0);
         assert_eq!(s[2].phase, "idle");
         assert_eq!(s[2].n_ctx, 32768);
+        assert_eq!(s[0].n_prompt_tokens_exact, None);
+        let r = parse_slots(r#"[{"id":0,"n_ctx":10,"is_processing":true,"n_prompt_tokens":5,"n_prompt_tokens_exact":false}]"#).unwrap();
+        assert_eq!(r[0].n_prompt_tokens_exact, Some(false));
     }
 
     #[test]
@@ -324,6 +332,14 @@ mod tests {
         assert_eq!(m.get("tokens_predicted_total"), Some(&329.0));
         assert!((m["predicted_tokens_seconds"] - 51.1284).abs() < 1e-9);
         assert!(!m.contains_key("thing"));
+    }
+
+    #[test]
+    fn sglang_lines_pass_through_without_overwriting() {
+        let m = parse_metrics("llamacpp:prompt_tokens_total 10\nsglang:prompt_tokens_total 99\nsglang:num_queue_reqs 2.0\nsglang:num_running_reqs{tp_rank=\"0\"} 1.0\n");
+        assert_eq!(m["prompt_tokens_total"], 10.0);
+        assert_eq!(m["num_queue_reqs"], 2.0);
+        assert_eq!(m["num_running_reqs"], 1.0);
     }
 
     #[test]

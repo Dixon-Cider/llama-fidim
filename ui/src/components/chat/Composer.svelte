@@ -38,7 +38,11 @@
     const s = stream;
     if (!s) {
       if (!target) return conv?.target ? "that server is not running; pick another one above" : "";
-      if (target.status !== "loaded") return "the router loads this model when you send (that can take a minute)";
+      if (target.status !== "loaded") {
+        return target.engine === "sglang"
+          ? "this model's SGLang server is stopped; start it from Router or Profiles"
+          : "the router loads this model when you send (that can take a minute)";
+      }
       return "";
     }
     if (s.stopping) return "stopping…";

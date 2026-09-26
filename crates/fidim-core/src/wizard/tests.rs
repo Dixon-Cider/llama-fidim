@@ -788,6 +788,24 @@ fn plan_without_any_build_downloads_but_makes_no_profile() {
 }
 
 #[test]
+fn sglang_host_without_builds_plans_files_only() {
+    let mut f = Fake::supported("plan-sglang-host");
+    f.builds.clear();
+    let mut cfg = f.cfg();
+    cfg.sglang = Some(serde_json::from_value(serde_json::json!({ "venv": "/opt/venv" })).unwrap());
+    let view = inspect_with(&f, &cfg, "ngquocvinh/K2-Horizon-7B-GGUF", None).unwrap();
+    let plan = plan_with(&f, &cfg, &view, &PlanRequest::default()).unwrap();
+    assert!(!plan.blocked, "{:?}", plan.notes);
+    assert!(plan.steps.iter().all(|s| matches!(s.action, StepAction::Download { .. })), "downloads only");
+    assert!(plan.profile.is_none() && plan.build.is_none());
+    assert!(plan.notes.iter().any(|n| n.code == "sglang-host"), "{:?}", plan.notes);
+    // Without the sglang section the build planning runs as before.
+    cfg.sglang = None;
+    let plan = plan_with(&f, &cfg, &view, &PlanRequest::default()).unwrap();
+    assert!(!plan.notes.iter().any(|n| n.code == "sglang-host"));
+}
+
+#[test]
 fn plan_with_projector_draft_and_partial_downloads() {
     let mut f = Fake::supported("plan-aux");
     f.info = hub::parse_model_info(&fixture("hub/model-info-unsloth__gemma-4-26B-A4B-it-GGUF.json")).unwrap();

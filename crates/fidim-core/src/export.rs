@@ -4,12 +4,42 @@
 //! FIDIM; a diffusion profile's runs FIDIM's `fidim-dg.exe` helper, which
 //! owns the runner, so the header says so.
 
+use crate::config::Config;
 use crate::launch::LaunchPlan;
+use crate::platform::Platform;
 use crate::profile::Profile;
+use crate::{Error, Result};
+
+/// The script format this OS runs: `sh` on Linux, `bat` on Windows.
+pub fn default_format() -> &'static str {
+    if cfg!(windows) { "bat" } else { "sh" }
+}
+
+/// Compose `profile`'s launch the way a launch would and render it as
+/// `format` (`sh`, `bat` or `ps1`; None = this OS's). Returns the text and
+/// its file extension.
+pub fn render(cfg: &Config, profile: &Profile, platform: &dyn Platform, running_aliases: Vec<String>, format: Option<&str>) -> Result<(String, &'static str)> {
+    let plan = if profile.engine.is_sglang() {
+        let devices = crate::sglang::devices_now(cfg, platform)?;
+        let device = crate::sglang::resolve_device(profile, &devices)
+            .ok_or_else(|| Error::Config(format!("no card matches {}", profile.devices.first().map(|d| d.key.as_str()).unwrap_or("(no device)"))))?;
+        crate::sglang::compose(cfg, profile, device, &cfg.runs_dir)?
+    } else {
+        crate::launch::prepare(cfg, profile, platform, running_aliases)?.plan
+    };
+    Ok(match format.unwrap_or(default_format()) {
+        "sh" => (to_sh(profile, &plan), "sh"),
+        "ps1" => (to_ps1(profile, &plan), "ps1"),
+        "bat" => (to_bat(profile, &plan), "bat"),
+        other => return Err(Error::Config(format!("unknown export format {other:?} (sh|bat|ps1)"))),
+    })
+}
 
 fn standalone_note(profile: &Profile) -> &'static str {
     if profile.engine.is_diffusion() {
         "Needs Llama FIDIM's fidim-dg.exe (the path below), which owns the DiffusionGemma runner."
+    } else if profile.engine.is_sglang() {
+        "Runs standalone; the router (fidim router serve) is not included."
     } else {
         "Runs standalone."
     }
@@ -88,6 +118,47 @@ pub fn to_ps1(profile: &Profile, plan: &LaunchPlan) -> String {
     s
 }
 
+/// A bash script (Linux): the same plan, one `export` per variable.
+pub fn to_sh(profile: &Profile, plan: &LaunchPlan) -> String {
+    let mut s = String::from("#!/usr/bin/env bash\n");
+    s.push_str(&format!("# Exported by Llama FIDIM from profile '{}' ({}). {}\n", profile.id, profile.name, standalone_note(profile)));
+    s.push_str(&format!(
+        "# Devices: {} (HIP_VISIBLE_DEVICES={}).\n# Regenerate with: fidim export {} --format sh\nset -e\n\n",
+        profile.devices.iter().map(|d| d.key.as_str()).collect::<Vec<_>>().join(", "),
+        plan.visibility_env,
+        profile.id
+    ));
+    if let Some(rocm) = &plan.path_prepend {
+        s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(&rocm.to_string_lossy())));
+    }
+    let cur_path = std::env::var("PATH").unwrap_or_default();
+    for (k, v) in &plan.env {
+        // A composed PATH is <prepend>:<this process's PATH>; keep the
+        // prepend and let the script extend the PATH it runs with.
+        match v.strip_suffix(cur_path.as_str()).filter(|pre| k == "PATH" && !cur_path.is_empty() && pre.ends_with(':')) {
+            Some(pre) => s.push_str(&format!("export PATH={}\"$PATH\"\n", sh_quote(pre))),
+            None => s.push_str(&format!("export {k}={}\n", sh_quote(v))),
+        }
+    }
+    s.push_str("\nexec ");
+    s.push_str(&sh_quote(&plan.exe.to_string_lossy()));
+    // One flag and its value per line.
+    for a in &plan.args {
+        s.push_str(if a.starts_with('-') { " \\\n  " } else { " " });
+        s.push_str(&sh_quote(a));
+    }
+    s.push('\n');
+    s
+}
+
+fn sh_quote(a: &str) -> String {
+    if !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=,@%+".contains(c)) {
+        a.to_string()
+    } else {
+        format!("'{}'", a.replace('\'', "'\\''"))
+    }
+}
+
 fn bat_quote(a: &str) -> String {
     if a.contains(' ') || a.contains('&') || a.contains('^') {
         format!("\"{a}\"")
@@ -146,6 +217,17 @@ mod tests {
             fraction: 1.0,
             rebound: false,
         }]
+    }
+
+    #[test]
+    fn sh_export_quotes_and_execs() {
+        let (profile, plan) = plan_and_profile();
+        let sh = to_sh(&profile, &plan);
+        assert!(sh.starts_with("#!/usr/bin/env bash\n"));
+        assert!(sh.contains("\nexec "));
+        assert_eq!(sh_quote("a b'c"), "'a b'\\''c'");
+        assert_eq!(sh_quote("--port"), "--port");
+        assert_eq!(sh_quote(""), "''");
     }
 
     #[test]
