@@ -689,6 +689,38 @@ enum TrackMode {
     Collect(Vec<u8>),
 }
 
+/// A taken slot that is released when dropped, unless it was handed on to
+/// the response body (`disarm`). hyper drops the proxy future when the
+/// client disconnects while the backend is still working on the response
+/// headers (a non-streamed request the client timed out on); before this
+/// guard such a slot stayed busy forever, showing phantom in-flight requests
+/// and keeping the prefill-progress polling of `/get_load` running.
+struct SlotGuard {
+    stats: Arc<Mutex<ModelStats>>,
+    idx: usize,
+    armed: bool,
+}
+
+impl SlotGuard {
+    fn new(stats: Arc<Mutex<ModelStats>>, idx: usize) -> Self {
+        SlotGuard { stats, idx, armed: true }
+    }
+
+    /// Hand the slot on to `TrackedBody`, which releases it itself.
+    fn disarm(mut self) -> (Arc<Mutex<ModelStats>>, usize) {
+        self.armed = false;
+        (self.stats.clone(), self.idx)
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            Router::lock_stats(&self.stats).release(self.idx);
+        }
+    }
+}
+
 /// The backend's response body on its way to the client, updating the
 /// slot as it flows and releasing the slot when it ends (or is dropped:
 /// a client that went away releases too).
@@ -1012,19 +1044,56 @@ impl Router {
         text
     }
 
-    /// Backend /health every 2 s into a cache: SGLang's /health can take
-    /// ~2 s while a request is in flight, and FIDIM asks /models and
-    /// /health at 1 Hz.
+    /// Backend liveness into a cache, for `/health` and per-model status.
+    ///
+    /// Probes `/ready`: on SGLang it is a plain HTTP answer (tokenizer up,
+    /// scheduler reported ready). SGLang's `/health` instead generates a token
+    /// on the GPU for every call (~15-20 J each at idle here, a GPU wake every
+    /// poll), so it is only the fallback for backends without `/ready`
+    /// (llama-server answers 404 there). Every 2 s while any backend is down or
+    /// any request is in flight or ended within the last minute; every 30 s
+    /// when everything is idle and healthy.
     async fn health_poller(self: Arc<Self>) {
+        const BUSY: Duration = Duration::from_secs(2);
+        const IDLE: Duration = Duration::from_secs(30);
+        const ACTIVE_WINDOW: f64 = 60.0;
+        let mut has_ready: HashMap<String, bool> = HashMap::new();
         loop {
+            let mut all_ok = true;
             for (name, url) in &self.opts.routes {
-                let ok = matches!(self.get_raw(format!("{url}/health"), Duration::from_secs(4)).await, Some((s, _, _)) if s == StatusCode::OK);
+                let ok = self.probe_backend(name, url, &mut has_ready).await;
                 if let Some(h) = self.healthy.get(name) {
                     h.store(ok, Ordering::Relaxed);
                 }
+                all_ok &= ok;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            let period = if !all_ok || self.recently_active(ACTIVE_WINDOW) { BUSY } else { IDLE };
+            tokio::time::sleep(period).await;
         }
+    }
+
+    /// One liveness probe: `/ready`, or `/health` once the backend showed it
+    /// has no `/ready` (404). The choice is remembered per backend.
+    async fn probe_backend(&self, name: &str, url: &str, has_ready: &mut HashMap<String, bool>) -> bool {
+        let ok_status = |r: &Option<(StatusCode, HeaderMap, Bytes)>| matches!(r, Some((s, _, _)) if *s == StatusCode::OK);
+        if *has_ready.get(name).unwrap_or(&true) {
+            let r = self.get_raw(format!("{url}/ready"), Duration::from_secs(4)).await;
+            if !matches!(r, Some((s, _, _)) if s == StatusCode::NOT_FOUND) {
+                return ok_status(&r);
+            }
+            has_ready.insert(name.to_string(), false);
+        }
+        ok_status(&self.get_raw(format!("{url}/health"), Duration::from_secs(4)).await)
+    }
+
+    /// Whether any member has a request in flight or finished one within
+    /// `window` seconds (drives the health poll rate).
+    fn recently_active(&self, window: f64) -> bool {
+        let t = now();
+        self.stats.values().any(|st| {
+            let s = Self::lock_stats(st);
+            s.slots.iter().any(|sl| sl.busy || (sl.t_end > 0.0 && t - sl.t_end < window))
+        })
     }
 
     // ---- handlers ----
@@ -1216,7 +1285,8 @@ impl Router {
         }
 
         let tracked = parts.method == Method::POST && TRACKED.contains(&parts.uri.path()) && parsed.is_some();
-        let mut slot: Option<(Arc<Mutex<ModelStats>>, usize)> = None;
+        // released on every early return and on cancellation (see SlotGuard)
+        let mut slot: Option<SlotGuard> = None;
         let mut tracker: Option<SseTracker> = None;
         if tracked {
             let mut p = parsed.unwrap_or_default();
@@ -1239,7 +1309,7 @@ impl Router {
                     sl.max_tokens = max_tokens;
                     idx
                 };
-                slot = Some((st, idx));
+                slot = Some(SlotGuard::new(st, idx));
                 if truthy(p.get("stream")) {
                     let mut so = p.get("stream_options").and_then(Value::as_object).cloned().unwrap_or_default();
                     let want_usage = truthy(so.get("include_usage"));
@@ -1251,17 +1321,10 @@ impl Router {
             }
         }
 
-        let release = |slot: &Option<(Arc<Mutex<ModelStats>>, usize)>| {
-            if let Some((st, idx)) = slot {
-                Self::lock_stats(st).release(*idx);
-            }
-        };
-
         let target = format!("{url}{}", parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"));
         let uri: Uri = match target.parse() {
             Ok(u) => u,
             Err(e) => {
-                release(&slot);
                 return text_response(StatusCode::BAD_GATEWAY, &format!("bad backend URL {target}: {e}"));
             }
         };
@@ -1271,7 +1334,6 @@ impl Router {
         let resp = match self.client.request(out_req).await {
             Ok(r) => r,
             Err(e) => {
-                release(&slot);
                 return text_response(StatusCode::BAD_GATEWAY, &format!("backend {resolved} ({url}): {e}"));
             }
         };
@@ -1286,7 +1348,7 @@ impl Router {
         }
         let is_sse = rparts.status == StatusCode::OK
             && rparts.headers.get(header::CONTENT_TYPE).map(|v| String::from_utf8_lossy(v.as_bytes()).contains("text/event-stream")).unwrap_or(false);
-        let out_body: OutBody = match slot {
+        let out_body: OutBody = match slot.map(SlotGuard::disarm) {
             None => rbody.boxed(),
             Some((st, idx)) => {
                 let mode = match tracker {
@@ -1399,6 +1461,20 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_guard_releases_on_drop_unless_disarmed() {
+        let st = Arc::new(Mutex::new(ModelStats::new("m", "http://127.0.0.1:1")));
+        // dropped (client went away before the response headers): slot freed
+        let idx = st.lock().unwrap().take();
+        drop(SlotGuard::new(st.clone(), idx));
+        assert!(!st.lock().unwrap().slots[idx].busy);
+        // disarmed (handed to the response body): still busy until the body ends
+        let idx = st.lock().unwrap().take();
+        let (st2, idx2) = SlotGuard::new(st.clone(), idx).disarm();
+        assert_eq!(idx2, idx);
+        assert!(st2.lock().unwrap().slots[idx].busy);
+    }
 
     fn fresh_slot() -> Slot {
         let mut s = Slot::new(0);

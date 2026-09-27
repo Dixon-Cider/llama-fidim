@@ -107,18 +107,41 @@
       data = d;
       loaded = true;
       error = "";
+      if (d.runs.some((r) => r.samples.some((s) => s.slots.some((x) => x.is_processing)))) lastBusy = Date.now();
     } catch (e) {
       error = String(e);
       loaded = true;
     }
   }
-  poll();
-  const timer = setInterval(poll, 1000);
-  const tick = setInterval(() => (now = Math.floor(Date.now() / 1000)), 1000);
-  onDestroy(() => { clearInterval(timer); clearInterval(tick); });
+  // Poll once a second while any slot is working (and for 30 s after, so the
+  // tail of a request and the next one in a conversation stay smooth); every
+  // 10 s when every model is idle; not at all while the window is hidden. A
+  // sample costs a /proc scan plus a round trip to every server, which at
+  // 1 Hz kept the app and its webview at ~14% CPU with nothing running.
+  let lastBusy = 0;
+  let active = $state(false);   // a model worked within BUSY_TAIL_MS: fast polling, animated chip
+  let timer = null;
+  const BUSY_MS = 1000, IDLE_MS = 10000, BUSY_TAIL_MS = 30000;
+  function busy() { return Date.now() - lastBusy < BUSY_TAIL_MS; }
+  async function loop() {
+    timer = null;
+    if (document.hidden) return;   // visibilitychange restarts the loop
+    await poll();
+    active = busy();
+    if (!document.hidden && timer === null) timer = setTimeout(loop, active ? BUSY_MS : IDLE_MS);
+  }
+  function onVisibility() {
+    if (document.hidden) { if (timer !== null) { clearTimeout(timer); timer = null; } }
+    else if (timer === null) loop();
+  }
+  document.addEventListener("visibilitychange", onVisibility);
+  loop();
+  // uptime shows minutes: a coarse tick is enough
+  const tick = setInterval(() => (now = Math.floor(Date.now() / 1000)), 15000);
+  onDestroy(() => { if (timer !== null) clearTimeout(timer); clearInterval(tick); document.removeEventListener("visibilitychange", onVisibility); });
 
   async function stop(target) {
-    try { await api("stop_run", { target }); await poll(); } catch (e) { error = String(e); }
+    try { await api("stop_run", { target }); lastBusy = Date.now(); await poll(); } catch (e) { error = String(e); }
   }
   function uptime(started) {
     const s = Math.max(0, now - started);
@@ -240,7 +263,7 @@
   {/each}
   <div class="strip-tools">
     <button class="btn" onclick={() => (paused = !paused)}>{paused ? "Resume" : "Pause"}</button>
-    <span class="chip {paused ? 'plain' : 'pass live'}" title={paused ? "Polling stopped; Resume to sample again" : "Sampled once a second"}>{paused ? "paused" : "live"}</span>
+    <span class="chip {paused ? 'plain' : active ? 'pass live' : 'pass'}" title={paused ? "Polling stopped; Resume to sample again" : "Sampled once a second while a model is working, every 10 s when idle"}>{paused ? "paused" : "live"}</span>
     {#if error}<span class="chip block shake">{error}</span>{/if}
     {#if pending}
       <span class="chip warn" transition:fade={{ duration: LAYOUT }}>dismissed {pending.id} · <button class="link" onclick={undo}>undo</button></span>
