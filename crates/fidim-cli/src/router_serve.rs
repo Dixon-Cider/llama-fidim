@@ -16,14 +16,26 @@
 //!   GET /health          200 only when every backend is healthy (cached)
 //!   GET /fidim/state     everything above as one JSON
 //!
-//! Plain HTTP/1.1 over hyper; no TLS. The layout follows the Python file:
+//! Pools: `~/.fidim/router-remotes.json` (or `--remotes-file`) can add remote
+//! OpenAI-compatible servers to a route (e.g. a DGX Spark behind `dd`). The
+//! router then picks a member per chat/completion request: one conversation
+//! stays on one member (prompt-cache reuse), new conversations go local
+//! while the local server has a free slot and spill to a remote with room,
+//! and a remote never gets more than its `max_inflight`. A remote that
+//! refuses or fails before anything reached the client is retried locally.
+//! See `RemoteSpec` and `Router::try_pick`.
+//!
+//! HTTP/1.1 over hyper; TLS (rustls) only toward remote members. The layout follows the Python file:
 //! `Slot`/`ModelStats` (per-model bookkeeping), `SseTracker` (feeds streamed
 //! chunks into a slot and strips the injected usage chunk), the pure
 //! helpers (`prompt_text`, `aggregate_backend_metrics`), then `Router` (the
 //! HTTP handlers) and `run`.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -38,9 +50,11 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 
@@ -59,7 +73,7 @@ const JSON_CT: &str = "application/json; charset=utf-8";
 const TEXT_CT: &str = "text/plain; charset=utf-8";
 
 type OutBody = BoxBody<Bytes, hyper::Error>;
-type HttpClient = Client<HttpConnector, Full<Bytes>>;
+type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 /// Seconds since the router started (monotonic; the Python uses
 /// `time.time()`, but only differences are ever exposed).
@@ -773,7 +787,11 @@ impl Drop for SlotGuard {
 /// slot as it flows and releasing the slot when it ends (or is dropped:
 /// a client that went away releases too).
 struct TrackedBody {
-    inner: Incoming,
+    /// None: the whole reply is in `prefix` (a buffered remote reply).
+    inner: Option<Incoming>,
+    /// Bytes already read from the backend (a remote's first SSE event, or
+    /// its whole non-streamed reply), passed on before `inner`.
+    prefix: Option<Bytes>,
     mode: TrackMode,
     stats: Arc<Mutex<ModelStats>>,
     slot: usize,
@@ -783,6 +801,25 @@ struct TrackedBody {
 }
 
 impl TrackedBody {
+    /// One chunk of the backend body: into the slot, and what the client gets.
+    fn track(&mut self, data: Bytes) -> Bytes {
+        match &mut self.mode {
+            TrackMode::Collect(buf) => {
+                if buf.len() < MAX_COLLECT {
+                    buf.extend_from_slice(&data);
+                }
+                data
+            }
+            TrackMode::Sse(tracker) => {
+                let mut st = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                match st.slots.get_mut(self.slot) {
+                    Some(slot) => Bytes::from(tracker.feed(&data, slot)),
+                    None => data,
+                }
+            }
+        }
+    }
+
     /// End of the backend body: flush the tracker (its tail is returned so
     /// the client gets it), parse a collected reply, release the slot.
     fn finish(&mut self) -> Vec<u8> {
@@ -852,7 +889,19 @@ impl Body for TrackedBody {
             if this.done {
                 return Poll::Ready(None);
             }
-            match Pin::new(&mut this.inner).poll_frame(cx) {
+            if let Some(data) = this.prefix.take() {
+                let out = this.track(data);
+                if out.is_empty() {
+                    continue;
+                }
+                return Poll::Ready(Some(Ok(Frame::data(out))));
+            }
+            let Some(inner) = this.inner.as_mut() else {
+                this.done = true;
+                let tail = this.finish();
+                return if tail.is_empty() { Poll::Ready(None) } else { Poll::Ready(Some(Ok(Frame::data(tail.into())))) };
+            };
+            match Pin::new(inner).poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     this.done = true;
@@ -867,22 +916,7 @@ impl Body for TrackedBody {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Err(other) => return Poll::Ready(Some(Ok(other))),
                     Ok(data) => {
-                        let out = match &mut this.mode {
-                            TrackMode::Collect(buf) => {
-                                if buf.len() < MAX_COLLECT {
-                                    buf.extend_from_slice(&data);
-                                }
-                                data
-                            }
-                            TrackMode::Sse(tracker) => {
-                                let mut st = this.stats.lock().unwrap_or_else(|e| e.into_inner());
-                                let idx = this.slot;
-                                match st.slots.get_mut(idx) {
-                                    Some(slot) => Bytes::from(tracker.feed(&data, slot)),
-                                    None => data,
-                                }
-                            }
-                        };
+                        let out = this.track(data);
                         if out.is_empty() {
                             continue;
                         }
@@ -920,6 +954,60 @@ pub struct Opts {
     /// (alias, model name).
     pub aliases: Vec<(String, String)>,
     pub default: String,
+    /// Remote members that add capacity to a route (router-remotes.json).
+    pub remotes: Vec<RemoteSpec>,
+    /// Seconds a conversation waits for its own member's slot before it may
+    /// move (a move costs one full prefill elsewhere).
+    pub sticky_wait: f64,
+}
+
+/// One remote OpenAI-compatible server in a route's pool, from
+/// `router-remotes.json`:
+///
+/// ```json
+/// {"sticky_wait_secs": 15,
+///  "remotes": [{"name": "spark", "pool": "dd",
+///               "base_url": "https://spark.example.com/v1", "served_model": "qwen3.8-27b",
+///               "api_key_file": "~/.secrets/spark_key.txt", "max_inflight": 2}]}
+/// ```
+///
+/// Requests for `pool` (aliases included) may go there with `model` set to
+/// `served_model` and `Authorization: Bearer <key>`; only
+/// `/v1/chat/completions` and `/v1/completions` are pooled. A client sends
+/// `x-fidim-local-only: 1` to keep a request local, and `x-fidim-session` to
+/// name its conversation (else the system prompt and first user message do).
+/// `touch ~/.fidim/remote-<name>.off` takes a remote out until removed.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct RemoteSpec {
+    pub name: String,
+    pub pool: String,
+    pub base_url: String,
+    pub served_model: String,
+    #[serde(default)]
+    pub api_key_file: Option<String>,
+    /// Requests the remote takes at once (its gateway refuses more).
+    #[serde(default = "one")]
+    pub max_inflight: usize,
+}
+
+fn one() -> usize {
+    1
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemotesFile {
+    #[serde(default)]
+    remotes: Vec<RemoteSpec>,
+    #[serde(default)]
+    sticky_wait_secs: Option<f64>,
+}
+
+/// `~/` at the start of a path, expanded (key files are written by hand).
+fn expand_home(p: &str) -> PathBuf {
+    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(p),
+    }
 }
 
 impl Opts {
@@ -948,14 +1036,292 @@ impl Opts {
         if !routes.iter().any(|(n, _)| n == default) {
             bail!("--default {default} is not one of the routes");
         }
-        Ok(Opts { host: host.to_string(), port, routes, aliases, default: default.to_string() })
+        Ok(Opts { host: host.to_string(), port, routes, aliases, default: default.to_string(), remotes: vec![], sticky_wait: 15.0 })
     }
+
+    /// Add the remote members in `path` when it exists. A bad file is
+    /// logged and ignored: the router still serves its local routes.
+    pub fn with_remotes_file(mut self, path: &Path) -> Self {
+        if !path.exists() {
+            return self;
+        }
+        match self.parse_remotes(path) {
+            Ok(()) => {}
+            Err(e) => {
+                log_line("WARNING", &format!("{}: {e:#}; serving without remote members", path.display()));
+                self.remotes.clear();
+            }
+        }
+        self
+    }
+
+    fn parse_remotes(&mut self, path: &Path) -> anyhow::Result<()> {
+        let text = std::fs::read_to_string(path).context("read")?;
+        let f: RemotesFile = serde_json::from_str(&text).context("parse")?;
+        for mut r in f.remotes {
+            r.base_url = r.base_url.trim().trim_end_matches('/').to_string();
+            let uri: Uri = r.base_url.parse().with_context(|| format!("remote {}: bad base_url", r.name))?;
+            if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none() {
+                bail!("remote {}: base_url must be http(s)://host[:port]/path", r.name);
+            }
+            if r.name.is_empty() || self.routes.iter().any(|(n, _)| *n == r.name) || self.remotes.iter().any(|x| x.name == r.name) {
+                bail!("remote `{}`: the name must be unique and not a route", r.name);
+            }
+            if !self.routes.iter().any(|(n, _)| *n == r.pool) {
+                bail!("remote {}: pool `{}` is not a route", r.name, r.pool);
+            }
+            if r.max_inflight == 0 || r.served_model.is_empty() {
+                bail!("remote {}: max_inflight must be at least 1 and served_model set", r.name);
+            }
+            self.remotes.push(r);
+        }
+        if let Some(w) = f.sticky_wait_secs {
+            self.sticky_wait = w.clamp(0.0, 300.0);
+        }
+        Ok(())
+    }
+}
+
+/// A remote member at run time.
+struct Remote {
+    spec: RemoteSpec,
+    key: Option<String>,
+    /// Slots for the live view; `max_inflight` of them.
+    stats: Arc<Mutex<ModelStats>>,
+    /// Last `/models` probe listed `served_model`.
+    healthy: AtomicBool,
+    /// After a refused or failed request: not picked until then (router clock).
+    cooling_until: Mutex<f64>,
+    last_error: Mutex<String>,
+    off_file: PathBuf,
+}
+
+/// How long a refused or failed remote sits out.
+const REMOTE_COOLDOWN: f64 = 30.0;
+
+impl Remote {
+    fn new(spec: RemoteSpec, config_dir: &Path) -> Self {
+        let key = spec.api_key_file.as_deref().and_then(|f| match std::fs::read_to_string(expand_home(f)) {
+            Ok(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
+            Ok(_) => {
+                log_line("WARNING", &format!("remote {}: key file {f} is empty", spec.name));
+                None
+            }
+            Err(e) => {
+                log_line("WARNING", &format!("remote {}: key file {f}: {e}", spec.name));
+                None
+            }
+        });
+        let mut st = ModelStats::new(&spec.name, &spec.base_url);
+        st.slots = (0..spec.max_inflight).map(Slot::new).collect();
+        st.n_slots = spec.max_inflight;
+        let off_file = config_dir.join(format!("remote-{}.off", spec.name));
+        Remote {
+            spec,
+            key,
+            stats: Arc::new(Mutex::new(st)),
+            healthy: AtomicBool::new(false),
+            cooling_until: Mutex::new(0.0),
+            last_error: Mutex::new(String::new()),
+            off_file,
+        }
+    }
+
+    fn busy(&self) -> usize {
+        Router::lock_stats(&self.stats).slots.iter().filter(|s| s.busy).count()
+    }
+
+    fn cooling(&self) -> bool {
+        now() < *self.cooling_until.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Up and switched on. A cooling remote (it refused recently) still
+    /// serves the conversations already on it (moving them costs a prefill),
+    /// but takes no new ones.
+    fn usable(&self, sticky: bool) -> bool {
+        self.healthy.load(Ordering::Relaxed) && (sticky || !self.cooling()) && !self.off_file.exists()
+    }
+
+    fn has_room(&self, sticky: bool) -> bool {
+        self.usable(sticky) && self.busy() < self.spec.max_inflight
+    }
+
+    /// A request it took failed before reaching the client: sit out a while.
+    fn fail(&self, reason: &str) {
+        *self.cooling_until.lock().unwrap_or_else(|e| e.into_inner()) = now() + REMOTE_COOLDOWN;
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = reason.to_string();
+        if reason.starts_with("HTTP 401") || reason.starts_with("HTTP 403") {
+            self.healthy.store(false, Ordering::Relaxed);
+        }
+        log_line("WARNING", &format!("remote {}: {reason}; retrying locally, out for {REMOTE_COOLDOWN:.0} s", self.spec.name));
+    }
+
+    fn state_json(&self) -> Value {
+        let mut v = Router::lock_stats(&self.stats).state_json();
+        v["max_inflight"] = json!(self.spec.max_inflight);
+        v["served_model"] = json!(self.spec.served_model);
+        v["healthy"] = json!(self.healthy.load(Ordering::Relaxed));
+        v["cooling"] = json!(self.cooling());
+        v["switched_off"] = json!(self.off_file.exists());
+        v["key_loaded"] = json!(self.key.is_some());
+        v["last_error"] = json!(self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        v
+    }
+}
+
+/// Which member a conversation is on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Target {
+    Local,
+    Remote(usize),
+}
+
+/// A member chosen for one request, its slot already taken.
+#[derive(Debug, PartialEq)]
+enum Pick {
+    Local(usize),
+    /// (remote index, slot index, why: new/sticky/spill)
+    Remote(usize, usize, &'static str),
+}
+
+/// Conversation key -> (member, last used), router clock.
+#[derive(Default)]
+struct Sticky {
+    map: HashMap<u64, (Target, f64)>,
+}
+
+const STICKY_TTL: f64 = 1800.0;
+const STICKY_MAX: usize = 4096;
+
+impl Sticky {
+    fn get(&self, key: Option<u64>) -> Option<Target> {
+        let t = now();
+        key.and_then(|k| self.map.get(&k)).filter(|(_, at)| t - at < STICKY_TTL).map(|(tg, _)| *tg)
+    }
+
+    fn put(&mut self, key: Option<u64>, target: Target) {
+        let Some(k) = key else { return };
+        let t = now();
+        if self.map.len() >= STICKY_MAX {
+            self.map.retain(|_, (_, at)| t - *at < STICKY_TTL);
+            if self.map.len() >= STICKY_MAX {
+                // still full of live entries: drop the oldest quarter
+                let mut ats: Vec<f64> = self.map.values().map(|(_, at)| *at).collect();
+                ats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let cut = ats[ats.len() / 4];
+                self.map.retain(|_, (_, at)| *at > cut);
+            }
+        }
+        self.map.insert(k, (target, t));
+    }
+}
+
+/// The conversation a request belongs to: the client's `x-fidim-session`,
+/// else the model, system prompt and first user message (an agent's later
+/// turns repeat them). None for a request with neither.
+fn sticky_key(headers: &HeaderMap, body: &Map<String, Value>) -> Option<u64> {
+    let mut h = DefaultHasher::new();
+    if let Some(v) = headers.get("x-fidim-session").filter(|v| !v.is_empty()) {
+        "session".hash(&mut h);
+        v.as_bytes().hash(&mut h);
+        return Some(h.finish());
+    }
+    let msgs = body.get("messages").and_then(Value::as_array)?;
+    let first = |role: &str| msgs.iter().find(|m| m.get("role").and_then(Value::as_str) == Some(role)).map(|m| text_of(m.get("content")));
+    let (system, user) = (first("system"), first("user"));
+    if system.is_none() && user.is_none() {
+        return None;
+    }
+    "prefix".hash(&mut h);
+    body.get("model").and_then(Value::as_str).unwrap_or("").hash(&mut h);
+    for part in [system, user].into_iter().flatten() {
+        let cut: String = part.chars().take(8000).collect();
+        cut.hash(&mut h);
+    }
+    Some(h.finish())
+}
+
+/// `x-fidim-local-only: 1|true|yes`.
+fn local_only(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-fidim-local-only")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// The remote URL for a pooled request path (`/v1` is in the remote's base).
+fn remote_target(base: &str, uri: &Uri) -> String {
+    let path = uri.path();
+    let rest = path.strip_prefix("/v1").unwrap_or(path);
+    match uri.query() {
+        Some(q) => format!("{base}{rest}?{q}"),
+        None => format!("{base}{rest}"),
+    }
+}
+
+/// The first SSE event of a remote reply is an error (a gateway refusal
+/// such as `{"error": {"type": "rate_limited"}}` sent with HTTP 200):
+/// its message, else None.
+fn sse_error(event: &[u8]) -> Option<String> {
+    for line in event.split(|b| *b == b'\n') {
+        let Some(payload) = line.strip_prefix(b"data:") else { continue };
+        let Ok(d) = serde_json::from_slice::<Value>(payload.trim_ascii()) else { continue };
+        if let Some(e) = d.get("error").filter(|e| truthy(Some(e))) {
+            let msg = e.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| e.to_string());
+            return Some(msg);
+        }
+    }
+    None
+}
+
+/// Fill a just-taken slot from the request and build the body to send:
+/// `model` replaced for a remote, and a stream asked for its usage (the
+/// tracker strips that chunk again unless the client asked for it).
+fn start_slot(st: &Arc<Mutex<ModelStats>>, idx: usize, p: &Map<String, Value>, body: &Bytes, model: Option<&str>) -> (SlotGuard, Option<SseTracker>, Bytes) {
+    let (prompt, n_prompt) = prompt_text(p);
+    let max_tokens = p
+        .get("max_tokens")
+        .filter(|v| truthy(Some(v)))
+        .or_else(|| p.get("max_completion_tokens").filter(|v| truthy(Some(v))))
+        .and_then(py_int)
+        .unwrap_or(-1);
+    {
+        let mut s = Router::lock_stats(st);
+        let scaled = s.estimate_prompt(n_prompt);
+        if let Some(sl) = s.slots.get_mut(idx) {
+            sl.prompt = prompt;
+            sl.n_prompt_est = n_prompt;
+            sl.n_prompt = scaled;
+            sl.max_tokens = max_tokens;
+        }
+    }
+    let guard = SlotGuard::new(st.clone(), idx);
+    let stream = truthy(p.get("stream"));
+    if !stream && model.is_none() {
+        return (guard, None, body.clone());
+    }
+    let mut out = p.clone();
+    if let Some(m) = model {
+        out.insert("model".into(), Value::String(m.to_string()));
+    }
+    let mut tracker = None;
+    if stream {
+        let mut so = out.get("stream_options").and_then(Value::as_object).cloned().unwrap_or_default();
+        let want_usage = truthy(so.get("include_usage"));
+        so.insert("include_usage".into(), Value::Bool(true));
+        out.insert("stream_options".into(), Value::Object(so));
+        tracker = Some(SseTracker::new(want_usage));
+    }
+    (guard, tracker, Bytes::from(serde_json::to_vec(&Value::Object(out)).unwrap_or_default()))
 }
 
 /// Everything the handlers share.
 pub struct Router {
     opts: Opts,
     stats: HashMap<String, Arc<Mutex<ModelStats>>>,
+    remotes: Vec<Remote>,
+    sticky: Mutex<Sticky>,
     healthy: HashMap<String, AtomicBool>,
     /// name -> (when, aggregated text), 1 s cache of the backend's /metrics.
     backend_metrics: Mutex<HashMap<String, (f64, String)>>,
@@ -966,8 +1332,24 @@ impl Router {
     pub fn new(opts: Opts) -> Arc<Self> {
         let stats = opts.routes.iter().map(|(n, u)| (n.clone(), Arc::new(Mutex::new(ModelStats::new(n, u))))).collect();
         let healthy = opts.routes.iter().map(|(n, _)| (n.clone(), AtomicBool::new(false))).collect();
-        let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
-        Arc::new(Router { opts, stats, healthy, backend_metrics: Mutex::new(HashMap::new()), client })
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
+            .expect("TLS provider")
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client = Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
+        let config_dir = fidim_core::config::Config::config_dir();
+        let remotes = opts.remotes.iter().map(|r| Remote::new(r.clone(), &config_dir)).collect();
+        Arc::new(Router {
+            opts,
+            stats,
+            remotes,
+            sticky: Mutex::new(Sticky::default()),
+            healthy,
+            backend_metrics: Mutex::new(HashMap::new()),
+            client,
+        })
     }
 
     fn lock_stats(st: &Mutex<ModelStats>) -> std::sync::MutexGuard<'_, ModelStats> {
@@ -1007,8 +1389,15 @@ impl Router {
     // ---- backend calls ----
 
     async fn get_raw(&self, url: String, timeout: Duration) -> Option<(StatusCode, HeaderMap, Bytes)> {
+        self.get_raw_auth(url, None, timeout).await
+    }
+
+    async fn get_raw_auth(&self, url: String, bearer: Option<&str>, timeout: Duration) -> Option<(StatusCode, HeaderMap, Bytes)> {
         let uri: Uri = url.parse().ok()?;
-        let req = Request::get(uri).body(Full::new(Bytes::new())).ok()?;
+        let mut req = Request::get(uri).body(Full::new(Bytes::new())).ok()?;
+        if let Some(k) = bearer {
+            req.headers_mut().insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {k}")).ok()?);
+        }
         tokio::time::timeout(timeout, async {
             let resp = self.client.request(req).await.ok()?;
             let (parts, body) = resp.into_parts();
@@ -1134,6 +1523,122 @@ impl Router {
         ok_status(&self.get_raw(format!("{url}/health"), Duration::from_secs(4)).await)
     }
 
+    /// A remote member's liveness: `GET {base}/models` lists `served_model`.
+    /// Every 60 s when idle, 20 s while it is in use, 15 s while it is down.
+    async fn remote_poller(self: Arc<Self>, i: usize) {
+        loop {
+            let r = &self.remotes[i];
+            let res = self.get_raw_auth(format!("{}/models", r.spec.base_url), r.key.as_deref(), Duration::from_secs(10)).await;
+            let (ok, why) = match &res {
+                None => (false, "no answer".to_string()),
+                Some((st, _, body)) if *st == StatusCode::OK => {
+                    let listed = serde_json::from_slice::<Value>(body)
+                        .ok()
+                        .and_then(|v| v.get("data").and_then(Value::as_array).cloned())
+                        .is_some_and(|a| a.iter().any(|m| m.get("id").and_then(Value::as_str) == Some(r.spec.served_model.as_str())));
+                    (listed, if listed { String::new() } else { format!("{} not listed", r.spec.served_model) })
+                }
+                Some((st, _, _)) => (false, format!("HTTP {}", st.as_u16())),
+            };
+            let was = r.healthy.swap(ok, Ordering::Relaxed);
+            if was != ok {
+                if ok {
+                    log_line("INFO", &format!("remote {} healthy ({})", r.spec.name, r.spec.base_url));
+                } else {
+                    log_line("WARNING", &format!("remote {} unavailable: {why}", r.spec.name));
+                }
+            }
+            if !ok {
+                *r.last_error.lock().unwrap_or_else(|e| e.into_inner()) = why;
+            }
+            let in_use = {
+                let t = now();
+                Self::lock_stats(&r.stats).slots.iter().any(|sl| sl.busy || (sl.t_end > 0.0 && t - sl.t_end < 60.0))
+            };
+            let period = if !ok { 15 } else if in_use { 20 } else { 60 };
+            tokio::time::sleep(Duration::from_secs(period)).await;
+        }
+    }
+
+    /// The remotes that may take this request: pooled with its route, and a
+    /// pooled path, and the client did not ask to stay local.
+    fn remotes_for(&self, route: &str, path: &str, headers: &HeaderMap) -> Vec<usize> {
+        if !matches!(path, "/v1/chat/completions" | "/v1/completions") || local_only(headers) {
+            return vec![];
+        }
+        self.remotes.iter().enumerate().filter(|(_, r)| r.spec.pool == route).map(|(i, _)| i).collect()
+    }
+
+    /// Choose a member for a pooled request, waiting up to `sticky_wait` for
+    /// the conversation's own member when it is full and another could take it.
+    async fn choose(&self, st: &Arc<Mutex<ModelStats>>, pool: &[usize], key: Option<u64>) -> Pick {
+        let start = now();
+        loop {
+            let waited = now() - start >= self.opts.sticky_wait;
+            if let Some(p) = self.try_pick(st, pool, key, waited) {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// One pick attempt (None: wait and try again). Rules:
+    /// - a conversation stays on its member while that member has a slot;
+    /// - its member full: wait (until `waited`) when another member could
+    ///   take it, then move; its remote unusable: move now;
+    /// - new conversations: local while it has a free slot, else a remote
+    ///   with room, else local (SGLang queues);
+    /// - a remote never gets more than `max_inflight` (the slot is taken
+    ///   here, under the lock).
+    fn try_pick(&self, st: &Arc<Mutex<ModelStats>>, pool: &[usize], key: Option<u64>, waited: bool) -> Option<Pick> {
+        let mut sticky = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
+        let local_room = {
+            let s = Self::lock_stats(st);
+            s.slots.iter().filter(|x| x.busy).count() < s.n_slots.max(1)
+        };
+        let remote_with_room = || pool.iter().copied().find(|&i| self.remotes[i].has_room(false));
+        let fresh = |prefer_remote: bool| -> (Target, &'static str) {
+            if local_room && !prefer_remote {
+                return (Target::Local, "new");
+            }
+            match remote_with_room() {
+                Some(i) => (Target::Remote(i), "spill"),
+                None => (Target::Local, "new"),
+            }
+        };
+        let (target, why) = match sticky.get(key) {
+            None => fresh(false),
+            Some(Target::Local) if local_room => (Target::Local, "sticky"),
+            Some(Target::Local) => {
+                if remote_with_room().is_none() {
+                    (Target::Local, "sticky") // nowhere else: queue locally
+                } else if !waited {
+                    return None;
+                } else {
+                    fresh(true)
+                }
+            }
+            Some(Target::Remote(i)) if pool.contains(&i) => {
+                let r = &self.remotes[i];
+                if r.has_room(true) {
+                    (Target::Remote(i), "sticky")
+                } else if !r.usable(true) {
+                    fresh(false)
+                } else if !waited {
+                    return None;
+                } else {
+                    fresh(false)
+                }
+            }
+            Some(Target::Remote(_)) => fresh(false),
+        };
+        sticky.put(key, target);
+        Some(match target {
+            Target::Local => Pick::Local(Self::lock_stats(st).take()),
+            Target::Remote(i) => Pick::Remote(i, Self::lock_stats(&self.remotes[i].stats).take(), why),
+        })
+    }
+
     /// Whether any member has a request in flight or finished one within
     /// `window` seconds (drives the health poll rate).
     fn recently_active(&self, window: f64) -> bool {
@@ -1158,6 +1663,7 @@ impl Router {
                 "/slots" => self.slots(query_param(req.uri(), "model")).await,
                 "/metrics" => self.metrics(query_param(req.uri(), "model")).await,
                 "/fidim/state" => self.fidim_state().await,
+                "/fidim/pool" => self.pool_state(),
                 _ => self.proxy(req).await,
             }
         } else {
@@ -1296,16 +1802,54 @@ impl Router {
             let Some(st) = self.stats.get(name) else { continue };
             self.ensure_info(st).await;
             self.prefill_progress(st).await;
-            out.insert(name.clone(), Self::lock_stats(st).state_json());
+            let mut v = Self::lock_stats(st).state_json();
+            let pool: Map<String, Value> =
+                self.remotes.iter().filter(|r| r.spec.pool == *name).map(|r| (r.spec.name.clone(), r.state_json())).collect();
+            if !pool.is_empty() {
+                v["pool"] = Value::Object(pool);
+            }
+            out.insert(name.clone(), v);
         }
         json_response(StatusCode::OK, &Value::Object(out))
     }
 
+    /// `/fidim/pool`: every remote member and how many conversations are pinned where.
+    fn pool_state(&self) -> Response<OutBody> {
+        let (mut local, mut remote) = (0usize, vec![0usize; self.remotes.len()]);
+        {
+            let t = now();
+            let sticky = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
+            for (tg, at) in sticky.map.values() {
+                if t - at < STICKY_TTL {
+                    match tg {
+                        Target::Local => local += 1,
+                        Target::Remote(i) => remote[*i] += 1,
+                    }
+                }
+            }
+        }
+        let remotes: Vec<Value> = self
+            .remotes
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut v = r.state_json();
+                v["name"] = json!(r.spec.name);
+                v["pool"] = json!(r.spec.pool);
+                v["conversations"] = json!(remote[i]);
+                v
+            })
+            .collect();
+        json_response(StatusCode::OK, &json!({"sticky_wait_secs": self.opts.sticky_wait, "local_conversations": local, "remotes": remotes}))
+    }
+
     /// Everything else: forward to the backend the `model` field names,
     /// streaming the reply back; tracked completion requests occupy a slot.
+    /// A route with remote members may send a tracked request to one of them
+    /// (`try_pick`); a remote that fails before answering is retried locally.
     async fn proxy(&self, req: Request<Incoming>) -> Response<OutBody> {
         let (parts, body) = req.into_parts();
-        let mut body = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
+        let body = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
             Ok(c) => c.to_bytes(),
             Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
                 return text_response(StatusCode::PAYLOAD_TOO_LARGE, &format!("Maximum request body size {MAX_REQUEST_BODY} exceeded"));
@@ -1331,86 +1875,190 @@ impl Router {
                 headers.append(k.clone(), v.clone());
             }
         }
+        let path_q = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
 
         let tracked = parts.method == Method::POST && TRACKED.contains(&parts.uri.path()) && parsed.is_some();
-        // released on every early return and on cancellation (see SlotGuard)
-        let mut slot: Option<SlotGuard> = None;
-        let mut tracker: Option<SseTracker> = None;
-        if tracked {
-            let mut p = parsed.unwrap_or_default();
-            let st = self.stats.get(&resolved).cloned();
-            if let Some(st) = st {
-                self.ensure_info(&st).await;
-                let (prompt, n_prompt) = prompt_text(&p);
-                let max_tokens = p
-                    .get("max_tokens")
-                    .filter(|v| truthy(Some(v)))
-                    .or_else(|| p.get("max_completion_tokens").filter(|v| truthy(Some(v))))
-                    .and_then(py_int)
-                    .unwrap_or(-1);
-                let idx = {
-                    let mut s = Self::lock_stats(&st);
-                    let idx = s.take();
-                    let scaled = s.estimate_prompt(n_prompt);
-                    let sl = &mut s.slots[idx];
-                    sl.prompt = prompt;
-                    sl.n_prompt_est = n_prompt;
-                    sl.n_prompt = scaled;
-                    sl.max_tokens = max_tokens;
-                    idx
-                };
-                slot = Some(SlotGuard::new(st, idx));
-                if truthy(p.get("stream")) {
-                    let mut so = p.get("stream_options").and_then(Value::as_object).cloned().unwrap_or_default();
-                    let want_usage = truthy(so.get("include_usage"));
-                    so.insert("include_usage".into(), Value::Bool(true));
-                    p.insert("stream_options".into(), Value::Object(so));
-                    body = Bytes::from(serde_json::to_vec(&Value::Object(p)).unwrap_or_default());
-                    tracker = Some(SseTracker::new(want_usage));
+        let st = if tracked { self.stats.get(&resolved).cloned() } else { None };
+        let Some(st) = st else {
+            return self.send(&url, &resolved, &parts.method, &path_q, headers, body, None).await;
+        };
+        let p = parsed.unwrap_or_default();
+        self.ensure_info(&st).await;
+        let pool = self.remotes_for(&resolved, parts.uri.path(), &parts.headers);
+        let idx = if pool.is_empty() {
+            Self::lock_stats(&st).take()
+        } else {
+            let key = sticky_key(&parts.headers, &p);
+            match self.choose(&st, &pool, key).await {
+                Pick::Local(idx) => idx,
+                Pick::Remote(i, idx, why) => {
+                    let r = &self.remotes[i];
+                    let by = if parts.headers.contains_key("x-fidim-session") { "session header" } else { "prompt prefix" };
+                    log_line("INFO", &format!("pool {resolved} -> {} ({why}, conversation by {by})", r.spec.name));
+                    match self.try_remote(r, idx, &parts.uri, &headers, &p, &body).await {
+                        Ok(resp) => return resp,
+                        Err(reason) => {
+                            r.fail(&reason);
+                            self.sticky.lock().unwrap_or_else(|e| e.into_inner()).put(key, Target::Local);
+                            Self::lock_stats(&st).take()
+                        }
+                    }
                 }
             }
-        }
+        };
+        let (guard, tracker, body) = start_slot(&st, idx, &p, &body, None);
+        self.send(&url, &resolved, &parts.method, &path_q, headers, body, Some((guard, tracker))).await
+    }
 
-        let target = format!("{url}{}", parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+    /// Forward one request to `base` and stream the reply back; a tracked
+    /// request's slot rides along on the response body.
+    #[allow(clippy::too_many_arguments)]
+    async fn send(
+        &self,
+        base: &str,
+        label: &str,
+        method: &Method,
+        path_q: &str,
+        headers: HeaderMap,
+        body: Bytes,
+        track: Option<(SlotGuard, Option<SseTracker>)>,
+    ) -> Response<OutBody> {
+        let target = format!("{base}{path_q}");
         let uri: Uri = match target.parse() {
             Ok(u) => u,
             Err(e) => {
                 return text_response(StatusCode::BAD_GATEWAY, &format!("bad backend URL {target}: {e}"));
             }
         };
-        let mut out_req = Request::builder().method(parts.method.clone()).uri(uri).body(Full::new(body)).expect("valid request");
+        let mut out_req = Request::builder().method(method.clone()).uri(uri).body(Full::new(body)).expect("valid request");
         *out_req.headers_mut() = headers;
-
         let resp = match self.client.request(out_req).await {
             Ok(r) => r,
             Err(e) => {
-                return text_response(StatusCode::BAD_GATEWAY, &format!("backend {resolved} ({url}): {e}"));
+                // `track` drops here: the slot is released.
+                return text_response(StatusCode::BAD_GATEWAY, &format!("backend {label} ({base}): {e}"));
             }
         };
         let (rparts, rbody) = resp.into_parts();
-        let mut builder = Response::builder().status(rparts.status);
-        if let Some(h) = builder.headers_mut() {
-            for (k, v) in rparts.headers.iter() {
-                if !HOP.contains(&k.as_str()) {
-                    h.append(k.clone(), v.clone());
+        tracked_response(rparts, Some(rbody), None, track)
+    }
+
+    /// Send a pooled request to remote `r` (slot `idx` already taken there).
+    /// Ok: the response, already committed to the remote. Err: why it should
+    /// go local instead; nothing has reached the client (the remote refused,
+    /// failed, or its first SSE event was an error).
+    async fn try_remote(&self, r: &Remote, idx: usize, uri: &Uri, client_headers: &HeaderMap, p: &Map<String, Value>, body: &Bytes) -> Result<Response<OutBody>, String> {
+        let (guard, tracker, rbody) = start_slot(&r.stats, idx, p, body, Some(&r.spec.served_model));
+        let stream = tracker.is_some();
+        let target = remote_target(&r.spec.base_url, uri);
+        let mut headers = HeaderMap::new();
+        for (k, v) in client_headers.iter() {
+            let name = k.as_str();
+            if name != "authorization" && !name.starts_with("x-fidim-") {
+                headers.append(k.clone(), v.clone());
+            }
+        }
+        if let Some(k) = &r.key {
+            let v = HeaderValue::from_str(&format!("Bearer {k}")).map_err(|_| "API key is not a valid header value".to_string())?;
+            headers.insert(header::AUTHORIZATION, v);
+        }
+        let uri: Uri = target.parse().map_err(|e| format!("bad URL {target}: {e}"))?;
+        let mut req = Request::builder().method(Method::POST).uri(uri).body(Full::new(rbody)).map_err(|e| format!("request: {e}"))?;
+        *req.headers_mut() = headers;
+        // Streams answer once prefill is done (the first token): long prompts take minutes there.
+        let wait = Duration::from_secs(900);
+        let resp = match tokio::time::timeout(wait, self.client.request(req)).await {
+            Err(_) => return Err("no reply in time".into()),
+            Ok(Err(e)) => return Err(format!("connect: {e}")),
+            Ok(Ok(r)) => r,
+        };
+        let (rparts, mut rbody) = resp.into_parts();
+        if rparts.status != StatusCode::OK {
+            let snippet = match tokio::time::timeout(Duration::from_secs(5), Limited::new(rbody, 4096).collect()).await {
+                Ok(Ok(b)) => String::from_utf8_lossy(&b.to_bytes()).chars().take(200).collect::<String>(),
+                _ => String::new(),
+            };
+            return Err(format!("HTTP {} {}", rparts.status.as_u16(), snippet.trim()));
+        }
+        if !stream {
+            let all = match tokio::time::timeout(wait, Limited::new(rbody, MAX_REQUEST_BODY).collect()).await {
+                Err(_) => return Err("reply not finished in time".into()),
+                Ok(Err(e)) => return Err(format!("read: {e}")),
+                Ok(Ok(b)) => b.to_bytes(),
+            };
+            let refused = serde_json::from_slice::<Value>(&all)
+                .ok()
+                .filter(|v| v.get("choices").is_none())
+                .and_then(|v| v.get("error").filter(|e| truthy(Some(e))).map(|e| e.to_string()));
+            if let Some(e) = refused {
+                return Err(format!("error reply: {}", e.chars().take(200).collect::<String>()));
+            }
+            return Ok(tracked_response(rparts, None, Some(all), Some((guard, tracker))));
+        }
+        // A stream: read up to its first event before committing to this member.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut ended = false;
+        while !buf.windows(2).any(|w| w == b"\n\n") {
+            match tokio::time::timeout(wait, rbody.frame()).await {
+                Err(_) => return Err("no first event in time".into()),
+                Ok(None) => {
+                    ended = true;
+                    break;
+                }
+                Ok(Some(Err(e))) => return Err(format!("read: {e}")),
+                Ok(Some(Ok(frame))) => {
+                    if let Ok(d) = frame.into_data() {
+                        buf.extend_from_slice(&d);
+                    }
                 }
             }
         }
-        let is_sse = rparts.status == StatusCode::OK
-            && rparts.headers.get(header::CONTENT_TYPE).map(|v| String::from_utf8_lossy(v.as_bytes()).contains("text/event-stream")).unwrap_or(false);
-        let out_body: OutBody = match slot.map(SlotGuard::disarm) {
-            None => rbody.boxed(),
-            Some((st, idx)) => {
-                let mode = match tracker {
-                    Some(t) if is_sse => TrackMode::Sse(t),
-                    _ => TrackMode::Collect(Vec::new()),
-                };
-                TrackedBody { inner: rbody, mode, stats: st, slot: idx, status_ok: rparts.status == StatusCode::OK, done: false, released: false }
-                    .boxed()
-            }
-        };
-        builder.body(out_body).unwrap_or_else(|e| text_response(StatusCode::BAD_GATEWAY, &format!("response: {e}")))
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err("empty reply".into());
+        }
+        let first_end = buf.windows(2).position(|w| w == b"\n\n").unwrap_or(buf.len());
+        if let Some(msg) = sse_error(&buf[..first_end]) {
+            return Err(format!("refused: {msg}"));
+        }
+        Ok(tracked_response(rparts, if ended { None } else { Some(rbody) }, Some(Bytes::from(buf)), Some((guard, tracker))))
     }
+}
+
+/// A backend reply on its way to the client: status and headers (hop
+/// headers dropped), the body tracked into the slot when there is one.
+fn tracked_response(
+    rparts: http::response::Parts,
+    rbody: Option<Incoming>,
+    prefix: Option<Bytes>,
+    track: Option<(SlotGuard, Option<SseTracker>)>,
+) -> Response<OutBody> {
+    let mut builder = Response::builder().status(rparts.status);
+    if let Some(h) = builder.headers_mut() {
+        for (k, v) in rparts.headers.iter() {
+            if !HOP.contains(&k.as_str()) {
+                h.append(k.clone(), v.clone());
+            }
+        }
+    }
+    let is_sse = rparts.status == StatusCode::OK
+        && rparts.headers.get(header::CONTENT_TYPE).map(|v| String::from_utf8_lossy(v.as_bytes()).contains("text/event-stream")).unwrap_or(false);
+    let out_body: OutBody = match track {
+        // untracked replies are never pre-read
+        None => match rbody {
+            Some(b) => b.boxed(),
+            None => full(prefix.unwrap_or_default()),
+        },
+        Some((guard, tracker)) => {
+            let (st, idx) = guard.disarm();
+            let mode = match tracker {
+                Some(t) if is_sse => TrackMode::Sse(t),
+                _ => TrackMode::Collect(Vec::new()),
+            };
+            TrackedBody { inner: rbody, prefix, mode, stats: st, slot: idx, status_ok: rparts.status == StatusCode::OK, done: false, released: false }
+                .boxed()
+        }
+    };
+    builder.body(out_body).unwrap_or_else(|e| text_response(StatusCode::BAD_GATEWAY, &format!("response: {e}")))
 }
 
 // ----------------------------------------------------------- helpers ----
@@ -1474,6 +2122,9 @@ fn query_param(uri: &Uri, key: &str) -> Option<String> {
 /// Serve on an already bound listener until the task is dropped.
 pub async fn serve(router: Arc<Router>, listener: TcpListener) -> anyhow::Result<()> {
     tokio::spawn(router.clone().health_poller());
+    for i in 0..router.remotes.len() {
+        tokio::spawn(router.clone().remote_poller(i));
+    }
     loop {
         let (stream, _) = listener.accept().await.context("accept")?;
         let router = router.clone();
@@ -1494,12 +2145,15 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
         let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| format!("{}:{}", opts.host, opts.port));
         let routes: Vec<String> = opts.routes.iter().map(|(n, u)| format!("{n}={u}")).collect();
         let aliases: Vec<String> = opts.aliases.iter().map(|(a, t)| format!("{a}={t}")).collect();
+        let remotes: Vec<String> =
+            opts.remotes.iter().map(|r| format!("{}->{} ({} x{})", r.pool, r.name, r.base_url, r.max_inflight)).collect();
         println!(
-            "{} INFO router listening on http://{addr}  routes [{}]  aliases [{}]  default {}",
+            "{} INFO router listening on http://{addr}  routes [{}]  aliases [{}]  default {}  remotes [{}]",
             timestamp(),
             routes.join(" "),
             aliases.join(" "),
-            opts.default
+            opts.default,
+            remotes.join(" ")
         );
         let router = Router::new(opts);
         serve(router, listener).await
@@ -1848,7 +2502,7 @@ vllm:other 1.0
         panic!("no free port in 41000..42000");
     }
 
-    async fn get(client: &HttpClient, url: &str) -> (StatusCode, String) {
+    async fn get(client: &Client<HttpConnector, Full<Bytes>>, url: &str) -> (StatusCode, String) {
         let r = client.get(url.parse().unwrap()).await.unwrap();
         let (p, b) = r.into_parts();
         (p.status, String::from_utf8_lossy(&b.collect().await.unwrap().to_bytes()).into_owned())
@@ -1873,7 +2527,7 @@ vllm:other 1.0
         let router = Router::new(opts);
         let server = tokio::spawn(serve(router, listener));
 
-        let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+        let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
 
         // streaming chat through the alias
         let req = Request::post(format!("{base}/v1/chat/completions"))
@@ -2011,4 +2665,268 @@ vllm:other 1.0
         assert_eq!(st.slots.len(), 4);
     }
 
+
+    // ---- pools ----
+
+    fn spec(name: &str, max: usize) -> RemoteSpec {
+        RemoteSpec {
+            name: name.into(),
+            pool: "dd".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            served_model: "served-x".into(),
+            api_key_file: None,
+            max_inflight: max,
+        }
+    }
+
+    /// A router with route `dd` (`local_slots` slots) and the given remotes, all healthy.
+    fn pool_router(local_slots: usize, remotes: Vec<RemoteSpec>) -> Arc<Router> {
+        let mut opts = Opts::parse_args("127.0.0.1", 0, &["dd=http://127.0.0.1:1".into()], &[], "dd").unwrap();
+        opts.remotes = remotes;
+        let r = Router::new(opts);
+        Router::lock_stats(&r.stats["dd"]).apply_info(Some(&json!({"max_running_requests": local_slots})));
+        for x in &r.remotes {
+            x.healthy.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+
+    #[test]
+    fn pick_prefers_local_spills_and_sticks() {
+        let r = pool_router(1, vec![spec("spark", 2)]);
+        let st = r.stats["dd"].clone();
+        let pool = [0usize];
+        // new conversation, local free -> local
+        let a = r.try_pick(&st, &pool, Some(1), false).unwrap();
+        assert_eq!(a, Pick::Local(0));
+        // local full -> a new conversation spills to the remote
+        let b = r.try_pick(&st, &pool, Some(2), false).unwrap();
+        assert!(matches!(b, Pick::Remote(0, _, "spill")), "{b:?}");
+        // conversation 2 stays on the remote even once local frees up
+        Router::lock_stats(&st).release(0);
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        let b2 = r.try_pick(&st, &pool, Some(2), false).unwrap();
+        assert!(matches!(b2, Pick::Remote(0, _, "sticky")), "{b2:?}");
+        // conversation 1 (local) waits while local is full and the remote has room...
+        let c = r.try_pick(&st, &pool, Some(3), false).unwrap(); // takes local
+        assert!(matches!(c, Pick::Local(_)));
+        assert_eq!(r.try_pick(&st, &pool, Some(1), false), None);
+        // ...and moves after the wait
+        assert!(matches!(r.try_pick(&st, &pool, Some(1), true), Some(Pick::Remote(0, _, "spill"))));
+        // remote at max_inflight (2): a new conversation queues locally, never a third remote request
+        assert!(matches!(r.try_pick(&st, &pool, Some(4), false), Some(Pick::Local(_))));
+        assert_eq!(r.remotes[0].busy(), 2);
+    }
+
+    #[test]
+    fn pick_skips_unusable_remotes() {
+        let r = pool_router(1, vec![spec("spark", 2)]);
+        let st = r.stats["dd"].clone();
+        let pool = [0usize];
+        let _ = r.try_pick(&st, &pool, Some(1), false); // local now full
+        r.remotes[0].healthy.store(false, Ordering::Relaxed);
+        assert!(matches!(r.try_pick(&st, &pool, Some(2), false), Some(Pick::Local(_))), "unhealthy: local queue");
+        r.remotes[0].healthy.store(true, Ordering::Relaxed);
+        let s5 = r.try_pick(&st, &pool, Some(5), false).unwrap(); // a conversation on the remote
+        assert!(matches!(s5, Pick::Remote(0, _, _)));
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        *r.remotes[0].cooling_until.lock().unwrap() = now() + 60.0;
+        assert!(matches!(r.try_pick(&st, &pool, Some(3), false), Some(Pick::Local(_))), "cooling: no new conversations");
+        assert!(matches!(r.try_pick(&st, &pool, Some(5), false), Some(Pick::Remote(0, _, "sticky"))), "cooling: its own stay");
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        *r.remotes[0].cooling_until.lock().unwrap() = 0.0;
+        // a conversation pinned to a remote that went away moves at once (no wait)
+        let x = r.try_pick(&st, &pool, Some(9), false).unwrap();
+        assert!(matches!(x, Pick::Remote(0, _, _)));
+        r.remotes[0].healthy.store(false, Ordering::Relaxed);
+        assert!(matches!(r.try_pick(&st, &pool, Some(9), false), Some(Pick::Local(_))));
+    }
+
+    #[test]
+    fn sticky_key_follows_the_conversation() {
+        let h = HeaderMap::new();
+        let turn1 = json!({"model": "dd", "messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "task A"}]});
+        let turn2 = json!({"model": "dd", "messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "task A"},
+            {"role": "assistant", "content": "ok"}, {"role": "user", "content": "more"}]});
+        let other = json!({"model": "dd", "messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "task B"}]});
+        let k = |v: &Value| sticky_key(&h, v.as_object().unwrap());
+        assert_eq!(k(&turn1), k(&turn2));
+        assert_ne!(k(&turn1), k(&other));
+        assert_eq!(sticky_key(&h, json!({"prompt": "x"}).as_object().unwrap()), None);
+        let mut hs = HeaderMap::new();
+        hs.insert("x-fidim-session", HeaderValue::from_static("abc"));
+        assert_eq!(sticky_key(&hs, turn1.as_object().unwrap()), sticky_key(&hs, other.as_object().unwrap()));
+        let mut lo = HeaderMap::new();
+        lo.insert("x-fidim-local-only", HeaderValue::from_static("TRUE"));
+        assert!(local_only(&lo) && !local_only(&h));
+    }
+
+    #[test]
+    fn remote_paths_and_refusals() {
+        let u: Uri = "/v1/chat/completions?x=1".parse().unwrap();
+        assert_eq!(remote_target("https://s.example/v1", &u), "https://s.example/v1/chat/completions?x=1");
+        let ev = br#"data: {"error": {"message": "concurrency limit: 2 in-flight requests", "type": "rate_limited"}}"#;
+        assert_eq!(sse_error(ev).as_deref(), Some("concurrency limit: 2 in-flight requests"));
+        assert_eq!(sse_error(br#"data: {"choices":[{"delta":{"content":""}}]}"#), None);
+        assert_eq!(sse_error(b"data: [DONE]"), None);
+    }
+
+    #[test]
+    fn remotes_file_validation() {
+        let dir = std::env::temp_dir().join(format!("fidim-remotes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = || Opts::parse_args("127.0.0.1", 0, &["dd=http://127.0.0.1:1".into()], &[], "dd").unwrap();
+        let write = |name: &str, text: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        let good = write("good.json", r#"{"sticky_wait_secs": 5, "remotes": [{"name": "spark", "pool": "dd",
+            "base_url": "https://s.example/v1/", "served_model": "m", "max_inflight": 2}]}"#);
+        let o = base().with_remotes_file(&good);
+        assert_eq!(o.remotes.len(), 1);
+        assert_eq!(o.remotes[0].base_url, "https://s.example/v1");
+        assert_eq!(o.sticky_wait, 5.0);
+        // a bad pool, a clashing name or a bad URL: no remotes, router still starts
+        for (n, t) in [
+            ("pool.json", r#"{"remotes": [{"name": "s", "pool": "nope", "base_url": "https://s/v1", "served_model": "m"}]}"#),
+            ("name.json", r#"{"remotes": [{"name": "dd", "pool": "dd", "base_url": "https://s/v1", "served_model": "m"}]}"#),
+            ("url.json", r#"{"remotes": [{"name": "s", "pool": "dd", "base_url": "ftp://s/v1", "served_model": "m"}]}"#),
+            ("junk.json", "not json"),
+        ] {
+            assert!(base().with_remotes_file(&write(n, t)).remotes.is_empty(), "{n}");
+        }
+        assert!(base().with_remotes_file(&dir.join("missing.json")).remotes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake SGLang (`who` = "local", 1 slot) or a fake gateway in front of a
+    /// remote (`who` = "remote": wants the key, the served model name and no
+    /// x-fidim headers; refuses with a rate_limited first event while `refuse`).
+    async fn fake_member(who: &'static str, refuse: Arc<AtomicBool>, req: Request<Incoming>) -> Result<Response<TestBody>, Infallible> {
+        let path = req.uri().path().to_string();
+        let json_ct = |b: &'static str| Response::builder().header("content-type", "application/json").body(tb(b)).unwrap();
+        Ok(match (req.method().clone(), path.as_str()) {
+            (Method::GET, "/get_server_info") => json_ct(r#"{"max_running_requests": 1, "context_length": 4096}"#),
+            (Method::GET, "/ready") => Response::new(tb("ok")),
+            (Method::GET, "/v1/models") => json_ct(r#"{"object":"list","data":[{"id":"served-x","object":"model"}]}"#),
+            (Method::POST, "/v1/chat/completions") => {
+                if who == "remote" {
+                    assert_eq!(req.headers().get("authorization").unwrap(), "Bearer testkey");
+                    assert!(req.headers().keys().all(|k| !k.as_str().starts_with("x-fidim-")), "x-fidim headers stripped");
+                }
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                let v: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(v["model"], if who == "remote" { "served-x" } else { "dd" });
+                let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+                let refused = who == "remote" && refuse.load(Ordering::Relaxed);
+                tokio::spawn(async move {
+                    if refused {
+                        let _ = tx.send(Bytes::from("data: {\"error\": {\"message\": \"concurrency limit: 2 in-flight requests\", \"type\": \"rate_limited\"}}\n\ndata: [DONE]\n\n")).await;
+                        return;
+                    }
+                    for _ in 0..3 {
+                        let _ = tx.send(Bytes::from(format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{who} \"}}}}]}}\n\n"))).await;
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    let _ = tx.send(Bytes::from("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n")).await;
+                });
+                Response::builder().header("content-type", "text/event-stream").body(ChannelBody(rx).boxed()).unwrap()
+            }
+            _ => Response::builder().status(404).body(tb("nope")).unwrap(),
+        })
+    }
+
+    async fn serve_fake(who: &'static str, refuse: Arc<AtomicBool>) -> String {
+        let l = free_listener().await;
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                let refuse = refuse.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| fake_member(who, refuse.clone(), req));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(s), svc).await;
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "starts local HTTP servers; run with --ignored"]
+    async fn pool_end_to_end() {
+        let refuse = Arc::new(AtomicBool::new(false));
+        let local = serve_fake("local", refuse.clone()).await;
+        let remote = serve_fake("remote", refuse.clone()).await;
+        let keyfile = std::env::temp_dir().join(format!("fidim-pool-key-{}", std::process::id()));
+        std::fs::write(&keyfile, "testkey\n").unwrap();
+        let mut opts = Opts::parse_args("127.0.0.1", 0, &[format!("dd={local}")], &[], "dd").unwrap();
+        opts.remotes = vec![RemoteSpec {
+            name: "spark".into(),
+            pool: "dd".into(),
+            base_url: format!("{remote}/v1"),
+            served_model: "served-x".into(),
+            api_key_file: Some(keyfile.to_string_lossy().into_owned()),
+            max_inflight: 1,
+        }];
+        opts.sticky_wait = 0.5;
+        let router = Router::new(opts);
+        let listener = free_listener().await;
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(router.clone(), listener));
+        for _ in 0..50 {
+            if router.remotes[0].healthy.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(router.remotes[0].healthy.load(Ordering::Relaxed), "probe with the key made it healthy");
+        let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let chat = |conv: &'static str, extra: Option<(&'static str, &'static str)>| {
+            let client = client.clone();
+            let base = base.clone();
+            async move {
+                let body = json!({"model": "dd", "stream": true, "messages": [{"role": "system", "content": "S"}, {"role": "user", "content": conv}]});
+                let mut req = Request::post(format!("{base}/v1/chat/completions"))
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(body.to_string())))
+                    .unwrap();
+                if let Some((k, v)) = extra {
+                    req.headers_mut().insert(k, HeaderValue::from_static(v));
+                }
+                let r = client.request(req).await.unwrap();
+                String::from_utf8_lossy(&r.into_body().collect().await.unwrap().to_bytes()).into_owned()
+            }
+        };
+        // A holds the only local slot; B spills to the remote; C (local only) queues locally.
+        let a = tokio::spawn(chat("conv A", None));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let b = tokio::spawn(chat("conv B", None));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let c = tokio::spawn(chat("conv C", Some(("x-fidim-local-only", "1"))));
+        let (a, b, c) = (a.await.unwrap(), b.await.unwrap(), c.await.unwrap());
+        assert!(a.contains("local ") && !a.contains("remote"), "{a}");
+        assert!(b.contains("remote ") && !b.contains("local"), "{b}");
+        assert!(c.contains("local "), "{c}");
+        assert!(!b.contains("\"usage\""), "injected usage chunk stripped on the remote path too");
+        // B's next turn sticks to the remote though local is free now
+        let b2 = chat("conv B", None).await;
+        assert!(b2.contains("remote "), "{b2}");
+        // the remote refuses (gateway limit): D goes local, nothing of the refusal reaches the client
+        refuse.store(true, Ordering::Relaxed);
+        let hold = tokio::spawn(chat("conv E", None)); // takes local
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let d = chat("conv D", None).await;
+        assert!(d.contains("local ") && !d.contains("rate_limited"), "{d}");
+        assert!(router.remotes[0].cooling(), "refusal puts the remote out for a while");
+        let _ = hold.await;
+        let (st, pool) = get(&client, &format!("{base}/fidim/pool")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(pool.contains("concurrency limit") && !pool.contains("testkey"), "{pool}");
+        let (_, state) = get(&client, &format!("{base}/fidim/state")).await;
+        let state: Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(state["dd"]["pool"]["spark"]["max_inflight"], 1);
+        let _ = std::fs::remove_file(&keyfile);
+    }
 }

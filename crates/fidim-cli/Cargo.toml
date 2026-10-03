@@ -28,6 +28,11 @@ http-body-util = "0.1"
 http-body = "1"
 http = "1"
 bytes = "1"
+# Remote pool members (router-remotes.json): HTTPS to an OpenAI-compatible
+# server. ring + webpki roots, no system cert store, no aws-lc build.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-roots", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde.workspace = true
 
 [build-dependencies]
 # Version resources for both executables (build.rs). Already in the lock

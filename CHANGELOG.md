@@ -15,6 +15,16 @@ build with uncommitted changes.
 
 ### Added
 
+- **Remote pool members for the SGLang router.** `~/.fidim/router-remotes.json`
+  (or `fidim router serve --remotes-file`) adds remote OpenAI-compatible
+  servers to a route, for example a DGX Spark behind `dd`. Each chat/completion
+  request goes to one member: a conversation stays where it started (prompt
+  cache), new ones go local while the local server has a free slot and spill
+  to a remote with room, a remote never gets more than its `max_inflight`,
+  and a remote that refuses or fails before answering is retried locally.
+  HTTPS with an API key file; `x-fidim-session` names a conversation,
+  `x-fidim-local-only: 1` keeps a request local, `~/.fidim/remote-<name>.off`
+  switches a remote off. Live view: `/fidim/pool`, and `pool` in `/fidim/state`.
 - **4-bit KV option.** The SGLang profile form offers `fp4_mx_block16`
   (needs the gfx1201 kernel patch in `sglang-gfx1201`); the pre-flight
   KV budget counts it at 9/16 byte per value.

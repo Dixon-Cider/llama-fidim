@@ -126,6 +126,9 @@ enum RouterCmd {
         /// The route for requests whose model is unknown or missing.
         #[arg(long, value_name = "MODEL")]
         default: String,
+        /// Remote pool members (default: ~/.fidim/router-remotes.json when it exists).
+        #[arg(long, value_name = "FILE")]
+        remotes_file: Option<PathBuf>,
     },
 }
 
@@ -1994,8 +1997,9 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
     use fidim_core::router::{self, RouterMember};
     // `serve` is the router process itself: it needs no router config.
     let cmd = match cmd {
-        RouterCmd::Serve { host, port, route, alias, default } => {
-            return router_serve::run(router_serve::Opts::parse_args(&host, port, &route, &alias, &default)?);
+        RouterCmd::Serve { host, port, route, alias, default, remotes_file } => {
+            let path = remotes_file.unwrap_or_else(|| fidim_core::config::Config::config_dir().join("router-remotes.json"));
+            return router_serve::run(router_serve::Opts::parse_args(&host, port, &route, &alias, &default)?.with_remotes_file(&path));
         }
         other => other,
     };
