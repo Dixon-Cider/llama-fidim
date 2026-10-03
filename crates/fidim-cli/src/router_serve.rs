@@ -968,8 +968,16 @@ pub struct Opts {
 /// {"sticky_wait_secs": 15,
 ///  "remotes": [{"name": "spark", "pool": "dd",
 ///               "base_url": "https://spark.example.com/v1", "served_model": "qwen3.8-27b",
-///               "api_key_file": "~/.secrets/spark_key.txt", "max_inflight": 2}]}
+///               "api_key_file": "~/.secrets/spark_key.txt", "max_inflight": 2,
+///               "context_length": 262144}]}
 /// ```
+///
+/// The remote is also listed by `name` in `/models`, so FIDIM's Running tab
+/// shows its slots (`/slots?model=<name>`) and counters
+/// (`/metrics?model=<name>`): what this router sent there, plus the queue
+/// the remote's own `/health` reports (`inflight`, `waiting`; every client
+/// of the remote, not just this router). A request for model `<name>` goes
+/// to that remote only (no local fallback).
 ///
 /// Requests for `pool` (aliases included) may go there with `model` set to
 /// `served_model` and `Authorization: Bearer <key>`; only
@@ -988,6 +996,9 @@ pub struct RemoteSpec {
     /// Requests the remote takes at once (its gateway refuses more).
     #[serde(default = "one")]
     pub max_inflight: usize,
+    /// Its context window, for the live view (`n_ctx`).
+    #[serde(default)]
+    pub context_length: Option<u64>,
 }
 
 fn one() -> usize {
@@ -1094,6 +1105,10 @@ struct Remote {
     cooling_until: Mutex<f64>,
     last_error: Mutex<String>,
     off_file: PathBuf,
+    /// (when, inflight, waiting) from the remote's own `/health`.
+    queue: Mutex<Option<(f64, f64, f64)>>,
+    /// When FIDIM last asked for its metrics (drives `queue_poller`).
+    viewed_at: Mutex<f64>,
 }
 
 /// How long a refused or failed remote sits out.
@@ -1115,6 +1130,7 @@ impl Remote {
         let mut st = ModelStats::new(&spec.name, &spec.base_url);
         st.slots = (0..spec.max_inflight).map(Slot::new).collect();
         st.n_slots = spec.max_inflight;
+        st.n_ctx = spec.context_length.unwrap_or(0);
         let off_file = config_dir.join(format!("remote-{}.off", spec.name));
         Remote {
             spec,
@@ -1124,6 +1140,8 @@ impl Remote {
             cooling_until: Mutex::new(0.0),
             last_error: Mutex::new(String::new()),
             off_file,
+            queue: Mutex::new(None),
+            viewed_at: Mutex::new(-1e9),
         }
     }
 
@@ -1153,7 +1171,7 @@ impl Remote {
         if reason.starts_with("HTTP 401") || reason.starts_with("HTTP 403") {
             self.healthy.store(false, Ordering::Relaxed);
         }
-        log_line("WARNING", &format!("remote {}: {reason}; retrying locally, out for {REMOTE_COOLDOWN:.0} s", self.spec.name));
+        log_line("WARNING", &format!("remote {}: {reason}; no new conversations for {REMOTE_COOLDOWN:.0} s", self.spec.name));
     }
 
     fn state_json(&self) -> Value {
@@ -1382,9 +1400,58 @@ impl Router {
     fn stats_for(&self, model: Option<&str>) -> Vec<Arc<Mutex<ModelStats>>> {
         match model {
             None => self.opts.routes.iter().filter_map(|(n, _)| self.stats.get(n).cloned()).collect(),
-            Some(m) => self.stats.get(self.alias_target(m)).cloned().into_iter().collect(),
+            Some(m) => match self.remote_named(m) {
+                Some(r) => vec![r.stats.clone()],
+                None => self.stats.get(self.alias_target(m)).cloned().into_iter().collect(),
+            },
         }
     }
+
+    fn remote_named(&self, name: &str) -> Option<&Remote> {
+        self.remotes.iter().find(|r| r.spec.name == name)
+    }
+
+    /// A remote's own queue (`inflight`, `waiting` from its `/health`) as the
+    /// SGLang gauge names FIDIM shows. Read from the cache `queue_poller`
+    /// fills (that `/health` takes ~2 s); asking marks the remote as watched.
+    fn remote_queue_text(&self, r: &Remote) -> String {
+        *r.viewed_at.lock().unwrap_or_else(|e| e.into_inner()) = now();
+        let q = r.queue.lock().unwrap_or_else(|e| e.into_inner());
+        match *q {
+            Some((at, inflight, waiting)) if now() - at < 20.0 => {
+                format!("sglang:num_running_reqs {}\nsglang:num_queue_reqs {}\n", py_float(inflight), py_float(waiting))
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Keeps a remote's queue numbers fresh: back to back (~2 s apart) while
+    /// FIDIM looks at it (asked within the last 30 s), else once a minute.
+    async fn queue_poller(self: Arc<Self>, i: usize) {
+        let r = &self.remotes[i];
+        let Some(origin) = r.spec.base_url.parse::<Uri>().ok().and_then(|u| Some(format!("{}://{}", u.scheme_str()?, u.authority()?))) else {
+            return;
+        };
+        let mut last_poll = -1e9;
+        loop {
+            let watched = now() - *r.viewed_at.lock().unwrap_or_else(|e| e.into_inner()) < 30.0;
+            if !watched && now() - last_poll < 60.0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            last_poll = now();
+            if let Some((StatusCode::OK, _, body)) = self.get_raw_auth(format!("{origin}/health"), r.key.as_deref(), Duration::from_secs(8)).await {
+                if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+                    let num = |k: &str| v.get(k).and_then(Value::as_f64);
+                    if let (Some(a), Some(b)) = (num("inflight"), num("waiting")) {
+                        *r.queue.lock().unwrap_or_else(|e| e.into_inner()) = Some((now(), a, b));
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
 
     // ---- backend calls ----
 
@@ -1764,6 +1831,11 @@ impl Router {
                 json!({"id": name, "object": "model", "owned_by": "sglang",
                        "status": {"value": if ok { "loaded" } else { "unloaded" }, "failed": !ok, "exit_code": null}})
             })
+            .chain(self.remotes.iter().map(|r| {
+                let ok = r.usable(true);
+                json!({"id": r.spec.name, "object": "model", "owned_by": "remote", "pool": r.spec.pool,
+                       "status": {"value": if ok { "loaded" } else { "unloaded" }, "failed": !ok, "exit_code": null}})
+            }))
             .collect();
         json_response(StatusCode::OK, &json!({"object": "list", "data": data}))
     }
@@ -1778,6 +1850,9 @@ impl Router {
     }
 
     async fn slots(&self, model: Option<String>) -> Response<OutBody> {
+        if let Some(r) = model.as_deref().and_then(|m| self.remote_named(m)) {
+            return json_response(StatusCode::OK, &Value::Array(Self::lock_stats(&r.stats).views()));
+        }
         let mut out: Vec<Value> = Vec::new();
         for st in self.stats_for(model.as_deref()) {
             self.ensure_info(&st).await;
@@ -1788,6 +1863,11 @@ impl Router {
     }
 
     async fn metrics(&self, model: Option<String>) -> Response<OutBody> {
+        if let Some(r) = model.as_deref().and_then(|m| self.remote_named(m)) {
+            let mut text = Self::lock_stats(&r.stats).metrics_text();
+            text.push_str(&self.remote_queue_text(r));
+            return text_response(StatusCode::OK, &text);
+        }
         let mut text = String::new();
         for st in self.stats_for(model.as_deref()) {
             text.push_str(&Self::lock_stats(&st).metrics_text());
@@ -1865,7 +1945,12 @@ impl Router {
             .and_then(Value::as_str)
             .unwrap_or(&self.opts.default)
             .to_string();
-        let (url, resolved) = self.backend_for(&model);
+        // A request for a remote by name (FIDIM's chat with "spark") goes there only.
+        let direct = self.remotes.iter().position(|r| r.spec.name == model);
+        let (url, resolved) = match direct {
+            Some(i) => self.backend_for(&self.remotes[i].spec.pool),
+            None => self.backend_for(&model),
+        };
         let url = url.to_string();
         let resolved = resolved.to_string();
 
@@ -1883,6 +1968,9 @@ impl Router {
             return self.send(&url, &resolved, &parts.method, &path_q, headers, body, None).await;
         };
         let p = parsed.unwrap_or_default();
+        if let Some(i) = direct.filter(|_| matches!(parts.uri.path(), "/v1/chat/completions" | "/v1/completions")) {
+            return self.proxy_direct(i, &parts.uri, &headers, &p, &body).await;
+        }
         self.ensure_info(&st).await;
         let pool = self.remotes_for(&resolved, parts.uri.path(), &parts.headers);
         let idx = if pool.is_empty() {
@@ -1899,6 +1987,7 @@ impl Router {
                         Ok(resp) => return resp,
                         Err(reason) => {
                             r.fail(&reason);
+                            log_line("INFO", &format!("pool {resolved}: retrying locally"));
                             self.sticky.lock().unwrap_or_else(|e| e.into_inner()).put(key, Target::Local);
                             Self::lock_stats(&st).take()
                         }
@@ -1908,6 +1997,30 @@ impl Router {
         };
         let (guard, tracker, body) = start_slot(&st, idx, &p, &body, None);
         self.send(&url, &resolved, &parts.method, &path_q, headers, body, Some((guard, tracker))).await
+    }
+
+    /// A request naming a remote: that remote or an error (no local fallback).
+    async fn proxy_direct(&self, i: usize, uri: &Uri, headers: &HeaderMap, p: &Map<String, Value>, body: &Bytes) -> Response<OutBody> {
+        let r = &self.remotes[i];
+        let idx = {
+            let _sticky = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
+            if !r.has_room(true) {
+                let why = if !r.usable(true) { "unavailable" } else { "busy (all its slots are in use)" };
+                return json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": {"message": format!("remote {} is {why}", r.spec.name), "type": "unavailable"}}),
+                );
+            }
+            Self::lock_stats(&r.stats).take()
+        };
+        log_line("INFO", &format!("remote {} (requested by name)", r.spec.name));
+        match self.try_remote(r, idx, uri, headers, p, body).await {
+            Ok(resp) => resp,
+            Err(reason) => {
+                r.fail(&reason);
+                json_response(StatusCode::BAD_GATEWAY, &json!({"error": {"message": format!("remote {}: {reason}", r.spec.name), "type": "bad_gateway"}}))
+            }
+        }
     }
 
     /// Forward one request to `base` and stream the reply back; a tracked
@@ -2124,6 +2237,7 @@ pub async fn serve(router: Arc<Router>, listener: TcpListener) -> anyhow::Result
     tokio::spawn(router.clone().health_poller());
     for i in 0..router.remotes.len() {
         tokio::spawn(router.clone().remote_poller(i));
+        tokio::spawn(router.clone().queue_poller(i));
     }
     loop {
         let (stream, _) = listener.accept().await.context("accept")?;
@@ -2676,6 +2790,7 @@ vllm:other 1.0
             served_model: "served-x".into(),
             api_key_file: None,
             max_inflight: max,
+            context_length: Some(8192),
         }
     }
 
@@ -2809,6 +2924,7 @@ vllm:other 1.0
         Ok(match (req.method().clone(), path.as_str()) {
             (Method::GET, "/get_server_info") => json_ct(r#"{"max_running_requests": 1, "context_length": 4096}"#),
             (Method::GET, "/ready") => Response::new(tb("ok")),
+            (Method::GET, "/health") if who == "remote" => json_ct(r#"{"gateway":"ok","inflight":3,"waiting":1}"#),
             (Method::GET, "/v1/models") => json_ct(r#"{"object":"list","data":[{"id":"served-x","object":"model"}]}"#),
             (Method::POST, "/v1/chat/completions") => {
                 if who == "remote" {
@@ -2869,6 +2985,7 @@ vllm:other 1.0
             served_model: "served-x".into(),
             api_key_file: Some(keyfile.to_string_lossy().into_owned()),
             max_inflight: 1,
+            context_length: Some(8192),
         }];
         opts.sticky_wait = 0.5;
         let router = Router::new(opts);
@@ -2927,6 +3044,33 @@ vllm:other 1.0
         let (_, state) = get(&client, &format!("{base}/fidim/state")).await;
         let state: Value = serde_json::from_str(&state).unwrap();
         assert_eq!(state["dd"]["pool"]["spark"]["max_inflight"], 1);
+        // FIDIM's view: listed in /models, its own slots and counters, the remote's queue
+        refuse.store(false, Ordering::Relaxed);
+        let (_, models) = get(&client, &format!("{base}/models")).await;
+        let models: Value = serde_json::from_str(&models).unwrap();
+        assert!(models["data"].as_array().unwrap().iter().any(|m| m["id"] == "spark" && m["owned_by"] == "remote"), "{models}");
+        let (_, v1) = get(&client, &format!("{base}/v1/models")).await;
+        assert!(!v1.contains("spark"), "clients' model list stays as it was: {v1}");
+        let (_, slots) = get(&client, &format!("{base}/slots?model=spark")).await;
+        let slots: Value = serde_json::from_str(&slots).unwrap();
+        assert_eq!(slots.as_array().unwrap().len(), 1);
+        assert_eq!(slots[0]["n_ctx"], 8192);
+        let mut metrics = String::new();
+        for _ in 0..30 {
+            metrics = get(&client, &format!("{base}/metrics?model=spark")).await.1;
+            if metrics.contains("num_running_reqs") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(metrics.contains("llamacpp:requests_processing") && metrics.contains("sglang:num_running_reqs 3.0") && metrics.contains("sglang:num_queue_reqs 1.0"), "{metrics}");
+        // a request for "spark" by name goes there (the cooldown blocks new pool conversations, not this)
+        let direct = {
+            let body = json!({"model": "spark", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+            let req = Request::post(format!("{base}/v1/chat/completions")).body(Full::new(Bytes::from(body.to_string()))).unwrap();
+            String::from_utf8_lossy(&client.request(req).await.unwrap().into_body().collect().await.unwrap().to_bytes()).into_owned()
+        };
+        assert!(direct.contains("remote "), "{direct}");
         let _ = std::fs::remove_file(&keyfile);
     }
 }

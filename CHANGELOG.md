@@ -25,6 +25,12 @@ build with uncommitted changes.
   HTTPS with an API key file; `x-fidim-session` names a conversation,
   `x-fidim-local-only: 1` keeps a request local, `~/.fidim/remote-<name>.off`
   switches a remote off. Live view: `/fidim/pool`, and `pool` in `/fidim/state`.
+- **Remote members on the Running tab.** The router lists each remote in
+  `/models` (owner `remote`), so FIDIM shows its slots and tokens/s like a
+  local member, plus the remote's own queue (`inflight`/`waiting` from its
+  `/health`, polled every ~2 s while watched). Chatting with the remote's
+  name (e.g. `spark`) sends the request there only. `context_length` in
+  `router-remotes.json` sets its `n_ctx`.
 - **4-bit KV option.** The SGLang profile form offers `fp4_mx_block16`
   (needs the gfx1201 kernel patch in `sglang-gfx1201`); the pre-flight
   KV budget counts it at 9/16 byte per value.
