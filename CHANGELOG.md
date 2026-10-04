@@ -31,6 +31,13 @@ build with uncommitted changes.
   `/health`, polled every ~2 s while watched). Chatting with the remote's
   name (e.g. `spark`) sends the request there only. `context_length` in
   `router-remotes.json` sets its `n_ctx`.
+- **KV-aware pool placement.** A new conversation goes local only while it
+  fits the local KV cache under `local_kv_fill` (default 0.9) of its
+  capacity, counting both what is in flight (`/get_load`) and what other
+  local conversations used in the last `kv_idle_window_secs` (default 300)
+  hold, so one long agent session does not push the rest out; otherwise it
+  goes to a remote with room. A local conversation continuing only moves
+  when requests in flight fill the cache. `/fidim/pool` shows `local_kv`.
 - **4-bit KV option.** The SGLang profile form offers `fp4_mx_block16`
   (needs the gfx1201 kernel patch in `sglang-gfx1201`); the pre-flight
   KV budget counts it at 9/16 byte per value.
