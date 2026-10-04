@@ -38,6 +38,16 @@ build with uncommitted changes.
   hold, so one long agent session does not push the rest out; otherwise it
   goes to a remote with room. A local conversation continuing only moves
   when requests in flight fill the cache. `/fidim/pool` shows `local_kv`.
+- **Load balancing across pool members.** A remote's own `/health`
+  (in-flight and waiting, every client of it) is read every few seconds
+  while the pool is in use, and it takes no new request while that shows it
+  full or queueing. `kv_capacity` on a remote applies the same KV rule as
+  locally to what the router sends there. When nothing has room, a request
+  waits in the router (up to `queue_wait_secs`, default 90) for whichever
+  member frees first, and when only local is short of a slot it waits for
+  local if that should free before the slower remote would catch up
+  (`local_prefill_tok_s`/`local_decode_tok_s`, `prefill_tok_s`/`decode_tok_s`
+  per remote).
 - **4-bit KV option.** The SGLang profile form offers `fp4_mx_block16`
   (needs the gfx1201 kernel patch in `sglang-gfx1201`); the pre-flight
   KV budget counts it at 9/16 byte per value.
