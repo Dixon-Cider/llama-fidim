@@ -317,6 +317,10 @@ pub struct Slot {
     pub n_decoded_exact: bool,
     pub max_tokens: i64,
     pub gen_chars: u64,
+    /// On a remote member: the route the request was for ("" when it named
+    /// the remote), and why it went there: overflow, failover or direct.
+    pub route: String,
+    pub placement: &'static str,
 }
 
 impl Slot {
@@ -338,6 +342,8 @@ impl Slot {
             n_decoded_exact: false,
             max_tokens: -1,
             gen_chars: 0,
+            route: String::new(),
+            placement: "",
         }
     }
 
@@ -354,7 +360,7 @@ impl Slot {
     /// `speculative`: the member runs a draft (SGLang `speculative_algorithm`).
     pub fn view(&self, n_ctx: u64, speculative: bool) -> Value {
         let decoded = self.decoded_now();
-        json!({
+        let mut v = json!({
             "id": self.id,
             "id_task": self.id_task,
             "n_ctx": n_ctx,
@@ -372,7 +378,12 @@ impl Slot {
             }],
             "prompt": tail(&self.prompt, TEXT_TAIL),
             "generated": tail(&self.generated, TEXT_TAIL),
-        })
+        });
+        if !self.placement.is_empty() {
+            v["route"] = json!(self.route);
+            v["placement"] = json!(self.placement);
+        }
+        v
     }
 
     /// Text generated for this request (a streamed delta or the final
@@ -1193,6 +1204,15 @@ struct Remote {
 
 /// How long a refused or failed remote sits out.
 const REMOTE_COOLDOWN: f64 = 30.0;
+/// How long a remote that said it is busy (429, a concurrency limit) sits out
+/// while it is the only member up: a refusal there means wait, not broken.
+const REMOTE_BUSY_BACKOFF: f64 = 2.0;
+
+/// A remote's refusal that means "full right now" rather than "failing".
+fn busy_refusal(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.starts_with("http 429") || r.contains("concurrency limit") || r.contains("rate_limited") || r.contains("too many requests")
+}
 
 impl Remote {
     fn new(spec: RemoteSpec, config_dir: &Path) -> Self {
@@ -1267,6 +1287,14 @@ impl Remote {
         Speed { prefill: self.spec.prefill_tok_s.unwrap_or(1400.0), decode: self.spec.decode_tok_s.unwrap_or(26.0) }
     }
 
+    /// It refused a request as busy while local is down: hold new requests
+    /// off briefly (the router waits for it, up to `queue_wait`).
+    fn back_off(&self, reason: &str) {
+        let mut until = self.cooling_until.lock().unwrap_or_else(|e| e.into_inner());
+        *until = until.max(now() + REMOTE_BUSY_BACKOFF);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = reason.to_string();
+    }
+
     /// A request it took failed before reaching the client: sit out a while.
     fn fail(&self, reason: &str) {
         *self.cooling_until.lock().unwrap_or_else(|e| e.into_inner()) = now() + REMOTE_COOLDOWN;
@@ -1275,6 +1303,14 @@ impl Remote {
             self.healthy.store(false, Ordering::Relaxed);
         }
         log_line("WARNING", &format!("remote {}: {reason}; no new conversations for {REMOTE_COOLDOWN:.0} s", self.spec.name));
+    }
+
+    /// Mark slot `idx` with the route it serves and why (the live view).
+    fn tag(&self, idx: usize, route: &str, placement: &'static str) {
+        if let Some(sl) = Router::lock_stats(&self.stats).slots.get_mut(idx) {
+            sl.route = route.to_string();
+            sl.placement = placement;
+        }
     }
 
     fn state_json(&self) -> Value {
@@ -1485,6 +1521,8 @@ pub struct Router {
     /// When a pooled request last arrived (keeps the remotes' load fresh).
     pool_seen_at: Mutex<f64>,
     healthy: HashMap<String, AtomicBool>,
+    /// Wakes the health poller early (a request found a backend down).
+    poll_now: tokio::sync::Notify,
     /// name -> (when, aggregated text), 1 s cache of the backend's /metrics.
     backend_metrics: Mutex<HashMap<String, (f64, String)>>,
     client: HttpClient,
@@ -1511,6 +1549,7 @@ impl Router {
             kv_used: Mutex::new(HashMap::new()),
             pool_seen_at: Mutex::new(-1e9),
             healthy,
+            poll_now: tokio::sync::Notify::new(),
             backend_metrics: Mutex::new(HashMap::new()),
             client,
         })
@@ -1539,6 +1578,26 @@ impl Router {
 
     fn is_healthy(&self, name: &str) -> bool {
         self.healthy.get(name).map(|h| h.load(Ordering::Relaxed)).unwrap_or(false)
+    }
+
+    /// A request could not reach route `name`'s server: down now (the next
+    /// request fails over) rather than at the next health poll, which then
+    /// runs at once and every 2 s until it is back.
+    fn mark_down(&self, name: &str) {
+        if let Some(h) = self.healthy.get(name) {
+            if h.swap(false, Ordering::Relaxed) {
+                log_line("WARNING", &format!("backend {name} refused a connection; down until its health probe passes"));
+            }
+            self.poll_now.notify_one();
+        }
+    }
+
+    /// Whether a pooled request for `route` could go to a remote once the
+    /// local server is marked down (its pool, or a failover for it).
+    fn could_fail_over(&self, route: &str, path: &str, headers: &HeaderMap) -> bool {
+        matches!(path, "/v1/chat/completions" | "/v1/completions")
+            && !local_only(headers)
+            && self.remotes.iter().any(|r| (r.spec.pool == route || r.spec.fallback_for.iter().any(|f| f == route)) && r.usable(false))
     }
 
     /// The models a `?model=` query names: one (alias resolved; none when
@@ -1720,7 +1779,7 @@ impl Router {
                 all_ok &= ok;
             }
             let period = if !all_ok || self.recently_active(ACTIVE_WINDOW) { BUSY } else { IDLE };
-            tokio::time::sleep(period).await;
+            let _ = tokio::time::timeout(period, self.poll_now.notified()).await;
         }
     }
 
@@ -1932,7 +1991,8 @@ impl Router {
             Some(Target::Remote(i)) if pool.contains(&i) => Some(remote_fits(i, true)),
             _ => None,
         };
-        let any_remote_usable = pool.iter().any(|&i| self.remotes[i].usable(false));
+        // Local down: a remote sitting out briefly is still worth waiting for.
+        let any_remote_usable = pool.iter().any(|&i| self.remotes[i].usable(!local_up));
         let waited_note = if elapsed >= 1.0 { format!(", after {elapsed:.0} s") } else { String::new() };
         let spill_why = match &kv_full {
             _ if !local_up => format!("failover, local down{waited_note}"),
@@ -2121,6 +2181,7 @@ impl Router {
             .chain(self.remotes.iter().map(|r| {
                 let ok = r.usable(true);
                 json!({"id": r.spec.name, "object": "model", "owned_by": "remote", "pool": r.spec.pool,
+                       "fallback_for": r.spec.fallback_for, "base_url": r.spec.base_url, "max_inflight": r.spec.max_inflight,
                        "status": {"value": if ok { "loaded" } else { "unloaded" }, "failed": !ok, "exit_code": null}})
             }))
             .collect();
@@ -2273,50 +2334,83 @@ impl Router {
             return self.proxy_direct(i, &parts.uri, &headers, &p, &body).await;
         }
         self.ensure_info(&st).await;
-        let pool = self.remotes_for(&resolved, parts.uri.path(), &parts.headers);
-        let idx = if pool.is_empty() {
-            Self::lock_stats(&st).take()
-        } else {
-            let key = sticky_key(&parts.headers, &p);
-            let need = {
-                let (_, est) = prompt_text(&p);
-                let max_tokens = p
-                    .get("max_tokens")
-                    .filter(|v| truthy(Some(v)))
-                    .or_else(|| p.get("max_completion_tokens").filter(|v| truthy(Some(v))))
-                    .and_then(py_int)
-                    .unwrap_or(-1);
-                let prompt = Self::lock_stats(&st).estimate_prompt(est);
-                (prompt, kv_need(prompt, max_tokens))
-            };
-            let (prompt, need) = need;
-            match self.choose(&resolved, &st, &pool, key, prompt, need).await {
-                Pick::Local(idx) => idx,
-                Pick::Remote(i, idx, why) => {
-                    let r = &self.remotes[i];
-                    let by = if parts.headers.contains_key("x-fidim-session") { "session header" } else { "prompt prefix" };
-                    log_line("INFO", &format!("pool {resolved} -> {} ({why}, conversation by {by})", r.spec.name));
-                    match self.try_remote(r, idx, &parts.uri, &headers, &p, &body).await {
-                        Ok(resp) => return resp,
-                        Err(reason) if !self.is_healthy(&resolved) => {
-                            r.fail(&reason);
-                            return json_response(
-                                StatusCode::BAD_GATEWAY,
-                                &json!({"error": {"message": format!("{resolved} is down and remote {} failed: {reason}", r.spec.name), "type": "bad_gateway"}}),
-                            );
-                        }
-                        Err(reason) => {
-                            r.fail(&reason);
-                            log_line("INFO", &format!("pool {resolved}: retrying locally"));
-                            self.sticky.lock().unwrap_or_else(|e| e.into_inner()).put(key, Target::Local, need);
-                            Self::lock_stats(&st).take()
+        let mut retried = false;
+        let t_req = now();
+        loop {
+            let pool = self.remotes_for(&resolved, parts.uri.path(), &parts.headers);
+            let idx = if pool.is_empty() {
+                Self::lock_stats(&st).take()
+            } else {
+                let key = sticky_key(&parts.headers, &p);
+                let need = {
+                    let (_, est) = prompt_text(&p);
+                    let max_tokens = p
+                        .get("max_tokens")
+                        .filter(|v| truthy(Some(v)))
+                        .or_else(|| p.get("max_completion_tokens").filter(|v| truthy(Some(v))))
+                        .and_then(py_int)
+                        .unwrap_or(-1);
+                    let prompt = Self::lock_stats(&st).estimate_prompt(est);
+                    (prompt, kv_need(prompt, max_tokens))
+                };
+                let (prompt, need) = need;
+                match self.choose(&resolved, &st, &pool, key, prompt, need).await {
+                    Pick::Local(idx) => idx,
+                    Pick::Remote(i, idx, why) => {
+                        let r = &self.remotes[i];
+                        r.tag(idx, &resolved, if self.is_healthy(&resolved) { "overflow" } else { "failover" });
+                        let by = if parts.headers.contains_key("x-fidim-session") { "session header" } else { "prompt prefix" };
+                        log_line("INFO", &format!("pool {resolved} -> {} ({why}, conversation by {by})", r.spec.name));
+                        match self.try_remote(r, idx, &parts.uri, &headers, &p, &body).await {
+                            Ok(resp) => return resp,
+                            Err(reason) if !self.is_healthy(&resolved) && busy_refusal(&reason) && now() - t_req < self.opts.queue_wait => {
+                                r.back_off(&reason);
+                                log_line("INFO", &format!("pool {resolved}: {} is busy ({reason}); waiting for it", r.spec.name));
+                                tokio::time::sleep(Duration::from_secs_f64(REMOTE_BUSY_BACKOFF)).await;
+                                continue;
+                            }
+                            Err(reason) if !self.is_healthy(&resolved) => {
+                                r.fail(&reason);
+                                return json_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    &json!({"error": {"message": format!("{resolved} is down and remote {} failed: {reason}", r.spec.name), "type": "bad_gateway"}}),
+                                );
+                            }
+                            Err(reason) => {
+                                r.fail(&reason);
+                                log_line("INFO", &format!("pool {resolved}: retrying locally"));
+                                self.sticky.lock().unwrap_or_else(|e| e.into_inner()).put(key, Target::Local, need);
+                                Self::lock_stats(&st).take()
+                            }
                         }
                     }
                 }
+            };
+            let (guard, tracker, sbody) = start_slot(&st, idx, &p, &body, None);
+            // A local server that refuses the connection (it just died; the health
+            // poll has not seen it yet) answered nothing: when a remote could take
+            // the route once it is marked down, the request goes round again.
+            if !retried && self.could_fail_over(&resolved, parts.uri.path(), &parts.headers) {
+                if let Ok(uri) = format!("{url}{path_q}").parse::<Uri>() {
+                    let mut req = Request::builder().method(parts.method.clone()).uri(uri).body(Full::new(sbody)).expect("valid request");
+                    *req.headers_mut() = headers.clone();
+                    match self.client.request(req).await {
+                        Ok(resp) => {
+                            let (rparts, rbody) = resp.into_parts();
+                            return tracked_response(rparts, Some(rbody), None, Some((guard, tracker)));
+                        }
+                        Err(e) if e.is_connect() => {
+                            drop(guard); // releases the local slot
+                            self.mark_down(&resolved);
+                            retried = true;
+                            continue;
+                        }
+                        Err(e) => return text_response(StatusCode::BAD_GATEWAY, &format!("backend {resolved} ({url}): {e}")),
+                    }
+                }
             }
-        };
-        let (guard, tracker, body) = start_slot(&st, idx, &p, &body, None);
-        self.send(&url, &resolved, &parts.method, &path_q, headers, body, Some((guard, tracker))).await
+            return self.send(&url, &resolved, &parts.method, &path_q, headers, sbody, Some((guard, tracker))).await;
+        }
     }
 
     /// A request naming a remote: that remote or an error (no local fallback).
@@ -2333,6 +2427,7 @@ impl Router {
             }
             Self::lock_stats(&r.stats).take()
         };
+        r.tag(idx, "", "direct");
         log_line("INFO", &format!("remote {} (requested by name)", r.spec.name));
         match self.try_remote(r, idx, uri, headers, p, body).await {
             Ok(resp) => resp,
@@ -2372,9 +2467,7 @@ impl Router {
                 // marks the route down now (the next request fails over) rather
                 // than at the next health poll (up to 30 s when idle).
                 if e.is_connect() {
-                    if let Some(h) = self.healthy.get(label) {
-                        h.store(false, Ordering::Relaxed);
-                    }
+                    self.mark_down(label);
                 }
                 return text_response(StatusCode::BAD_GATEWAY, &format!("backend {label} ({base}): {e}"));
             }
@@ -2690,6 +2783,12 @@ mod tests {
         );
         assert_eq!(v["n_ctx"], 4096);
         assert_eq!(v["is_processing"], true);
+        // a remote member's slot also says what it serves
+        let mut t = fresh_slot();
+        t.route = "dd".into();
+        t.placement = "failover";
+        let tv = t.view(4096, false);
+        assert_eq!((tv["route"].as_str(), tv["placement"].as_str()), (Some("dd"), Some("failover")));
         assert_eq!(v["speculative"], true);
         // prefill: processed shown while nothing is decoded
         assert_eq!(v["n_prompt_tokens_processed"], 4);
@@ -3156,6 +3255,11 @@ vllm:other 1.0
         Router::lock_stats(&r.remotes[0].stats).release(0);
         assert!(matches!(r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0, true), Some(Pick::Local(_))));
         assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0, false), "failover"));
+        // a remote backing off after a busy refusal: wait for it, do not send to the dead local server
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        r.remotes[0].back_off("HTTP 429 concurrency limit");
+        assert_eq!(r.try_pick(&st, &pool, Some(4), 100, 100, None, 0.0, false), None);
+        assert!(busy_refusal("refused: concurrency limit: 1 in-flight requests") && busy_refusal("HTTP 429 {}") && !busy_refusal("connect: refused"));
     }
 
     #[test]

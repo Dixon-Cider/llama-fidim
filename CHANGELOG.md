@@ -31,6 +31,15 @@ build with uncommitted changes.
   `/health`, polled every ~2 s while watched). Chatting with the remote's
   name (e.g. `spark`) sends the request there only. `context_length` in
   `router-remotes.json` sets its `n_ctx`.
+- **Failover to remote members.** When a route's local server is down, the
+  router sends its requests to a remote with room at once (conversations that
+  were local too); `fallback_for` in `router-remotes.json` lets a remote take
+  other routes only while their server is down. A refused connection marks the
+  route down and retries the request on the remote; a busy refusal (429,
+  concurrency limit) while local is down waits for the remote instead of
+  failing. The Running tab shows each remote on the router's header (standby,
+  overflow, failover) and, per slot, the route it serves and why; a member row
+  shows how many of its requests run remotely.
 - **KV-aware pool placement.** A new conversation goes local only while it
   fits the local KV cache under `local_kv_fill` (default 0.9) of its
   capacity, counting both what is in flight (`/get_load`) and what other

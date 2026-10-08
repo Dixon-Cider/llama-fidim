@@ -61,6 +61,13 @@ pub struct SlotView {
     /// DiffusionGemma: where the denoise is. None for llama-server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diffusion: Option<DiffusionProgress>,
+    /// A remote member of FIDIM's SGLang router: the route the request was
+    /// for ("" when it named the remote) and why it went there (`overflow`,
+    /// `failover`, `direct`). None elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
@@ -170,6 +177,8 @@ pub fn parse_slots(json: &str) -> Result<Vec<SlotView>> {
                 loop_hint,
                 committed_chars,
                 diffusion: s.get("diffusion").and_then(|d| serde_json::from_value(d.clone()).ok()),
+                route: s.get("route").and_then(|x| x.as_str()).map(str::to_string),
+                placement: s.get("placement").and_then(|x| x.as_str()).map(str::to_string),
             }
         })
         .collect())
@@ -296,6 +305,9 @@ mod tests {
         assert_eq!(s[0].n_prompt_tokens_exact, None);
         let r = parse_slots(r#"[{"id":0,"n_ctx":10,"is_processing":true,"n_prompt_tokens":5,"n_prompt_tokens_exact":false}]"#).unwrap();
         assert_eq!(r[0].n_prompt_tokens_exact, Some(false));
+        assert_eq!((r[0].route.as_deref(), r[0].placement.as_deref()), (None, None));
+        let t = parse_slots(r#"[{"id":0,"n_ctx":10,"is_processing":true,"route":"dd","placement":"overflow"}]"#).unwrap();
+        assert_eq!((t[0].route.as_deref(), t[0].placement.as_deref()), (Some("dd"), Some("overflow")));
     }
 
     #[test]

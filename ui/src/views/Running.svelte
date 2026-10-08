@@ -185,6 +185,26 @@
   const phaseChip = (p) => (p === "decode" ? "accent live" : p === "prefill" ? "warn live" : "plain");
   // The SGLang router has no samples of its own: its phase is its members'.
   const rowPhase = (row) => phaseOf([...row.samples, ...(row.fronting?.length ? data.runs.filter((x) => x !== row && row.fronting.includes(x.run.state.alias)).flatMap((x) => x.samples) : [])]);
+  // Remote pool members of the SGLang router (a DGX Spark behind dd): what
+  // each is doing, for the chips on the router and on the routes it serves.
+  const remoteOf = (row, s) => row.remotes?.find((x) => x.id === s?.model) ?? null;
+  const hostOf = (url) => String(url ?? "").replace(/^https?:\/\//, "").split("/")[0];
+  const remoteBusy = (row, id) => row.samples.filter((s) => s.model === id).flatMap((s) => s.slots.filter((x) => x.is_processing));
+  function remoteChip(row, rm) {
+    if (!rm.up) return { kind: "block", label: `${rm.id} down`, hint: `${hostOf(rm.base_url)} is not answering; nothing goes there` };
+    const busy = remoteBusy(row, rm.id);
+    const counts = Object.entries(busy.reduce((a, x) => ({ ...a, [x.route || "direct"]: (a[x.route || "direct"] ?? 0) + 1 }), {})).map(([k, n]) => `${k} ×${n}`).join(", ");
+    const covers = [...new Set([rm.pool, ...rm.fallback_for])].join(" + ");
+    if (busy.some((x) => x.placement === "failover")) return { kind: "warn live", label: `${rm.id} failover`, hint: `Local server down: ${rm.id} serves ${counts} (${busy.length} of ${rm.max_inflight})` };
+    if (busy.length) return { kind: "accent live", label: `${rm.id} overflow`, hint: `Local slots full: ${rm.id} serves ${counts} (${busy.length} of ${rm.max_inflight})` };
+    return { kind: "plain", label: rm.id, hint: `Standby at ${hostOf(rm.base_url)}: ${rm.pool} overflow, and ${covers} while their server is down` };
+  }
+  // A member route's requests running on a remote right now.
+  function offloaded(alias) {
+    const router = data.runs.find((x) => isSgRouter(x.run));
+    if (!router?.remotes?.length) return [];
+    return router.remotes.map((rm) => ({ id: rm.id, n: remoteBusy(router, rm.id).filter((x) => x.route === alias).length })).filter((x) => x.n);
+  }
   const phaseHint = (p) => (p === "decode" ? "Generating tokens on at least one slot" : p === "prefill" ? "Reading a prompt on at least one slot" : "No request in progress");
   const heldOn = (cardKey) => data.runs.reduce((a, row) => a + row.resident.filter((m) => m.card === cardKey).reduce((b, m) => b + Math.max(m.dedicated_bytes, m.committed_bytes), 0), 0);
   const short = (k) => String(k ?? "").split(":").pop();
@@ -216,9 +236,15 @@
     const n = draftChars(x);
     return [chars.slice(0, chars.length - n).join(""), chars.slice(chars.length - n).join("")];
   }
+  // On a remote member: the route a request came for, and why it went there.
+  const servingOf = (x) => (x.placement ? `${x.route || "by name"} · ${x.placement}` : "");
   function slotTitle(x) {
     // The router estimates a prompt's size until the reply reports usage.
     const est = x.n_prompt_tokens_exact === false ? "~" : "";
+    if (x.is_processing && x.placement) return `${slotTitleLocal(x, est)} · for ${servingOf(x)}`;
+    return slotTitleLocal(x, est);
+  }
+  function slotTitleLocal(x, est) {
     if (!x.is_processing) return `slot ${x.id}: idle · ${est}${Math.round(100 * x.ctx_fraction)}% of ${x.n_ctx.toLocaleString()} ctx used`;
     const p = x.phase === "prefill"
       ? `prefill ${est}${x.n_prompt_tokens_processed.toLocaleString()} / ${est}${x.n_prompt_tokens.toLocaleString()} prompt tokens`
@@ -320,6 +346,13 @@
         <span class="chip {h.kind}" title={h.hint}>{h.label}</span>
         {#if r.alive}<span class="chip {phaseChip(phase)}" title={phaseHint(phase)}>{phase}</span>{/if}
         {#if (row.evicting_ms_per_s ?? 0) > 20}<span class="chip block live" title="The driver is evicting this server from VRAM ({Math.round(row.evicting_ms_per_s)} ms per second): lower the VRAM share or move a display">evicting</span>{/if}
+        {#each row.remotes ?? [] as rm (rm.id)}
+          {@const c = remoteChip(row, rm)}
+          <span class="chip {c.kind}" title={c.hint}>{c.label}</span>
+        {/each}
+        {#each r.alive && via ? offloaded(r.state.alias) : [] as o (o.id)}
+          <span class="chip accent live" title="{o.n} {r.state.alias} request{o.n > 1 ? "s" : ""} running on {o.id}, not on this server">+{o.n} on {o.id}</span>
+        {/each}
         {#if asking}<span class="chip warn" transition:fade={{ duration: LAYOUT }} title="Requests for {r.state.alias} through the router fail until the router restarts">router still routes here</span>{/if}
       </div>
       <div class="facts">
@@ -358,12 +391,14 @@
       {@const queued = m.requests_deferred ?? m.num_queue_reqs ?? 0}
       {@const inFlight = Math.max(m.requests_processing ?? 0, m.num_running_reqs ?? 0)}
       {@const dg = s.slots.some((x) => x.diffusion)}
+      {@const rm = remoteOf(row, s)}
       <div class="model" class:active={s.phase !== "idle"} in:fly={arrive(stagger(si, 40))} out:slide={leave} animate:flip={flipParams}>
         <div class="ident">
           <div class="model-name">{s.model ?? r.state.alias}</div>
           <span class="chip {phaseChip(s.phase)}" title={phaseHint(s.phase)}>{s.phase}</span>
+          {#if rm}<span class="chip plain" title="Remote server at {hostOf(rm.base_url)}; serves {rm.pool} overflow, and {[...new Set([rm.pool, ...rm.fallback_for])].join(" + ")} while their server is down">remote</span>{/if}
           {#if s.slots.some((x) => x.loop_hint)}<span class="chip block live" title="A slot is repeating the same fragment; click it to see the text">looping</span>{/if}
-          <div class="slot-count" title="Slots serving a request, of the {s.slots.length} this model has ({isSg(r) ? "--max-running-requests" : "-np"})"><b class="num">{busySlots}</b><span class="faint"> / {s.slots.length} busy</span></div>
+          <div class="slot-count" title="Slots serving a request, of the {s.slots.length} this model has ({rm ? "max_inflight" : isSg(r) ? "--max-running-requests" : "-np"})"><b class="num">{busySlots}</b><span class="faint"> / {s.slots.length} busy</span></div>
           {#if s.error}<div class="err">{s.error}</div>{/if}
           {#if s.model && r.alive}
             <div class="row-actions">
@@ -469,6 +504,7 @@
                 {:else}idle{/if}
               </span>
               <span class="what">
+                {#if x.is_processing && x.placement}<b class:fo={x.placement === "failover"}>{x.route || "direct"}</b> ·{/if}
                 {#if x.loop_hint}loop ×{x.loop_hint.repeats}
                 {:else if x.phase === "prefill"}prefill
                 {:else if x.phase === "decode"}{isDiffusion(x) ? "denoising" : "decoding"}
@@ -484,6 +520,7 @@
             <div class="dhead">
               <span class="mono" style="font-weight: 700;">slot {x.id}</span>
               <span class="chip {phaseChip(x.phase)}">{x.phase}</span>
+              {#if x.placement}<span class="chip {x.placement === "failover" ? "warn" : "plain"}" title="The route this request was for, and why the router sent it here">{servingOf(x)}</span>{/if}
               {#if x.loop_hint}<span class="chip block live" title="The same fragment came back {x.loop_hint.repeats} times: “{trimFrag(x.loop_hint.fragment)}”">looping ×{x.loop_hint.repeats}</span>{/if}
               {#if x.generated != null && isSg(r)}<span class="faint small" title="The router keeps only the tail of each text; these are the chars shown">last {[...x.generated].length.toLocaleString()} chars out · {[...(x.prompt ?? "")].length.toLocaleString()} in</span>
               {:else if x.generated != null}<span class="faint small" title="Characters generated, then in the prompt{x.prompt_chars > 4000 || x.generated_chars > 4000 ? "; the panes show the last 4,000 of each" : ""}">{x.generated_chars.toLocaleString()} out · {x.prompt_chars.toLocaleString()} in</span>{/if}
@@ -619,6 +656,9 @@
   .slot.prefill { border-color: rgba(220, 176, 74, 0.55); }
   .slot.decode { border-color: rgba(224, 140, 76, 0.6); }
   .slot .n { position: relative; font-size: 11px; color: var(--ink-faint); align-self: start; }
+  .slot .what { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .slot .what b { color: var(--ink); font-weight: 600; }
+  .slot .what b.fo { color: var(--warn); }
   .slot .p { position: relative; font-size: 15px; font-weight: 600; text-align: right; color: var(--ink); align-self: start; }
   .slot.idle .p { color: var(--ink-faint); font-weight: 500; font-size: 12px; }
   .slot .what { position: relative; grid-column: 1 / -1; font-family: var(--sans); font-size: 11px; color: var(--ink-muted); }

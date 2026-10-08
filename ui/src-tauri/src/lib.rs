@@ -1298,6 +1298,9 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                 // SGLang members are runs of their own with their own cards; the
                 // router card just names them instead of repeating their slots.
                 let mut fronting: Vec<String> = Vec::new();
+                // Remote pool members (a DGX Spark behind `dd`): which samples
+                // are remote, what they serve, and whether they are up.
+                let mut remotes: Vec<serde_json::Value> = Vec::new();
                 let profile = profiles.iter().find(|p| p.id == r.state.profile_id);
                 let is_router = r.state.profile_id == fidim_core::router::ROUTER_ID;
                 let routed_by = sg_router.filter(|_| r.alive && !is_router && r.state.engine.is_sglang()).filter(|_| {
@@ -1316,6 +1319,9 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                     if is_router {
                         if let Ok(ms) = fidim_core::router::models(&r.state.host, r.state.port) {
                             for m in &ms {
+                                if let Some(x) = &m.remote {
+                                    remotes.push(serde_json::json!({ "id": m.id, "up": m.status == "loaded", "pool": x.pool, "fallback_for": x.fallback_for, "base_url": x.base_url, "max_inflight": x.max_inflight }));
+                                }
                                 if member(&m.id).is_some_and(chat::requires_api_key) {
                                     keyed_models.push(m.id.clone());
                                 }
@@ -1405,6 +1411,7 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                     "samples": samples,
                     "resident": resident,
                     "fronting": fronting,
+                    "remotes": remotes,
                     "evicted_ms": evicted_ms,
                     "evicting_ms_per_s": evict_rate,
                     "gpu_busy_percent": if busy <= 0.0 { 0.0 } else { busy.min(100.0) },

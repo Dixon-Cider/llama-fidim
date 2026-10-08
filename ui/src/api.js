@@ -771,7 +771,17 @@ async function mock(cmd, args) {
         keyed_models: [],
       };
       const runCrashed = { run: { ...MOCK_RUN, alive: false, health: "dead", crashed: true }, samples: [], resident: [], gpu_busy_percent: 0, has_api_key: false, keyed_models: [] };
-      return { runs: [runRouter, runDiffusion, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
+      // FIDIM's SGLang router with both local servers down: the DGX Spark
+      // (a remote pool member) has taken over dd and qwenMoE.
+      const remoteSlot = (id, phase, route) => ({ ...slot(id, phase), id: id, ctx_fraction: 0.18, n_ctx: 262144, route, placement: "failover" });
+      const runSgRouter = {
+        run: { state: { profile_id: "router", pid: 24410, port: 1236, host: "127.0.0.1", alias: "router", engine: "sglang", started_unix: Math.floor(t / 1000) - 900, log_path: "", command_line: "", visibility_env: null, device_keys: [], free_mib_before: [], cold_start: false }, alive: true, health: "healthy", crashed: false },
+        samples: [{ model: "spark", sampled_unix_ms: t, phase: "decode", slots: [remoteSlot(0, "decode", "dd"), remoteSlot(1, "prefill", "qwenMoE")], metrics: { requests_processing: 2, requests_deferred: 0 }, error: null }],
+        remotes: [{ id: "spark", up: true, pool: "dd", fallback_for: ["qwenMoE"], base_url: "https://spark.example.com/v1", max_inflight: 2 }],
+        router_health: { ok: false, detail: "dd, qwenMoE unhealthy" },
+        resident: [], gpu_busy_percent: 0, has_api_key: false, keyed_models: [], fronting: [],
+      };
+      return { runs: [runSgRouter, runRouter, runDiffusion, runCrashed], cards: MOCK_DEVICES.filter((d) => !d.device.integrated).map((d, i) => ({ key: d.device.stable_key, name: d.device.name, busy_percent: i ? 24 : 95, total_mib: d.device.total_mib })) };
     }
     case "app_version":
       return { version: "0.2.0", long: "0.2.0+3 (4f2a1c9 2026-09-20)", commit: "4f2a1c9", commit_date: "2026-09-20", commits_ahead: 3, modified: false };
