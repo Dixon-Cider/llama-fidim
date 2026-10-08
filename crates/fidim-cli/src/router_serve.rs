@@ -1032,6 +1032,10 @@ pub struct RemoteSpec {
     pub prefill_tok_s: Option<f64>,
     #[serde(default)]
     pub decode_tok_s: Option<f64>,
+    /// Other routes this remote serves only while their local server is
+    /// down (failover, not overflow).
+    #[serde(default)]
+    pub fallback_for: Vec<String>,
 }
 
 /// A member's speed for one request (prompt read, reply written) in tokens
@@ -1138,6 +1142,9 @@ impl Opts {
             }
             if !self.routes.iter().any(|(n, _)| *n == r.pool) {
                 bail!("remote {}: pool `{}` is not a route", r.name, r.pool);
+            }
+            if let Some(f) = r.fallback_for.iter().find(|f| !self.routes.iter().any(|(n, _)| n == *f)) {
+                bail!("remote {}: fallback_for `{f}` is not a route", r.name);
             }
             if r.max_inflight == 0 || r.served_model.is_empty() {
                 bail!("remote {}: max_inflight must be at least 1 and served_model set", r.name);
@@ -1768,13 +1775,20 @@ impl Router {
         }
     }
 
-    /// The remotes that may take this request: pooled with its route, and a
-    /// pooled path, and the client did not ask to stay local.
+    /// The remotes that may take this request: pooled with its route (or
+    /// its failover while the route's local server is down), and a pooled
+    /// path, and the client did not ask to stay local.
     fn remotes_for(&self, route: &str, path: &str, headers: &HeaderMap) -> Vec<usize> {
         if !matches!(path, "/v1/chat/completions" | "/v1/completions") || local_only(headers) {
             return vec![];
         }
-        self.remotes.iter().enumerate().filter(|(_, r)| r.spec.pool == route).map(|(i, _)| i).collect()
+        let down = !self.is_healthy(route);
+        self.remotes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.spec.pool == route || (down && r.spec.fallback_for.iter().any(|f| f == route)))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// The local member's KV load: capacity (`/get_server_info`) and the
@@ -1812,7 +1826,8 @@ impl Router {
         let start = now();
         loop {
             let kv = self.local_kv(route, st).await;
-            if let Some(p) = self.try_pick(st, pool, key, prompt, need, kv, now() - start) {
+            let local_up = self.is_healthy(route);
+            if let Some(p) = self.try_pick(st, pool, key, prompt, need, kv, now() - start, local_up) {
                 return p;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1869,10 +1884,13 @@ impl Router {
     ///   Nothing has room: wait in the router for whichever frees first,
     ///   up to `queue_wait`, then the local server's own queue (also at
     ///   once when no remote is usable);
+    /// - local down (`local_up` false, its health probe failing): it has no
+    ///   room, and every conversation goes to a remote with room at once,
+    ///   waiting up to `queue_wait` for one before trying local anyway;
     /// - a remote never gets more than `max_inflight` (the slot is taken
     ///   here, under the lock).
     #[allow(clippy::too_many_arguments)]
-    fn try_pick(&self, st: &Arc<Mutex<ModelStats>>, pool: &[usize], key: Option<u64>, prompt: u64, need: u64, kv: Option<KvLoad>, elapsed: f64) -> Option<Pick> {
+    fn try_pick(&self, st: &Arc<Mutex<ModelStats>>, pool: &[usize], key: Option<u64>, prompt: u64, need: u64, kv: Option<KvLoad>, elapsed: f64, local_up: bool) -> Option<Pick> {
         let mut sticky = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
         let waited = elapsed >= self.opts.sticky_wait;
         let queue_over = elapsed >= self.opts.queue_wait;
@@ -1894,7 +1912,7 @@ impl Router {
         // hold; a local one continuing is likely cached here, so moving it
         // costs more than it saves unless requests in flight fill the cache.
         let kv_full = kv.filter(|k| k.capacity > 0).and_then(|k| over(if prev == Some(Target::Local) { used } else { used.max(held) }, k.capacity));
-        let local_room = slot_free && kv_full.is_none();
+        let local_room = local_up && slot_free && kv_full.is_none();
         let remote_fits = |i: usize, continuing: bool| -> bool {
             let r = &self.remotes[i];
             if !r.has_room(continuing) {
@@ -1917,6 +1935,7 @@ impl Router {
         let any_remote_usable = pool.iter().any(|&i| self.remotes[i].usable(false));
         let waited_note = if elapsed >= 1.0 { format!(", after {elapsed:.0} s") } else { String::new() };
         let spill_why = match &kv_full {
+            _ if !local_up => format!("failover, local down{waited_note}"),
             Some(k) if slot_free => format!("spill, {k}{waited_note}"),
             _ => format!("spill, slots full{waited_note}"),
         };
@@ -1927,7 +1946,7 @@ impl Router {
                 return Some((Target::Local, String::new()));
             }
             if let Some(i) = remote_now {
-                if !prefer_remote && kv_full.is_none() && !queue_over {
+                if local_up && !prefer_remote && kv_full.is_none() && !queue_over {
                     // Local is short of a slot only: the remote is slower, so waiting
                     // for local pays when its slot frees before the remote catches up.
                     let gain = self.remotes[i].speed().service(prompt, reply) - local_speed.service(prompt, reply);
@@ -1946,6 +1965,7 @@ impl Router {
         let (target, why) = match prev {
             None => fresh(false)?,
             Some(Target::Local) if local_room => (Target::Local, String::new()),
+            Some(Target::Local) if !local_up => fresh(true)?,
             Some(Target::Local) => {
                 if remote_now.is_none() {
                     (Target::Local, String::new()) // nowhere else: queue locally
@@ -2278,6 +2298,13 @@ impl Router {
                     log_line("INFO", &format!("pool {resolved} -> {} ({why}, conversation by {by})", r.spec.name));
                     match self.try_remote(r, idx, &parts.uri, &headers, &p, &body).await {
                         Ok(resp) => return resp,
+                        Err(reason) if !self.is_healthy(&resolved) => {
+                            r.fail(&reason);
+                            return json_response(
+                                StatusCode::BAD_GATEWAY,
+                                &json!({"error": {"message": format!("{resolved} is down and remote {} failed: {reason}", r.spec.name), "type": "bad_gateway"}}),
+                            );
+                        }
                         Err(reason) => {
                             r.fail(&reason);
                             log_line("INFO", &format!("pool {resolved}: retrying locally"));
@@ -2341,7 +2368,14 @@ impl Router {
         let resp = match self.client.request(out_req).await {
             Ok(r) => r,
             Err(e) => {
-                // `track` drops here: the slot is released.
+                // `track` drops here: the slot is released. A refused connection
+                // marks the route down now (the next request fails over) rather
+                // than at the next health poll (up to 30 s when idle).
+                if e.is_connect() {
+                    if let Some(h) = self.healthy.get(label) {
+                        h.store(false, Ordering::Relaxed);
+                    }
+                }
                 return text_response(StatusCode::BAD_GATEWAY, &format!("backend {label} ({base}): {e}"));
             }
         };
@@ -3087,6 +3121,7 @@ vllm:other 1.0
             kv_capacity: None,
             prefill_tok_s: None,
             decode_tok_s: None,
+            fallback_for: vec![],
         }
     }
 
@@ -3107,11 +3142,42 @@ vllm:other 1.0
     }
 
     #[test]
+    fn pick_fails_over_when_local_is_down() {
+        let r = pool_router(4, vec![spec("spark", 1)]);
+        let st = r.stats["dd"].clone();
+        let pool = [0usize];
+        // local down with free slots: a new conversation goes remote at once
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0, false), "failover, local down"));
+        // remote full: wait for it rather than send to a dead server...
+        assert_eq!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0, false), None);
+        // ...until queue_wait, then local anyway (it may be back)
+        assert!(matches!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 90.0, false), Some(Pick::Local(_))));
+        // a local conversation moves without the sticky wait once its server is down
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        assert!(matches!(r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0, true), Some(Pick::Local(_))));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0, false), "failover"));
+    }
+
+    #[test]
+    fn fallback_remote_joins_only_while_its_route_is_down() {
+        let mut opts = Opts::parse_args("127.0.0.1", 0, &["dd=http://127.0.0.1:1".into(), "moe=http://127.0.0.1:2".into()], &[], "dd").unwrap();
+        opts.remotes = vec![RemoteSpec { fallback_for: vec!["moe".into()], ..spec("spark", 2) }];
+        let r = Router::new(opts);
+        let h = HeaderMap::new();
+        let path = "/v1/chat/completions";
+        r.healthy["moe"].store(true, Ordering::Relaxed);
+        assert!(r.remotes_for("moe", path, &h).is_empty(), "moe up: no overflow to a fallback-only remote");
+        r.healthy["moe"].store(false, Ordering::Relaxed);
+        assert_eq!(r.remotes_for("moe", path, &h), vec![0]);
+        assert_eq!(r.remotes_for("dd", path, &h), vec![0], "its own pool always");
+    }
+
+    #[test]
     fn pick_prefers_local_spills_and_sticks() {
         let r = pool_router(1, vec![spec("spark", 2)]);
         let st = r.stats["dd"].clone();
         let pool = [0usize];
-        let pick = |key: u64, elapsed: f64| r.try_pick(&st, &pool, Some(key), 100, 100, None, elapsed);
+        let pick = |key: u64, elapsed: f64| r.try_pick(&st, &pool, Some(key), 100, 100, None, elapsed, true);
         // new conversation, local free -> local
         assert_eq!(pick(1, 0.0), Some(Pick::Local(0)));
         // local full (its request only started) -> a new conversation spills to the remote
@@ -3138,7 +3204,7 @@ vllm:other 1.0
         let r = pool_router(1, vec![spec("spark", 2)]);
         let st = r.stats["dd"].clone();
         let pool = [0usize];
-        let pick = |key: u64| r.try_pick(&st, &pool, Some(key), 100, 100, None, 0.0);
+        let pick = |key: u64| r.try_pick(&st, &pool, Some(key), 100, 100, None, 0.0, true);
         let _ = pick(1); // local now full
         r.remotes[0].healthy.store(false, Ordering::Relaxed);
         assert!(matches!(pick(2), Some(Pick::Local(_))), "unhealthy: local queue at once, no router wait");
@@ -3165,7 +3231,7 @@ vllm:other 1.0
         let pool = [0usize];
         let kv = |used: u64| Some(KvLoad { capacity: 100_000, used });
         let tp = |r: &Router, st: &Arc<Mutex<ModelStats>>, key: u64, need: u64, used: u64, elapsed: f64| {
-            r.try_pick(st, &pool, Some(key), need, need, kv(used), elapsed)
+            r.try_pick(st, &pool, Some(key), need, need, kv(used), elapsed, true)
         };
         // a big agent session already in flight (60k): a 40k newcomer would overflow -> Spark,
         // although a local slot is free
@@ -3195,11 +3261,11 @@ vllm:other 1.0
         // no remote: everything goes local as before
         let r2 = pool_router(3, vec![]);
         let st2 = r2.stats["dd"].clone();
-        assert!(matches!(r2.try_pick(&st2, &[], Some(1), 95_000, 95_000, kv(60_000), 0.0), Some(Pick::Local(_))));
+        assert!(matches!(r2.try_pick(&st2, &[], Some(1), 95_000, 95_000, kv(60_000), 0.0, true), Some(Pick::Local(_))));
         // KV unknown (capacity 0): slots alone decide
         let r3 = pool_router(3, vec![spec("spark", 2)]);
         let st3 = r3.stats["dd"].clone();
-        assert!(matches!(r3.try_pick(&st3, &pool, Some(1), 500_000, 500_000, None, 0.0), Some(Pick::Local(_))));
+        assert!(matches!(r3.try_pick(&st3, &pool, Some(1), 500_000, 500_000, None, 0.0, true), Some(Pick::Local(_))));
     }
 
     #[test]
@@ -3207,20 +3273,20 @@ vllm:other 1.0
         let r = pool_router(1, vec![spec("spark", 2)]);
         let st = r.stats["dd"].clone();
         let pool = [0usize];
-        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0); // local full
+        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0, true); // local full
         // the Spark's own /health: two requests in flight from someone else -> full for us
         *r.remotes[0].queue.lock().unwrap() = Some((now(), 2.0, 0.0));
-        assert_eq!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0), None, "wait, do not get refused");
+        assert_eq!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0, true), None, "wait, do not get refused");
         // one of theirs plus a queue there -> still full
         *r.remotes[0].queue.lock().unwrap() = Some((now(), 1.0, 1.0));
-        assert_eq!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0), None);
+        assert_eq!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0, true), None);
         // one of theirs, nothing waiting -> one slot left for us
         *r.remotes[0].queue.lock().unwrap() = Some((now(), 1.0, 0.0));
-        assert!(is_remote(&r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0), "spill"));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0, true), "spill"));
         // a stale reading (over 15 s old) is ignored
         Router::lock_stats(&r.remotes[0].stats).release(0);
         *r.remotes[0].queue.lock().unwrap() = Some((now() - 60.0, 2.0, 5.0));
-        assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0), "spill"));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0, true), "spill"));
     }
 
     #[test]
@@ -3230,19 +3296,19 @@ vllm:other 1.0
         let r = pool_router(1, vec![sp]);
         let st = r.stats["dd"].clone();
         let pool = [0usize];
-        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0); // local full...
+        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0, true); // local full...
         Router::lock_stats(&st).slots[0].n_prompt = 200_000; // ...for a long while (a 200k prefill)
         // conversation X (60k) goes to the Spark, finishes; it stays cached there
-        assert!(is_remote(&r.try_pick(&st, &pool, Some(7), 60_000, 60_000, None, 0.0), "spill"));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(7), 60_000, 60_000, None, 0.0, true), "spill"));
         Router::lock_stats(&r.remotes[0].stats).release(0);
         // a new 50k conversation would push X out of the Spark's cache: it waits instead
-        assert_eq!(r.try_pick(&st, &pool, Some(8), 50_000, 50_000, None, 0.0), None);
+        assert_eq!(r.try_pick(&st, &pool, Some(8), 50_000, 50_000, None, 0.0, true), None);
         // X continuing (70k) fits: only what is in flight counts for it
-        assert!(is_remote(&r.try_pick(&st, &pool, Some(7), 70_000, 70_000, None, 0.0), "sticky"));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(7), 70_000, 70_000, None, 0.0, true), "sticky"));
         // ...and with X in flight, a 30k newcomer does not fit (70k + 2k reply room + 30k > 90k)
-        assert_eq!(r.try_pick(&st, &pool, Some(9), 30_000, 30_000, None, 0.0), None);
+        assert_eq!(r.try_pick(&st, &pool, Some(9), 30_000, 30_000, None, 0.0, true), None);
         // after queue_wait it goes to the local queue
-        assert!(matches!(r.try_pick(&st, &pool, Some(9), 30_000, 30_000, None, 90.0), Some(Pick::Local(_))));
+        assert!(matches!(r.try_pick(&st, &pool, Some(9), 30_000, 30_000, None, 90.0, true), Some(Pick::Local(_))));
     }
 
     #[test]
@@ -3250,7 +3316,7 @@ vllm:other 1.0
         let r = pool_router(1, vec![spec("spark", 2)]);
         let st = r.stats["dd"].clone();
         let pool = [0usize];
-        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0); // local full
+        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0, true); // local full
         {
             // its request is decoding and nearly done (typical reply 600 tokens)
             let mut s = Router::lock_stats(&st);
@@ -3258,13 +3324,13 @@ vllm:other 1.0
             s.slots[0].n_decoded = 590;
         }
         // a 50k prompt: the Spark would take ~25 s longer; local frees in ~3 s -> wait
-        assert_eq!(r.try_pick(&st, &pool, Some(2), 50_000, 52_048, None, 0.0), None);
+        assert_eq!(r.try_pick(&st, &pool, Some(2), 50_000, 52_048, None, 0.0, true), None);
         // still busy after the remote's head start is gone -> go to the remote
-        assert!(is_remote(&r.try_pick(&st, &pool, Some(2), 50_000, 52_048, None, 30.0), "spill, slots full, after 30 s"));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(2), 50_000, 52_048, None, 30.0, true), "spill, slots full, after 30 s"));
         Router::lock_stats(&r.remotes[0].stats).release(0);
         // a slot that just started its reply (~13 s left) vs a tiny prompt (~10 s slower remotely) -> remote now
         Router::lock_stats(&st).slots[0].n_decoded = 0;
-        assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 2148, None, 0.0), "spill"));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 2148, None, 0.0, true), "spill"));
     }
 
     #[test]
@@ -3401,6 +3467,7 @@ vllm:other 1.0
             kv_capacity: None,
             prefill_tok_s: None,
             decode_tok_s: None,
+            fallback_for: vec![],
         }];
         opts.sticky_wait = 0.5;
         let router = Router::new(opts);
