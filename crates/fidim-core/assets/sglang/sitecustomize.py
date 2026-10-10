@@ -2,7 +2,11 @@
 (including SGLang's spawned scheduler/detokenizer). When a process crosses
 SGL_MEMGUARD_GB (default 6; 0 = no guard), it writes every thread's stack to
 SGL_MEMGUARD_LOG and exits, before the kernel OOM killer takes the desktop down.
-Also raises oom_score_adj so that if something else blows up, we die first."""
+Also sets oom_score_adj to SGL_OOM_SCORE_ADJ (default 0) so a host OOM takes runners,
+builds and browser tabs before the model; the RSS guard still stops a runaway server.
+An unprivileged process cannot go below the floor a privileged ancestor set (100 under
+systemd's user@.service, whose apps start at 200): the kernel refuses that write, so 100
+is tried next, and if that is refused too the inherited value stays."""
 import os, sys, threading, time, traceback
 
 _LIMIT = float(os.environ.get("SGL_MEMGUARD_GB", "6"))
@@ -34,10 +38,12 @@ def _guard():
             os._exit(3)
         time.sleep(0.25)
 
-try:
-    with open("/proc/self/oom_score_adj", "w") as f:
-        f.write("1000")
-except Exception:
-    pass
+for _adj in (os.environ.get("SGL_OOM_SCORE_ADJ", "0"), "100"):
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write(_adj)
+        break
+    except Exception:
+        pass
 if _LIMIT > 0:
     threading.Thread(target=_guard, daemon=True, name="memguard").start()
