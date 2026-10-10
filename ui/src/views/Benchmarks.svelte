@@ -11,7 +11,7 @@
   async function load() {
     const [p, s] = await Promise.all([api("list_profiles"), api("status", { deep: false })]);
     profiles = p.map((r) => r.profile);
-    liveRunIds = s.filter((r) => r.alive).map((r) => r.state.profile_id);
+    liveRunIds = s.filter((r) => r.alive && !r.loading).map((r) => r.state.profile_id);
     if (!selected && profiles.length) selected = profiles[0].id;
     await loadHistory();
   }

@@ -39,9 +39,9 @@
     if (!s) {
       if (!target) return conv?.target ? "that server is not running; pick another one above" : "";
       if (target.status !== "loaded") {
-        return target.engine === "sglang"
-          ? "this model's SGLang server is stopped; start it from Router or Profiles"
-          : "the router loads this model when you send (that can take a minute)";
+        return target.engine !== "sglang" ? "the router loads this model when you send (that can take a minute)"
+          : target.status === "loading" ? "this model's SGLang server is still loading"
+          : "this model's SGLang server is stopped; start it from Router or Profiles";
       }
       return "";
     }

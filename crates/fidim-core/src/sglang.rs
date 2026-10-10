@@ -1262,10 +1262,16 @@ pub fn launch_router(
     let mut started = Vec::new();
     let runs = supervise::reattach(&cfg.runs_dir);
     for (m, member) in rc.members.iter().zip(&members) {
-        let alive = runs.iter().any(|r| r.alive && r.state.profile_id == member.id);
-        if m.load_on_startup && !alive {
-            launch(cfg, member, platform, false, ready_timeout)?;
-            started.push(member.id.clone());
+        match runs.iter().find(|r| r.alive && r.state.profile_id == member.id) {
+            // Started elsewhere and still loading: the router's readiness
+            // needs it answering, and starting it again would replace it.
+            Some(r) if r.loading => supervise::wait_ready_in(&r.state, ready_timeout, Some(&cfg.runs_dir))?,
+            Some(_) => {}
+            None if m.load_on_startup => {
+                launch(cfg, member, platform, false, ready_timeout)?;
+                started.push(member.id.clone());
+            }
+            None => {}
         }
     }
     let plan = router_plan(cfg, rc, &members)?;

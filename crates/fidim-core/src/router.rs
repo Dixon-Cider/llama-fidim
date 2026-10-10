@@ -367,6 +367,22 @@ pub fn models(host: &str, port: u16) -> Result<Vec<RouterModel>> {
         .unwrap_or_default())
 }
 
+/// The SGLang router reports a member it cannot reach as `unloaded`; one
+/// whose own server is still loading (`AttachedRun::loading`) reads
+/// `loading` instead, so it is neither "stopped" nor started a second time.
+pub fn mark_loading(models: &mut [RouterModel], runs: &[supervise::AttachedRun]) {
+    for m in models.iter_mut().filter(|m| m.status != "loaded") {
+        // The served name, as `model_id` derives it from the profile.
+        let loading = runs.iter().any(|r| {
+            r.loading && if r.state.alias.trim().is_empty() { r.state.profile_id == m.id } else { r.state.alias == m.id }
+        });
+        if loading {
+            m.status = "loading".into();
+            m.failed = false;
+        }
+    }
+}
+
 fn post_model(host: &str, port: u16, path: &str, id: &str) -> Result<()> {
     let body = serde_json::json!({ "model": id }).to_string();
     let (code, resp) = http_post_json(host, port, path, &body, Duration::from_secs(600))?;
@@ -495,5 +511,29 @@ mod tests {
         assert!(s.contains("--models-max 3"));
         assert!(s.contains("--no-models-autoload"));
         assert!(s.contains("--port 1234"));
+    }
+
+    #[test]
+    fn loading_members_read_loading() {
+        let run = |alias: &str, profile_id: &str, loading: bool| supervise::AttachedRun {
+            state: serde_json::from_value(serde_json::json!({
+                "profile_id": profile_id, "pid": 1, "port": 30000, "host": "127.0.0.1", "alias": alias,
+                "started_unix": 0, "log_path": "x.log", "command_line": "python", "visibility_env": "",
+                "device_keys": [], "free_mib_before": [], "engine": "sglang",
+            }))
+            .unwrap(),
+            alive: true,
+            health: supervise::Health::Dead,
+            crashed: false,
+            loading,
+        };
+        let model = |id: &str, status: &str| RouterModel { id: id.into(), status: status.into(), failed: status != "loaded", exit_code: None };
+        let mut ms = vec![model("dd", "unloaded"), model("qwenMoE", "unloaded"), model("gemma", "unloaded"), model("big", "loaded")];
+        // dd by alias, qwenMoE by profile id (no alias), gemma alive and
+        // not loading (bound but not yet healthy at the router) stays as is.
+        let runs = [run("dd", "dd-tp2", true), run("", "qwenMoE", true), run("gemma", "gemma", false), run("big", "big", true)];
+        mark_loading(&mut ms, &runs);
+        let got: Vec<(&str, &str, bool)> = ms.iter().map(|m| (m.id.as_str(), m.status.as_str(), m.failed)).collect();
+        assert_eq!(got, [("dd", "loading", false), ("qwenMoE", "loading", false), ("gemma", "unloaded", true), ("big", "loaded", false)]);
     }
 }

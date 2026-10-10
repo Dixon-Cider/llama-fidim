@@ -172,6 +172,7 @@
   }
   function health(r, row) {
     if (r.crashed) return { kind: "block", label: "crashed", hint: "The process exited; its log is kept below" };
+    if (r.loading) return { kind: "warn live", label: "loading", hint: "SGLang opens its port once weights, KV pools and CUDA graphs are ready" };
     const rh = r.health === "healthy" ? row?.router_health : null;
     if (rh && !rh.ok) return { kind: "warn", label: "degraded", hint: `The router's /health reports: ${rh.detail}` };
     if (rh) return { kind: "pass", label: "healthy", hint: "Every member answers the router's readiness probe (/health)" };
@@ -318,7 +319,7 @@
       <div class="who">
         <span class="title">{r.state.profile_id}</span>
         <span class="chip {h.kind}" title={h.hint}>{h.label}</span>
-        {#if r.alive}<span class="chip {phaseChip(phase)}" title={phaseHint(phase)}>{phase}</span>{/if}
+        {#if r.alive && !r.loading}<span class="chip {phaseChip(phase)}" title={phaseHint(phase)}>{phase}</span>{/if}
         {#if (row.evicting_ms_per_s ?? 0) > 20}<span class="chip block live" title="The driver is evicting this server from VRAM ({Math.round(row.evicting_ms_per_s)} ms per second): lower the VRAM share or move a display">evicting</span>{/if}
         {#if asking}<span class="chip warn" transition:fade={{ duration: LAYOUT }} title="Requests for {r.state.alias} through the router fail until the router restarts">router still routes here</span>{/if}
       </div>
@@ -332,7 +333,7 @@
         <span title="Time since the process started"><b class="num">{uptime(r.state.started_unix)}</b> up</span>
         <span class="mono" title="Listens on port {r.state.port} as “{r.state.alias}”">pid {r.state.pid}</span>
       </div>
-      {#if r.alive && r.state.profile_id !== ROUTER}
+      {#if r.alive && !r.loading && r.state.profile_id !== ROUTER}
         <button class="btn" onclick={() => chatWith(chatRun, via ? r.state.alias : null)} title={via ? "Open a chat with this model through the router" : "Open a chat with this server"}>Chat</button>
       {/if}
       {#if r.alive && (r.state.profile_id !== ROUTER || isSgRouter(r))}
@@ -521,8 +522,8 @@
     {:else}
       {#if r.alive && row.fronting?.length}
         <div class="empty small" title="The router forwards to these models; each has its own card below">fronting {row.fronting.join(" · ")}</div>
-      {:else if r.alive && isSg(r) && !isSgRouter(r)}<div class="empty small" title="SGLang has no per-slot view; FIDIM's router tracks each request">Slots need the router — Router → Start</div>
-      {:else if r.alive}<div class="empty small">No models loaded</div>{/if}
+      {:else if r.alive && !r.loading && isSg(r) && !isSgRouter(r)}<div class="empty small" title="SGLang has no per-slot view; FIDIM's router tracks each request">Slots need the router — Router → Start</div>
+      {:else if r.alive && !r.loading}<div class="empty small">No models loaded</div>{/if}
     {/each}
 
     <footer class="server-foot">

@@ -35,10 +35,15 @@ pub struct LaunchPlan {
 impl LaunchPlan {
     /// Full command line for display/state files (args quoted when needed).
     pub fn command_line(&self) -> String {
-        let mut parts = vec![quote_arg(&self.exe.to_string_lossy())];
-        parts.extend(self.args.iter().map(|a| quote_arg(a)));
-        parts.join(" ")
+        let exe = self.exe.to_string_lossy();
+        join_command_line(std::iter::once(exe.as_ref()).chain(self.args.iter().map(String::as_str)))
     }
+}
+
+/// argv as `LaunchPlan::command_line` renders it, so a live process's argv
+/// can be compared with a run state's `command_line`.
+pub(crate) fn join_command_line<'a>(argv: impl IntoIterator<Item = &'a str>) -> String {
+    argv.into_iter().map(quote_arg).collect::<Vec<_>>().join(" ")
 }
 
 fn quote_arg(a: &str) -> String {

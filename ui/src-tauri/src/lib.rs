@@ -584,7 +584,7 @@ async fn status(deep: bool) -> Result<serde_json::Value, String> {
         let mut runs = supervise::reattach(&cfg.runs_dir);
         if deep {
             for r in &mut runs {
-                if r.alive {
+                if r.alive && !r.loading {
                     r.health = supervise::probe_health(&r.state, true);
                 }
             }
@@ -685,6 +685,9 @@ fn do_bench(id: &str, concurrency: Option<u32>, tokens: u32) -> Result<serde_jso
         .into_iter()
         .find(|r| r.state.profile_id == id && r.alive)
         .ok_or("no live run for this profile — launch it first")?;
+    if run.loading {
+        return Err(format!("{id} is still loading — benchmark once it answers"));
+    }
     let opts = bench::BenchOptions {
         warmups: 2,
         max_tokens: tokens,
@@ -1191,8 +1194,10 @@ fn router_status() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn router_models() -> Result<serde_json::Value, String> {
     blocking(move || {
+        let cfg = cfg()?;
         let rc = fidim_core::router::load_config().map_err(|e| e.to_string())?;
-        let ms = fidim_core::router::models(&rc.host, rc.port).map_err(|e| e.to_string())?;
+        let mut ms = fidim_core::router::models(&rc.host, rc.port).map_err(|e| e.to_string())?;
+        fidim_core::router::mark_loading(&mut ms, &supervise::reattach(&cfg.runs_dir));
         serde_json::to_value(ms).map_err(|e| e.to_string())
     })
     .await
@@ -1313,7 +1318,8 @@ async fn live(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
                         Err(e) => serde_json::json!({ "ok": false, "detail": e.to_string() }),
                     }
                 });
-                if r.alive {
+                // A loading SGLang server has nothing to sample yet.
+                if r.alive && !r.loading {
                     if is_router {
                         if let Ok(ms) = fidim_core::router::models(&r.state.host, r.state.port) {
                             for m in &ms {

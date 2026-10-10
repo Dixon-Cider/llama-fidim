@@ -49,8 +49,8 @@ export const current = () => (chat.currentId ? chat.convs[chat.currentId] ?? nul
 export const targetOf = (conv) => (conv ? chat.targets.find((t) => t.key === targetKey(conv.target)) ?? null : null);
 export const isDiffusion = (conv) => (targetOf(conv)?.engine ?? conv?.target?.engine) === "diffusion-gemma";
 /// An SGLang target that is not running: behind the router nothing loads it
-/// on demand, its server has to be started.
-export const isStoppedSglang = (t) => t?.engine === "sglang" && t.status !== "loaded";
+/// on demand, its server has to be started. One still loading is not stopped.
+export const isStoppedSglang = (t) => t?.engine === "sglang" && t.status !== "loaded" && t.status !== "loading";
 
 /// The first 60 characters, cut between graphemes. Never by UTF-16 code
 /// unit: a cut through an emoji leaves half a surrogate pair, which the IPC
@@ -433,12 +433,14 @@ async function reply(conv) {
     finalize(convId, m, null, { error: `${conv.target?.model ?? conv.target?.run ?? "that server"} is not running. Pick another target above.` });
     return;
   }
-  if (isStoppedSglang(target)) {
+  if (target.engine === "sglang" && target.status !== "loaded") {
     // The list is polled every 5 s: look again before refusing.
     await refreshTargets();
     const now = targetOf(conv);
-    if (!now || isStoppedSglang(now)) {
-      finalize(convId, m, null, { error: `${target.model_id}'s SGLang server is stopped. Start it from Router or Profiles.` });
+    if (!now || now.status !== "loaded") {
+      finalize(convId, m, null, { error: now?.status === "loading"
+        ? `${target.model_id}'s SGLang server is still loading. Send again once it is ready.`
+        : `${target.model_id}'s SGLang server is stopped. Start it from Router or Profiles.` });
       return;
     }
   }

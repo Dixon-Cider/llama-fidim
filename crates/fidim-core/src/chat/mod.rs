@@ -1107,7 +1107,8 @@ pub fn targets(runs: &[AttachedRun], profiles: &[Profile]) -> Vec<Target> {
         let s = &r.state;
         let host = connect_host(&s.host);
         if s.profile_id == crate::router::ROUTER_ID {
-            let Ok(models) = crate::router::models(host, s.port) else { continue };
+            let Ok(mut models) = crate::router::models(host, s.port) else { continue };
+            crate::router::mark_loading(&mut models, runs);
             for m in models {
                 let member = profiles.iter().find(|p| crate::router::model_id(p) == m.id);
                 let key = member.and_then(api_key);
@@ -1117,6 +1118,10 @@ pub fn targets(runs: &[AttachedRun], profiles: &[Profile]) -> Vec<Target> {
             }
         } else {
             let profile = profiles.iter().find(|p| p.id == s.profile_id);
+            if r.loading {
+                out.push(target_for(s, profile, None, "loading", None));
+                continue;
+            }
             let key = profile.and_then(api_key);
             let sample = crate::live::sample_with_key(host, s.port, None, key.as_deref());
             out.push(target_for(s, profile, None, "loaded", Some(&sample)));

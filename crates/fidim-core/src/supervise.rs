@@ -494,19 +494,66 @@ pub fn process_alive_as(pid: u32, image_contains: &str) -> bool {
 ///   `llama-fidim.exe` and the keep-alive `fidim.exe`) AND that pid is the one
 ///   listening on the run's port. The helper binds before anything else, and
 ///   a reused pid on another helper listens elsewhere.
+/// - SGLang: the pid owns the port, or is still loading (see `Liveness`).
 /// - unknown: never ours to kill.
 pub fn run_alive(s: &RunState) -> bool {
+    liveness(s) != Liveness::Gone
+}
+
+/// What a run's pid is doing now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    Up,
+    /// SGLang that has not bound its port yet: it binds only once weights,
+    /// KV pools and CUDA graphs are ready, minutes for a big model.
+    Loading,
+    Gone,
+}
+
+fn liveness(s: &RunState) -> Liveness {
+    let up_if = |b: bool| if b { Liveness::Up } else { Liveness::Gone };
     match s.engine {
-        Engine::LlamaServer => process_alive_as(s.pid, "llama-server"),
-        Engine::DiffusionGemma => {
+        Engine::LlamaServer => up_if(process_alive_as(s.pid, "llama-server")),
+        Engine::DiffusionGemma => up_if(
             process_image(s.pid).is_some_and(|img| img.eq_ignore_ascii_case(DG_HELPER_EXE))
-                && crate::launch::listens_on(s.port, s.pid)
-        }
+                && crate::launch::listens_on(s.port, s.pid),
+        ),
         // The router (or a bare server) is a python process; what matters is
-        // that the recorded pid still owns the port.
-        Engine::SgLang => process_alive(s.pid) && crate::launch::listens_on(s.port, s.pid),
-        Engine::Unknown => false,
+        // that the recorded pid still owns the port. Before the run has ever
+        // answered, a pid running exactly the command we spawned is ours too:
+        // a reused pid runs something else.
+        Engine::SgLang => {
+            if !process_alive(s.pid) {
+                Liveness::Gone
+            } else if crate::launch::listens_on(s.port, s.pid) {
+                Liveness::Up
+            } else if !s.ready && runs_command(s.pid, &s.command_line) {
+                Liveness::Loading
+            } else {
+                Liveness::Gone
+            }
+        }
+        Engine::Unknown => Liveness::Gone,
     }
+}
+
+/// Whether `pid` runs exactly `command_line`, as `LaunchPlan::command_line`
+/// rendered it at spawn. Linux reads `/proc/<pid>/cmdline`; Windows has no
+/// cheap equivalent and SGLang does not run there, so it never matches.
+#[cfg(not(windows))]
+fn runs_command(pid: u32, command_line: &str) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+    let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+    if raw.is_empty() {
+        return false;
+    }
+    let argv: Vec<String> = raw.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    crate::launch::join_command_line(argv.iter().map(String::as_str)) == command_line
+}
+
+#[cfg(windows)]
+fn runs_command(_pid: u32, _command_line: &str) -> bool {
+    false
 }
 
 /// The keep-alive helper's image: `fidim.exe`, or `llamactl.exe` from before
@@ -615,6 +662,9 @@ pub struct AttachedRun {
     /// True when the state file's PID is dead — a crash while the tool was
     /// away (its log outlives it for diagnosis).
     pub crashed: bool,
+    /// Alive but not serving yet: an SGLang server that has not bound its
+    /// port (weights, KV pools, CUDA graphs). Health reads dead meanwhile.
+    pub loading: bool,
 }
 
 /// Re-discover servers from state files (§07: reopening the tool re-attaches).
@@ -632,9 +682,10 @@ pub fn reattach(runs_dir: &Path) -> Vec<AttachedRun> {
         }
         let Ok(text) = std::fs::read_to_string(&p) else { continue };
         let Ok(state) = serde_json::from_str::<RunState>(text.trim_start_matches('\u{feff}')) else { continue };
-        let alive = run_alive(&state);
-        let health = if alive { probe_health(&state, false) } else { Health::Dead };
-        out.push(AttachedRun { crashed: !alive, alive, health, state });
+        let live = liveness(&state);
+        let alive = live != Liveness::Gone;
+        let health = if live == Liveness::Up { probe_health(&state, false) } else { Health::Dead };
+        out.push(AttachedRun { crashed: !alive, alive, health, loading: live == Liveness::Loading, state });
     }
     out.sort_by_key(|r| r.state.port);
     out
@@ -810,6 +861,97 @@ mod tests {
         assert!(is_keepalive_image("llamactl.exe"));
         assert!(!is_keepalive_image("llama-fidim.exe"));
         assert!(!is_keepalive_image("fidim-dg.exe"));
+    }
+
+    /// SGLang binds its port only once it is ready (minutes for dd): until
+    /// then a live pid running the spawned command is loading, not crashed.
+    /// A dead pid, or one now running something else, is still crashed.
+    #[cfg(not(windows))]
+    #[test]
+    fn sglang_loading_is_not_crashed() {
+        let dir = std::env::temp_dir().join(format!("fidim-runs-sglang-{}", std::process::id()));
+        // A port nobody listens on, and a live process standing in for a
+        // loading `python -m sglang.launch_server`.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let state = RunState {
+            profile_id: "dd".into(),
+            pid: child.id(),
+            port,
+            host: "127.0.0.1".into(),
+            alias: "dd".into(),
+            started_unix: 1_700_000_000,
+            log_path: dir.join("dd-30000.log"),
+            command_line: "sleep 60".into(),
+            visibility_env: "0,1".into(),
+            device_keys: vec!["pci:A:bus03".into(), "pci:A:bus07".into()],
+            free_mib_before: vec![],
+            cold_start: false,
+            estimated_bytes: 28 * 1024 * 1024 * 1024,
+            ready: false,
+            keepalive_pid: None,
+            engine: Engine::SgLang,
+        };
+        let attach = |s: &RunState| {
+            std::fs::remove_dir_all(&dir).ok();
+            s.save(&dir).unwrap();
+            let mut runs = reattach(&dir);
+            assert_eq!(runs.len(), 1);
+            runs.remove(0)
+        };
+
+        let r = attach(&state);
+        assert!(r.alive && r.loading && !r.crashed, "{r:?}");
+        assert_eq!(r.health, Health::Dead);
+        assert!(run_alive(&state));
+        // Its memory counts against a concurrent launch while it loads.
+        assert_eq!(inflight_of(std::slice::from_ref(&r)), state.estimated_bytes);
+
+        // Same live pid, but not what we spawned (a reused pid): crashed.
+        let r = attach(&RunState { command_line: "sleep 61".into(), ..state.clone() });
+        assert!(r.crashed && !r.alive && !r.loading, "{r:?}");
+        // It answered once and has lost its port since: not loading.
+        let r = attach(&RunState { ready: true, ..state.clone() });
+        assert!(r.crashed && !r.loading, "{r:?}");
+        // The other engines are judged as before.
+        for engine in [Engine::LlamaServer, Engine::DiffusionGemma, Engine::Unknown] {
+            let r = attach(&RunState { engine, ..state.clone() });
+            assert!(r.crashed && !r.loading, "{engine:?}: {r:?}");
+        }
+
+        // Stop kills a loading server rather than only forgetting it.
+        attach(&state);
+        let reaper = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait().unwrap()
+        });
+        stop(&state, &dir).unwrap();
+        assert!(!reaper.join().unwrap().success());
+        assert!(!RunState::state_path(&dir, "dd", port).exists());
+        // And once the pid is gone the run reads crashed.
+        let r = attach(&state);
+        assert!(r.crashed && !r.alive && !r.loading, "{r:?}");
+
+        // Bound and answering: up, not loading.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let up = RunState {
+            pid: std::process::id(),
+            port: listener.local_addr().unwrap().port(),
+            ready: true,
+            command_line: "python -m sglang.launch_server".into(),
+            ..state.clone()
+        };
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        });
+        let r = attach(&up);
+        assert!(r.alive && !r.loading && !r.crashed, "{r:?}");
+        assert_eq!(r.health, Health::Healthy);
+        t.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

@@ -1696,7 +1696,7 @@ fn cmd_status(cfg: &Config, deep: bool, json: bool) -> anyhow::Result<()> {
     let mut runs = supervise::reattach(&cfg.runs_dir);
     if deep {
         for r in &mut runs {
-            if r.alive {
+            if r.alive && !r.loading {
                 r.health = supervise::probe_health(&r.state, true);
             }
         }
@@ -1712,6 +1712,7 @@ fn cmd_status(cfg: &Config, deep: bool, json: bool) -> anyhow::Result<()> {
     for r in &runs {
         let health = match (&r.crashed, &r.health) {
             (true, _) => "CRASHED (state file kept; see log)".into(),
+            (false, _) if r.loading => "loading (process alive, port not open yet)".into(),
             (false, Health::Healthy) => match r.state.keepalive_pid {
                 Some(kp) if supervise::process_alive(kp) => "healthy + keep-alive".to_string(),
                 Some(_) => "healthy, keep-alive DIED".to_string(),
@@ -1786,6 +1787,9 @@ fn cmd_bench(
     let run = find_run(cfg, profile_id)?;
     if run.crashed {
         bail!("run for {profile_id} has crashed — relaunch before benchmarking");
+    }
+    if run.loading {
+        bail!("{profile_id} is still loading — benchmark once it answers");
     }
     let n = concurrency.unwrap_or(profile.concurrent_requests()).max(1);
     let opts = fidim_core::bench::BenchOptions {
@@ -2079,7 +2083,8 @@ fn cmd_router(cfg: &Config, json: bool, cmd: RouterCmd) -> anyhow::Result<()> {
             }
         }
         RouterCmd::Status => {
-            let ms = router::models(&rc.host, rc.port)?;
+            let mut ms = router::models(&rc.host, rc.port)?;
+            router::mark_loading(&mut ms, &supervise::reattach(&cfg.runs_dir));
             if json { println!("{}", serde_json::to_string_pretty(&ms)?); } else {
                 for m in &ms {
                     println!("  {:<40} {}{}", m.id, m.status, if m.failed { format!(" FAILED exit {:?}", m.exit_code) } else { String::new() });
@@ -2103,7 +2108,9 @@ fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
     let all_runs = supervise::reattach(&cfg.runs_dir);
     let router_run = all_runs.iter().find(|x| x.alive && x.state.profile_id == fidim_core::router::ROUTER_ID).map(|x| x.state.clone());
     for r in all_runs.into_iter().filter(|r| r.alive) {
-        let samples: Vec<live::LiveSample> = if r.state.profile_id == fidim_core::router::ROUTER_ID {
+        let samples: Vec<live::LiveSample> = if r.loading {
+            vec![]
+        } else if r.state.profile_id == fidim_core::router::ROUTER_ID {
             fidim_core::router::models(&r.state.host, r.state.port)
                 .unwrap_or_default()
                 .iter()
@@ -2131,7 +2138,7 @@ fn cmd_live(cfg: &Config, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     for (r, samples, busy) in &rows {
-        println!("{:<16} :{:<5} pid {:<6} gpu busy {:>5.1}%", r.state.profile_id, r.state.port, r.state.pid, busy);
+        println!("{:<16} :{:<5} pid {:<6} gpu busy {:>5.1}%{}", r.state.profile_id, r.state.port, r.state.pid, busy, if r.loading { "  loading" } else { "" });
         for s in samples {
             let m = &s.metrics;
             let g = |k: &str| m.get(k).copied().unwrap_or(0.0);

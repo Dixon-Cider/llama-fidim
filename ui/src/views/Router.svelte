@@ -252,6 +252,7 @@
               <td>
                 {#if sg}
                   {#if m.status === "loaded"}<span class="chip pass" title="The member's SGLang server answers the router's health check">running</span>
+                  {:else if m.status === "loading"}<span class="chip warn live" title="The member's SGLang server is up but has not opened its port yet">loading</span>
                   {:else}<span class="chip plain" title="The member's SGLang server is not answering; Start launches it from its profile">stopped</span>{/if}
                 {:else if m.status === "loaded"}<span class="chip pass">loaded</span>
                 {:else if m.status === "loading"}<span class="chip warn">loading</span>
@@ -260,7 +261,7 @@
               </td>
               <td>
                 {#if sg}
-                  {#if m.status === "loaded"}
+                  {#if m.status === "loaded" || m.status === "loading"}
                     <button class="btn" onclick={() => unloadModel(m.id)} disabled={!!busy} title="Stop this member's SGLang server; the router stays up">{busy === m.id ? busyVerb : "Stop"}</button>
                   {:else}
                     <button class="btn" onclick={() => loadModel(m.id)} disabled={!!busy} title="Launch this member's SGLang server from its profile (can take minutes)">{busy === m.id ? busyVerb : "Start"}</button>
