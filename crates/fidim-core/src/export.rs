@@ -21,9 +21,10 @@ pub fn default_format() -> &'static str {
 pub fn render(cfg: &Config, profile: &Profile, platform: &dyn Platform, running_aliases: Vec<String>, format: Option<&str>) -> Result<(String, &'static str)> {
     let plan = if profile.engine.is_sglang() {
         let devices = crate::sglang::devices_now(cfg, platform)?;
-        let device = crate::sglang::resolve_device(profile, &devices)
-            .ok_or_else(|| Error::Config(format!("no card matches {}", profile.devices.first().map(|d| d.key.as_str()).unwrap_or("(no device)"))))?;
-        crate::sglang::compose(cfg, profile, device, &cfg.runs_dir)?
+        let devs = crate::sglang::resolve_devices(profile, &devices).ok_or_else(|| {
+            Error::Config(format!("no card matches {}", profile.devices.iter().map(|d| d.key.as_str()).collect::<Vec<_>>().join(", ")))
+        })?;
+        crate::sglang::compose(cfg, profile, &devs, &cfg.runs_dir)?
     } else {
         crate::launch::prepare(cfg, profile, platform, running_aliases)?.plan
     };

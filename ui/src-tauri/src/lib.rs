@@ -353,9 +353,10 @@ fn live_check_blocking(
     let findings = profile::validate(&p);
     if p.engine.is_sglang() {
         let devices = fidim_core::sglang::devices_now(&cfg, &HostPlatform).map_err(|e| e.to_string())?;
-        let device = fidim_core::sglang::resolve_device(&p, &devices);
-        let results = fidim_core::sglang::preflight(&cfg, &p, device, &HostPlatform, &fidim_core::sglang::running_aliases(&cfg));
-        let plan = device.and_then(|d| fidim_core::sglang::compose(&cfg, &p, d, &cfg.runs_dir).ok());
+        let devs = fidim_core::sglang::resolve_devices(&p, &devices);
+        let device = devs.as_ref().and_then(|v| v.first().copied());
+        let results = fidim_core::sglang::preflight(&cfg, &p, devs.as_deref(), &HostPlatform, &fidim_core::sglang::running_aliases(&cfg));
+        let plan = devs.as_ref().and_then(|d| fidim_core::sglang::compose(&cfg, &p, d, &cfg.runs_dir).ok());
         let s = fidim_core::sglang::cfg_of(&p);
         let estimate = device.map(|d| serde_json::json!({
             "total_bytes": fidim_core::sglang::estimated_bytes(&s, d),
@@ -454,8 +455,8 @@ fn do_launch(id: &str, override_blocks: bool) -> Result<serde_json::Value, Strin
         // rows for the editor (and its Override button), not as an error.
         if !override_blocks {
             let devices = fidim_core::sglang::devices_now(&cfg, &platform).map_err(|e| e.to_string())?;
-            let device = fidim_core::sglang::resolve_device(&profile, &devices);
-            let results = fidim_core::sglang::preflight(&cfg, &profile, device, &platform, &fidim_core::sglang::running_aliases(&cfg));
+            let devs = fidim_core::sglang::resolve_devices(&profile, &devices);
+            let results = fidim_core::sglang::preflight(&cfg, &profile, devs.as_deref(), &platform, &fidim_core::sglang::running_aliases(&cfg));
             if preflight::any_block(&results) {
                 return Ok(serde_json::json!({ "blocked": true, "results": results }));
             }

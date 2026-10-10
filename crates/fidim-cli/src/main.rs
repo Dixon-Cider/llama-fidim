@@ -1414,13 +1414,13 @@ fn cmd_check(
     let sg_profile = load_profile(cfg, profile_id)?;
     if sg_profile.engine.is_sglang() {
         let devices = fidim_core::sglang::devices_now(cfg, platform)?;
-        let device = fidim_core::sglang::resolve_device(&sg_profile, &devices);
-        let results = fidim_core::sglang::preflight(cfg, &sg_profile, device, platform, &fidim_core::sglang::running_aliases(cfg));
+        let devs = fidim_core::sglang::resolve_devices(&sg_profile, &devices);
+        let results = fidim_core::sglang::preflight(cfg, &sg_profile, devs.as_deref(), platform, &fidim_core::sglang::running_aliases(cfg));
         if json {
             println!("{}", serde_json::to_string_pretty(&results)?);
         } else {
             print_results(&results);
-            if let Some(d) = device {
+            if let Some(d) = &devs {
                 println!("\n  {}", fidim_core::sglang::compose(cfg, &sg_profile, d, &cfg.runs_dir)?.command_line());
             }
         }

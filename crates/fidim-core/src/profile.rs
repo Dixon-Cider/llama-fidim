@@ -941,8 +941,15 @@ fn validate_server(p: &Profile, out: &mut Vec<Finding>) {
 /// every prompt here, and those are Errors.
 fn validate_sglang(p: &Profile, out: &mut Vec<Finding>) {
     let s = crate::sglang::cfg_of(p);
-    if p.devices.len() != 1 {
-        out.push(finding(Severity::Error, "sglang-one-device", format!("an SGLang profile runs on exactly one card ({} listed)", p.devices.len())));
+    // One card, or several for tensor parallelism (one rank per card, `--tp N`).
+    if p.devices.is_empty() {
+        out.push(finding(Severity::Error, "sglang-one-device", "an SGLang profile needs at least one card".into()));
+    } else if p.devices.iter().any(|d| d.split_fraction.is_some()) && p.devices.len() > 1 {
+        out.push(finding(
+            Severity::Warning,
+            "sglang-tp-split",
+            "tensor parallelism splits every layer evenly across the cards; split fractions are ignored".into(),
+        ));
     }
     if p.runtime.ctx_total == 0 {
         out.push(finding(Severity::Error, "sglang-context", "runtime.ctx_total (the --context-length) is 0".into()));

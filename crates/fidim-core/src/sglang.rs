@@ -366,22 +366,25 @@ const MAMBA_AUTO_SHARE: f64 = 0.9 / 1.9;
 /// processes hold on the card now. Checked against both servers on this box:
 /// 27B GGUF (fp4 KV, NEXTN, 10 slots) 204K predicted vs 208,379 allocated;
 /// 35B-A3B (fp8 KV, 40 slots) 438K vs 428,128.
-pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64, others_bytes: u64) -> PoolBudget {
+/// The split on ONE card. `tp` > 1 (one card per profile device) shards the
+/// weights, the draft, the recurrent state and the KV heads across the cards.
+pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64, others_bytes: u64, tp: u64) -> PoolBudget {
+    let tp = tp.max(1);
     let pool = estimated_bytes(s, device);
-    let weights = shape.weights_bytes / WEIGHTS_VRAM_DEN * WEIGHTS_VRAM_NUM;
+    let weights = shape.weights_bytes / WEIGHTS_VRAM_DEN * WEIGHTS_VRAM_NUM / tp;
     let spec = s.spec.as_ref();
     let draft = match spec {
         Some(sp) if sp.is_nextn() => NEXTN_DRAFT_BYTES,
         Some(sp) if sp.needs_draft_model() => sp.draft_model.as_deref().map(path_bytes).unwrap_or(0) / WEIGHTS_VRAM_DEN * WEIGHTS_VRAM_NUM,
         _ => 0,
-    };
+    } / tp;
     // SGLang starts from what is free (the card minus other processes) and
     // keeps (1 - mem_fraction) of the whole card back.
     let base = (256u64 << 20).max(others_bytes);
     let rest = pool.saturating_sub(base).saturating_sub(weights).saturating_sub(draft);
     let draft_tokens = spec.map(|sp| sp.draft_tokens.max(1) as u64).unwrap_or(0);
     let (state_bytes, state_slots, state_auto) = if shape.hybrid {
-        let per_slot = shape.state_bytes_per_slot.unwrap_or(DEFAULT_STATE_BYTES_PER_SLOT);
+        let per_slot = shape.state_bytes_per_slot.unwrap_or(DEFAULT_STATE_BYTES_PER_SLOT) / tp;
         match s.mamba_slots {
             Some(k) => {
                 let k = k as u64;
@@ -404,7 +407,7 @@ pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64,
         (0, None, false)
     };
     let kv_budget = rest.saturating_sub(state_bytes);
-    let mut per_token = shape.kv_bytes_per_token(&s.kv_cache_dtype).max(1);
+    let mut per_token = (shape.kv_bytes_per_token(&s.kv_cache_dtype) / tp).max(1);
     // NEXTN's draft layer keeps its own KV for every token of the pool.
     if spec.is_some_and(SgSpec::is_nextn) && shape.attention_layers > 0 {
         per_token = per_token * (shape.attention_layers + shape.nextn_layers.unwrap_or(1)) / shape.attention_layers;
@@ -631,10 +634,13 @@ fn join_paths(parts: &[PathBuf]) -> String {
     parts.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":")
 }
 
-/// The server command for `p` on `device`.
-pub fn compose(cfg: &Config, p: &Profile, device: &Device, runs_dir: &Path) -> Result<LaunchPlan> {
+/// The server command for `p` on `devices` (one tensor-parallel rank per card).
+pub fn compose(cfg: &Config, p: &Profile, devices: &[&Device], runs_dir: &Path) -> Result<LaunchPlan> {
     let host = host_of(cfg)?;
     let s = cfg_of(p);
+    if devices.is_empty() {
+        return Err(Error::Config("no card to launch on".into()));
+    }
     let model = p.model.path.to_string_lossy().into_owned();
     let mut args: Vec<String> = vec![
         "-m".into(),
@@ -646,7 +652,7 @@ pub fn compose(cfg: &Config, p: &Profile, device: &Device, runs_dir: &Path) -> R
         "--attention-backend".into(),
         s.attention_backend.clone(),
         "--tp".into(),
-        "1".into(),
+        devices.len().to_string(),
         "--host".into(),
         p.server.host.clone(),
         "--port".into(),
@@ -695,7 +701,7 @@ pub fn compose(cfg: &Config, p: &Profile, device: &Device, runs_dir: &Path) -> R
     }
     args.extend(s.extra_args.iter().cloned());
 
-    let visibility_env = device.hip_index.to_string();
+    let visibility_env = devices.iter().map(|d| d.hip_index.to_string()).collect::<Vec<_>>().join(",");
     let mut env: Vec<(String, String)> = Vec::new();
     let rocm = host.rocm_home();
     if let Some(r) = &rocm {
@@ -733,6 +739,12 @@ pub fn compose(cfg: &Config, p: &Profile, device: &Device, runs_dir: &Path) -> R
     env.push(("ROCPROFILER_REGISTER_ENABLED".into(), "0".into()));
     for (k, v) in &host.env {
         env.push((k.clone(), v.clone()));
+    }
+    // Tensor parallelism across cards without RCCL: card 1 here sits behind a chipset link
+    // with no PCIe AtomicOps, where RCCL's kernels cannot be dispatched. hostcomm (the
+    // tools-dir SGLang patch) all-reduces through pinned host memory instead.
+    if devices.len() > 1 && !p.env.contains_key("SGLANG_HOSTCOMM") {
+        env.push(("SGLANG_HOSTCOMM".into(), "1".into()));
     }
     for (k, v) in &p.env {
         env.push((k.clone(), v.clone()));
@@ -801,6 +813,30 @@ fn check(id: &'static str, n: u8, title: &'static str, outcome: Outcome) -> Chec
 /// Bytes the launch will take on the card: SGLang reserves `mem_fraction` of
 /// the card's total for weights and pool, then grows ~3 GB of activations
 /// and allocator cache under long-context load.
+/// `--max-total-tokens N` from the profile's extra args. SGLang then allocates a KV pool of
+/// N tokens instead of filling its whole static share, so two servers can share the cards
+/// (dd + qwenMoE at --tp 2, both at share 0.95, launched in either order).
+pub fn max_total_tokens(s: &SgLangCfg) -> Option<u64> {
+    let a = &s.extra_args;
+    a.windows(2)
+        .find(|w| w[0] == "--max-total-tokens")
+        .and_then(|w| w[1].parse().ok())
+        .or_else(|| a.iter().find_map(|x| x.strip_prefix("--max-total-tokens=").and_then(|v| v.parse().ok())))
+}
+
+/// VRAM the server holds on ONE card once its pools are allocated: the static share, or,
+/// with a token cap and a readable model, only weights + draft + state + the capped KV.
+pub fn need_bytes(s: &SgLangCfg, device: &Device, shape: Option<&ModelShape>, ctx: u64, tp: u64) -> u64 {
+    let share = estimated_bytes(s, device);
+    match (max_total_tokens(s), shape) {
+        (Some(cap), Some(shape)) => {
+            let b = pool_budget(s, shape, device, ctx, 0, tp);
+            ((256u64 << 20) + b.weights_bytes + b.draft_bytes + b.state_bytes + cap * b.kv_bytes_per_token).min(share)
+        }
+        _ => share,
+    }
+}
+
 pub fn estimated_bytes(s: &SgLangCfg, device: &Device) -> u64 {
     (device.total_mib as f64 * 1024.0 * 1024.0 * s.mem_fraction) as u64
 }
@@ -829,18 +865,21 @@ pub fn free_for_launch(cfg: &Config, p: &Profile, d: &Device, platform: &dyn Pla
 pub fn budget_for(cfg: &Config, p: &Profile, d: &Device, platform: &dyn Platform) -> Option<PoolBudget> {
     let shape = ModelShape::of_model(&p.model.path)?;
     let others = (d.total_mib * 1024 * 1024).saturating_sub(free_for_launch(cfg, p, d, platform));
-    Some(pool_budget(&cfg_of(p), &shape, d, p.runtime.ctx_total, others))
+    Some(pool_budget(&cfg_of(p), &shape, d, p.runtime.ctx_total, others, tp_of(p)))
 }
 
 pub fn preflight(
     cfg: &Config,
     p: &Profile,
-    device: Option<&Device>,
+    devices: Option<&[&Device]>,
     platform: &dyn Platform,
     running_aliases: &[String],
 ) -> Vec<CheckResult> {
     let s = cfg_of(p);
     let mut out = Vec::new();
+    // Per-card checks run on every card of a tensor-parallel profile.
+    let devs: Vec<&Device> = devices.map(<[&Device]>::to_vec).unwrap_or_default();
+    let device = devs.first().copied();
 
     // 1: the engine runs
     out.push(match host_of(cfg) {
@@ -917,7 +956,7 @@ pub fn preflight(
     });
 
     // 4: the attention kernel exists for this card's vendor
-    if let Some(d) = device {
+    for d in devs.iter().copied() {
         let b = s.attention_backend.as_str();
         let amd = d.stable_key.contains("VEN_1002");
         let nvidia = d.stable_key.contains("VEN_10DE");
@@ -939,20 +978,26 @@ pub fn preflight(
 
     // 6: VRAM fits (free now + what our own previous instance holds)
     let mut others_bytes = 0u64;
-    if let Some(d) = device {
-        let need = estimated_bytes(&s, d);
+    let shape6 = ModelShape::of_model(&p.model.path);
+    let capped = max_total_tokens(&s).is_some();
+    for d in devs.iter().copied() {
+        let need = need_bytes(&s, d, shape6.as_ref(), p.runtime.ctx_total, tp_of(p));
         let free = free_for_launch(cfg, p, d, platform);
-        others_bytes = (d.total_mib * 1024 * 1024).saturating_sub(free);
+        others_bytes = others_bytes.max((d.total_mib * 1024 * 1024).saturating_sub(free));
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         out.push(check(
             "vram-fits",
             6,
             "Static pool fits in free VRAM",
             if need > free {
-                Outcome::Block(format!(
-                    "{}: SGLang will reserve {:.1} GiB ({:.0}% of {:.1}) but only {:.1} GiB is free",
-                    d.name, gib(need), s.mem_fraction * 100.0, gib(d.total_mib * 1024 * 1024), gib(free)
-                ))
+                Outcome::Block(if capped {
+                    format!("{}: SGLang will hold ~{:.1} GiB (weights, state, capped KV) but only {:.1} GiB is free", d.name, gib(need), gib(free))
+                } else {
+                    format!(
+                        "{}: SGLang will reserve {:.1} GiB ({:.0}% of {:.1}) but only {:.1} GiB is free",
+                        d.name, gib(need), s.mem_fraction * 100.0, gib(d.total_mib * 1024 * 1024), gib(free)
+                    )
+                })
             } else {
                 Outcome::Pass
             },
@@ -960,7 +1005,9 @@ pub fn preflight(
         // display headroom: the static pool is taken at launch; activations,
         // CUDA graphs and the allocator cache grow on top of it under load.
         let total = d.total_mib * 1024 * 1024;
-        let headroom = total.saturating_sub(need);
+        // With a token cap the server takes only `need`; whatever the other servers on this
+        // card hold is gone too, so measure the headroom from what is free.
+        let headroom = if capped { free.saturating_sub(need) } else { total.saturating_sub(need) };
         let loaded = headroom.saturating_sub(RUNTIME_OVERHEAD_BYTES);
         let safe_fraction = 1.0 - (DISPLAY_HEADROOM_BYTES + RUNTIME_OVERHEAD_BYTES) as f64 / total as f64;
         out.push(check(
@@ -986,7 +1033,7 @@ pub fn preflight(
 
     // 7: does the model + KV for the context fit inside the pool?
     if let (Some(d), Some(shape)) = (device, ModelShape::of_model(&p.model.path)) {
-        let b = pool_budget(&s, &shape, d, p.runtime.ctx_total, others_bytes);
+        let b = pool_budget(&s, &shape, d, p.runtime.ctx_total, others_bytes, tp_of(p));
         let gib = |x: u64| x as f64 / (1u64 << 30) as f64;
         let state = match (b.state_slots, b.state_auto) {
             (Some(n), true) => format!(", state pool {:.1} GiB (auto, ~{n} slots)", gib(b.state_bytes)),
@@ -1108,8 +1155,28 @@ pub fn devices_now(cfg: &Config, platform: &dyn Platform) -> Result<Vec<Device>>
 }
 
 pub fn resolve_device<'d>(p: &Profile, devices: &'d [Device]) -> Option<&'d Device> {
-    let key = p.devices.first()?.key.as_str();
-    crate::devices::resolve_key(key, devices, &[]).ok().and_then(|r| devices.iter().find(|d| d.stable_key == r.device.stable_key))
+    resolve_devices(p, devices).and_then(|v| v.into_iter().next())
+}
+
+/// Every card of the profile, in order; None when any key fails to resolve.
+/// More than one card = tensor parallelism across them (`--tp N`).
+pub fn resolve_devices<'d>(p: &Profile, devices: &'d [Device]) -> Option<Vec<&'d Device>> {
+    if p.devices.is_empty() {
+        return None;
+    }
+    p.devices
+        .iter()
+        .map(|pd| {
+            crate::devices::resolve_key(pd.key.as_str(), devices, &[])
+                .ok()
+                .and_then(|r| devices.iter().find(|d| d.stable_key == r.device.stable_key))
+        })
+        .collect()
+}
+
+/// SGLang tensor-parallel width: one rank per profile device.
+pub fn tp_of(p: &Profile) -> u64 {
+    p.devices.len().max(1) as u64
 }
 
 pub fn running_aliases(cfg: &Config) -> Vec<String> {
@@ -1126,8 +1193,8 @@ pub fn launch(
     ready_timeout: Duration,
 ) -> Result<SgLaunch> {
     let devices = devices_now(cfg, platform)?;
-    let device = resolve_device(p, &devices);
-    let results = preflight(cfg, p, device, platform, &running_aliases(cfg));
+    let devs = resolve_devices(p, &devices);
+    let results = preflight(cfg, p, devs.as_deref(), platform, &running_aliases(cfg));
     if crate::preflight::any_block(&results) && !override_blocks {
         return Err(Error::Config(format!(
             "pre-flight blocked: {}",
@@ -1142,8 +1209,9 @@ pub fn launch(
                 .join("; ")
         )));
     }
-    let device = device.ok_or_else(|| Error::Config("device does not resolve".into()))?;
-    let plan = compose(cfg, p, device, &cfg.runs_dir)?;
+    let devs = devs.ok_or_else(|| Error::Config("device does not resolve".into()))?;
+    let device = devs[0];
+    let plan = compose(cfg, p, &devs, &cfg.runs_dir)?;
 
     let mut replaced = None;
     for run in supervise::reattach(&cfg.runs_dir).into_iter().filter(|r| r.alive && r.state.port == p.server.port) {
@@ -1159,10 +1227,10 @@ pub fn launch(
         &plan,
         p,
         &cfg.runs_dir,
-        vec![device.stable_key.clone()],
-        vec![device.free_mib],
+        devs.iter().map(|d| d.stable_key.clone()).collect(),
+        devs.iter().map(|d| d.free_mib).collect(),
         cold,
-        estimated_bytes(&s, device),
+        need_bytes(&s, device, ModelShape::of_model(&p.model.path).as_ref(), p.runtime.ctx_total, tp_of(p)),
     )?;
     supervise::wait_ready_in(&state, ready_timeout, Some(&cfg.runs_dir))?;
     let _ = supervise::record_model_loaded(&Config::config_dir(), &p.model.path);
@@ -1288,20 +1356,64 @@ mod tests {
             "mem_fraction": 0.85, "mamba_slots": 10, "max_running_requests": 2,
             "kv_cache_dtype": "fp4_mx_block16", "spec": { "algorithm": "NEXTN" } })).unwrap();
         let shape = ModelShape { weights_bytes: (17.2 * (1u64 << 30) as f64) as u64, attention_layers: 16, kv_heads: 4, head_dim: 256, label: "qwen35".into(), state_bytes_per_slot: Some(151 << 20), hybrid: true, nextn_layers: Some(1) };
-        let b = pool_budget(&s, &shape, &dev(32624), 262144, 0);
+        let b = pool_budget(&s, &shape, &dev(32624), 262144, 0, 1);
         assert!((190_000..225_000).contains(&b.tokens_in_budget), "{}", b.tokens_in_budget);
         assert!(b.tokens_in_budget < b.ctx);
         // qwenMoE: 35B-A3B (19.8 GiB), fp8 KV, 40 slots, 8 requests, 0.90: 428,128.
         let s: SgLangCfg = serde_json::from_value(serde_json::json!({
             "mem_fraction": 0.90, "mamba_slots": 40, "max_running_requests": 8, "kv_cache_dtype": "fp8_e4m3" })).unwrap();
         let shape = ModelShape { weights_bytes: (19.8 * (1u64 << 30) as f64) as u64, attention_layers: 10, kv_heads: 2, head_dim: 256, label: "qwen35moe".into(), state_bytes_per_slot: Some(30 * 4096 * 128 * 4), hybrid: true, nextn_layers: Some(0) };
-        let b = pool_budget(&s, &shape, &dev(32624), 262144, 0);
+        let b = pool_budget(&s, &shape, &dev(32624), 262144, 0, 1);
         assert!((405_000..450_000).contains(&b.tokens_in_budget), "{}", b.tokens_in_budget);
         assert!(b.tokens_in_budget > b.ctx);
         // auto state slots: SGLang gives the state pool 0.9/1.9 of the rest.
         let s: SgLangCfg = serde_json::from_value(serde_json::json!({ "mem_fraction": 0.90, "kv_cache_dtype": "fp8_e4m3" })).unwrap();
-        let b2 = pool_budget(&s, &shape, &dev(32624), 262144, 0);
+        let b2 = pool_budget(&s, &shape, &dev(32624), 262144, 0, 1);
         assert!(b2.state_auto && b2.state_bytes > b.state_bytes && b2.tokens_in_budget < b.tokens_in_budget);
+    }
+
+    #[test]
+    fn pool_budget_per_card_under_tensor_parallelism() {
+        // dd at --tp 2 over both R9700s (2026-10-09): 0.85, 15 state slots, 3 requests,
+        // NEXTN 4 draft tokens; SGLang allocated 1,475,208 tokens per rank (heads split,
+        // so each rank's per-token KV is half and every token lives on both cards).
+        let s: SgLangCfg = serde_json::from_value(serde_json::json!({
+            "mem_fraction": 0.85, "mamba_slots": 15, "max_running_requests": 3,
+            "kv_cache_dtype": "fp4_mx_block16", "spec": { "algorithm": "NEXTN", "draft_tokens": 4 } })).unwrap();
+        let shape = ModelShape { weights_bytes: (17.2 * (1u64 << 30) as f64) as u64, attention_layers: 16, kv_heads: 4, head_dim: 256, label: "qwen35".into(), state_bytes_per_slot: Some(151 << 20), hybrid: true, nextn_layers: Some(1) };
+        let one = pool_budget(&s, &shape, &dev(32624), 262144, 0, 1);
+        let two = pool_budget(&s, &shape, &dev(32624), 262144, 0, 2);
+        assert!(two.weights_bytes * 2 <= one.weights_bytes + 1 && two.kv_bytes_per_token * 2 <= one.kv_bytes_per_token + 1);
+        assert!((1_350_000..1_700_000).contains(&two.tokens_in_budget), "{}", two.tokens_in_budget);
+    }
+
+    #[test]
+    fn compose_tensor_parallel_over_both_cards() {
+        let mut d1 = dev(32624);
+        d1.stable_key = "pci:VEN_1002&DEV_7551:bus08".into();
+        d1.hip_index = 1;
+        let d0 = dev(32624);
+        let dir = std::env::temp_dir().join(format!("fidim-tp-{}", std::process::id()));
+        let tools = dir.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let mut cfg = Config::default_for_machine();
+        cfg.sglang = Some(serde_json::from_value(serde_json::json!({ "venv": dir.join("venv"), "tools_dir": tools })).unwrap());
+        let p: Profile = serde_json::from_value(serde_json::json!({
+            "schema": 1, "engine": "sglang", "id": "tp", "name": "tp",
+            "build": { "path": "" }, "model": { "path": "/m/x.gguf" },
+            "devices": [ { "key": "pci:VEN_1002&DEV_7551:bus03" }, { "key": "pci:VEN_1002&DEV_7551:bus08" } ],
+            "server": { "port": 30010, "alias": "tp", "host": "127.0.0.1" },
+            "runtime": { "ctx_total": 262144 } })).unwrap();
+        let plan = compose(&cfg, &p, &[&d0, &d1], &dir).unwrap();
+        let tp = plan.args.iter().position(|a| a == "--tp").unwrap();
+        assert_eq!(plan.args[tp + 1], "2");
+        assert_eq!(plan.visibility_env, "0,1");
+        assert!(plan.env.iter().any(|(k, v)| k == "SGLANG_HOSTCOMM" && v == "1"));
+        assert!(plan.env.iter().any(|(k, v)| k == "HIP_VISIBLE_DEVICES" && v == "0,1"));
+        // one card: no hostcomm, --tp 1
+        let single = compose(&cfg, &p, &[&d0], &dir).unwrap();
+        assert!(!single.env.iter().any(|(k, _)| k == "SGLANG_HOSTCOMM"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
