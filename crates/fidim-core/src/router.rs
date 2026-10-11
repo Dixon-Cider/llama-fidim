@@ -549,7 +549,7 @@ mod tests {
             crashed: false,
             loading,
         };
-        let model = |id: &str, status: &str| RouterModel { id: id.into(), status: status.into(), failed: status != "loaded", exit_code: None };
+        let model = |id: &str, status: &str| RouterModel { id: id.into(), status: status.into(), failed: status != "loaded", exit_code: None, remote: None };
         let mut ms = vec![model("dd", "unloaded"), model("qwenMoE", "unloaded"), model("gemma", "unloaded"), model("big", "loaded")];
         // dd by alias, qwenMoE by profile id (no alias), gemma alive and
         // not loading (bound but not yet healthy at the router) stays as is.

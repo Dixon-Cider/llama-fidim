@@ -150,24 +150,27 @@
     mem_fraction: 0.85, chunked_prefill: 8192, max_running_requests: 2, mamba_slots: null,
     kv_cache_dtype: "fp8_e4m3", attention_backend: "triton", dtype: "bfloat16", spec: null,
     reasoning_parser: "", tool_call_parser: "", memguard_gb: 12, enable_metrics: true,
-    sleep_on_idle: true, compile_threads: 2, aliases: [], extra_args: [],
+    sleep_on_idle: true, compile_threads: 2, aliases: [], extra_args: [], mamba_ssm_dtype: "",
   };
-  const SG_SPEC_DEFAULTS = { algorithm: "NEXTN", steps: 3, topk: 1, draft_tokens: 4, token_map: "", draft_model: "" };
+  const SG_SPEC_DEFAULTS = { algorithm: "NEXTN", steps: 3, topk: 1, draft_tokens: 4, token_map: "", draft_model: "", draft_window: null, draft_kv_cache_dtype: "" };
+  // Recurrent-state precision for hybrid models; empty = SGLang's float32.
+  const SG_SSM_DTYPES = ["", "bfloat16", "float32"];
   const SG_KV_DTYPES = ["fp8_e4m3", "fp4_mx_block16", "fp8_e5m2", "bf16", "auto"];
   // Attention kernels by vendor (pre-flight blocks the other vendor's);
   // aiter and wave are Instinct (gfx9) kernels, so a Radeon gets triton.
   const SG_ATTN_BACKENDS_AMD = ["triton", "torch_native", "aiter", "wave"];
   const SG_ATTN_BACKENDS_NVIDIA = ["triton", "flashinfer", "fa3", "fa4", "trtllm_mha", "torch_native"];
   const SG_DTYPES = ["bfloat16", "float16", "auto"];
-  const SG_SPEC_ALGOS = ["NEXTN", "EAGLE", "EAGLE3", "STANDALONE", "NGRAM"];
+  const SG_SPEC_ALGOS = ["NEXTN", "DFLASH", "EAGLE", "EAGLE3", "STANDALONE", "NGRAM"];
   const SG_SPEC_LABELS = {
     NEXTN: "the model's own draft head (NEXTN)",
+    DFLASH: "a block-diffusion draft model (DFLASH)",
     EAGLE: "EAGLE draft model",
     EAGLE3: "EAGLE-3 draft model",
     STANDALONE: "a small model of the same family (STANDALONE)",
     NGRAM: "prompt lookup, no model (NGRAM)",
   };
-  const sgNeedsDraftModel = (a) => ["EAGLE", "EAGLE3", "STANDALONE"].includes(String(a ?? "").toUpperCase());
+  const sgNeedsDraftModel = (a) => ["EAGLE", "EAGLE3", "STANDALONE", "DFLASH"].includes(String(a ?? "").toUpperCase());
   const SG_REASONING_PARSERS = ["qwen3-thinking", "qwen3", "deepseek-r1", "deepseek-v3", "glm45", "kimi", "gpt-oss", "step3"];
   const SG_TOOL_PARSERS = ["qwen3_coder", "qwen25", "hermes", "llama3", "mistral", "deepseekv3", "glm45", "kimi_k2", "pythonic", "gpt-oss"];
   // The one card an SGLang profile runs on, from the device list.
@@ -705,10 +708,15 @@
         if (!sp.token_map) delete sp.token_map;
         sp.draft_model = String(sp.draft_model ?? "").trim();
         if (!sp.draft_model || !sgNeedsDraftModel(sp.algorithm)) delete sp.draft_model;
+        sp.draft_window = numOrNull(sp.draft_window);
+        if (sp.draft_window === null || !(sp.draft_window > 0) || String(sp.algorithm).toUpperCase() !== "DFLASH") delete sp.draft_window;
+        else sp.draft_window = Math.round(sp.draft_window);
+        sp.draft_kv_cache_dtype = String(sp.draft_kv_cache_dtype ?? "").trim();
+        if (!sp.draft_kv_cache_dtype || !sgNeedsDraftModel(sp.algorithm)) delete sp.draft_kv_cache_dtype;
       } else {
         delete s.spec;
       }
-      for (const k of ["reasoning_parser", "tool_call_parser"]) {
+      for (const k of ["reasoning_parser", "tool_call_parser", "mamba_ssm_dtype"]) {
         s[k] = String(s[k] ?? "").trim();
         if (!s[k]) delete s[k];
       }
@@ -1415,6 +1423,13 @@
                 hint={sgPool?.state_auto ? `auto: ~${sgPool.state_slots} slots, ${(sgPool.state_bytes / GIB).toFixed(1)} GiB taken from KV` : `5 per concurrent request: ${Math.max(1, Number(draft.sglang.max_running_requests) || 1) * 5} for ${draft.sglang.max_running_requests}`}
                 onchange={scheduleCheck} span={3}
                 title="Recurrent-state slots; fewer than 5 per request caps concurrency (--max-mamba-cache-size)" />
+              <label class="field" style="grid-column: span 2;" title="Recurrent-state precision; bfloat16 halves the state pool and its verify snapshots, leaving that VRAM to the KV cache (--mamba-ssm-dtype)">
+                <span class="k">state precision</span>
+                <select bind:value={draft.sglang.mamba_ssm_dtype} onchange={scheduleCheck}>
+                  {#each SG_SSM_DTYPES as t}<option value={t}>{t || "float32 (default)"}</option>{/each}
+                  {#if draft.sglang.mamba_ssm_dtype && !SG_SSM_DTYPES.includes(draft.sglang.mamba_ssm_dtype)}<option value={draft.sglang.mamba_ssm_dtype}>{draft.sglang.mamba_ssm_dtype}</option>{/if}
+                </select>
+              </label>
             {/if}
             <Range bind:value={draft.sglang.memguard_gb} label="host RAM guard" min={0} max={128} step={1}
               hint="GB of anonymous RAM per process · 0 = off" onchange={scheduleCheck} span={3}
@@ -1514,17 +1529,33 @@
               {#if sgNeedsDraftModel(algo)}
                 <label class="field" style="grid-column: 1 / -1;" title="The draft checkpoint, a folder or file SGLang loads beside the model (--speculative-draft-model-path)">
                   <span class="k">draft model</span>
-                  <input bind:value={draft.sglang.spec.draft_model} oninput={scheduleCheck} placeholder={algo === "STANDALONE" ? "/models/Qwen3-0.6B" : "/models/EAGLE3-Qwen3-8B"} />
+                  <input bind:value={draft.sglang.spec.draft_model} oninput={scheduleCheck} placeholder={algo === "STANDALONE" ? "/models/Qwen3-0.6B" : algo === "DFLASH" ? "/models/Qwen3.8-27B-DFlash2" : "/models/EAGLE3-Qwen3-8B"} />
                 </label>
               {/if}
+              {#if algo !== "DFLASH"}
               <Range bind:value={draft.sglang.spec.steps} label="draft steps" min={1} max={8} step={1} hint={algo === "NGRAM" ? "n-gram lookups per pass" : "3 suits an MTP head"} onchange={scheduleCheck} span={2}
                 title="Draft passes per verify pass (--speculative-num-steps)" />
-              {#if algo !== "NGRAM"}
+              {/if}
+              {#if algo !== "NGRAM" && algo !== "DFLASH"}
                 <Range bind:value={draft.sglang.spec.topk} label="draft top-k" min={1} max={8} step={1} hint="1 = a single chain" onchange={scheduleCheck} span={2}
                   title="Branches kept per step; 1 is what an MTP head is trained for (--speculative-eagle-topk)" />
               {/if}
-              <Range bind:value={draft.sglang.spec.draft_tokens} label="draft tokens" min={1} max={16} step={1} hint={algo === "NGRAM" ? "SGLang picks 12 when unset" : "steps + 1 for a chain"} onchange={scheduleCheck} span={2}
+              <Range bind:value={draft.sglang.spec.draft_tokens} label="draft tokens" min={1} max={16} step={1} hint={algo === "NGRAM" ? "SGLang picks 12 when unset" : algo === "DFLASH" ? "the draft's block size (8 for DFlash2)" : "steps + 1 for a chain"} onchange={scheduleCheck} span={2}
                 title="Tokens verified per pass; more is faster if accepted, wasted if not (--speculative-num-draft-tokens)" />
+              {#if algo === "DFLASH"}
+                <Range bind:value={draft.sglang.spec.draft_window} label="draft window" min={256} max={16384} step={256} nullable offLabel="full"
+                  hint="positions the draft attends to; set, its KV pool is window-sized" format={fmtInt} onchange={scheduleCheck} span={2}
+                  title="Sliding window of the draft's attention; with the gfx1201 draft ring its KV cache holds a window per request instead of a slot per cached token (--speculative-draft-window-size)" />
+              {/if}
+              {#if sgNeedsDraftModel(algo)}
+                <label class="field" style="grid-column: span 2;" title="The draft's own KV precision; empty follows the model's (--speculative-draft-kv-cache-dtype)">
+                  <span class="k">draft cache precision</span>
+                  <select bind:value={draft.sglang.spec.draft_kv_cache_dtype} onchange={scheduleCheck}>
+                    <option value="">same as the model</option>
+                    {#each SG_KV_DTYPES.filter((t) => t !== "auto") as t}<option value={t}>{t}</option>{/each}
+                  </select>
+                </label>
+              {/if}
               {#if algo === "NEXTN" || algo === "EAGLE" || algo === "EAGLE3"}
                 <label class="field" style="grid-column: 1 / -1;" title="Torch-saved id tensor limiting the draft head to hot tokens; empty is full (--speculative-token-map)">
                   <span class="k">hot-token map</span>

@@ -15,6 +15,18 @@ build with uncommitted changes.
 
 ### Added
 
+- **DFLASH speculative decoding for SGLang profiles.** DFLASH (a block-diffusion
+  draft model such as DFlash2) is an algorithm choice with its draft checkpoint,
+  a draft attention window (`--speculative-draft-window-size`) and the draft's
+  own cache precision (`--speculative-draft-kv-cache-dtype`). A safetensors
+  draft beside a GGUF model gets `--speculative-draft-load-format auto
+  --speculative-draft-model-quantization unquant` (SGLang would read it as
+  GGUF); steps and top-k are left to SGLang, which derives them from the block
+  size. Pre-flight counts the draft weights and its KV: window-sized with a
+  window (the gfx1201 draft ring), per cached token without.
+- **State precision for hybrid models** (`--mamba-ssm-dtype`). bfloat16 halves
+  the recurrent-state pool and its verify snapshots; pre-flight and the pool bar
+  follow it.
 - **Remote pool members for the SGLang router.** `~/.fidim/router-remotes.json`
   (or `fidim router serve --remotes-file`) adds remote OpenAI-compatible
   servers to a route, for example a DGX Spark behind `dd`. Each chat/completion

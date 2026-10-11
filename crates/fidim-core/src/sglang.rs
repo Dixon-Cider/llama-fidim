@@ -117,15 +117,28 @@ pub struct SgSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_map: Option<PathBuf>,
     /// `--speculative-draft-model-path`: the separate draft checkpoint EAGLE,
-    /// EAGLE3 and STANDALONE need (NEXTN and NGRAM take none).
+    /// EAGLE3, STANDALONE and DFLASH need (NEXTN and NGRAM take none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_model: Option<PathBuf>,
+    /// `--speculative-draft-window-size`: positions a DFLASH draft attends to. With the
+    /// gfx1201 draft ring (sglang-gfx1201 dflash patch) its KV pool is then window-sized
+    /// instead of one slot per target token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_window: Option<u32>,
+    /// `--speculative-draft-kv-cache-dtype`: the draft's own KV precision (default: the target's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_kv_cache_dtype: Option<String>,
 }
 
 impl SgSpec {
     /// Algorithms that load a second checkpoint from `draft_model`.
     pub fn needs_draft_model(&self) -> bool {
-        matches!(self.algorithm.to_ascii_uppercase().as_str(), "EAGLE" | "EAGLE3" | "STANDALONE")
+        matches!(self.algorithm.to_ascii_uppercase().as_str(), "EAGLE" | "EAGLE3" | "STANDALONE" | "DFLASH")
+    }
+    /// DFLASH drafts a whole block per pass with a block-diffusion model; SGLang derives
+    /// its steps and top-k from the block size (`draft_tokens`).
+    pub fn is_dflash(&self) -> bool {
+        self.algorithm.eq_ignore_ascii_case("DFLASH")
     }
     pub fn is_ngram(&self) -> bool {
         self.algorithm.eq_ignore_ascii_case("NGRAM")
@@ -172,6 +185,10 @@ pub struct SgLangCfg {
     pub dtype: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<SgSpec>,
+    /// `--mamba-ssm-dtype`: precision of a hybrid model's recurrent state (and its
+    /// verify snapshots); bfloat16 halves the state pool. Default: SGLang's (float32).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mamba_ssm_dtype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_parser: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -373,11 +390,13 @@ pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64,
     let pool = estimated_bytes(s, device);
     let weights = shape.weights_bytes / WEIGHTS_VRAM_DEN * WEIGHTS_VRAM_NUM / tp;
     let spec = s.spec.as_ref();
+    let dflash_kv = spec.and_then(|sp| dflash_draft_kv(sp, s, tp));
     let draft = match spec {
         Some(sp) if sp.is_nextn() => NEXTN_DRAFT_BYTES,
         Some(sp) if sp.needs_draft_model() => sp.draft_model.as_deref().map(path_bytes).unwrap_or(0) / WEIGHTS_VRAM_DEN * WEIGHTS_VRAM_NUM,
         _ => 0,
-    } / tp;
+    } / tp
+        + dflash_kv.map_or(0, |k| k.fixed_bytes);
     // SGLang starts from what is free (the card minus other processes) and
     // keeps (1 - mem_fraction) of the whole card back.
     let base = (256u64 << 20).max(others_bytes);
@@ -385,6 +404,11 @@ pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64,
     let draft_tokens = spec.map(|sp| sp.draft_tokens.max(1) as u64).unwrap_or(0);
     let (state_bytes, state_slots, state_auto) = if shape.hybrid {
         let per_slot = shape.state_bytes_per_slot.unwrap_or(DEFAULT_STATE_BYTES_PER_SLOT) / tp;
+        // the state is fp32 unless --mamba-ssm-dtype says otherwise
+        let per_slot = match s.mamba_ssm_dtype.as_deref() {
+            Some("bfloat16" | "float16" | "bf16" | "fp16") => per_slot / 2,
+            _ => per_slot,
+        };
         match s.mamba_slots {
             Some(k) => {
                 let k = k as u64;
@@ -412,6 +436,8 @@ pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64,
     if spec.is_some_and(SgSpec::is_nextn) && shape.attention_layers > 0 {
         per_token = per_token * (shape.attention_layers + shape.nextn_layers.unwrap_or(1)) / shape.attention_layers;
     }
+    // A DFLASH draft without a window keeps its KV per pool token too.
+    per_token += dflash_kv.map_or(0, |k| k.per_token_bytes);
     PoolBudget {
         pool_bytes: pool,
         weights_bytes: weights,
@@ -424,6 +450,52 @@ pub fn pool_budget(s: &SgLangCfg, shape: &ModelShape, device: &Device, ctx: u64,
         tokens_in_budget: kv_budget / per_token,
         ctx,
     }
+}
+
+/// Draft KV cost of a DFLASH draft model on one card.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DflashDraftKv {
+    /// Window-sized pool (`draft_window` set): a ring per request row plus the tail cache.
+    pub fixed_bytes: u64,
+    /// No window: one draft KV cell per target pool token.
+    pub per_token_bytes: u64,
+}
+
+/// Tail-cache slots of the gfx1201 draft ring (SGLANG_DFLASH_DRAFT_TAIL_SLOTS default).
+const DFLASH_DRAFT_TAIL_SLOTS: u64 = 32768;
+
+/// From the draft checkpoint's config.json: layers x KV heads x head_dim, at the draft KV dtype.
+/// None when the algorithm is not DFLASH or the config is unreadable.
+pub fn dflash_draft_kv(sp: &SgSpec, s: &SgLangCfg, tp: u64) -> Option<DflashDraftKv> {
+    if !sp.is_dflash() {
+        return None;
+    }
+    let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(sp.draft_model.as_ref()?.join("config.json")).ok()?).ok()?;
+    let n = |k: &str| cfg.get(k).and_then(serde_json::Value::as_u64);
+    let layers = n("num_hidden_layers")?;
+    let heads = n("num_attention_heads")?;
+    let kv_heads = n("num_key_value_heads").unwrap_or(heads);
+    let head_dim = n("head_dim").or_else(|| Some(n("hidden_size")? / heads.max(1)))?;
+    let draft = ModelShape {
+        weights_bytes: 0,
+        attention_layers: layers,
+        kv_heads,
+        head_dim,
+        label: String::new(),
+        state_bytes_per_slot: None,
+        hybrid: false,
+        nextn_layers: None,
+    };
+    let cell = draft.kv_bytes_per_token(sp.draft_kv_cache_dtype.as_deref().unwrap_or(&s.kv_cache_dtype)) / tp.max(1);
+    Some(match sp.draft_window {
+        Some(w) => {
+            // rows: the request pool (max running + spare); each ring holds window + 2 blocks
+            let rows = s.max_running_requests as u64 + 2;
+            let ring = w as u64 + 2 * sp.draft_tokens.max(1) as u64;
+            DflashDraftKv { fixed_bytes: cell * (1 + rows * ring + DFLASH_DRAFT_TAIL_SLOTS), per_token_bytes: 0 }
+        }
+        None => DflashDraftKv { fixed_bytes: 0, per_token_bytes: cell },
+    })
 }
 
 /// State slots SGLang holds per running request on a hybrid model
@@ -674,10 +746,13 @@ pub fn compose(cfg: &Config, p: &Profile, devices: &[&Device], runs_dir: &Path) 
         args.extend(["--max-mamba-cache-size".into(), m.to_string()]);
     }
     if let Some(sp) = &s.spec {
-        args.extend(["--speculative-algorithm".into(), sp.algorithm.clone(), "--speculative-num-steps".into(), sp.steps.to_string()]);
-        // NGRAM sets its own top-k (the n-gram search breadth) and ignores ours.
-        if !sp.is_ngram() {
-            args.extend(["--speculative-eagle-topk".into(), sp.topk.to_string()]);
+        args.extend(["--speculative-algorithm".into(), sp.algorithm.clone()]);
+        if !sp.is_dflash() {
+            args.extend(["--speculative-num-steps".into(), sp.steps.to_string()]);
+            // NGRAM sets its own top-k (the n-gram search breadth) and ignores ours.
+            if !sp.is_ngram() {
+                args.extend(["--speculative-eagle-topk".into(), sp.topk.to_string()]);
+            }
         }
         args.extend(["--speculative-num-draft-tokens".into(), sp.draft_tokens.to_string()]);
         if let Some(m) = &sp.token_map {
@@ -685,7 +760,27 @@ pub fn compose(cfg: &Config, p: &Profile, devices: &[&Device], runs_dir: &Path) 
         }
         if let Some(m) = sp.draft_model.as_ref().filter(|_| sp.needs_draft_model()) {
             args.extend(["--speculative-draft-model-path".into(), m.to_string_lossy().into_owned()]);
+            // SGLang loads the draft with the target's format and quantization: a safetensors
+            // draft beside a GGUF target would be read as GGUF.
+            let is_gguf = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+            if is_gguf(&p.model.path) && !is_gguf(m.as_path()) {
+                args.extend([
+                    "--speculative-draft-load-format".into(),
+                    "auto".into(),
+                    "--speculative-draft-model-quantization".into(),
+                    "unquant".into(),
+                ]);
+            }
         }
+        if let Some(w) = sp.draft_window {
+            args.extend(["--speculative-draft-window-size".into(), w.to_string()]);
+        }
+        if let Some(d) = &sp.draft_kv_cache_dtype {
+            args.extend(["--speculative-draft-kv-cache-dtype".into(), d.clone()]);
+        }
+    }
+    if let Some(d) = &s.mamba_ssm_dtype {
+        args.extend(["--mamba-ssm-dtype".into(), d.clone()]);
     }
     if let Some(r) = &s.reasoning_parser {
         args.extend(["--reasoning-parser".into(), r.clone()]);
@@ -1419,6 +1514,68 @@ mod tests {
         // one card: no hostcomm, --tp 1
         let single = compose(&cfg, &p, &[&d0], &dir).unwrap();
         assert!(!single.env.iter().any(|(k, _)| k == "SGLANG_HOSTCOMM"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compose_dflash_draft_beside_a_gguf_target() {
+        let d0 = dev(32624);
+        let dir = std::env::temp_dir().join(format!("fidim-dflash-{}", std::process::id()));
+        let tools = dir.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let mut cfg = Config::default_for_machine();
+        cfg.sglang = Some(serde_json::from_value(serde_json::json!({ "venv": dir.join("venv"), "tools_dir": tools })).unwrap());
+        let p: Profile = serde_json::from_value(serde_json::json!({
+            "schema": 1, "engine": "sglang", "id": "df", "name": "df",
+            "build": { "path": "" }, "model": { "path": "/m/x.gguf" },
+            "devices": [ { "key": "pci:VEN_1002&DEV_7551:bus03" } ],
+            "server": { "port": 30011, "alias": "df", "host": "127.0.0.1" },
+            "runtime": { "ctx_total": 262144 },
+            "sglang": { "mamba_ssm_dtype": "bfloat16", "spec": { "algorithm": "DFLASH", "draft_tokens": 8,
+                "draft_model": "/m/DFlash2", "draft_window": 2048, "draft_kv_cache_dtype": "fp8_e4m3" } } })).unwrap();
+        let a = compose(&cfg, &p, &[&d0], &dir).unwrap().args;
+        let val = |f: &str| a.iter().position(|x| x == f).map(|i| a[i + 1].clone());
+        assert_eq!(val("--speculative-algorithm").as_deref(), Some("DFLASH"));
+        assert_eq!(val("--speculative-num-draft-tokens").as_deref(), Some("8"));
+        assert_eq!(val("--speculative-draft-model-path").as_deref(), Some("/m/DFlash2"));
+        assert_eq!(val("--speculative-draft-load-format").as_deref(), Some("auto"));
+        assert_eq!(val("--speculative-draft-model-quantization").as_deref(), Some("unquant"));
+        assert_eq!(val("--speculative-draft-window-size").as_deref(), Some("2048"));
+        assert_eq!(val("--speculative-draft-kv-cache-dtype").as_deref(), Some("fp8_e4m3"));
+        assert_eq!(val("--mamba-ssm-dtype").as_deref(), Some("bfloat16"));
+        // the block size is the draft; SGLang derives steps and top-k
+        assert!(val("--speculative-num-steps").is_none() && val("--speculative-eagle-topk").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pool_budget_dflash_window_and_bf16_state() {
+        // dd at --tp 2 (2026-10-11): 0.85, 64 state slots, 4 requests, DFLASH 8 tokens with a
+        // 2048 window and fp8 draft KV, bf16 SSM state: SGLang allocated 1,187,734 tokens per
+        // rank and a 43,089-slot draft pool (5 KB per slot per rank).
+        let dir = std::env::temp_dir().join(format!("fidim-dflash-kv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"num_hidden_layers": 5, "num_attention_heads": 32,
+            "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 5120}"#).unwrap();
+        let spec = |w: Option<u32>, ssm: Option<&str>| -> SgLangCfg {
+            serde_json::from_value(serde_json::json!({
+                "mem_fraction": 0.85, "mamba_slots": 64, "max_running_requests": 4, "kv_cache_dtype": "fp4_mx_block16",
+                "mamba_ssm_dtype": ssm, "spec": { "algorithm": "DFLASH", "draft_tokens": 8, "draft_model": dir,
+                "draft_window": w, "draft_kv_cache_dtype": "fp8_e4m3" } })).unwrap()
+        };
+        let shape = ModelShape { weights_bytes: (17.2 * (1u64 << 30) as f64) as u64, attention_layers: 16, kv_heads: 4, head_dim: 256, label: "qwen35".into(), state_bytes_per_slot: Some(151 << 20), hybrid: true, nextn_layers: Some(1) };
+        let s = spec(Some(2048), Some("bfloat16"));
+        let k = dflash_draft_kv(s.spec.as_ref().unwrap(), &s, 2).unwrap();
+        assert_eq!(k.per_token_bytes, 0);
+        assert_eq!(k.fixed_bytes, 5120 * (1 + 6 * 2064 + 32768));
+        let windowed = pool_budget(&s, &shape, &dev(32624), 262144, 0, 2);
+        // without the window every pool token carries a draft cell
+        let unwindowed = pool_budget(&spec(None, Some("bfloat16")), &shape, &dev(32624), 262144, 0, 2);
+        assert!(unwindowed.kv_bytes_per_token > windowed.kv_bytes_per_token);
+        assert!(unwindowed.tokens_in_budget * 3 < windowed.tokens_in_budget * 2);
+        // fp32 state: twice the state pool, fewer tokens
+        let fp32 = pool_budget(&spec(Some(2048), None), &shape, &dev(32624), 262144, 0, 2);
+        assert!(fp32.state_bytes > windowed.state_bytes * 19 / 10 && fp32.tokens_in_budget < windowed.tokens_in_budget);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
