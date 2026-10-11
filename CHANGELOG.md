@@ -31,6 +31,32 @@ build with uncommitted changes.
   `/health`, polled every ~2 s while watched). Chatting with the remote's
   name (e.g. `spark`) sends the request there only. `context_length` in
   `router-remotes.json` sets its `n_ctx`.
+- **Failover to remote members.** When a route's local server is down, the
+  router sends its requests to a remote with room at once (conversations that
+  were local too); `fallback_for` in `router-remotes.json` lets a remote take
+  other routes only while their server is down. A refused connection marks the
+  route down and retries the request on the remote; a busy refusal (429,
+  concurrency limit) while local is down waits for the remote instead of
+  failing. The Running tab shows each remote on the router's header (standby,
+  overflow, failover) and, per slot, the route it serves and why; a member row
+  shows how many of its requests run remotely.
+- **KV-aware pool placement.** A new conversation goes local only while it
+  fits the local KV cache under `local_kv_fill` (default 0.9) of its
+  capacity, counting both what is in flight (`/get_load`) and what other
+  local conversations used in the last `kv_idle_window_secs` (default 300)
+  hold, so one long agent session does not push the rest out; otherwise it
+  goes to a remote with room. A local conversation continuing only moves
+  when requests in flight fill the cache. `/fidim/pool` shows `local_kv`.
+- **Load balancing across pool members.** A remote's own `/health`
+  (in-flight and waiting, every client of it) is read every few seconds
+  while the pool is in use, and it takes no new request while that shows it
+  full or queueing. `kv_capacity` on a remote applies the same KV rule as
+  locally to what the router sends there. When nothing has room, a request
+  waits in the router (up to `queue_wait_secs`, default 90) for whichever
+  member frees first, and when only local is short of a slot it waits for
+  local if that should free before the slower remote would catch up
+  (`local_prefill_tok_s`/`local_decode_tok_s`, `prefill_tok_s`/`decode_tok_s`
+  per remote).
 - **4-bit KV option.** The SGLang profile form offers `fp4_mx_block16`
   (needs the gfx1201 kernel patch in `sglang-gfx1201`); the pre-flight
   KV budget counts it at 9/16 byte per value.

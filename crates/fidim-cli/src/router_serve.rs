@@ -317,6 +317,10 @@ pub struct Slot {
     pub n_decoded_exact: bool,
     pub max_tokens: i64,
     pub gen_chars: u64,
+    /// On a remote member: the route the request was for ("" when it named
+    /// the remote), and why it went there: overflow, failover or direct.
+    pub route: String,
+    pub placement: &'static str,
 }
 
 impl Slot {
@@ -338,6 +342,8 @@ impl Slot {
             n_decoded_exact: false,
             max_tokens: -1,
             gen_chars: 0,
+            route: String::new(),
+            placement: "",
         }
     }
 
@@ -354,7 +360,7 @@ impl Slot {
     /// `speculative`: the member runs a draft (SGLang `speculative_algorithm`).
     pub fn view(&self, n_ctx: u64, speculative: bool) -> Value {
         let decoded = self.decoded_now();
-        json!({
+        let mut v = json!({
             "id": self.id,
             "id_task": self.id_task,
             "n_ctx": n_ctx,
@@ -372,7 +378,12 @@ impl Slot {
             }],
             "prompt": tail(&self.prompt, TEXT_TAIL),
             "generated": tail(&self.generated, TEXT_TAIL),
-        })
+        });
+        if !self.placement.is_empty() {
+            v["route"] = json!(self.route);
+            v["placement"] = json!(self.placement);
+        }
+        v
     }
 
     /// Text generated for this request (a streamed delta or the final
@@ -411,6 +422,9 @@ pub struct ModelStats {
     pub slots: Vec<Slot>,
     pub n_ctx: u64,
     pub n_slots: usize,
+    /// KV cache tokens the backend holds across all requests
+    /// (SGLang `max_total_num_tokens`; 0 = unknown).
+    pub kv_capacity: u64,
     pub tokens_predicted_total: u64,
     pub predicted_seconds: f64,
     pub prompt_tokens_total: u64,
@@ -433,6 +447,7 @@ impl ModelStats {
             slots: vec![],
             n_ctx: 0,
             n_slots: 0,
+            kv_capacity: 0,
             tokens_predicted_total: 0,
             predicted_seconds: 0.0,
             prompt_tokens_total: 0,
@@ -464,6 +479,7 @@ impl ModelStats {
                     .unwrap_or(0)
                     .max(0) as u64;
                 self.speculative = truthy(d.get("speculative_algorithm"));
+                self.kv_capacity = pick("max_total_num_tokens").unwrap_or(0).max(0) as u64;
                 // The scheduler's own cap wins over the flag: on a hybrid model
                 // SGLang lowers it to state slots / 5 (qwenMoE: flag 8, runs 4).
                 let effective = d
@@ -959,18 +975,36 @@ pub struct Opts {
     /// Seconds a conversation waits for its own member's slot before it may
     /// move (a move costs one full prefill elsewhere).
     pub sticky_wait: f64,
+    /// A new request goes local only if the local KV cache stays under this
+    /// share of its capacity (see `Router::try_pick`).
+    pub local_kv_fill: f64,
+    /// Local conversations used within this many seconds count as holding
+    /// their context in the KV cache (agents between tool calls).
+    pub kv_idle_window: f64,
+    /// Longest a request waits in the router for a member with room before
+    /// it is sent to the local server's own queue anyway.
+    pub queue_wait: f64,
+    /// The local server's speed for one request (prompt read, reply written).
+    pub local_prefill_tok_s: f64,
+    pub local_decode_tok_s: f64,
 }
 
 /// One remote OpenAI-compatible server in a route's pool, from
 /// `router-remotes.json`:
 ///
 /// ```json
-/// {"sticky_wait_secs": 15,
+/// {"sticky_wait_secs": 15, "local_kv_fill": 0.9, "kv_idle_window_secs": 300, "queue_wait_secs": 90,
+///  "local_prefill_tok_s": 2400, "local_decode_tok_s": 45,
 ///  "remotes": [{"name": "spark", "pool": "dd",
 ///               "base_url": "https://spark.example.com/v1", "served_model": "qwen3.8-27b",
 ///               "api_key_file": "~/.secrets/spark_key.txt", "max_inflight": 2,
-///               "context_length": 262144}]}
+///               "context_length": 262144, "kv_capacity": 262144,
+///               "prefill_tok_s": 1400, "decode_tok_s": 26}]}
 /// ```
+///
+/// The remote's own `/health` (`inflight`, `waiting`: every client of it)
+/// is read every few seconds while the pool is in use; it takes no new
+/// request while those show it full or queueing.
 ///
 /// The remote is also listed by `name` in `/models`, so FIDIM's Running tab
 /// shows its slots (`/slots?model=<name>`) and counters
@@ -999,6 +1033,35 @@ pub struct RemoteSpec {
     /// Its context window, for the live view (`n_ctx`).
     #[serde(default)]
     pub context_length: Option<u64>,
+    /// Its KV cache in tokens: what this router sends there (in flight, and
+    /// recent conversations it likely still caches) stays under
+    /// `local_kv_fill` of it. None: not checked.
+    #[serde(default)]
+    pub kv_capacity: Option<u64>,
+    /// Its speed for one request, to compare with local when both are busy.
+    #[serde(default)]
+    pub prefill_tok_s: Option<f64>,
+    #[serde(default)]
+    pub decode_tok_s: Option<f64>,
+    /// Other routes this remote serves only while their local server is
+    /// down (failover, not overflow).
+    #[serde(default)]
+    pub fallback_for: Vec<String>,
+}
+
+/// A member's speed for one request (prompt read, reply written) in tokens
+/// per second, and the typical reply length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Speed {
+    prefill: f64,
+    decode: f64,
+}
+
+impl Speed {
+    /// Seconds to serve a new conversation: read `prompt`, write `reply`.
+    fn service(&self, prompt: u64, reply: f64) -> f64 {
+        prompt as f64 / self.prefill.max(1.0) + reply / self.decode.max(0.1)
+    }
 }
 
 fn one() -> usize {
@@ -1011,6 +1074,16 @@ struct RemotesFile {
     remotes: Vec<RemoteSpec>,
     #[serde(default)]
     sticky_wait_secs: Option<f64>,
+    #[serde(default)]
+    local_kv_fill: Option<f64>,
+    #[serde(default)]
+    kv_idle_window_secs: Option<f64>,
+    #[serde(default)]
+    queue_wait_secs: Option<f64>,
+    #[serde(default)]
+    local_prefill_tok_s: Option<f64>,
+    #[serde(default)]
+    local_decode_tok_s: Option<f64>,
 }
 
 /// `~/` at the start of a path, expanded (key files are written by hand).
@@ -1047,7 +1120,7 @@ impl Opts {
         if !routes.iter().any(|(n, _)| n == default) {
             bail!("--default {default} is not one of the routes");
         }
-        Ok(Opts { host: host.to_string(), port, routes, aliases, default: default.to_string(), remotes: vec![], sticky_wait: 15.0 })
+        Ok(Opts { host: host.to_string(), port, routes, aliases, default: default.to_string(), remotes: vec![], sticky_wait: 15.0, local_kv_fill: 0.9, kv_idle_window: 300.0, queue_wait: 90.0, local_prefill_tok_s: 2400.0, local_decode_tok_s: 45.0 })
     }
 
     /// Add the remote members in `path` when it exists. A bad file is
@@ -1081,6 +1154,9 @@ impl Opts {
             if !self.routes.iter().any(|(n, _)| *n == r.pool) {
                 bail!("remote {}: pool `{}` is not a route", r.name, r.pool);
             }
+            if let Some(f) = r.fallback_for.iter().find(|f| !self.routes.iter().any(|(n, _)| n == *f)) {
+                bail!("remote {}: fallback_for `{f}` is not a route", r.name);
+            }
             if r.max_inflight == 0 || r.served_model.is_empty() {
                 bail!("remote {}: max_inflight must be at least 1 and served_model set", r.name);
             }
@@ -1088,6 +1164,21 @@ impl Opts {
         }
         if let Some(w) = f.sticky_wait_secs {
             self.sticky_wait = w.clamp(0.0, 300.0);
+        }
+        if let Some(x) = f.local_kv_fill {
+            self.local_kv_fill = x.clamp(0.1, 1.0);
+        }
+        if let Some(x) = f.kv_idle_window_secs {
+            self.kv_idle_window = x.clamp(0.0, 3600.0);
+        }
+        if let Some(x) = f.queue_wait_secs {
+            self.queue_wait = x.clamp(0.0, 1800.0);
+        }
+        if let Some(x) = f.local_prefill_tok_s.filter(|x| *x > 0.0) {
+            self.local_prefill_tok_s = x;
+        }
+        if let Some(x) = f.local_decode_tok_s.filter(|x| *x > 0.0) {
+            self.local_decode_tok_s = x;
         }
         Ok(())
     }
@@ -1113,6 +1204,15 @@ struct Remote {
 
 /// How long a refused or failed remote sits out.
 const REMOTE_COOLDOWN: f64 = 30.0;
+/// How long a remote that said it is busy (429, a concurrency limit) sits out
+/// while it is the only member up: a refusal there means wait, not broken.
+const REMOTE_BUSY_BACKOFF: f64 = 2.0;
+
+/// A remote's refusal that means "full right now" rather than "failing".
+fn busy_refusal(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.starts_with("http 429") || r.contains("concurrency limit") || r.contains("rate_limited") || r.contains("too many requests")
+}
 
 impl Remote {
     fn new(spec: RemoteSpec, config_dir: &Path) -> Self {
@@ -1160,8 +1260,39 @@ impl Remote {
         self.healthy.load(Ordering::Relaxed) && (sticky || !self.cooling()) && !self.off_file.exists()
     }
 
+    /// The remote's own `/health` says it is full (its in-flight count,
+    /// every client included, at `max_inflight`) or queueing. Only a reading
+    /// from the last 15 s counts.
+    fn shared_full(&self) -> bool {
+        match *self.queue.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((at, inflight, waiting)) if now() - at < 15.0 => {
+                let ours = self.busy() as f64;
+                let others = (inflight - ours).max(0.0);
+                waiting > 0.0 || ours + others >= self.spec.max_inflight as f64
+            }
+            _ => false,
+        }
+    }
+
     fn has_room(&self, sticky: bool) -> bool {
-        self.usable(sticky) && self.busy() < self.spec.max_inflight
+        self.usable(sticky) && self.busy() < self.spec.max_inflight && !self.shared_full()
+    }
+
+    /// KV tokens of this router's requests running there now.
+    fn inflight_tokens(&self) -> u64 {
+        Router::lock_stats(&self.stats).slots.iter().filter(|s| s.busy).map(|s| s.n_prompt + 2048).sum()
+    }
+
+    fn speed(&self) -> Speed {
+        Speed { prefill: self.spec.prefill_tok_s.unwrap_or(1400.0), decode: self.spec.decode_tok_s.unwrap_or(26.0) }
+    }
+
+    /// It refused a request as busy while local is down: hold new requests
+    /// off briefly (the router waits for it, up to `queue_wait`).
+    fn back_off(&self, reason: &str) {
+        let mut until = self.cooling_until.lock().unwrap_or_else(|e| e.into_inner());
+        *until = until.max(now() + REMOTE_BUSY_BACKOFF);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = reason.to_string();
     }
 
     /// A request it took failed before reaching the client: sit out a while.
@@ -1172,6 +1303,14 @@ impl Remote {
             self.healthy.store(false, Ordering::Relaxed);
         }
         log_line("WARNING", &format!("remote {}: {reason}; no new conversations for {REMOTE_COOLDOWN:.0} s", self.spec.name));
+    }
+
+    /// Mark slot `idx` with the route it serves and why (the live view).
+    fn tag(&self, idx: usize, route: &str, placement: &'static str) {
+        if let Some(sl) = Router::lock_stats(&self.stats).slots.get_mut(idx) {
+            sl.route = route.to_string();
+            sl.placement = placement;
+        }
     }
 
     fn state_json(&self) -> Value {
@@ -1198,14 +1337,15 @@ enum Target {
 #[derive(Debug, PartialEq)]
 enum Pick {
     Local(usize),
-    /// (remote index, slot index, why: new/sticky/spill)
-    Remote(usize, usize, &'static str),
+    /// (remote index, slot index, why: sticky / spill and the reason)
+    Remote(usize, usize, String),
 }
 
-/// Conversation key -> (member, last used), router clock.
+/// Conversation key -> (member, last used (router clock), its size in
+/// tokens at the last request: prompt plus room for the reply).
 #[derive(Default)]
 struct Sticky {
-    map: HashMap<u64, (Target, f64)>,
+    map: HashMap<u64, (Target, f64, u64)>,
 }
 
 const STICKY_TTL: f64 = 1800.0;
@@ -1214,24 +1354,60 @@ const STICKY_MAX: usize = 4096;
 impl Sticky {
     fn get(&self, key: Option<u64>) -> Option<Target> {
         let t = now();
-        key.and_then(|k| self.map.get(&k)).filter(|(_, at)| t - at < STICKY_TTL).map(|(tg, _)| *tg)
+        key.and_then(|k| self.map.get(&k)).filter(|(_, at, _)| t - at < STICKY_TTL).map(|(tg, _, _)| *tg)
     }
 
-    fn put(&mut self, key: Option<u64>, target: Target) {
+    fn put(&mut self, key: Option<u64>, target: Target, tokens: u64) {
         let Some(k) = key else { return };
         let t = now();
         if self.map.len() >= STICKY_MAX {
-            self.map.retain(|_, (_, at)| t - *at < STICKY_TTL);
+            self.map.retain(|_, (_, at, _)| t - *at < STICKY_TTL);
             if self.map.len() >= STICKY_MAX {
                 // still full of live entries: drop the oldest quarter
-                let mut ats: Vec<f64> = self.map.values().map(|(_, at)| *at).collect();
+                let mut ats: Vec<f64> = self.map.values().map(|(_, at, _)| *at).collect();
                 ats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let cut = ats[ats.len() / 4];
-                self.map.retain(|_, (_, at)| *at > cut);
+                self.map.retain(|_, (_, at, _)| *at > cut);
             }
         }
-        self.map.insert(k, (target, t));
+        self.map.insert(k, (target, t, tokens));
     }
+
+    /// Tokens the conversations on `target` used within `window` seconds
+    /// hold in its KV cache (in flight, or cached between an agent's turns),
+    /// other than conversation `except`.
+    fn recent_tokens(&self, target: Target, window: f64, except: Option<u64>) -> u64 {
+        let t = now();
+        self.map
+            .iter()
+            .filter(|(k, (tg, at, _))| *tg == target && t - at < window && Some(**k) != except)
+            .map(|(_, (_, _, n))| *n)
+            .sum()
+    }
+}
+
+/// What the local member's KV cache holds for a pick: its capacity and the
+/// tokens of requests in flight or waiting (SGLang `/get_load`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct KvLoad {
+    capacity: u64,
+    used: u64,
+}
+
+/// A token count for a log line: `116k`, `2.3k`, `310`.
+fn kilo(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1000..=9999 => format!("{:.1}k", n as f64 / 1000.0),
+        _ => format!("{}k", n / 1000),
+    }
+}
+
+/// Tokens a request will hold in the KV cache: its prompt plus room for the
+/// reply (`max_tokens`, 2k when unset, at most 16k).
+fn kv_need(prompt_tokens: u64, max_tokens: i64) -> u64 {
+    let reply = if max_tokens > 0 { (max_tokens as u64).min(16_384) } else { 2048 };
+    prompt_tokens + reply
 }
 
 /// The conversation a request belongs to: the client's `x-fidim-session`,
@@ -1340,7 +1516,13 @@ pub struct Router {
     stats: HashMap<String, Arc<Mutex<ModelStats>>>,
     remotes: Vec<Remote>,
     sticky: Mutex<Sticky>,
+    /// route -> (when, KV tokens in flight or waiting), from `/get_load`.
+    kv_used: Mutex<HashMap<String, (f64, u64)>>,
+    /// When a pooled request last arrived (keeps the remotes' load fresh).
+    pool_seen_at: Mutex<f64>,
     healthy: HashMap<String, AtomicBool>,
+    /// Wakes the health poller early (a request found a backend down).
+    poll_now: tokio::sync::Notify,
     /// name -> (when, aggregated text), 1 s cache of the backend's /metrics.
     backend_metrics: Mutex<HashMap<String, (f64, String)>>,
     client: HttpClient,
@@ -1364,7 +1546,10 @@ impl Router {
             stats,
             remotes,
             sticky: Mutex::new(Sticky::default()),
+            kv_used: Mutex::new(HashMap::new()),
+            pool_seen_at: Mutex::new(-1e9),
             healthy,
+            poll_now: tokio::sync::Notify::new(),
             backend_metrics: Mutex::new(HashMap::new()),
             client,
         })
@@ -1393,6 +1578,26 @@ impl Router {
 
     fn is_healthy(&self, name: &str) -> bool {
         self.healthy.get(name).map(|h| h.load(Ordering::Relaxed)).unwrap_or(false)
+    }
+
+    /// A request could not reach route `name`'s server: down now (the next
+    /// request fails over) rather than at the next health poll, which then
+    /// runs at once and every 2 s until it is back.
+    fn mark_down(&self, name: &str) {
+        if let Some(h) = self.healthy.get(name) {
+            if h.swap(false, Ordering::Relaxed) {
+                log_line("WARNING", &format!("backend {name} refused a connection; down until its health probe passes"));
+            }
+            self.poll_now.notify_one();
+        }
+    }
+
+    /// Whether a pooled request for `route` could go to a remote once the
+    /// local server is marked down (its pool, or a failover for it).
+    fn could_fail_over(&self, route: &str, path: &str, headers: &HeaderMap) -> bool {
+        matches!(path, "/v1/chat/completions" | "/v1/completions")
+            && !local_only(headers)
+            && self.remotes.iter().any(|r| (r.spec.pool == route || r.spec.fallback_for.iter().any(|f| f == route)) && r.usable(false))
     }
 
     /// The models a `?model=` query names: one (alias resolved; none when
@@ -1425,8 +1630,9 @@ impl Router {
         }
     }
 
-    /// Keeps a remote's queue numbers fresh: back to back (~2 s apart) while
-    /// FIDIM looks at it (asked within the last 30 s), else once a minute.
+    /// Keeps a remote's queue numbers fresh: back to back (~2 s apart; its
+    /// `/health` itself takes ~2 s) while FIDIM looks at it or pooled
+    /// requests arrived in the last 5 minutes, else once a minute.
     async fn queue_poller(self: Arc<Self>, i: usize) {
         let r = &self.remotes[i];
         let Some(origin) = r.spec.base_url.parse::<Uri>().ok().and_then(|u| Some(format!("{}://{}", u.scheme_str()?, u.authority()?))) else {
@@ -1434,7 +1640,8 @@ impl Router {
         };
         let mut last_poll = -1e9;
         loop {
-            let watched = now() - *r.viewed_at.lock().unwrap_or_else(|e| e.into_inner()) < 30.0;
+            let watched = now() - *r.viewed_at.lock().unwrap_or_else(|e| e.into_inner()) < 30.0
+                || now() - *self.pool_seen_at.lock().unwrap_or_else(|e| e.into_inner()) < 300.0;
             if !watched && now() - last_poll < 60.0 {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
@@ -1572,7 +1779,7 @@ impl Router {
                 all_ok &= ok;
             }
             let period = if !all_ok || self.recently_active(ACTIVE_WINDOW) { BUSY } else { IDLE };
-            tokio::time::sleep(period).await;
+            let _ = tokio::time::timeout(period, self.poll_now.notified()).await;
         }
     }
 
@@ -1627,79 +1834,219 @@ impl Router {
         }
     }
 
-    /// The remotes that may take this request: pooled with its route, and a
-    /// pooled path, and the client did not ask to stay local.
+    /// The remotes that may take this request: pooled with its route (or
+    /// its failover while the route's local server is down), and a pooled
+    /// path, and the client did not ask to stay local.
     fn remotes_for(&self, route: &str, path: &str, headers: &HeaderMap) -> Vec<usize> {
         if !matches!(path, "/v1/chat/completions" | "/v1/completions") || local_only(headers) {
             return vec![];
         }
-        self.remotes.iter().enumerate().filter(|(_, r)| r.spec.pool == route).map(|(i, _)| i).collect()
+        let down = !self.is_healthy(route);
+        self.remotes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.spec.pool == route || (down && r.spec.fallback_for.iter().any(|f| f == route)))
+            .map(|(i, _)| i)
+            .collect()
     }
 
-    /// Choose a member for a pooled request, waiting up to `sticky_wait` for
-    /// the conversation's own member when it is full and another could take it.
-    async fn choose(&self, st: &Arc<Mutex<ModelStats>>, pool: &[usize], key: Option<u64>) -> Pick {
+    /// The local member's KV load: capacity (`/get_server_info`) and the
+    /// tokens of requests running or waiting (`/get_load`, cached 0.5 s).
+    /// None when unknown (then KV is not considered).
+    async fn local_kv(&self, route: &str, st: &Arc<Mutex<ModelStats>>) -> Option<KvLoad> {
+        let (capacity, url) = {
+            let s = Self::lock_stats(st);
+            (s.kv_capacity, s.url.clone())
+        };
+        if capacity == 0 {
+            return None;
+        }
+        if let Some((at, used)) = self.kv_used.lock().unwrap_or_else(|e| e.into_inner()).get(route) {
+            if now() - at < 0.5 {
+                return Some(KvLoad { capacity, used: *used });
+            }
+        }
+        let load = self.get_json(format!("{url}/get_load"), Duration::from_secs(1)).await?;
+        let used: i64 = load
+            .as_array()?
+            .iter()
+            .map(|x| ["num_tokens", "num_pending_tokens"].iter().filter_map(|k| x.get(*k).and_then(py_int)).sum::<i64>())
+            .sum();
+        let used = used.max(0) as u64;
+        self.kv_used.lock().unwrap_or_else(|e| e.into_inner()).insert(route.to_string(), (now(), used));
+        Some(KvLoad { capacity, used })
+    }
+
+    /// Choose a member for a pooled request (`prompt` tokens, `need` KV
+    /// tokens with its reply), re-trying every 200 ms while `try_pick` says
+    /// to wait.
+    async fn choose(&self, route: &str, st: &Arc<Mutex<ModelStats>>, pool: &[usize], key: Option<u64>, prompt: u64, need: u64) -> Pick {
+        *self.pool_seen_at.lock().unwrap_or_else(|e| e.into_inner()) = now();
         let start = now();
         loop {
-            let waited = now() - start >= self.opts.sticky_wait;
-            if let Some(p) = self.try_pick(st, pool, key, waited) {
+            let kv = self.local_kv(route, st).await;
+            let local_up = self.is_healthy(route);
+            if let Some(p) = self.try_pick(st, pool, key, prompt, need, kv, now() - start, local_up) {
                 return p;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
-    /// One pick attempt (None: wait and try again). Rules:
-    /// - a conversation stays on its member while that member has a slot;
-    /// - its member full: wait (until `waited`) when another member could
-    ///   take it, then move; its remote unusable: move now;
-    /// - new conversations: local while it has a free slot, else a remote
-    ///   with room, else local (SGLang queues);
+    /// Typical reply length on the local member (its average so far, 600
+    /// until five requests have finished).
+    fn reply_tokens(s: &ModelStats) -> f64 {
+        if s.requests_total >= 5 {
+            (s.tokens_predicted_total as f64 / s.requests_total as f64).clamp(50.0, 4000.0)
+        } else {
+            600.0
+        }
+    }
+
+    /// Seconds until a local slot frees: 0 with one free, else the soonest
+    /// busy slot's remaining prompt and (typical) reply at the local speed.
+    fn local_eta(&self, s: &ModelStats, reply: f64) -> f64 {
+        let busy: Vec<&Slot> = s.slots.iter().filter(|x| x.busy).collect();
+        if busy.len() < s.n_slots.max(1) {
+            return 0.0;
+        }
+        busy.iter()
+            .map(|x| {
+                let left = (reply - x.decoded_now() as f64).max(reply * 0.25) / self.opts.local_decode_tok_s;
+                if x.t_first.is_none() {
+                    x.n_prompt.saturating_sub(x.processed) as f64 / self.opts.local_prefill_tok_s + left
+                } else {
+                    left
+                }
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// One pick attempt for a request that has waited `elapsed` seconds
+    /// (None: wait and try again). Rules:
+    /// - local has room when it has a free slot and the request fits its KV
+    ///   cache under `local_kv_fill` of the capacity. For a new conversation
+    ///   that is the larger of what is in flight (`kv.used`) and what the
+    ///   other recent local conversations hold (agents between tool calls
+    ///   keep their context cached; pushing it out costs them a full prefill
+    ///   next turn), plus `need`; for a local conversation continuing, only
+    ///   what is in flight plus `need`;
+    /// - a remote has room when it is usable, under its `max_inflight`, its
+    ///   own `/health` does not show it full or queueing (other clients
+    ///   count), and the request fits its `kv_capacity` the same way;
+    /// - a conversation stays on its member while that member has room; its
+    ///   member full: wait (until `sticky_wait`) when another could take it,
+    ///   then move; its remote unusable: move now;
+    /// - new conversations: local while it has room. Local short of a slot
+    ///   only: wait for it when it should free up before the slower remote
+    ///   would have caught up (`Speed`, waiting counts), else the remote.
+    ///   Nothing has room: wait in the router for whichever frees first,
+    ///   up to `queue_wait`, then the local server's own queue (also at
+    ///   once when no remote is usable);
+    /// - local down (`local_up` false, its health probe failing): it has no
+    ///   room, and every conversation goes to a remote with room at once,
+    ///   waiting up to `queue_wait` for one before trying local anyway;
     /// - a remote never gets more than `max_inflight` (the slot is taken
     ///   here, under the lock).
-    fn try_pick(&self, st: &Arc<Mutex<ModelStats>>, pool: &[usize], key: Option<u64>, waited: bool) -> Option<Pick> {
+    #[allow(clippy::too_many_arguments)]
+    fn try_pick(&self, st: &Arc<Mutex<ModelStats>>, pool: &[usize], key: Option<u64>, prompt: u64, need: u64, kv: Option<KvLoad>, elapsed: f64, local_up: bool) -> Option<Pick> {
         let mut sticky = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
-        let local_room = {
+        let waited = elapsed >= self.opts.sticky_wait;
+        let queue_over = elapsed >= self.opts.queue_wait;
+        let prev = sticky.get(key);
+        let (slot_free, reply, local_eta) = {
             let s = Self::lock_stats(st);
-            s.slots.iter().filter(|x| x.busy).count() < s.n_slots.max(1)
+            let reply = Self::reply_tokens(&s);
+            (s.slots.iter().filter(|x| x.busy).count() < s.n_slots.max(1), reply, self.local_eta(&s, reply))
         };
-        let remote_with_room = || pool.iter().copied().find(|&i| self.remotes[i].has_room(false));
-        let fresh = |prefer_remote: bool| -> (Target, &'static str) {
+        let window = self.opts.kv_idle_window;
+        let held = sticky.recent_tokens(Target::Local, window, key);
+        // Over the fill limit with `base` tokens already there: why, else None.
+        let over = |base: u64, capacity: u64| {
+            ((base + need) as f64 > capacity as f64 * self.opts.local_kv_fill)
+                .then(|| format!("KV {} + {} of {}", kilo(base), kilo(need), kilo(capacity)))
+        };
+        let used = kv.map(|k| k.used).unwrap_or(0);
+        // A new conversation also keeps clear of what recent conversations
+        // hold; a local one continuing is likely cached here, so moving it
+        // costs more than it saves unless requests in flight fill the cache.
+        let kv_full = kv.filter(|k| k.capacity > 0).and_then(|k| over(if prev == Some(Target::Local) { used } else { used.max(held) }, k.capacity));
+        let local_room = local_up && slot_free && kv_full.is_none();
+        let remote_fits = |i: usize, continuing: bool| -> bool {
+            let r = &self.remotes[i];
+            if !r.has_room(continuing) {
+                return false;
+            }
+            match r.spec.kv_capacity {
+                None => true,
+                Some(cap) => {
+                    let inflight = r.inflight_tokens();
+                    let base = if continuing { inflight } else { inflight.max(sticky.recent_tokens(Target::Remote(i), window, key)) };
+                    over(base, cap).is_none()
+                }
+            }
+        };
+        let remote_now = pool.iter().copied().find(|&i| remote_fits(i, false));
+        let prev_remote_fits = match prev {
+            Some(Target::Remote(i)) if pool.contains(&i) => Some(remote_fits(i, true)),
+            _ => None,
+        };
+        // Local down: a remote sitting out briefly is still worth waiting for.
+        let any_remote_usable = pool.iter().any(|&i| self.remotes[i].usable(!local_up));
+        let waited_note = if elapsed >= 1.0 { format!(", after {elapsed:.0} s") } else { String::new() };
+        let spill_why = match &kv_full {
+            _ if !local_up => format!("failover, local down{waited_note}"),
+            Some(k) if slot_free => format!("spill, {k}{waited_note}"),
+            _ => format!("spill, slots full{waited_note}"),
+        };
+        let local_speed = Speed { prefill: self.opts.local_prefill_tok_s, decode: self.opts.local_decode_tok_s };
+        // A new conversation (or one moving): None means wait.
+        let fresh = |prefer_remote: bool| -> Option<(Target, String)> {
             if local_room && !prefer_remote {
-                return (Target::Local, "new");
+                return Some((Target::Local, String::new()));
             }
-            match remote_with_room() {
-                Some(i) => (Target::Remote(i), "spill"),
-                None => (Target::Local, "new"),
+            if let Some(i) = remote_now {
+                if local_up && !prefer_remote && kv_full.is_none() && !queue_over {
+                    // Local is short of a slot only: the remote is slower, so waiting
+                    // for local pays when its slot frees before the remote catches up.
+                    let gain = self.remotes[i].speed().service(prompt, reply) - local_speed.service(prompt, reply);
+                    if elapsed + local_eta < gain {
+                        return None;
+                    }
+                }
+                return Some((Target::Remote(i), spill_why.clone()));
+            }
+            if any_remote_usable && !queue_over {
+                None // both full: wait for whichever frees first
+            } else {
+                Some((Target::Local, String::new()))
             }
         };
-        let (target, why) = match sticky.get(key) {
-            None => fresh(false),
-            Some(Target::Local) if local_room => (Target::Local, "sticky"),
+        let (target, why) = match prev {
+            None => fresh(false)?,
+            Some(Target::Local) if local_room => (Target::Local, String::new()),
+            Some(Target::Local) if !local_up => fresh(true)?,
             Some(Target::Local) => {
-                if remote_with_room().is_none() {
-                    (Target::Local, "sticky") // nowhere else: queue locally
+                if remote_now.is_none() {
+                    (Target::Local, String::new()) // nowhere else: queue locally
                 } else if !waited {
                     return None;
                 } else {
-                    fresh(true)
+                    fresh(true)?
                 }
             }
             Some(Target::Remote(i)) if pool.contains(&i) => {
-                let r = &self.remotes[i];
-                if r.has_room(true) {
-                    (Target::Remote(i), "sticky")
-                } else if !r.usable(true) {
-                    fresh(false)
-                } else if !waited {
-                    return None;
+                if prev_remote_fits == Some(true) {
+                    (Target::Remote(i), "sticky".to_string())
+                } else if !self.remotes[i].usable(true) || waited {
+                    fresh(false)?
                 } else {
-                    fresh(false)
+                    return None;
                 }
             }
-            Some(Target::Remote(_)) => fresh(false),
+            Some(Target::Remote(_)) => fresh(false)?,
         };
-        sticky.put(key, target);
+        sticky.put(key, target, need);
         Some(match target {
             Target::Local => Pick::Local(Self::lock_stats(st).take()),
             Target::Remote(i) => Pick::Remote(i, Self::lock_stats(&self.remotes[i].stats).take(), why),
@@ -1834,6 +2181,7 @@ impl Router {
             .chain(self.remotes.iter().map(|r| {
                 let ok = r.usable(true);
                 json!({"id": r.spec.name, "object": "model", "owned_by": "remote", "pool": r.spec.pool,
+                       "fallback_for": r.spec.fallback_for, "base_url": r.spec.base_url, "max_inflight": r.spec.max_inflight,
                        "status": {"value": if ok { "loaded" } else { "unloaded" }, "failed": !ok, "exit_code": null}})
             }))
             .collect();
@@ -1899,7 +2247,7 @@ impl Router {
         {
             let t = now();
             let sticky = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
-            for (tg, at) in sticky.map.values() {
+            for (tg, at, _) in sticky.map.values() {
                 if t - at < STICKY_TTL {
                     match tg {
                         Target::Local => local += 1,
@@ -1920,7 +2268,21 @@ impl Router {
                 v
             })
             .collect();
-        json_response(StatusCode::OK, &json!({"sticky_wait_secs": self.opts.sticky_wait, "local_conversations": local, "remotes": remotes}))
+        let held = self.sticky.lock().unwrap_or_else(|e| e.into_inner()).recent_tokens(Target::Local, self.opts.kv_idle_window, None);
+        let mut kv = Map::new();
+        for r in &self.remotes {
+            if let (Some(st), false) = (self.stats.get(&r.spec.pool), kv.contains_key(&r.spec.pool)) {
+                let capacity = Self::lock_stats(st).kv_capacity;
+                let used = self.kv_used.lock().unwrap_or_else(|e| e.into_inner()).get(&r.spec.pool).map(|(_, u)| *u);
+                kv.insert(r.spec.pool.clone(), json!({"capacity": capacity, "in_flight_tokens": used,
+                    "recent_conversation_tokens": held, "fill_limit": self.opts.local_kv_fill}));
+            }
+        }
+        json_response(
+            StatusCode::OK,
+            &json!({"sticky_wait_secs": self.opts.sticky_wait, "kv_idle_window_secs": self.opts.kv_idle_window,
+                    "local_conversations": local, "local_kv": kv, "remotes": remotes}),
+        )
     }
 
     /// Everything else: forward to the backend the `model` field names,
@@ -1972,31 +2334,83 @@ impl Router {
             return self.proxy_direct(i, &parts.uri, &headers, &p, &body).await;
         }
         self.ensure_info(&st).await;
-        let pool = self.remotes_for(&resolved, parts.uri.path(), &parts.headers);
-        let idx = if pool.is_empty() {
-            Self::lock_stats(&st).take()
-        } else {
-            let key = sticky_key(&parts.headers, &p);
-            match self.choose(&st, &pool, key).await {
-                Pick::Local(idx) => idx,
-                Pick::Remote(i, idx, why) => {
-                    let r = &self.remotes[i];
-                    let by = if parts.headers.contains_key("x-fidim-session") { "session header" } else { "prompt prefix" };
-                    log_line("INFO", &format!("pool {resolved} -> {} ({why}, conversation by {by})", r.spec.name));
-                    match self.try_remote(r, idx, &parts.uri, &headers, &p, &body).await {
-                        Ok(resp) => return resp,
-                        Err(reason) => {
-                            r.fail(&reason);
-                            log_line("INFO", &format!("pool {resolved}: retrying locally"));
-                            self.sticky.lock().unwrap_or_else(|e| e.into_inner()).put(key, Target::Local);
-                            Self::lock_stats(&st).take()
+        let mut retried = false;
+        let t_req = now();
+        loop {
+            let pool = self.remotes_for(&resolved, parts.uri.path(), &parts.headers);
+            let idx = if pool.is_empty() {
+                Self::lock_stats(&st).take()
+            } else {
+                let key = sticky_key(&parts.headers, &p);
+                let need = {
+                    let (_, est) = prompt_text(&p);
+                    let max_tokens = p
+                        .get("max_tokens")
+                        .filter(|v| truthy(Some(v)))
+                        .or_else(|| p.get("max_completion_tokens").filter(|v| truthy(Some(v))))
+                        .and_then(py_int)
+                        .unwrap_or(-1);
+                    let prompt = Self::lock_stats(&st).estimate_prompt(est);
+                    (prompt, kv_need(prompt, max_tokens))
+                };
+                let (prompt, need) = need;
+                match self.choose(&resolved, &st, &pool, key, prompt, need).await {
+                    Pick::Local(idx) => idx,
+                    Pick::Remote(i, idx, why) => {
+                        let r = &self.remotes[i];
+                        r.tag(idx, &resolved, if self.is_healthy(&resolved) { "overflow" } else { "failover" });
+                        let by = if parts.headers.contains_key("x-fidim-session") { "session header" } else { "prompt prefix" };
+                        log_line("INFO", &format!("pool {resolved} -> {} ({why}, conversation by {by})", r.spec.name));
+                        match self.try_remote(r, idx, &parts.uri, &headers, &p, &body).await {
+                            Ok(resp) => return resp,
+                            Err(reason) if !self.is_healthy(&resolved) && busy_refusal(&reason) && now() - t_req < self.opts.queue_wait => {
+                                r.back_off(&reason);
+                                log_line("INFO", &format!("pool {resolved}: {} is busy ({reason}); waiting for it", r.spec.name));
+                                tokio::time::sleep(Duration::from_secs_f64(REMOTE_BUSY_BACKOFF)).await;
+                                continue;
+                            }
+                            Err(reason) if !self.is_healthy(&resolved) => {
+                                r.fail(&reason);
+                                return json_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    &json!({"error": {"message": format!("{resolved} is down and remote {} failed: {reason}", r.spec.name), "type": "bad_gateway"}}),
+                                );
+                            }
+                            Err(reason) => {
+                                r.fail(&reason);
+                                log_line("INFO", &format!("pool {resolved}: retrying locally"));
+                                self.sticky.lock().unwrap_or_else(|e| e.into_inner()).put(key, Target::Local, need);
+                                Self::lock_stats(&st).take()
+                            }
                         }
                     }
                 }
+            };
+            let (guard, tracker, sbody) = start_slot(&st, idx, &p, &body, None);
+            // A local server that refuses the connection (it just died; the health
+            // poll has not seen it yet) answered nothing: when a remote could take
+            // the route once it is marked down, the request goes round again.
+            if !retried && self.could_fail_over(&resolved, parts.uri.path(), &parts.headers) {
+                if let Ok(uri) = format!("{url}{path_q}").parse::<Uri>() {
+                    let mut req = Request::builder().method(parts.method.clone()).uri(uri).body(Full::new(sbody)).expect("valid request");
+                    *req.headers_mut() = headers.clone();
+                    match self.client.request(req).await {
+                        Ok(resp) => {
+                            let (rparts, rbody) = resp.into_parts();
+                            return tracked_response(rparts, Some(rbody), None, Some((guard, tracker)));
+                        }
+                        Err(e) if e.is_connect() => {
+                            drop(guard); // releases the local slot
+                            self.mark_down(&resolved);
+                            retried = true;
+                            continue;
+                        }
+                        Err(e) => return text_response(StatusCode::BAD_GATEWAY, &format!("backend {resolved} ({url}): {e}")),
+                    }
+                }
             }
-        };
-        let (guard, tracker, body) = start_slot(&st, idx, &p, &body, None);
-        self.send(&url, &resolved, &parts.method, &path_q, headers, body, Some((guard, tracker))).await
+            return self.send(&url, &resolved, &parts.method, &path_q, headers, sbody, Some((guard, tracker))).await;
+        }
     }
 
     /// A request naming a remote: that remote or an error (no local fallback).
@@ -2013,6 +2427,7 @@ impl Router {
             }
             Self::lock_stats(&r.stats).take()
         };
+        r.tag(idx, "", "direct");
         log_line("INFO", &format!("remote {} (requested by name)", r.spec.name));
         match self.try_remote(r, idx, uri, headers, p, body).await {
             Ok(resp) => resp,
@@ -2048,7 +2463,12 @@ impl Router {
         let resp = match self.client.request(out_req).await {
             Ok(r) => r,
             Err(e) => {
-                // `track` drops here: the slot is released.
+                // `track` drops here: the slot is released. A refused connection
+                // marks the route down now (the next request fails over) rather
+                // than at the next health poll (up to 30 s when idle).
+                if e.is_connect() {
+                    self.mark_down(label);
+                }
                 return text_response(StatusCode::BAD_GATEWAY, &format!("backend {label} ({base}): {e}"));
             }
         };
@@ -2363,6 +2783,12 @@ mod tests {
         );
         assert_eq!(v["n_ctx"], 4096);
         assert_eq!(v["is_processing"], true);
+        // a remote member's slot also says what it serves
+        let mut t = fresh_slot();
+        t.route = "dd".into();
+        t.placement = "failover";
+        let tv = t.view(4096, false);
+        assert_eq!((tv["route"].as_str(), tv["placement"].as_str()), (Some("dd"), Some("failover")));
         assert_eq!(v["speculative"], true);
         // prefill: processed shown while nothing is decoded
         assert_eq!(v["n_prompt_tokens_processed"], 4);
@@ -2791,6 +3217,10 @@ vllm:other 1.0
             api_key_file: None,
             max_inflight: max,
             context_length: Some(8192),
+            kv_capacity: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            fallback_for: vec![],
         }
     }
 
@@ -2806,30 +3236,70 @@ vllm:other 1.0
         r
     }
 
+    fn is_remote(p: &Option<Pick>, why: &str) -> bool {
+        matches!(p, Some(Pick::Remote(0, _, w)) if w.starts_with(why))
+    }
+
+    #[test]
+    fn pick_fails_over_when_local_is_down() {
+        let r = pool_router(4, vec![spec("spark", 1)]);
+        let st = r.stats["dd"].clone();
+        let pool = [0usize];
+        // local down with free slots: a new conversation goes remote at once
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0, false), "failover, local down"));
+        // remote full: wait for it rather than send to a dead server...
+        assert_eq!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0, false), None);
+        // ...until queue_wait, then local anyway (it may be back)
+        assert!(matches!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 90.0, false), Some(Pick::Local(_))));
+        // a local conversation moves without the sticky wait once its server is down
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        assert!(matches!(r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0, true), Some(Pick::Local(_))));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0, false), "failover"));
+        // a remote backing off after a busy refusal: wait for it, do not send to the dead local server
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        r.remotes[0].back_off("HTTP 429 concurrency limit");
+        assert_eq!(r.try_pick(&st, &pool, Some(4), 100, 100, None, 0.0, false), None);
+        assert!(busy_refusal("refused: concurrency limit: 1 in-flight requests") && busy_refusal("HTTP 429 {}") && !busy_refusal("connect: refused"));
+    }
+
+    #[test]
+    fn fallback_remote_joins_only_while_its_route_is_down() {
+        let mut opts = Opts::parse_args("127.0.0.1", 0, &["dd=http://127.0.0.1:1".into(), "moe=http://127.0.0.1:2".into()], &[], "dd").unwrap();
+        opts.remotes = vec![RemoteSpec { fallback_for: vec!["moe".into()], ..spec("spark", 2) }];
+        let r = Router::new(opts);
+        let h = HeaderMap::new();
+        let path = "/v1/chat/completions";
+        r.healthy["moe"].store(true, Ordering::Relaxed);
+        assert!(r.remotes_for("moe", path, &h).is_empty(), "moe up: no overflow to a fallback-only remote");
+        r.healthy["moe"].store(false, Ordering::Relaxed);
+        assert_eq!(r.remotes_for("moe", path, &h), vec![0]);
+        assert_eq!(r.remotes_for("dd", path, &h), vec![0], "its own pool always");
+    }
+
     #[test]
     fn pick_prefers_local_spills_and_sticks() {
         let r = pool_router(1, vec![spec("spark", 2)]);
         let st = r.stats["dd"].clone();
         let pool = [0usize];
+        let pick = |key: u64, elapsed: f64| r.try_pick(&st, &pool, Some(key), 100, 100, None, elapsed, true);
         // new conversation, local free -> local
-        let a = r.try_pick(&st, &pool, Some(1), false).unwrap();
-        assert_eq!(a, Pick::Local(0));
-        // local full -> a new conversation spills to the remote
-        let b = r.try_pick(&st, &pool, Some(2), false).unwrap();
-        assert!(matches!(b, Pick::Remote(0, _, "spill")), "{b:?}");
+        assert_eq!(pick(1, 0.0), Some(Pick::Local(0)));
+        // local full (its request only started) -> a new conversation spills to the remote
+        assert!(is_remote(&pick(2, 0.0), "spill, slots full"));
         // conversation 2 stays on the remote even once local frees up
         Router::lock_stats(&st).release(0);
         Router::lock_stats(&r.remotes[0].stats).release(0);
-        let b2 = r.try_pick(&st, &pool, Some(2), false).unwrap();
-        assert!(matches!(b2, Pick::Remote(0, _, "sticky")), "{b2:?}");
+        assert!(is_remote(&pick(2, 0.0), "sticky"));
         // conversation 1 (local) waits while local is full and the remote has room...
-        let c = r.try_pick(&st, &pool, Some(3), false).unwrap(); // takes local
-        assert!(matches!(c, Pick::Local(_)));
-        assert_eq!(r.try_pick(&st, &pool, Some(1), false), None);
+        assert!(matches!(pick(3, 0.0), Some(Pick::Local(_)))); // takes local
+        assert_eq!(pick(1, 0.0), None);
         // ...and moves after the wait
-        assert!(matches!(r.try_pick(&st, &pool, Some(1), true), Some(Pick::Remote(0, _, "spill"))));
-        // remote at max_inflight (2): a new conversation queues locally, never a third remote request
-        assert!(matches!(r.try_pick(&st, &pool, Some(4), false), Some(Pick::Local(_))));
+        assert!(is_remote(&pick(1, 15.0), "spill"));
+        // both full: a new conversation waits in the router for whichever frees first...
+        assert_eq!(r.remotes[0].busy(), 2);
+        assert_eq!(pick(4, 0.0), None);
+        // ...up to queue_wait, then the local server's own queue; never a third remote request
+        assert!(matches!(pick(4, 90.0), Some(Pick::Local(_))));
         assert_eq!(r.remotes[0].busy(), 2);
     }
 
@@ -2838,23 +3308,133 @@ vllm:other 1.0
         let r = pool_router(1, vec![spec("spark", 2)]);
         let st = r.stats["dd"].clone();
         let pool = [0usize];
-        let _ = r.try_pick(&st, &pool, Some(1), false); // local now full
+        let pick = |key: u64| r.try_pick(&st, &pool, Some(key), 100, 100, None, 0.0, true);
+        let _ = pick(1); // local now full
         r.remotes[0].healthy.store(false, Ordering::Relaxed);
-        assert!(matches!(r.try_pick(&st, &pool, Some(2), false), Some(Pick::Local(_))), "unhealthy: local queue");
+        assert!(matches!(pick(2), Some(Pick::Local(_))), "unhealthy: local queue at once, no router wait");
         r.remotes[0].healthy.store(true, Ordering::Relaxed);
-        let s5 = r.try_pick(&st, &pool, Some(5), false).unwrap(); // a conversation on the remote
-        assert!(matches!(s5, Pick::Remote(0, _, _)));
+        let s5 = pick(5); // a conversation on the remote
+        assert!(is_remote(&s5, "spill"));
         Router::lock_stats(&r.remotes[0].stats).release(0);
         *r.remotes[0].cooling_until.lock().unwrap() = now() + 60.0;
-        assert!(matches!(r.try_pick(&st, &pool, Some(3), false), Some(Pick::Local(_))), "cooling: no new conversations");
-        assert!(matches!(r.try_pick(&st, &pool, Some(5), false), Some(Pick::Remote(0, _, "sticky"))), "cooling: its own stay");
+        assert!(matches!(pick(3), Some(Pick::Local(_))), "cooling: no new conversations");
+        assert!(is_remote(&pick(5), "sticky"), "cooling: its own stay");
         Router::lock_stats(&r.remotes[0].stats).release(0);
         *r.remotes[0].cooling_until.lock().unwrap() = 0.0;
         // a conversation pinned to a remote that went away moves at once (no wait)
-        let x = r.try_pick(&st, &pool, Some(9), false).unwrap();
-        assert!(matches!(x, Pick::Remote(0, _, _)));
+        assert!(is_remote(&pick(9), "spill"));
         r.remotes[0].healthy.store(false, Ordering::Relaxed);
-        assert!(matches!(r.try_pick(&st, &pool, Some(9), false), Some(Pick::Local(_))));
+        assert!(matches!(pick(9), Some(Pick::Local(_))));
+    }
+
+    #[test]
+    fn pick_keeps_room_in_the_local_kv_cache() {
+        // 3 slots, KV 100k, fill limit 0.9 -> 90k usable
+        let r = pool_router(3, vec![spec("spark", 2)]);
+        let st = r.stats["dd"].clone();
+        let pool = [0usize];
+        let kv = |used: u64| Some(KvLoad { capacity: 100_000, used });
+        let tp = |r: &Router, st: &Arc<Mutex<ModelStats>>, key: u64, need: u64, used: u64, elapsed: f64| {
+            r.try_pick(st, &pool, Some(key), need, need, kv(used), elapsed, true)
+        };
+        // a big agent session already in flight (60k): a 40k newcomer would overflow -> Spark,
+        // although a local slot is free
+        let p = tp(&r, &st, 1, 40_000, 60_000, 0.0);
+        assert!(is_remote(&p, "spill, KV 60k + 40k of 100k"), "{p:?}");
+        // a small request still fits locally
+        assert!(matches!(tp(&r, &st, 2, 10_000, 60_000, 0.0), Some(Pick::Local(_))));
+        // between turns nothing is in flight, but recent local conversations hold their context:
+        // A (50k) and B (35k) were just used; a new 20k conversation would push them out -> Spark
+        let r = pool_router(3, vec![spec("spark", 2)]);
+        let st = r.stats["dd"].clone();
+        assert!(matches!(tp(&r, &st, 10, 50_000, 0, 0.0), Some(Pick::Local(_))));
+        Router::lock_stats(&st).release(0);
+        assert!(matches!(tp(&r, &st, 11, 35_000, 0, 0.0), Some(Pick::Local(_))));
+        Router::lock_stats(&st).release(0);
+        assert!(is_remote(&tp(&r, &st, 12, 20_000, 0, 0.0), "spill, KV 85k"));
+        // A's own next turn (now 52k) still fits: its own context does not count against it
+        assert!(matches!(tp(&r, &st, 10, 52_000, 0, 0.0), Some(Pick::Local(_))));
+        Router::lock_stats(&st).release(0);
+        // B continuing at 60k: 52k + 35k recent elsewhere is over, but only what is in flight
+        // counts for a conversation already here (it is likely cached locally) -> stays
+        assert!(matches!(tp(&r, &st, 11, 60_000, 20_000, 0.0), Some(Pick::Local(_))));
+        Router::lock_stats(&st).release(0);
+        // ...until requests in flight really fill the cache: then it waits, and moves after the wait
+        assert_eq!(tp(&r, &st, 11, 60_000, 45_000, 0.0), None);
+        assert!(is_remote(&tp(&r, &st, 11, 60_000, 45_000, 15.0), "spill, KV 45k + 60k"));
+        // no remote: everything goes local as before
+        let r2 = pool_router(3, vec![]);
+        let st2 = r2.stats["dd"].clone();
+        assert!(matches!(r2.try_pick(&st2, &[], Some(1), 95_000, 95_000, kv(60_000), 0.0, true), Some(Pick::Local(_))));
+        // KV unknown (capacity 0): slots alone decide
+        let r3 = pool_router(3, vec![spec("spark", 2)]);
+        let st3 = r3.stats["dd"].clone();
+        assert!(matches!(r3.try_pick(&st3, &pool, Some(1), 500_000, 500_000, None, 0.0, true), Some(Pick::Local(_))));
+    }
+
+    #[test]
+    fn remote_load_from_other_clients_counts() {
+        let r = pool_router(1, vec![spec("spark", 2)]);
+        let st = r.stats["dd"].clone();
+        let pool = [0usize];
+        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0, true); // local full
+        // the Spark's own /health: two requests in flight from someone else -> full for us
+        *r.remotes[0].queue.lock().unwrap() = Some((now(), 2.0, 0.0));
+        assert_eq!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0, true), None, "wait, do not get refused");
+        // one of theirs plus a queue there -> still full
+        *r.remotes[0].queue.lock().unwrap() = Some((now(), 1.0, 1.0));
+        assert_eq!(r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0, true), None);
+        // one of theirs, nothing waiting -> one slot left for us
+        *r.remotes[0].queue.lock().unwrap() = Some((now(), 1.0, 0.0));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(2), 100, 100, None, 0.0, true), "spill"));
+        // a stale reading (over 15 s old) is ignored
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        *r.remotes[0].queue.lock().unwrap() = Some((now() - 60.0, 2.0, 5.0));
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 100, None, 0.0, true), "spill"));
+    }
+
+    #[test]
+    fn remote_kv_budget() {
+        let mut sp = spec("spark", 2);
+        sp.kv_capacity = Some(100_000); // 90k usable at fill 0.9
+        let r = pool_router(1, vec![sp]);
+        let st = r.stats["dd"].clone();
+        let pool = [0usize];
+        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0, true); // local full...
+        Router::lock_stats(&st).slots[0].n_prompt = 200_000; // ...for a long while (a 200k prefill)
+        // conversation X (60k) goes to the Spark, finishes; it stays cached there
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(7), 60_000, 60_000, None, 0.0, true), "spill"));
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        // a new 50k conversation would push X out of the Spark's cache: it waits instead
+        assert_eq!(r.try_pick(&st, &pool, Some(8), 50_000, 50_000, None, 0.0, true), None);
+        // X continuing (70k) fits: only what is in flight counts for it
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(7), 70_000, 70_000, None, 0.0, true), "sticky"));
+        // ...and with X in flight, a 30k newcomer does not fit (70k + 2k reply room + 30k > 90k)
+        assert_eq!(r.try_pick(&st, &pool, Some(9), 30_000, 30_000, None, 0.0, true), None);
+        // after queue_wait it goes to the local queue
+        assert!(matches!(r.try_pick(&st, &pool, Some(9), 30_000, 30_000, None, 90.0, true), Some(Pick::Local(_))));
+    }
+
+    #[test]
+    fn waits_for_local_when_it_frees_before_the_remote_catches_up() {
+        let r = pool_router(1, vec![spec("spark", 2)]);
+        let st = r.stats["dd"].clone();
+        let pool = [0usize];
+        let _ = r.try_pick(&st, &pool, Some(1), 100, 100, None, 0.0, true); // local full
+        {
+            // its request is decoding and nearly done (typical reply 600 tokens)
+            let mut s = Router::lock_stats(&st);
+            s.slots[0].t_first = Some(now());
+            s.slots[0].n_decoded = 590;
+        }
+        // a 50k prompt: the Spark would take ~25 s longer; local frees in ~3 s -> wait
+        assert_eq!(r.try_pick(&st, &pool, Some(2), 50_000, 52_048, None, 0.0, true), None);
+        // still busy after the remote's head start is gone -> go to the remote
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(2), 50_000, 52_048, None, 30.0, true), "spill, slots full, after 30 s"));
+        Router::lock_stats(&r.remotes[0].stats).release(0);
+        // a slot that just started its reply (~13 s left) vs a tiny prompt (~10 s slower remotely) -> remote now
+        Router::lock_stats(&st).slots[0].n_decoded = 0;
+        assert!(is_remote(&r.try_pick(&st, &pool, Some(3), 100, 2148, None, 0.0, true), "spill"));
     }
 
     #[test]
@@ -2924,7 +3504,9 @@ vllm:other 1.0
         Ok(match (req.method().clone(), path.as_str()) {
             (Method::GET, "/get_server_info") => json_ct(r#"{"max_running_requests": 1, "context_length": 4096}"#),
             (Method::GET, "/ready") => Response::new(tb("ok")),
-            (Method::GET, "/health") if who == "remote" => json_ct(r#"{"gateway":"ok","inflight":3,"waiting":1}"#),
+            // the remote's own load: one request of another client in flight (max_inflight 2 in the
+            // e2e test leaves one slot for the router)
+            (Method::GET, "/health") if who == "remote" => json_ct(r#"{"gateway":"ok","inflight":1,"waiting":0}"#),
             (Method::GET, "/v1/models") => json_ct(r#"{"object":"list","data":[{"id":"served-x","object":"model"}]}"#),
             (Method::POST, "/v1/chat/completions") => {
                 if who == "remote" {
@@ -2984,8 +3566,12 @@ vllm:other 1.0
             base_url: format!("{remote}/v1"),
             served_model: "served-x".into(),
             api_key_file: Some(keyfile.to_string_lossy().into_owned()),
-            max_inflight: 1,
+            max_inflight: 2,
             context_length: Some(8192),
+            kv_capacity: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            fallback_for: vec![],
         }];
         opts.sticky_wait = 0.5;
         let router = Router::new(opts);
@@ -3043,7 +3629,7 @@ vllm:other 1.0
         assert!(pool.contains("concurrency limit") && !pool.contains("testkey"), "{pool}");
         let (_, state) = get(&client, &format!("{base}/fidim/state")).await;
         let state: Value = serde_json::from_str(&state).unwrap();
-        assert_eq!(state["dd"]["pool"]["spark"]["max_inflight"], 1);
+        assert_eq!(state["dd"]["pool"]["spark"]["max_inflight"], 2);
         // FIDIM's view: listed in /models, its own slots and counters, the remote's queue
         refuse.store(false, Ordering::Relaxed);
         let (_, models) = get(&client, &format!("{base}/models")).await;
@@ -3053,7 +3639,7 @@ vllm:other 1.0
         assert!(!v1.contains("spark"), "clients' model list stays as it was: {v1}");
         let (_, slots) = get(&client, &format!("{base}/slots?model=spark")).await;
         let slots: Value = serde_json::from_str(&slots).unwrap();
-        assert_eq!(slots.as_array().unwrap().len(), 1);
+        assert_eq!(slots.as_array().unwrap().len(), 2);
         assert_eq!(slots[0]["n_ctx"], 8192);
         let mut metrics = String::new();
         for _ in 0..30 {
@@ -3063,7 +3649,7 @@ vllm:other 1.0
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(metrics.contains("llamacpp:requests_processing") && metrics.contains("sglang:num_running_reqs 3.0") && metrics.contains("sglang:num_queue_reqs 1.0"), "{metrics}");
+        assert!(metrics.contains("llamacpp:requests_processing") && metrics.contains("sglang:num_running_reqs ") && metrics.contains("sglang:num_queue_reqs 0.0"), "{metrics}");
         // a request for "spark" by name goes there (the cooldown blocks new pool conversations, not this)
         let direct = {
             let body = json!({"model": "spark", "stream": true, "messages": [{"role": "user", "content": "hi"}]});

@@ -344,6 +344,19 @@ pub struct RouterModel {
     pub status: String,
     pub failed: bool,
     pub exit_code: Option<i64>,
+    /// A remote pool member of FIDIM's SGLang router: the route it adds
+    /// capacity to, the routes it takes over while their server is down,
+    /// and where it is. None for a local model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemoteInfo {
+    pub pool: String,
+    pub fallback_for: Vec<String>,
+    pub base_url: String,
+    pub max_inflight: u64,
 }
 
 pub fn models(host: &str, port: u16) -> Result<Vec<RouterModel>> {
@@ -361,6 +374,15 @@ pub fn models(host: &str, port: u16) -> Result<Vec<RouterModel>> {
                     status: m["status"]["value"].as_str().unwrap_or("?").to_string(),
                     failed: m["status"]["failed"].as_bool().unwrap_or(false),
                     exit_code: m["status"]["exit_code"].as_i64(),
+                    remote: (m["owned_by"].as_str() == Some("remote")).then(|| RemoteInfo {
+                        pool: m["pool"].as_str().unwrap_or_default().to_string(),
+                        fallback_for: m["fallback_for"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                            .unwrap_or_default(),
+                        base_url: m["base_url"].as_str().unwrap_or_default().to_string(),
+                        max_inflight: m["max_inflight"].as_u64().unwrap_or(1),
+                    }),
                 })
                 .collect()
         })
